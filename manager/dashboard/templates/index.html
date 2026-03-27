@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mac_intel — Manager Dashboard</title>
+<link rel="stylesheet" href="/static/css/dashboard.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<!-- ── Sidebar ─────────────────────────────────────────────────────────────── -->
+<aside id="sidebar">
+  <div class="sidebar-header">
+    <span class="logo">mac_intel</span>
+    <span class="sub">Manager</span>
+  </div>
+  <div class="sidebar-label">AGENTS</div>
+  <ul id="agent-list"></ul>
+  <div class="sidebar-footer" id="server-time"></div>
+</aside>
+
+<!-- ── Main ───────────────────────────────────────────────────────────────── -->
+<main id="main">
+
+  <!-- No agent selected -->
+  <div id="welcome" class="welcome">
+    <div class="welcome-icon">⬡</div>
+    <h2>Select an agent</h2>
+    <p>Choose an agent from the sidebar to view live data.</p>
+  </div>
+
+  <!-- Agent dashboard (hidden until agent selected) -->
+  <div id="dashboard" class="hidden">
+
+    <!-- Header -->
+    <div class="dash-header">
+      <div>
+        <h1 id="agent-name">—</h1>
+        <span id="agent-id" class="muted"></span>
+      </div>
+      <div class="dash-header-right">
+        <span id="agent-status" class="badge"></span>
+        <span id="last-seen" class="muted"></span>
+      </div>
+    </div>
+
+    <!-- Stat cards -->
+    <div class="cards">
+      <div class="card" id="card-cpu">
+        <div class="card-label">CPU</div>
+        <div class="card-value" id="val-cpu">—</div>
+      </div>
+      <div class="card" id="card-mem">
+        <div class="card-label">Memory Used</div>
+        <div class="card-value" id="val-mem">—</div>
+      </div>
+      <div class="card" id="card-battery">
+        <div class="card-label">Battery</div>
+        <div class="card-value" id="val-battery">—</div>
+      </div>
+      <div class="card" id="card-ports">
+        <div class="card-label">Open Ports</div>
+        <div class="card-value" id="val-ports">—</div>
+      </div>
+      <div class="card" id="card-conns">
+        <div class="card-label">Connections</div>
+        <div class="card-value" id="val-conns">—</div>
+      </div>
+      <div class="card" id="card-procs">
+        <div class="card-label">Processes</div>
+        <div class="card-value" id="val-procs">—</div>
+      </div>
+    </div>
+
+    <!-- Charts row -->
+    <div class="charts-row">
+      <div class="chart-box">
+        <div class="chart-title">CPU Usage %</div>
+        <canvas id="chart-cpu"></canvas>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">Memory (GB)</div>
+        <canvas id="chart-mem"></canvas>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">Battery %</div>
+        <canvas id="chart-battery"></canvas>
+      </div>
+    </div>
+
+    <!-- Security panel -->
+    <div class="section-box">
+      <div class="section-title">Security Status</div>
+      <div id="security-panel" class="security-grid">
+        <div class="sec-item" id="sec-sip">      <span class="sec-icon">?</span> SIP</div>
+        <div class="sec-item" id="sec-gk">       <span class="sec-icon">?</span> Gatekeeper</div>
+        <div class="sec-item" id="sec-fv">        <span class="sec-icon">?</span> FileVault</div>
+        <div class="sec-item" id="sec-fw">        <span class="sec-icon">?</span> Firewall</div>
+        <div class="sec-item" id="sec-ssh">       <span class="sec-icon">?</span> SSH Server</div>
+        <div class="sec-item" id="sec-screen">    <span class="sec-icon">?</span> Screen Sharing</div>
+      </div>
+    </div>
+
+    <!-- Tables row -->
+    <div class="tables-row">
+
+      <!-- Processes -->
+      <div class="section-box">
+        <div class="section-title">
+          Running Processes
+          <input class="table-filter" id="filter-procs" placeholder="filter…">
+        </div>
+        <div class="table-wrap">
+          <table id="tbl-procs">
+            <thead><tr>
+              <th data-col="pid">PID</th>
+              <th data-col="user">User</th>
+              <th data-col="cpu" class="sort-desc">CPU%</th>
+              <th data-col="mem">Mem%</th>
+              <th data-col="cmd">Command</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Open Ports -->
+      <div class="section-box">
+        <div class="section-title">
+          Open Ports
+          <input class="table-filter" id="filter-ports" placeholder="filter…">
+        </div>
+        <div class="table-wrap">
+          <table id="tbl-ports">
+            <thead><tr>
+              <th>Process</th><th>PID</th><th>Proto</th><th>Address:Port</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Connections -->
+    <div class="section-box">
+      <div class="section-title">
+        Active Connections
+        <input class="table-filter" id="filter-conns" placeholder="filter…">
+      </div>
+      <div class="table-wrap">
+        <table id="tbl-conns">
+          <thead><tr>
+            <th>Process</th><th>PID</th><th>Remote Address</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- System Info -->
+    <div class="section-box">
+      <div class="section-title">System Info</div>
+      <div id="sysinfo-panel" class="kv-grid"></div>
+    </div>
+
+    <!-- SBOM summary -->
+    <div class="section-box">
+      <div class="section-title">SBOM — Software Bill of Materials
+        <span id="sbom-count" class="badge badge-neutral"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="tbl-sbom">
+          <thead><tr>
+            <th>Name</th><th>Version</th><th>Type</th><th>Source</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /#dashboard -->
+</main>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

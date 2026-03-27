@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Unit + integration tests ─────────────────────────────────────────────
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r agent/requirements.txt
+          pip install -r manager/requirements.txt
+          pip install pytest pytest-asyncio httpx pytest-cov
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit/ -v --tb=short
+        env:
+          PYTHONPATH: .
+
+      - name: Run integration tests
+        run: python -m pytest tests/integration/ -v --tb=short
+        env:
+          PYTHONPATH: .
+
+  # ── Linting ───────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ruff
+      - name: ruff check
+        run: ruff check agent/agent/ manager/manager/ shared/ tests/
+
+  # ── Security scanning ─────────────────────────────────────────────────────
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install bandit pip-audit
+      - name: bandit (SAST)
+        run: |
+          bandit -r agent/agent/ manager/manager/ shared/ \
+            -ll --skip B101,B603,B607 \
+            -f json -o bandit-report.json || true
+          bandit -r agent/agent/ manager/manager/ shared/ \
+            -ll --skip B101,B603,B607
+      - name: pip-audit (CVE scan)
+        run: |
+          pip-audit --requirement agent/requirements.txt
+          pip-audit --requirement manager/requirements.txt
+      - name: Upload bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json

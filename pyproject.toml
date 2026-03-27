@@ -1,0 +1,39 @@
+# =============================================================================
+#  pyproject.toml (root) — dev tool configuration only.
+#
+#  Package-specific pyproject.toml files live in agent/ and manager/.
+#  This file configures ruff, mypy, and pytest for the whole monorepo.
+# =============================================================================
+
+[tool.ruff]
+line-length    = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "S"]
+ignore = [
+  "S101",   # assert is fine in tests
+  "S603",   # subprocess — intentional in collectors
+  "S607",   # partial path in subprocess — intentional
+  "S605",   # shell=True — not used here, but kept for clarity
+  "UP007",  # use X | Y — keep compat with 3.9
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "N"]   # relax security + naming in tests
+
+[tool.mypy]
+python_version        = "3.11"
+ignore_missing_imports = true
+strict                = false
+warn_unused_imports   = true
+warn_return_any       = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths    = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Add project root to sys.path so imports resolve without install
+pythonpath = ["."]

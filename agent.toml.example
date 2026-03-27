@@ -1,0 +1,167 @@
+# =============================================================================
+#  agent.toml.example — mac_intel Agent Configuration Reference
+#
+#  HOW TO USE:
+#    1. Copy this file:  cp agent.toml.example agent.toml
+#    2. Generate API key: python3 scripts/keygen.py
+#    3. Fill in [manager] url and api_key
+#    4. Run setup:        bash scripts/setup.sh agent
+#
+#  SECURITY:
+#    - agent.toml is in .gitignore — NEVER commit it (contains your API key)
+#    - The API key is a 256-bit secret shared between agent and manager
+#    - All data is encrypted with AES-256-GCM + HMAC-SHA256 before transit
+# =============================================================================
+
+# ── Agent Identity ────────────────────────────────────────────────────────────
+[agent]
+id          = "agent-001"           # unique ID per machine (any slug you want)
+name        = "My MacBook Air"      # human label shown on dashboard
+description = "M4 MacBook Air"      # free-text description
+
+# ── Manager Connection ────────────────────────────────────────────────────────
+[manager]
+url              = "https://YOUR_SERVER_IP:8443"  # manager public IP + port
+api_key          = "REPLACE_ME"                   # output of scripts/keygen.py
+tls_verify       = true              # set false ONLY for self-signed cert in dev
+timeout_sec      = 30               # HTTP request timeout
+retry_attempts   = 3                # how many times to retry on 5xx / network error
+retry_delay_sec  = 5                # initial delay between retries (exponential backoff)
+max_queue_size   = 500              # drop oldest payloads if outbound backlog exceeds this
+
+# ── Collection Engine ─────────────────────────────────────────────────────────
+#  tick_sec: how often the scheduler wakes to check what sections are due.
+#  Keep tick_sec ≤ smallest interval_sec across all enabled sections.
+[collection]
+enabled   = true
+tick_sec  = 5
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Per-Section Settings
+#    enabled      — true/false to activate this section
+#    interval_sec — how often to collect (in seconds)
+#    send         — true = transmit to manager | false = collect locally only
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── CRITICAL: Volatile metrics (every 10 s) ───────────────────────────────────
+[collection.sections.metrics]       # CPU, RAM, swap, battery charge
+enabled      = true
+interval_sec = 10
+send         = true
+
+[collection.sections.connections]   # Established TCP connections
+enabled      = true
+interval_sec = 10
+send         = true
+
+[collection.sections.processes]     # Top processes by CPU/RAM
+enabled      = true
+interval_sec = 10
+send         = true
+
+# ── HIGH: Network activity (every 30 s) ──────────────────────────────────────
+[collection.sections.ports]         # All LISTEN sockets (process, PID, proto, addr:port)
+enabled      = true
+interval_sec = 30
+send         = true
+
+# ── HIGH: System state (every 2 min) ─────────────────────────────────────────
+[collection.sections.network]       # Interface IPs, MACs, DNS, WiFi SSID, routes
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.battery]       # Charge %, cycle count, condition, power source
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.openfiles]     # Top processes by open file descriptor count
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.services]      # Running launchd daemons, plist paths, login items
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.users]         # Local users, admins, groups, login history
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.hardware]      # USB, Thunderbolt, Bluetooth, displays, audio
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.containers]    # Docker / Podman running containers and images
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.arp]           # ARP table (hosts visible on local network)
+enabled      = true
+interval_sec = 120
+send         = true
+
+[collection.sections.mounts]        # Active filesystem mounts (NFS, SMB, APFS, etc.)
+enabled      = true
+interval_sec = 120
+send         = true
+
+# ── MEDIUM: Slower-changing state (every 10 min) ─────────────────────────────
+[collection.sections.storage]       # Disk usage per volume, diskutil list
+enabled      = true
+interval_sec = 600
+send         = true
+
+[collection.sections.tasks]         # Crontabs, periodic scripts, launchd timers
+enabled      = true
+interval_sec = 600
+send         = true
+
+# ── LOW: Security posture (hourly) ───────────────────────────────────────────
+[collection.sections.security]      # SIP, Gatekeeper, FileVault, Firewall, pf rules, TCC
+enabled      = true
+interval_sec = 3600
+send         = true
+
+[collection.sections.sysctl]        # Kernel parameters (net.*, security.*, kern.*)
+enabled      = true
+interval_sec = 3600
+send         = true
+
+[collection.sections.configs]       # Shell rc, SSH config, authorized_keys, /etc/hosts
+enabled      = true
+interval_sec = 3600
+send         = true
+
+# ── LOW: Software inventory (daily) ──────────────────────────────────────────
+[collection.sections.apps]          # Installed .app bundles + versions
+enabled      = true
+interval_sec = 86400
+send         = true
+
+[collection.sections.packages]      # brew, pip, npm, gems, go bins, cargo bins
+enabled      = true
+interval_sec = 86400
+send         = true
+
+[collection.sections.binaries]      # All executables in Homebrew + /usr/local + ~/bin
+enabled      = false                # disabled by default — can produce large payloads
+interval_sec = 86400
+send         = false
+
+[collection.sections.sbom]          # Full SBOM: all components with version + source
+enabled      = true
+interval_sec = 86400
+send         = true
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+[logging]
+level    = "INFO"            # DEBUG | INFO | WARNING | ERROR
+file     = "logs/agent.log"  # path relative to project root
+max_mb   = 10                # rotate at this size
+backups  = 3                 # keep this many rotated files

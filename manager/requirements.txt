@@ -1,0 +1,18 @@
+# manager/requirements.txt — mac_intel manager dependencies
+# Install: pip install -r manager/requirements.txt
+
+# Web framework + ASGI server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Async SQLite
+aiosqlite>=0.20.0
+
+# Crypto — AES-256-GCM, HKDF (shared with agent)
+cryptography>=42.0.0
+
+# Jinja2 templating (for dashboard HTML rendering)
+jinja2>=3.1.0
+
+# For serving static files
+python-multipart>=0.0.9

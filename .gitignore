@@ -1,0 +1,47 @@
+# ── Sensitive config (contains API key) ──────────────────────────────────────
+agent.toml
+
+# ── TLS certificates ──────────────────────────────────────────────────────────
+certs/
+
+# ── Runtime data ──────────────────────────────────────────────────────────────
+data/
+output/
+manager/data/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+
+# ── Runtime artifacts ─────────────────────────────────────────────────────────
+*.fifo
+*.lock
+.last_full_epoch
+run_wrapper.sh
+.watch_state/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Dev / test artifacts ──────────────────────────────────────────────────────
+.env
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# ── Security scan reports ─────────────────────────────────────────────────────
+bandit-report.json
+*-audit.json
+sast-report.json

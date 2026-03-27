@@ -1,0 +1,206 @@
+"""
+agent/agent.py — Main orchestrator
+Reads agent.toml, schedules collectors, encrypts, sends to manager.
+
+Usage:
+    python3 agent/agent.py [--config path/to/agent.toml]
+
+Signal handling:
+    SIGTERM / SIGINT  → graceful shutdown
+    SIGHUP            → reload config (change intervals without restart)
+"""
+
+import argparse
+import logging
+import logging.handlers
+import os
+import queue
+import signal
+import sys
+import threading
+import time
+
+# ── Config ────────────────────────────────────────────────────────────────────
+try:
+    import tomllib                          # Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib             # backport: pip install tomli
+    except ImportError:
+        print("ERROR: Python 3.11+ required, or: pip install tomli", file=sys.stderr)
+        sys.exit(1)
+
+from .crypto import derive_keys, encrypt
+from .collectors import COLLECTORS   # modular collector registry
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Orchestrator:
+    def __init__(self, config: dict, enc_key: bytes, mac_key: bytes,
+                 send_queue: "queue.Queue"):
+        self.config     = config
+        self.enc_key    = enc_key
+        self.mac_key    = mac_key
+        self.send_queue = send_queue
+        self.agent_id   = config["agent"]["id"]
+        self.tick       = config["collection"].get("tick_sec", 5)
+        self._stop      = threading.Event()
+        self._last_run: dict = {}
+        self._executor  = None
+
+    def start(self):
+        import concurrent.futures
+        self._stop.clear()
+        self._last_run = {}
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(COLLECTORS), thread_name_prefix="collector"
+        )
+        t = threading.Thread(target=self._tick_loop, daemon=True,
+                             name="orchestrator")
+        t.start()
+        return t
+
+    def stop(self):
+        self._stop.set()
+        if self._executor:
+            self._executor.shutdown(wait=False)
+
+    def _tick_loop(self):
+        sections = self.config.get("collection", {}).get("sections", {})
+        while not self._stop.is_set():
+            now = time.time()
+            for name, cfg in sections.items():
+                if not cfg.get("enabled", True):
+                    continue
+                interval = cfg.get("interval_sec", 60)
+                last     = self._last_run.get(name, 0)
+                if now - last >= interval:
+                    self._last_run[name] = now
+                    self._executor.submit(self._run_section, name, cfg)
+            self._stop.wait(timeout=self.tick)
+
+    def _run_section(self, name: str, cfg: dict):
+        fn = COLLECTORS.get(name)
+        if not fn:
+            return
+        try:
+            data = fn()
+            log.debug("Collected %s", name)
+        except Exception as exc:
+            log.warning("Collector %s failed: %s", name, exc)
+            data = {"error": str(exc)}
+
+        if not cfg.get("send", True):
+            return
+
+        payload = {
+            "section":    name,
+            "agent_id":   self.agent_id,
+            "agent_name": self.config["agent"].get("name", ""),
+            "collected_at": int(time.time()),
+            "data":       data,
+        }
+        try:
+            envelope = encrypt(payload, self.enc_key, self.mac_key,
+                               self.agent_id, int(time.time()))
+            envelope["section"] = name   # plaintext routing hint for manager
+            maxq = self.config["manager"].get("max_queue_size", 500)
+            if self.send_queue.qsize() >= maxq:
+                try:
+                    self.send_queue.get_nowait()   # drop oldest
+                    log.warning("Send queue full — dropped oldest item")
+                except queue.Empty:
+                    pass
+            self.send_queue.put_nowait(envelope)
+        except Exception as exc:
+            log.error("Encrypt/enqueue failed for %s: %s", name, exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+log = logging.getLogger("agent")
+
+
+def setup_logging(cfg: dict):
+    lcfg    = cfg.get("logging", {})
+    level   = getattr(logging, lcfg.get("level", "INFO").upper(), logging.INFO)
+    logfile = lcfg.get("file", "logs/agent.log")
+    os.makedirs(os.path.dirname(logfile), exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        logfile,
+        maxBytes=lcfg.get("max_mb", 10) * 1024 * 1024,
+        backupCount=lcfg.get("backups", 3),
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        handlers=[handler, logging.StreamHandler()],
+    )
+
+
+def load_config(path: str) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="mac_intel agent")
+    parser.add_argument("--config", default="agent.toml")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    setup_logging(cfg)
+    log.info("Starting mac_intel agent id=%s", cfg["agent"]["id"])
+
+    api_key = cfg["manager"]["api_key"]
+    if not api_key or api_key.startswith("REPLACE"):
+        log.error("api_key not configured in agent.toml. "
+                  "Run: python3 scripts/keygen.py"); sys.exit(1)
+
+    enc_key, mac_key = derive_keys(api_key)
+    log.info("Crypto keys derived (api_key=...%s)", api_key[-4:])
+
+    send_queue: queue.Queue = queue.Queue()
+
+    # Import sender here (avoids circular import)
+    from .sender import Sender
+    sender = Sender(cfg, send_queue)
+    sender_thread = sender.start()
+
+    orch = Orchestrator(cfg, enc_key, mac_key, send_queue)
+    orch_thread  = orch.start()
+
+    # Reload config on SIGHUP
+    def _reload(signum, frame):
+        nonlocal cfg
+        try:
+            cfg = load_config(args.config)
+            log.info("Config reloaded on SIGHUP")
+            orch.stop()
+            orch.__init__(cfg, enc_key, mac_key, send_queue)
+            orch.start()
+        except Exception as exc:
+            log.error("Config reload failed: %s", exc)
+
+    signal.signal(signal.SIGHUP, _reload)
+
+    def _shutdown(signum, frame):
+        log.info("Shutting down (signal %d)", signum)
+        orch.stop()
+        sender.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
+
+    log.info("Agent running. tick=%ss. SIGHUP to reload, SIGTERM to stop.",
+             cfg["collection"].get("tick_sec", 5))
+    orch_thread.join()
+
+
+if __name__ == "__main__":
+    main()

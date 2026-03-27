@@ -1,0 +1,24 @@
+[build-system]
+requires      = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name        = "mac-intel-manager"
+version     = "1.0.0"
+description = "mac_intel Manager — FastAPI backend + real-time dashboard"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "aiosqlite>=0.20.0",
+    "cryptography>=42.0.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+mac-intel-manager = "manager.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["manager*"]

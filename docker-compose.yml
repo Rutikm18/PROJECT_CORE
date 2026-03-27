@@ -1,0 +1,46 @@
+# =============================================================================
+#  docker-compose.yml — mac_intel manager in Docker
+#
+#  Quick start:
+#    export API_KEY="$(python3 scripts/keygen.py | grep 'API Key' | awk '{print $NF}')"
+#    make certs             # generate self-signed TLS (dev only)
+#    docker compose up -d
+#    open https://localhost:8443
+#
+#  The agent runs natively on macOS — it uses host system APIs that
+#  cannot be accessed from inside a container.
+# =============================================================================
+
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: manager/Dockerfile
+    container_name: mac-intel-manager
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - manager_data:/app/data
+      - manager_logs:/app/logs
+      - ./certs:/app/certs:ro          # TLS certificates (read-only)
+    environment:
+      API_KEY:    ${API_KEY:?API_KEY environment variable is required}
+      BIND_HOST:  "0.0.0.0"
+      BIND_PORT:  "8443"
+      TLS_CERT:   "/app/certs/server.crt"
+      TLS_KEY:    "/app/certs/server.key"
+      LOG_LEVEL:  "${LOG_LEVEL:-INFO}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://localhost:8443/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 15s
+
+volumes:
+  manager_data:
+    driver: local
+  manager_logs:
+    driver: local

@@ -1,0 +1,54 @@
+name: Weekly Security Scan
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Every Monday at 06:00 UTC
+  workflow_dispatch:       # Allow manual trigger
+
+jobs:
+  dependency-audit:
+    name: Dependency CVE audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install audit tools
+        run: pip install pip-audit bandit
+
+      - name: pip-audit — agent dependencies
+        run: |
+          pip-audit \
+            --requirement agent/requirements.txt \
+            --format json \
+            --output agent-audit.json
+        continue-on-error: true
+
+      - name: pip-audit — manager dependencies
+        run: |
+          pip-audit \
+            --requirement manager/requirements.txt \
+            --format json \
+            --output manager-audit.json
+        continue-on-error: true
+
+      - name: bandit SAST scan
+        run: |
+          bandit -r agent/agent/ manager/manager/ shared/ \
+            -ll --skip B101,B603,B607 \
+            -f json -o sast-report.json
+        continue-on-error: true
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-${{ github.run_number }}
+          path: |
+            agent-audit.json
+            manager-audit.json
+            sast-report.json
+          retention-days: 90

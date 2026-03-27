@@ -1,0 +1,11 @@
+[04:55:02] v5.0.0-core | mode=full | pid=63867 | user=rutikmangale
+[04:55:03] Starting collection
+[04:55:03] Dispatching mode=full
+[04:55:03]   Starting: identity
+[04:55:03]   Starting: packages
+[04:55:03]   Starting: network
+[04:55:03]   Starting: processes
+[04:55:03]   Starting: services
+[04:55:07] All domains complete. Failures: 0
+[04:55:07] Assembling JSON
+[04:55:07] Written to: /Users/rutikmangale/Downloads/macbook_data/intel.fifo
