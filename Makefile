@@ -51,20 +51,28 @@ install-manager: ## Install manager dependencies only
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 .PHONY: test
-test: ## Run the full test suite
-	PYTHONPATH=. $(PYTHON) -m pytest tests/ -v --tb=short
+test: ## Run the full test suite (agent + manager)
+	PYTHONPATH=. $(PYTHON) -m pytest agent/tests/ manager/tests/ -v --tb=short
+
+.PHONY: test-agent
+test-agent: ## Run agent tests only
+	PYTHONPATH=. $(PYTHON) -m pytest agent/tests/ -v --tb=short
+
+.PHONY: test-manager
+test-manager: ## Run manager tests only
+	PYTHONPATH=. $(PYTHON) -m pytest manager/tests/ -v --tb=short
 
 .PHONY: test-unit
-test-unit: ## Run unit tests only
-	PYTHONPATH=. $(PYTHON) -m pytest tests/unit/ -v --tb=short
+test-unit: ## Run all unit tests (agent + manager)
+	PYTHONPATH=. $(PYTHON) -m pytest agent/tests/unit/ manager/tests/unit/ -v --tb=short
 
 .PHONY: test-integration
 test-integration: ## Run integration tests only
-	PYTHONPATH=. $(PYTHON) -m pytest tests/integration/ -v --tb=short
+	PYTHONPATH=. $(PYTHON) -m pytest manager/tests/integration/ -v --tb=short
 
 .PHONY: test-coverage
 test-coverage: ## Run tests with HTML + terminal coverage report
-	PYTHONPATH=. $(PYTHON) -m pytest tests/ \
+	PYTHONPATH=. $(PYTHON) -m pytest agent/tests/ manager/tests/ \
 	  --cov=agent/agent --cov=manager/manager --cov=shared \
 	  --cov-report=term-missing \
 	  --cov-report=html:htmlcov
@@ -73,13 +81,13 @@ test-coverage: ## Run tests with HTML + terminal coverage report
 # ── Linting ───────────────────────────────────────────────────────────────────
 .PHONY: lint
 lint: ## Run ruff linter + mypy type checker
-	$(PYTHON) -m ruff check agent/agent/ manager/manager/ shared/ tests/
+	$(PYTHON) -m ruff check agent/agent/ manager/manager/ shared/ agent/tests/ manager/tests/
 	$(PYTHON) -m mypy agent/agent/ manager/manager/ shared/ \
 	  --ignore-missing-imports --no-error-summary
 
 .PHONY: lint-fix
 lint-fix: ## Auto-fix ruff linting issues
-	$(PYTHON) -m ruff check --fix agent/agent/ manager/manager/ shared/ tests/
+	$(PYTHON) -m ruff check --fix agent/agent/ manager/manager/ shared/ agent/tests/ manager/tests/
 
 # ── Security scanning ─────────────────────────────────────────────────────────
 .PHONY: security
@@ -94,7 +102,7 @@ security: ## bandit SAST scan + pip-audit CVE scan
 # ── Key + cert generation ─────────────────────────────────────────────────────
 .PHONY: keygen
 keygen: ## Generate a new 256-bit API key pair
-	$(PYTHON) scripts/keygen.py
+	$(PYTHON) manager/scripts/keygen.py
 
 .PHONY: certs
 certs: ## Generate self-signed TLS certificate (dev use only)
@@ -108,19 +116,33 @@ certs: ## Generate self-signed TLS certificate (dev use only)
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 .PHONY: run-manager
-run-manager: ## Start manager server (export API_KEY=... first)
-	@test -n "$$API_KEY" || (echo "ERROR: export API_KEY=<your-key> first" && exit 1)
-	PYTHONPATH=. $(PYTHON) -m uvicorn manager.manager.server:app \
-	  --host 0.0.0.0 \
-	  --port $${BIND_PORT:-8443} \
-	  --ssl-certfile certs/server.crt \
-	  --ssl-keyfile  certs/server.key \
-	  --log-level info \
-	  --reload
+run-manager: ## Start manager server (API_KEY read from agent.toml)
+	@test -f certs/server.crt || (echo ""; echo "  ERROR: certs/server.crt not found. Run: make certs"; echo ""; exit 1)
+	@test -f agent.toml      || (echo ""; echo "  ERROR: agent.toml not found. Run: cp agent/config/agent.toml.example agent.toml && make keygen"; echo ""; exit 1)
+	@PORT=$${BIND_PORT:-8443}; \
+	 PID=$$(lsof -ti tcp:$$PORT 2>/dev/null); \
+	 if [ -n "$$PID" ]; then \
+	   echo "  Port $$PORT in use by PID $$PID — killing..."; \
+	   kill -9 $$PID 2>/dev/null; sleep 1; \
+	 fi
+	./scripts/run_manager.sh
+
+.PHONY: stop-manager
+stop-manager: ## Kill any process running on port 8443
+	@PORT=$${BIND_PORT:-8443}; \
+	 PID=$$(lsof -ti tcp:$$PORT 2>/dev/null); \
+	 if [ -n "$$PID" ]; then \
+	   echo "  Stopping manager (PID $$PID) on port $$PORT..."; \
+	   kill -9 $$PID; \
+	   echo "  Stopped."; \
+	 else \
+	   echo "  No process found on port $$PORT."; \
+	 fi
 
 .PHONY: run-agent
 run-agent: ## Start the agent (requires agent.toml)
-	@test -f agent.toml || (echo "ERROR: agent.toml not found. cp agent.toml.example agent.toml" && exit 1)
+	@test -f agent.toml || (echo ""; echo "  ERROR: agent.toml not found."; echo "  Run:   cp agent/config/agent.toml.example agent.toml"; echo ""; exit 1)
+	@grep -q "REPLACE_ME" agent.toml 2>/dev/null && (echo ""; echo "  ERROR: agent.toml still has placeholder api_key."; echo "  Run:   make keygen  then paste the key into agent.toml"; echo ""; exit 1) || true
 	PYTHONPATH=. $(PYTHON) -m agent.agent.core --config agent.toml
 
 # ── Docker ────────────────────────────────────────────────────────────────────

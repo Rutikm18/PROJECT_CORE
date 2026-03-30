@@ -162,6 +162,6 @@ send         = true
 # ── Logging ───────────────────────────────────────────────────────────────────
 [logging]
 level    = "INFO"            # DEBUG | INFO | WARNING | ERROR
-file     = "logs/agent.log"  # path relative to project root
+file     = "agent/logs/agent.log"  # path relative to project root
 max_mb   = 10                # rotate at this size
 backups  = 3                 # keep this many rotated files

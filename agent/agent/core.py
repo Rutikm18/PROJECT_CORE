@@ -30,8 +30,23 @@ except ImportError:
         print("ERROR: Python 3.11+ required, or: pip install tomli", file=sys.stderr)
         sys.exit(1)
 
+import platform
+import socket
+
 from .crypto import derive_keys, encrypt
 from .collectors import COLLECTORS   # modular collector registry
+
+try:
+    from .normalizer import normalize as _normalize
+    _HAS_NORMALIZER = True
+except Exception:
+    _HAS_NORMALIZER = False
+
+# Cached at startup — never changes during the process lifetime
+_OS_NAME   = "macos" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else "windows")
+_OS_VER    = platform.mac_ver()[0] if sys.platform == "darwin" else platform.version()
+_ARCH      = platform.machine()
+_HOSTNAME  = socket.gethostname()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Orchestrator
@@ -86,21 +101,34 @@ class Orchestrator:
         if not fn:
             return
         try:
-            data = fn()
+            raw = fn()
             log.debug("Collected %s", name)
         except Exception as exc:
             log.warning("Collector %s failed: %s", name, exc)
-            data = {"error": str(exc)}
+            raw = {"error": str(exc)}
 
         if not cfg.get("send", True):
             return
 
+        # Normalize raw collector output to canonical schema
+        data = raw
+        if _HAS_NORMALIZER:
+            try:
+                data = _normalize(name, raw)
+            except Exception as exc:
+                log.debug("Normalizer skipped for %s: %s", name, exc)
+                data = raw
+
         payload = {
-            "section":    name,
-            "agent_id":   self.agent_id,
-            "agent_name": self.config["agent"].get("name", ""),
+            "section":      name,
+            "agent_id":     self.agent_id,
+            "agent_name":   self.config["agent"].get("name", ""),
+            "os":           _OS_NAME,
+            "os_version":   _OS_VER,
+            "arch":         _ARCH,
+            "hostname":     _HOSTNAME,
             "collected_at": int(time.time()),
-            "data":       data,
+            "data":         data,
         }
         try:
             envelope = encrypt(payload, self.enc_key, self.mac_key,
@@ -128,7 +156,7 @@ log = logging.getLogger("agent")
 def setup_logging(cfg: dict):
     lcfg    = cfg.get("logging", {})
     level   = getattr(logging, lcfg.get("level", "INFO").upper(), logging.INFO)
-    logfile = lcfg.get("file", "logs/agent.log")
+    logfile = lcfg.get("file", "agent/logs/agent.log")
     os.makedirs(os.path.dirname(logfile), exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
         logfile,

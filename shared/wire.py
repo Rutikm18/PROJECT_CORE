@@ -49,3 +49,15 @@ WIRE_VERSION          = 1
 REPLAY_WINDOW_SECONDS = 300   # ±5 minutes
 NONCE_BYTES           = 12    # 96-bit GCM nonce (NIST SP 800-38D)
 KEY_BYTES             = 32    # AES-256
+
+# ── Time window → seconds mapping (used by both agent and manager) ────────────
+WINDOW_SECONDS: dict[str, int] = {
+    "5m":  300,
+    "15m": 900,
+    "1h":  3600,
+    "8h":  28800,
+    "1d":  86400,
+    "7d":  604800,
+    "30d": 2592000,
+    "90d": 7776000,
+}

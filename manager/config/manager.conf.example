@@ -1,0 +1,181 @@
+# =============================================================================
+#  manager.conf — mac_intel Manager Configuration
+#
+#  Copy:  cp manager.conf.example manager.conf
+#  API_KEY can also be set via environment variable (env takes priority).
+#
+#  [policy.*] sections are pushed DOWN to agents via GET /api/v1/config.
+#  Agents poll this every 5 minutes — changes take effect without restart.
+# =============================================================================
+
+# ── Server ────────────────────────────────────────────────────────────────────
+[server]
+host     = "0.0.0.0"
+port     = 8443
+tls_cert = "certs/server.crt"
+tls_key  = "certs/server.key"
+
+# ── Authentication ────────────────────────────────────────────────────────────
+[auth]
+# api_key is required — generate with: python3 manager/scripts/keygen.py
+# Prefer setting via API_KEY environment variable rather than here.
+api_key            = ""              # leave empty to use API_KEY env var
+replay_window_sec  = 300             # ±5 min timestamp window
+max_payload_bytes  = 10485760        # 10 MiB hard cap per ingest
+
+# ── Storage — file-based time-series ─────────────────────────────────────────
+[storage]
+data_dir = "data"                    # root directory for all agent data
+
+# Retention by time window bucket
+# raw     : individual events as received
+# 5m      : 5-minute aggregated rollups
+# 1h      : hourly rollups
+# 1d      : daily rollups
+[storage.retention]
+raw_hours = 24                       # keep raw files for 24 hours
+5m_days   = 7                        # 5-min rollups kept for 7 days
+1h_days   = 30                       # hourly rollups kept for 30 days
+1d_days   = 365                      # daily rollups kept for 1 year
+
+# How often the cleanup job runs
+cleanup_interval_sec = 3600          # hourly cleanup
+
+# ── CORS ─────────────────────────────────────────────────────────────────────
+[cors]
+# Comma-separated allowed origins. Use specific domains in production.
+origins = ["*"]
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+[logging]
+level   = "INFO"
+file    = "manager/logs/manager.log"
+max_mb  = 50
+backups = 5
+
+# =============================================================================
+#  AGENT POLICY — pushed to agents on every config poll
+#
+#  These override the agent's local agent.conf for the matching section.
+#  Only set values you want to ENFORCE from the manager side.
+#  Unset values fall back to the agent's own agent.conf.
+#
+#  Use cases:
+#   - Increase security.interval_sec during an incident
+#   - Disable a noisy section across all agents
+#   - Force a section on that an agent disabled locally
+# =============================================================================
+
+[policy.global]
+# Applied to ALL agents unless overridden per-group
+tick_sec = 5
+
+[policy.global.sections.metrics]
+enabled      = true
+interval_sec = 10
+send         = true
+
+[policy.global.sections.connections]
+enabled      = true
+interval_sec = 10
+send         = true
+
+[policy.global.sections.processes]
+enabled      = true
+interval_sec = 10
+send         = true
+
+[policy.global.sections.ports]
+enabled      = true
+interval_sec = 30
+send         = true
+
+[policy.global.sections.security]
+enabled      = true
+interval_sec = 3600
+send         = true
+
+[policy.global.sections.services]
+enabled      = true
+interval_sec = 120
+send         = true
+
+[policy.global.sections.users]
+enabled      = true
+interval_sec = 120
+send         = true
+
+[policy.global.sections.network]
+enabled      = true
+interval_sec = 120
+send         = true
+
+[policy.global.sections.arp]
+enabled      = true
+interval_sec = 120
+send         = true
+
+[policy.global.sections.configs]
+enabled      = true
+interval_sec = 3600
+send         = true
+
+[policy.global.sections.sysctl]
+enabled      = true
+interval_sec = 3600
+send         = true
+
+[policy.global.sections.battery]
+enabled      = true
+interval_sec = 120
+send         = true
+
+[policy.global.sections.containers]
+enabled      = true
+interval_sec = 120
+send         = true
+
+[policy.global.sections.storage]
+enabled      = true
+interval_sec = 600
+send         = true
+
+[policy.global.sections.tasks]
+enabled      = true
+interval_sec = 600
+send         = true
+
+[policy.global.sections.apps]
+enabled      = true
+interval_sec = 86400
+send         = true
+
+[policy.global.sections.packages]
+enabled      = true
+interval_sec = 86400
+send         = true
+
+[policy.global.sections.sbom]
+enabled      = true
+interval_sec = 86400
+send         = true
+
+[policy.global.sections.binaries]
+enabled      = false                 # disabled globally — high volume
+interval_sec = 86400
+send         = true
+
+# ── Per-group policy (overrides global) ──────────────────────────────────────
+# Groups are set in agent.conf [agent] group = "servers"
+[policy.group.servers]
+tick_sec = 5
+
+[policy.group.servers.sections.metrics]
+interval_sec = 5                     # faster metrics for servers
+
+[policy.group.servers.sections.security]
+interval_sec = 1800                  # check security posture every 30 min on servers
+
+# ── Per-agent policy (overrides group and global) ─────────────────────────────
+# [policy.agent.agent-001.sections.metrics]
+# interval_sec = 5
