@@ -12,3 +12,6 @@ requests>=2.31.0
 
 # System metrics (optional but recommended for richer metrics collection)
 psutil>=5.9.0
+
+# macOS Keychain access for secure key storage (optional — falls back to file)
+keyring>=24.0.0

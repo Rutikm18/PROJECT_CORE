@@ -114,11 +114,13 @@ def decrypt(envelope: dict, enc_key: bytes, mac_key: bytes) -> dict:
     if envelope["v"] != 1:
         raise ValueError(f"Unsupported envelope version: {envelope['v']}")
 
+    ts = int(float(envelope["timestamp"]))
+
     # 1. Verify HMAC (constant-time)
     expected_mac = _compute_hmac(
         mac_key,
         envelope["agent_id"],
-        envelope["timestamp"],
+        ts,
         envelope["nonce"],
         envelope["ct"],
     )

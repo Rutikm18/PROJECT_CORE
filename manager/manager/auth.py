@@ -17,14 +17,14 @@ def verify_envelope(envelope: dict, enc_key: bytes, mac_key: bytes,
         if field not in envelope:
             raise ValueError(f"Missing field: {field}")
 
-    skew = abs(time.time() - envelope["timestamp"])
+    skew = abs(time.time() - float(envelope["timestamp"]))
     if skew > REPLAY_WINDOW:
         raise ValueError("Timestamp out of window")
+
+    payload = decrypt(envelope, enc_key, mac_key)   # raises on HMAC failure
 
     nonce = envelope["nonce"]
     if nonce in nonce_cache:
         raise ValueError("Duplicate nonce (replay)")
-
-    payload = decrypt(envelope, enc_key, mac_key)   # raises on HMAC failure
     nonce_cache[nonce] = time.time() + REPLAY_WINDOW
     return payload

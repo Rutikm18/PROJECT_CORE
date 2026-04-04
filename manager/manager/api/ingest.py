@@ -39,12 +39,18 @@ def make_ingest_router(
     db:          "Database",
     store:       "TelemetryStore",
     hub:         "WebSocketHub",
-    enc_key:     bytes,
-    mac_key:     bytes,
     nonce_cache: dict,
+    jarvis=None,
 ) -> APIRouter:
-    from ..auth    import verify_envelope
-    from ..crypto  import decrypt
+    """
+    Per-agent key lookup: each enrolled agent has its own 256-bit key stored
+    in the agent_keys table.  The ingest pipeline looks up the key by agent_id
+    (plaintext field in envelope) before running HMAC+decrypt.
+
+    Even if an attacker spoofs agent_id, HMAC will reject the payload because
+    the derived keys will not match the forged agent_id's stored key.
+    """
+    from ..crypto  import decrypt, derive_keys
 
     router = APIRouter()
 
@@ -62,25 +68,33 @@ def make_ingest_router(
             if field not in envelope:
                 raise HTTPException(400, f"Missing field: {field}")
 
-        # ── 3. Timestamp window (cheap — before crypto) ───────────────────────
+        # ── 3. Timestamp window (cheap — before DB + crypto) ─────────────────
         skew = abs(time.time() - float(envelope["timestamp"]))
         if skew > REPLAY_WINDOW_SECONDS:
             raise HTTPException(401, "Timestamp out of window")
 
-        # ── 4. Nonce dedup ────────────────────────────────────────────────────
-        nonce = envelope["nonce"]
-        if nonce in nonce_cache:
-            raise HTTPException(401, "Duplicate nonce")
-        nonce_cache[nonce] = time.time() + REPLAY_WINDOW_SECONDS
+        # ── 4. Per-agent key lookup ───────────────────────────────────────────
+        raw_agent_id = envelope.get("agent_id", "")
+        api_key_hex  = await db.get_agent_key(raw_agent_id)
+        if not api_key_hex:
+            log.warning("Ingest from unenrolled agent_id=%s — rejected", raw_agent_id)
+            raise HTTPException(401, "Agent not enrolled — run enrollment first")
+        enc_key, mac_key = derive_keys(api_key_hex)
 
         # ── 5. HMAC + decrypt ─────────────────────────────────────────────────
         try:
             payload = decrypt(envelope, enc_key, mac_key)
         except ValueError as exc:
-            log.warning("Decrypt failed agent=%s: %s", envelope.get("agent_id"), exc)
+            log.warning("Decrypt failed agent=%s: %s", raw_agent_id, exc)
             raise HTTPException(401, "Verification failed")
 
-        # ── 6. Extract fields ─────────────────────────────────────────────────
+        # ── 6. Nonce dedup (after successful decrypt — avoids locking out retries) ─
+        nonce = envelope["nonce"]
+        if nonce in nonce_cache:
+            raise HTTPException(401, "Duplicate nonce")
+        nonce_cache[nonce] = time.time() + REPLAY_WINDOW_SECONDS
+
+        # ── 7. Extract fields ──────────────────────────────────────────────────
         agent_id   = payload.get("agent_id",    envelope["agent_id"])
         section    = payload.get("section",      envelope.get("section", "unknown"))
         collected  = payload.get("collected_at", int(float(envelope["timestamp"])))
@@ -90,10 +104,10 @@ def make_ingest_router(
         data       = payload.get("data",         {})
         client_ip  = request.client.host if request.client else ""
 
-        # ── 7. Agent registry ─────────────────────────────────────────────────
+        # ── 8. Agent registry ─────────────────────────────────────────────────
         await db.upsert_agent(agent_id, agent_name, client_ip)
 
-        # ── 8. File store (NDJSON+gzip, three-tier) ───────────────────────────
+        # ── 9. File store (NDJSON+gzip, three-tier) ───────────────────────────
         try:
             await store.write(
                 agent_id=agent_id,
@@ -107,10 +121,15 @@ def make_ingest_router(
             # Non-fatal — log and continue so the agent doesn't retry
             log.error("Store write failed agent=%s section=%s: %s", agent_id, section, exc)
 
-        # ── 9. SQLite payload summary (section timestamps for dashboard) ───────
+        # ── 10. SQLite payload summary (section timestamps for dashboard) ──────
         await db.insert_payload(agent_id, section, collected, data)
 
-        # ── 10. WebSocket broadcast ────────────────────────────────────────────
+        # ── 11. Jarvis analysis (async, non-blocking) — raw telemetry → verified findings
+        if jarvis is not None:
+            import asyncio
+            asyncio.create_task(jarvis.process(agent_id, section, data))
+
+        # ── 12. WebSocket broadcast ────────────────────────────────────────────
         await hub.broadcast(agent_id, {
             "type":         "payload",
             "agent_id":     agent_id,

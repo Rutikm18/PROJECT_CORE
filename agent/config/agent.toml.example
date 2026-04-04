@@ -20,14 +20,46 @@ name        = "My MacBook Air"      # human label shown on dashboard
 description = "M4 MacBook Air"      # free-text description
 
 # ── Manager Connection ────────────────────────────────────────────────────────
+# api_key is NOT set here — it is auto-generated on first run and stored in
+# the macOS Keychain (or security_dir file). Never paste a key into this file.
 [manager]
 url              = "https://YOUR_SERVER_IP:8443"  # manager public IP + port
-api_key          = "REPLACE_ME"                   # output of scripts/keygen.py
 tls_verify       = true              # set false ONLY for self-signed cert in dev
 timeout_sec      = 30               # HTTP request timeout
 retry_attempts   = 3                # how many times to retry on 5xx / network error
 retry_delay_sec  = 5                # initial delay between retries (exponential backoff)
 max_queue_size   = 500              # drop oldest payloads if outbound backlog exceeds this
+
+# ── First-Run Enrollment ──────────────────────────────────────────────────────
+# On first run the agent generates a 256-bit key, stores it in the keystore,
+# and registers with the manager using this one-time token.
+# After successful enrollment this token is no longer needed (clear it).
+[enrollment]
+token    = ""                  # set to enrollment token from manager operator
+                               # get tokens from: ENROLLMENT_TOKENS env on manager
+keystore = "keychain"          # "keychain" = macOS Keychain (recommended)
+                               # "file"     = /Library/Application Support/MacIntel/security/
+
+# ── Watchdog (process monitor) ────────────────────────────────────────────────
+[watchdog]
+enabled             = true
+check_interval_sec  = 30       # how often watchdog checks agent health
+max_restarts        = 5        # max auto-restarts within restart_window_sec
+restart_window_sec  = 300      # sliding window for restart rate limit
+
+# ── Filesystem Paths (macOS production) ──────────────────────────────────────
+[paths]
+install_dir  = "/opt/macintel"
+config_dir   = "/Library/Application Support/MacIntel"
+log_dir      = "/Library/Logs/MacIntel"
+data_dir     = "/Library/Application Support/MacIntel/data"
+security_dir = "/Library/Application Support/MacIntel/security"
+pid_file     = "/var/run/macintel-agent.pid"
+
+# ── Managed Binary Paths ──────────────────────────────────────────────────────
+[binaries]
+agent    = "/opt/macintel/bin/macintel-agent"
+watchdog = "/opt/macintel/bin/macintel-watchdog"
 
 # ── Collection Engine ─────────────────────────────────────────────────────────
 #  tick_sec: how often the scheduler wakes to check what sections are due.

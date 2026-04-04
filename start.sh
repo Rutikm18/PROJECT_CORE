@@ -1,9 +1,6 @@
 #!/bin/bash
 # =============================================================================
-#  start.sh — Start manager with API_KEY pulled directly from agent.toml
-#
-#  This script guarantees the manager always uses the same key as the agent.
-#  No manual export needed. No mismatch possible.
+#  start.sh — Start manager + agent (reads enrollment token from agent.toml)
 #
 #  Usage:
 #    bash start.sh            → start manager
@@ -14,34 +11,34 @@
 set -e
 cd "$(dirname "$0")"
 
-# ── Read API key from agent.toml ───────────────────────────────────────────────
+# ── Read enrollment token from agent.toml ─────────────────────────────────────
 if [ ! -f agent.toml ]; then
   echo ""
   echo "  ERROR: agent.toml not found."
-  echo "  Run:   cp agent/config/agent.toml.example agent.toml  then fill in your key."
+  echo "  Run:   cp agent/config/agent.toml.example agent.toml"
+  echo "         make enroll-token"
   echo ""
   exit 1
 fi
 
-export API_KEY=$(python3 -c "
+ENROLL_TOKEN=$(python3 -c "
 import tomllib
 with open('agent.toml', 'rb') as f:
     cfg = tomllib.load(f)
-print(cfg['manager']['api_key'], end='')
-")
+print(cfg.get('enrollment', {}).get('token', '').strip(), end='')
+" 2>/dev/null || true)
 
-if [ -z "$API_KEY" ] || [ "$API_KEY" = "REPLACE_ME" ]; then
+if [ -n "$ENROLL_TOKEN" ]; then
+  export ENROLLMENT_TOKENS="$ENROLL_TOKEN"
   echo ""
-  echo "  ERROR: api_key in agent.toml is not set."
-  echo "  Run:   python3 manager/scripts/keygen.py"
-  echo "  Then paste the key into agent.toml [manager] api_key"
+  echo "  ENROLLMENT_TOKENS loaded from agent.toml (...${ENROLLMENT_TOKENS: -8})"
   echo ""
-  exit 1
+else
+  echo ""
+  echo "  WARNING: No enrollment token in agent.toml [enrollment] token."
+  echo "  Run:  make enroll-token  to generate one."
+  echo ""
 fi
-
-echo ""
-echo "  API_KEY loaded from agent.toml (last 8): ...${API_KEY: -8}"
-echo ""
 
 # ── Kill any process already on port 8443 ─────────────────────────────────────
 PORT=${BIND_PORT:-8443}

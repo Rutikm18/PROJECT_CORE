@@ -31,11 +31,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from .db      import Database
-from .store   import TelemetryStore
-from .ws_hub  import WebSocketHub
-from .crypto  import derive_keys
-
+from .db        import Database
+from .store     import TelemetryStore
+from .ws_hub    import WebSocketHub
+from .indexer   import IntelDB
+from .jarvis    import JarvisEngine
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
@@ -65,24 +65,22 @@ def setup_logging(
 
 def create_app() -> FastAPI:
     # ── Config from env ───────────────────────────────────────────────────────
+    # API_KEY is now optional — used only for WebSocket token auth.
+    # Per-agent keys are stored in the agent_keys SQLite table after enrollment.
     api_key = os.environ.get("API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "API_KEY environment variable is required. "
-            "Run: ./scripts/run_manager.sh  (reads key from agent.toml automatically)"
-        )
-
-    enc_key, mac_key = derive_keys(api_key)
 
     data_dir = os.environ.get("DATA_DIR", os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "data"
     ))
-    db_path = os.path.join(data_dir, "manager.db")
+    db_path    = os.path.join(data_dir, "manager.db")
+    intel_path = os.path.join(data_dir, "intel.db")
     os.makedirs(data_dir, exist_ok=True)
 
-    db    = Database(db_path)
-    store = TelemetryStore(data_dir)
-    hub   = WebSocketHub()
+    db       = Database(db_path)
+    store    = TelemetryStore(data_dir)
+    hub      = WebSocketHub()
+    intel_db = IntelDB(intel_path)
+    jarvis   = JarvisEngine(db, intel_db)
 
     # ── App ───────────────────────────────────────────────────────────────────
     app = FastAPI(title="mac_intel Manager", version="1.0.0", docs_url=None)
@@ -115,6 +113,27 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 log.warning("Store cleanup error: %s", exc)
 
+    async def _dev_bootstrap_agent_key():
+        """
+        Local dev: agent.toml and manager share one key via API_KEY, but ingest
+        looks up HMAC keys in agent_keys. Seed the row so crypto matches without
+        a separate enroll step. Enable with MACOS_INTEL_DEV_BOOTSTRAP=1 (run_manager.sh).
+        """
+        if os.environ.get("MACOS_INTEL_DEV_BOOTSTRAP") != "1":
+            return
+        raw = (api_key or "").strip()
+        if len(raw) != 64 or any(c not in "0123456789abcdefABCDEF" for c in raw):
+            log.warning(
+                "Dev bootstrap skipped: API_KEY must be 64 hex chars (same as [manager] api_key)"
+            )
+            return
+        key = raw.lower()
+        aid = os.environ.get("BOOTSTRAP_AGENT_ID", "agent-001").strip()
+        name = os.environ.get("BOOTSTRAP_AGENT_NAME", "dev")
+        await db.upsert_agent(aid, name, "127.0.0.1")
+        await db.upsert_agent_key(aid, key, enrolled_ip="dev-bootstrap")
+        log.info("Dev bootstrap: agent_keys synced for agent_id=%s (ingest HMAC will match)", aid)
+
     @app.on_event("startup")
     async def startup():
         setup_logging(
@@ -122,24 +141,38 @@ def create_app() -> FastAPI:
             level=os.environ.get("LOG_LEVEL", "INFO"),
         )
         await db.init()
+        await _dev_bootstrap_agent_key()
         await store.init()
+        await intel_db.init()
+        await jarvis.start()
         asyncio.create_task(_evict_nonces())
         asyncio.create_task(_cleanup_store())
-        log.info("Manager started. DB=%s  Data=%s", db_path, data_dir)
+        log.info("Manager started. DB=%s  Intel=%s  Data=%s",
+                 db_path, intel_path, data_dir)
 
     @app.on_event("shutdown")
     async def shutdown():
         await store.close()
+        await intel_db.close()
 
     # ── Mount routers ─────────────────────────────────────────────────────────
-    from .api.ingest import make_ingest_router
-    from .api.agents import make_agents_router
+    from .api.ingest  import make_ingest_router
+    from .api.agents  import make_agents_router
+    from .api.enroll  import make_enroll_router
+    from .api.jarvis  import make_jarvis_router
 
-    ingest_router = make_ingest_router(db, store, hub, enc_key, mac_key, nonce_cache)
-    agents_router = make_agents_router(db, store)
+    enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
+    enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
+
+    ingest_router  = make_ingest_router(db, store, hub, nonce_cache, jarvis)
+    agents_router  = make_agents_router(db, store)
+    enroll_router  = make_enroll_router(db, enrollment_tokens)
+    jarvis_router  = make_jarvis_router(intel_db)
 
     app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(agents_router, prefix="/api/v1/agents")
+    app.include_router(enroll_router, prefix="/api/v1")
+    app.include_router(jarvis_router, prefix="/api/v1/jarvis")
 
     # ── Health ────────────────────────────────────────────────────────────────
     @app.get("/health")
@@ -147,16 +180,25 @@ def create_app() -> FastAPI:
         ok = await db.ping()
         idx_stats = await store.index.stats()
         return {
-            "status": "ok",
+                "status": "ok",
             "db":     "ok" if ok else "error",
             "store":  idx_stats,
+            "intel":  await intel_db.stats(),
         }
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
     @app.websocket("/ws/{agent_id}")
     async def ws_endpoint(websocket: WebSocket, agent_id: str):
-        token = websocket.query_params.get("token", "")
-        if token and token != api_key:
+        token = websocket.query_params.get("token", "").strip()
+        master = (api_key or "").strip()
+        ok = False
+        if token and master and token.lower() == master.lower():
+            ok = True
+        elif token:
+            agent_key = await db.get_agent_key(agent_id)
+            if agent_key and token.lower() == agent_key.lower():
+                ok = True
+        if not ok:
             await websocket.close(code=4001)
             return
 

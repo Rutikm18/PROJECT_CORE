@@ -3,1142 +3,1016 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>mac_intel — Security Dashboard</title>
+<title>mac_intel — Jarvis Dashboard</title>
 <link rel="stylesheet" href="/static/css/dashboard.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
-<div class="layout">
+<div class="shell">
 
-<!-- ══ HEADER ══════════════════════════════════════════════════════════════════ -->
-<header class="header">
-  <a class="logo" href="#">
-    <div class="logo-icon">⬡</div>
+<!-- ══ SIDEBAR ══════════════════════════════════════════════════════════════ -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-hex">⬡</div>
     <div>
-      <div>mac_intel</div>
-      <div class="logo-sub">Security Dashboard</div>
+      <div class="logo-name">mac_intel</div>
+      <div class="logo-sub">Powered by Jarvis</div>
     </div>
-  </a>
-  <div class="hdiv"></div>
-
-  <div class="agent-select-wrap">
-    <label>Agent</label>
-    <select id="agentSelect" onchange="selectAgent(this.value)">
-      <option value="">— select agent —</option>
-    </select>
   </div>
 
-  <div class="hdiv"></div>
+  <div class="sidebar-nav">
+    <div class="nav-section">Workspace</div>
 
-  <div class="time-range" id="timeRange">
-    <button class="tr-btn active" onclick="setWindow('5m',this)">5m</button>
-    <button class="tr-btn" onclick="setWindow('15m',this)">15m</button>
-    <button class="tr-btn" onclick="setWindow('1h',this)">1h</button>
-    <button class="tr-btn" onclick="setWindow('8h',this)">8h</button>
-    <button class="tr-btn" onclick="setWindow('1d',this)">1d</button>
-    <button class="tr-btn" onclick="setWindow('7d',this)">7d</button>
-    <button class="tr-btn" onclick="setWindow('30d',this)">30d</button>
-    <button class="tr-btn" onclick="setWindow('90d',this)">90d</button>
-  </div>
-
-  <div class="h-right">
-    <button class="refresh-btn" id="refreshBtn" onclick="manualRefresh()" aria-label="Refresh data">
-      <span class="icon" id="refreshIcon">⟳</span>
-      <span class="text">Refresh</span>
+    <button class="nav-item active" onclick="showPanel('overview',this)">
+      <span class="nav-icon">⊞</span>
+      <span class="nav-label">Overview</span>
     </button>
-    
-    <style>
-    .refresh-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 16px;
-      font-size: 14px;
-      font-weight: 500;
-      border: none;
-      border-radius: 8px;
-      background: #2563eb;
-      color: #fff;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-    
-    .refresh-btn:hover {
-      background: #1e40af;
-      transform: translateY(-1px);
-    }
-    
-    .refresh-btn:active {
-      transform: scale(0.96);
-    }
-    
-    .refresh-btn:disabled {
-      background: #94a3b8;
-      cursor: not-allowed;
-    }
-    
-    .icon {
-      display: inline-block;
-      transition: transform 0.6s linear;
-    }
-    
-    .loading .icon {
-      animation: spin 1s linear infinite;
-    }
-    
-    @keyframes spin {
-      100% {
-        transform: rotate(360deg);
-      }
-    }
-    </style>
-    
-    <script>
-    function manualRefresh() {
-      const btn = document.getElementById("refreshBtn");
-      const icon = document.getElementById("refreshIcon");
-    
-      // Add loading state
-      btn.classList.add("loading");
-      btn.disabled = true;
-    
-      // Simulate refresh (replace with actual API call)
-      setTimeout(() => {
-        btn.classList.remove("loading");
-        btn.disabled = false;
-      }, 2000);
-    }
-    </script>
-    <div class="status-pill">
-      <span class="pulse off" id="connPulse"></span>
-      <span id="connStatus">Connecting…</span>
-    </div>
-    <div class="last-upd" id="lastUpd">—</div>
-  </div>
-</header>
 
-<!-- ══ SIDEBAR ═════════════════════════════════════════════════════════════════ -->
-<aside class="sidebar">
-  <div class="sb-label">Agents</div>
-  <div id="agentList"></div>
+    <button class="nav-item" onclick="showPanel('agents',this)">
+      <span class="nav-icon">◈</span>
+      <span class="nav-label">Agents</span>
+    </button>
 
-  <div class="sb-label" style="margin-top:10px">Sections</div>
-  <div id="sectionNav">
-    <div class="sb-item" onclick="nav('sec-overview')"><span class="sb-icon">🏠</span> Overview</div>
-    <div class="sb-item" onclick="nav('sec-posture')"><span class="sb-icon">🔒</span> Security Posture</div>
-    <div class="sb-item" onclick="nav('sec-metrics')"><span class="sb-icon">📊</span> Metrics</div>
-    <div class="sb-item" onclick="nav('sec-processes')"><span class="sb-icon">⚙️</span> Processes</div>
-    <div class="sb-item" onclick="nav('sec-connections')"><span class="sb-icon">🔗</span> Connections</div>
-    <div class="sb-item" onclick="nav('sec-ports')"><span class="sb-icon">🚪</span> Ports</div>
-    <div class="sb-item" onclick="nav('sec-network')"><span class="sb-icon">🌐</span> Network</div>
-    <div class="sb-item" onclick="nav('sec-arp')"><span class="sb-icon">📡</span> ARP</div>
-    <div class="sb-item" onclick="nav('sec-services')"><span class="sb-icon">🔧</span> Services</div>
-    <div class="sb-item" onclick="nav('sec-users')"><span class="sb-icon">👤</span> Users</div>
-    <div class="sb-item" onclick="nav('sec-hardware')"><span class="sb-icon">🖥</span> Hardware</div>
-    <div class="sb-item" onclick="nav('sec-containers')"><span class="sb-icon">🐳</span> Containers</div>
-    <div class="sb-item" onclick="nav('sec-storage')"><span class="sb-icon">💾</span> Storage</div>
-    <div class="sb-item" onclick="nav('sec-tasks')"><span class="sb-icon">🕐</span> Sched. Tasks</div>
-    <div class="sb-item" onclick="nav('sec-apps')"><span class="sb-icon">📱</span> Apps</div>
-    <div class="sb-item" onclick="nav('sec-packages')"><span class="sb-icon">📦</span> Packages</div>
-    <div class="sb-item" onclick="nav('sec-sbom')"><span class="sb-icon">📋</span> SBOM</div>
-    <div class="sb-item" onclick="nav('sec-timeline')"><span class="sb-icon">🕙</span> Timeline</div>
-  </div>
-</aside>
+    <div class="nav-section">Intelligence</div>
 
-<!-- ══ MAIN ════════════════════════════════════════════════════════════════════ -->
-<main class="main" id="mainContent">
+    <button class="nav-item" id="nav-jarvis" onclick="showPanel('jarvis',this)">
+      <span class="nav-icon">⬡</span>
+      <span class="nav-label">Jarvis Findings</span>
+      <span class="nav-badge" id="jarvis-badge" style="display:none">0</span>
+    </button>
 
-  <!-- Welcome -->
-  <div class="welcome" id="welcomeState">
-    <div class="welcome-icon">⬡</div>
-    <h2>mac_intel Security Dashboard</h2>
-    <p>Select an agent from the dropdown above to start monitoring.</p>
-    <div class="welcome-actions">
-      <button class="btn" onclick="loadAgents()">Refresh Agents</button>
-    </div>
+    <button class="nav-item" onclick="showPanel('timeline',this)">
+      <span class="nav-icon">◷</span>
+      <span class="nav-label">Change Timeline</span>
+    </button>
+
+    <div class="nav-section">Telemetry</div>
+
+    <button class="nav-item" onclick="showPanel('rawdata',this)">
+      <span class="nav-icon">▦</span>
+      <span class="nav-label">Raw Telemetry</span>
+    </button>
   </div>
 
-  <!-- Dashboard -->
-  <div id="dashboard" style="display:none;flex-direction:column;gap:14px">
+  <div class="sidebar-footer">
+    <div class="conn-indicator">
+      <span class="conn-dot" id="connDot"></span>
+      <span id="connText">Connecting…</span>
+    </div>
+  </div>
+</nav>
 
-    <!-- Offline banner -->
-    <div class="offline-banner" id="offlineBanner" style="display:none">
-      ⚠ Agent offline — showing last known data
+<!-- ══ MAIN ═════════════════════════════════════════════════════════════════ -->
+<div class="main">
+
+  <!-- Topbar -->
+  <div class="topbar">
+    <div class="agent-wrap">
+      <label>Agent</label>
+      <select id="agentSelect" onchange="onAgentChange(this.value)">
+        <option value="">— select —</option>
+      </select>
     </div>
 
-    <!-- ── Overview stat row ── -->
-    <div id="sec-overview"></div>
-    <div class="stat-row">
-      <div class="stat-card" id="sc-cpu">
-        <div class="stat-icon">🖥</div>
-        <div class="stat-lbl">CPU</div>
-        <div class="stat-val" id="statCpu">—</div>
-        <div class="stat-sub" id="statLoad">load —</div>
-      </div>
-      <div class="stat-card" id="sc-mem">
-        <div class="stat-icon">🧠</div>
-        <div class="stat-lbl">Memory</div>
-        <div class="stat-val" id="statMem">—</div>
-        <div class="stat-sub" id="statSwap">swap —</div>
-      </div>
-      <div class="stat-card" id="sc-batt">
-        <div class="stat-icon">🔋</div>
-        <div class="stat-lbl">Battery</div>
-        <div class="stat-val" id="statBatt">—</div>
-        <div class="stat-sub" id="statPower">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🔗</div>
-        <div class="stat-lbl">Connections</div>
-        <div class="stat-val" id="statConn">—</div>
-        <div class="stat-sub">established TCP</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🚪</div>
-        <div class="stat-lbl">Open Ports</div>
-        <div class="stat-val" id="statPorts">—</div>
-        <div class="stat-sub">listening</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">⚙️</div>
-        <div class="stat-lbl">Processes</div>
-        <div class="stat-val" id="statProcs">—</div>
-        <div class="stat-sub">running</div>
-      </div>
+    <div class="tb-divider"></div>
+
+    <div class="time-range">
+      <button class="tr-btn active" onclick="setWin('5m',this)">5m</button>
+      <button class="tr-btn" onclick="setWin('15m',this)">15m</button>
+      <button class="tr-btn" onclick="setWin('1h',this)">1h</button>
+      <button class="tr-btn" onclick="setWin('8h',this)">8h</button>
+      <button class="tr-btn" onclick="setWin('1d',this)">1d</button>
+      <button class="tr-btn" onclick="setWin('7d',this)">7d</button>
+      <button class="tr-btn" onclick="setWin('30d',this)">30d</button>
     </div>
 
-    <!-- ── Security Posture + Score ── -->
-    <div id="sec-posture">
-      <div class="posture-row">
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-title"><span class="card-title-icon">🔒</span> Security Posture</span>
-            <span class="card-tag" id="postureAge">—</span>
-          </div>
-          <div class="posture-grid" id="postureGrid">
-            <div class="pi" id="pi-sip">  <span class="pi-ico">🛡</span><span class="pi-name">SIP</span><span class="pi-val">—</span></div>
-            <div class="pi" id="pi-gk">   <span class="pi-ico">🔐</span><span class="pi-name">Gatekeeper</span><span class="pi-val">—</span></div>
-            <div class="pi" id="pi-fv">   <span class="pi-ico">💾</span><span class="pi-name">FileVault</span><span class="pi-val">—</span></div>
-            <div class="pi" id="pi-fw">   <span class="pi-ico">🧱</span><span class="pi-name">Firewall</span><span class="pi-val">—</span></div>
-            <div class="pi" id="pi-xp">   <span class="pi-ico">🦠</span><span class="pi-name">XProtect</span><span class="pi-val">—</span></div>
-            <div class="pi" id="pi-sb">   <span class="pi-ico">🔑</span><span class="pi-name">Secure Boot</span><span class="pi-val">—</span></div>
+    <div class="tb-spacer"></div>
+
+    <button class="refresh-btn" id="refreshBtn" onclick="manualRefresh()">
+      <span class="refresh-icon" id="refreshIcon">⟳</span>
+      Refresh
+    </button>
+  </div>
+
+  <!-- Panels -->
+  <div class="content">
+
+    <!-- ── OVERVIEW PANEL ─────────────────────────────────────────────────── -->
+    <div class="panel active" id="panel-overview">
+      <div class="panel-hdr">
+        <div class="panel-hdr-left">
+          <div class="panel-icon-wrap">⊞</div>
+          <div>
+            <div class="panel-title">Overview</div>
+            <div class="panel-sub">System health &amp; activity summary</div>
           </div>
         </div>
-        <div class="card">
-          <div class="card-hd"><span class="card-title">Security Score</span></div>
-          <div class="score-card">
-            <div class="score-ring">
-              <svg viewBox="0 0 90 90">
-                <circle class="ring-track" cx="45" cy="45" r="36"/>
-                <circle class="ring-fill"  cx="45" cy="45" r="36" id="scoreRing"/>
-              </svg>
-              <div class="score-over">
-                <div class="score-num" id="scoreNum">—</div>
-                <div class="score-lbl">/ 100</div>
-              </div>
+      </div>
+
+      <!-- Quick stats -->
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="stat-icon" style="background:#EFF6FF">◈</div>
+          <div>
+            <div class="stat-value" id="ov-agents">—</div>
+            <div class="stat-label">Enrolled Agents</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon" style="background:#FEF2F2">⚑</div>
+          <div>
+            <div class="stat-value" id="ov-critical">—</div>
+            <div class="stat-label">Critical Findings</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon" style="background:#FFF7ED">⚠</div>
+          <div>
+            <div class="stat-value" id="ov-high">—</div>
+            <div class="stat-label">High Findings</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon" style="background:#F0FDF4">✓</div>
+          <div>
+            <div class="stat-value" id="ov-total">—</div>
+            <div class="stat-label">Total Findings</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Charts row -->
+      <div class="grid-2">
+        <div class="chart-card">
+          <div class="chart-title">CPU Usage (active agent)</div>
+          <canvas id="cpuChart" height="160"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Memory Usage</div>
+          <canvas id="memChart" height="160"></canvas>
+        </div>
+      </div>
+
+      <!-- Recent findings -->
+      <div class="mt-16">
+        <div style="font-size:13px;font-weight:600;color:var(--text-muted);margin-bottom:10px;">Recent Jarvis Findings</div>
+        <div id="ov-findings-list" class="findings-list">
+          <div class="empty"><div class="ei">⬡</div><p>Select an agent to view findings</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── AGENTS PANEL ────────────────────────────────────────────────────── -->
+    <div class="panel" id="panel-agents">
+      <div class="panel-hdr">
+        <div class="panel-hdr-left">
+          <div class="panel-icon-wrap">◈</div>
+          <div>
+            <div class="panel-title">Agents</div>
+            <div class="panel-sub">Enrolled endpoints &amp; telemetry</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agent list table -->
+      <div id="agents-list-view">
+        <div class="table-wrap mb-16">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Agent ID</th>
+                <th>Name</th>
+                <th>IP</th>
+                <th>Last Seen</th>
+                <th>Sections</th>
+              </tr>
+            </thead>
+            <tbody id="agentsTableBody">
+              <tr><td colspan="6" style="text-align:center;color:var(--text-faint);padding:30px">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Agent detail view (hidden until row clicked) -->
+      <div id="agent-detail-view" style="display:none">
+        <div class="flex items-c gap-8 mb-16">
+          <button class="btn btn-secondary" onclick="closeAgentDetail()">← Back</button>
+          <span style="font-size:15px;font-weight:700" id="detail-agent-title">Agent Detail</span>
+        </div>
+
+        <div class="section-tabs" id="sectionTabs"></div>
+        <div id="sectionData">
+          <div class="empty"><div class="ei">▦</div><p>Select a section above</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── JARVIS PANEL ────────────────────────────────────────────────────── -->
+    <div class="panel" id="panel-jarvis">
+      <div class="panel-hdr">
+        <div class="panel-hdr-left">
+          <div class="panel-icon-wrap" style="background:#EFF6FF">⬡</div>
+          <div>
+            <div class="panel-title">Jarvis Engine</div>
+            <div class="panel-sub">Verified findings from correlation &amp; behavioral analysis</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-secondary" onclick="loadTimeline()">View Timeline</button>
+          <button class="btn btn-primary" onclick="refreshJarvis()">↻ Refresh</button>
+        </div>
+      </div>
+
+      <!-- Hero: score ring + info grid -->
+      <div class="jarvis-hero">
+        <div class="score-card">
+          <div class="score-ring-wrap">
+            <svg class="score-ring-svg" viewBox="0 0 116 116" width="116" height="116">
+              <circle class="score-ring-bg" cx="58" cy="58" r="51"/>
+              <circle class="score-ring-val" id="scoreRingVal" cx="58" cy="58" r="51"
+                stroke-dasharray="320.4" stroke-dashoffset="320.4" stroke="#2563EB"/>
+            </svg>
+            <div class="score-center">
+              <div class="score-num" id="scoreNum">0</div>
+              <div class="score-denom">/10</div>
             </div>
-            <div class="score-title" id="scoreLabel">Calculating…</div>
+          </div>
+          <div class="score-label">Risk Score</div>
+          <div class="score-status" id="scoreStatus" style="background:var(--sev-info-bg);color:var(--sev-info)">—</div>
+        </div>
+
+        <div class="jarvis-info-grid">
+          <div class="info-block">
+            <div class="info-label">Active Findings</div>
+            <div class="info-value" id="ji-active">—</div>
+            <div class="info-sub">Unresolved issues</div>
+          </div>
+          <div class="info-block">
+            <div class="info-label">Critical + High</div>
+            <div class="info-value" id="ji-critical-high" style="color:var(--sev-critical)">—</div>
+            <div class="info-sub">Require immediate attention</div>
+          </div>
+          <div class="info-block">
+            <div class="info-label">Total Scans</div>
+            <div class="info-value" id="ji-scans">—</div>
+            <div class="info-sub">Cumulative correlations</div>
+          </div>
+          <div class="info-block">
+            <div class="info-label">Last Updated</div>
+            <div class="info-value" id="ji-updated" style="font-size:13px">—</div>
+            <div class="info-sub">Most recent finding</div>
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- ── Charts ── -->
-    <div id="sec-metrics" class="chart-row">
-      <div class="card">
-        <div class="card-hd"><span class="card-title"><span class="card-title-icon">📈</span> CPU Usage %</span></div>
-        <div class="card-body"><div class="chart-wrap"><canvas id="cpuChart"></canvas></div></div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span class="card-title"><span class="card-title-icon">📈</span> Memory %</span></div>
-        <div class="card-body"><div class="chart-wrap"><canvas id="memChart"></canvas></div></div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span class="card-title"><span class="card-title-icon">📈</span> Connections</span></div>
-        <div class="card-body"><div class="chart-wrap"><canvas id="connChart"></canvas></div></div>
-      </div>
-    </div>
-
-    <!-- ── Processes ── -->
-    <div id="sec-processes" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">⚙️</span> Processes</span>
-        <span class="card-tag" id="procCount">0</span>
-      </div>
-      <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter processes…" oninput="filterTable('procBody',this.value)"></div>
-      <div class="tbl-wrap" style="max-height:320px">
-        <table>
-          <thead><tr>
-            <th>PID</th><th>Name</th><th>User</th><th>CPU %</th><th>Mem %</th><th>RSS</th><th>Status</th><th>Command</th>
-          </tr></thead>
-          <tbody id="procBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ── Connections + Ports ── -->
-    <div class="table-row">
-      <div id="sec-connections" class="card">
-        <div class="card-hd">
-          <span class="card-title"><span class="card-title-icon">🔗</span> Active Connections</span>
-          <span class="card-tag" id="connCount">0</span>
+      <!-- Severity summary row -->
+      <div class="sev-row mb-20">
+        <div class="sev-card" data-sev="critical" onclick="filterSev('critical',this)">
+          <div class="sev-dot"></div>
+          <div>
+            <div class="sev-count" id="sev-critical">0</div>
+            <div class="sev-label">Critical</div>
+          </div>
         </div>
-        <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter connections…" oninput="filterTable('connBody',this.value)"></div>
-        <div class="tbl-wrap" style="max-height:280px">
-          <table>
-            <thead><tr><th>Proto</th><th>Local</th><th>Remote</th><th>State</th><th>PID</th><th>Process</th></tr></thead>
-            <tbody id="connBody"></tbody>
-          </table>
+        <div class="sev-card" data-sev="high" onclick="filterSev('high',this)">
+          <div class="sev-dot"></div>
+          <div>
+            <div class="sev-count" id="sev-high">0</div>
+            <div class="sev-label">High</div>
+          </div>
+        </div>
+        <div class="sev-card" data-sev="medium" onclick="filterSev('medium',this)">
+          <div class="sev-dot"></div>
+          <div>
+            <div class="sev-count" id="sev-medium">0</div>
+            <div class="sev-label">Medium</div>
+          </div>
+        </div>
+        <div class="sev-card" data-sev="low" onclick="filterSev('low',this)">
+          <div class="sev-dot"></div>
+          <div>
+            <div class="sev-count" id="sev-low">0</div>
+            <div class="sev-label">Low</div>
+          </div>
+        </div>
+        <div class="sev-card" data-sev="info" onclick="filterSev('info',this)">
+          <div class="sev-dot"></div>
+          <div>
+            <div class="sev-count" id="sev-info">0</div>
+            <div class="sev-label">Info</div>
+          </div>
         </div>
       </div>
 
-      <div id="sec-ports" class="card">
-        <div class="card-hd">
-          <span class="card-title"><span class="card-title-icon">🚪</span> Listening Ports</span>
-          <span class="card-tag" id="portsCount">0</span>
+      <!-- Controls -->
+      <div class="jarvis-controls">
+        <div class="search-wrap">
+          <input type="text" id="findingSearch" placeholder="Search findings…" oninput="onSearchInput(this.value)">
         </div>
-        <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter ports…" oninput="filterTable('portsBody',this.value)"></div>
-        <div class="tbl-wrap" style="max-height:280px">
-          <table>
-            <thead><tr><th>Proto</th><th>Port</th><th>Bind Addr</th><th>Process</th><th>PID</th><th>Risk</th></tr></thead>
-            <tbody id="portsBody"></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── Network ── -->
-    <div id="sec-network" class="card">
-      <div class="card-hd"><span class="card-title"><span class="card-title-icon">🌐</span> Network Interfaces</span></div>
-      <div class="info-grid" id="netGrid"></div>
-    </div>
-
-    <!-- ── ARP + Services ── -->
-    <div class="table-row">
-      <div id="sec-arp" class="card">
-        <div class="card-hd">
-          <span class="card-title"><span class="card-title-icon">📡</span> ARP Neighbors</span>
-          <span class="card-tag" id="arpCount">0</span>
-        </div>
-        <div class="tbl-wrap" style="max-height:260px">
-          <table>
-            <thead><tr><th>IP</th><th>MAC</th><th>Interface</th><th>State</th></tr></thead>
-            <tbody id="arpBody"></tbody>
-          </table>
+        <div class="pills">
+          <button class="pill active" data-sev="all" onclick="filterPill('all',this)">All</button>
+          <button class="pill" data-sev="critical" onclick="filterPill('critical',this)">Critical</button>
+          <button class="pill" data-sev="high"     onclick="filterPill('high',this)">High</button>
+          <button class="pill" data-sev="medium"   onclick="filterPill('medium',this)">Medium</button>
+          <button class="pill" data-sev="low"       onclick="filterPill('low',this)">Low</button>
+          <button class="pill" data-sev="info"      onclick="filterPill('info',this)">Info</button>
         </div>
       </div>
 
-      <div id="sec-services" class="card">
-        <div class="card-hd">
-          <span class="card-title"><span class="card-title-icon">🔧</span> Services</span>
-          <span class="card-tag" id="servicesCount">0</span>
+      <!-- Findings list -->
+      <div id="findingsList" class="findings-list">
+        <div class="empty"><div class="ei">⬡</div><p>Select an agent to view findings</p></div>
+      </div>
+
+      <!-- Pagination -->
+      <div class="pagination" id="findingsPagination" style="display:none">
+        <button class="page-btn" id="prevPage" onclick="changePage(-1)">← Prev</button>
+        <span class="page-info" id="pageInfo"></span>
+        <button class="page-btn" id="nextPage" onclick="changePage(1)">Next →</button>
+      </div>
+    </div>
+
+    <!-- ── TIMELINE PANEL ──────────────────────────────────────────────────── -->
+    <div class="panel" id="panel-timeline">
+      <div class="panel-hdr">
+        <div class="panel-hdr-left">
+          <div class="panel-icon-wrap">◷</div>
+          <div>
+            <div class="panel-title">Change Timeline</div>
+            <div class="panel-sub">History of detected changes &amp; resolved findings</div>
+          </div>
         </div>
-        <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter services…" oninput="filterTable('servicesBody',this.value)"></div>
-        <div class="tbl-wrap" style="max-height:260px">
-          <table>
-            <thead><tr><th>Name</th><th>Status</th><th>PID</th><th>Type</th></tr></thead>
-            <tbody id="servicesBody"></tbody>
-          </table>
+      </div>
+      <div id="timelineList" class="timeline">
+        <div class="empty"><div class="ei">◷</div><p>Select an agent to view timeline</p></div>
+      </div>
+    </div>
+
+    <!-- ── RAW TELEMETRY PANEL ─────────────────────────────────────────────── -->
+    <div class="panel" id="panel-rawdata">
+      <div class="panel-hdr">
+        <div class="panel-hdr-left">
+          <div class="panel-icon-wrap">▦</div>
+          <div>
+            <div class="panel-title">Raw Telemetry</div>
+            <div class="panel-sub">All ingested agent data — unprocessed</div>
+          </div>
         </div>
       </div>
-    </div>
-
-    <!-- ── Users ── -->
-    <div id="sec-users" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">👤</span> Users</span>
-        <span class="card-tag" id="usersCount">0</span>
+      <div class="section-tabs" id="rawSectionTabs">
+        <div class="text-faint" style="padding:6px 8px;font-size:12px">Select an agent first</div>
       </div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>Name</th><th>UID</th><th>GID</th><th>Shell</th><th>Home</th><th>Last Login</th><th>Admin</th><th>Locked</th></tr></thead>
-          <tbody id="usersBody"></tbody>
-        </table>
+      <div id="rawSectionData">
+        <div class="empty"><div class="ei">▦</div><p>Select an agent to view raw telemetry</p></div>
       </div>
     </div>
 
-    <!-- ── Hardware ── -->
-    <div id="sec-hardware" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">🖥</span> Hardware Devices</span>
-        <span class="card-tag" id="hwCount">0</span>
+  </div><!-- /content -->
+</div><!-- /main -->
+</div><!-- /shell -->
+
+<!-- ══ FINDING DETAIL MODAL ═════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="findingModal" onclick="closeModal(event)">
+  <div class="modal">
+    <div class="modal-hdr">
+      <div>
+        <div style="margin-bottom:6px" id="modalSevPill"></div>
+        <div class="modal-title" id="modalTitle">Finding Detail</div>
       </div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>Bus</th><th>Name</th><th>Vendor</th><th>Product ID</th><th>Serial</th><th>Status</th></tr></thead>
-          <tbody id="hwBody"></tbody>
-        </table>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="detail-grid" id="modalDetails"></div>
+      <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px">Evidence</div>
+      <div class="evidence-block" id="modalEvidence"></div>
+      <div class="modal-actions">
+        <button class="btn btn-danger" id="resolveBtn" onclick="resolveCurrentFinding()">Mark Resolved</button>
+        <button class="btn btn-secondary" onclick="closeModal()">Close</button>
       </div>
     </div>
+  </div>
+</div>
 
-    <!-- ── Containers ── -->
-    <div id="sec-containers" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">🐳</span> Containers</span>
-        <span class="card-tag" id="containerCount">0</span>
-      </div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>ID</th><th>Name</th><th>Image</th><th>Status</th><th>Runtime</th><th>Ports</th><th>Created</th></tr></thead>
-          <tbody id="containerBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ── Storage ── -->
-    <div id="sec-storage" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">💾</span> Storage</span>
-        <span class="card-tag" id="storageCount">0</span>
-      </div>
-      <div class="card-body" id="storageGrid" style="display:flex;flex-direction:column;gap:10px"></div>
-    </div>
-
-    <!-- ── Scheduled Tasks ── -->
-    <div id="sec-tasks" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">🕐</span> Scheduled Tasks</span>
-        <span class="card-tag" id="tasksCount">0</span>
-      </div>
-      <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter tasks…" oninput="filterTable('tasksBody',this.value)"></div>
-      <div class="tbl-wrap" style="max-height:300px">
-        <table>
-          <thead><tr><th>Type</th><th>Name</th><th>Schedule</th><th>Command</th><th>User</th><th>Enabled</th><th>Last Run</th></tr></thead>
-          <tbody id="tasksBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ── Installed Apps ── -->
-    <div id="sec-apps" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">📱</span> Installed Apps</span>
-        <span class="card-tag" id="appsCount">0</span>
-      </div>
-      <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter apps…" oninput="filterTable('appsBody',this.value)"></div>
-      <div class="tbl-wrap" style="max-height:300px">
-        <table>
-          <thead><tr><th>Name</th><th>Version</th><th>Vendor</th><th>Signed</th><th>Bundle ID</th><th>Path</th></tr></thead>
-          <tbody id="appsBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ── Packages ── -->
-    <div id="sec-packages" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">📦</span> Installed Packages</span>
-        <span class="card-tag" id="pkgCount">0</span>
-      </div>
-      <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter packages…" oninput="filterTable('pkgBody',this.value)"></div>
-      <div class="tbl-wrap" style="max-height:320px">
-        <table>
-          <thead><tr><th>Manager</th><th>Package</th><th>Version</th><th>Latest</th><th>Outdated</th></tr></thead>
-          <tbody id="pkgBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ── SBOM ── -->
-    <div id="sec-sbom" class="card">
-      <div class="card-hd">
-        <span class="card-title"><span class="card-title-icon">📋</span> Software Bill of Materials (SBOM)</span>
-        <span class="card-tag" id="sbomCount">0</span>
-      </div>
-      <div class="tbl-search-wrap"><input class="tbl-search" placeholder="Filter SBOM…" oninput="filterTable('sbomBody',this.value)"></div>
-      <div class="tbl-wrap" style="max-height:300px">
-        <table>
-          <thead><tr><th>Type</th><th>Name</th><th>Version</th><th>Source</th><th>License</th><th>PURL</th></tr></thead>
-          <tbody id="sbomBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- ── Section Timeline ── -->
-    <div id="sec-timeline" class="card">
-      <div class="card-hd"><span class="card-title"><span class="card-title-icon">🕙</span> Collection Timeline</span></div>
-      <div class="timeline" id="timelineItems"></div>
-    </div>
-
-  </div><!-- /dashboard -->
-</main>
-</div><!-- /layout -->
-
+<!-- ══ SCRIPTS ═══════════════════════════════════════════════════════════════ -->
 <script>
-// =============================================================================
-//  mac_intel Dashboard — Full Section JS
-// =============================================================================
+'use strict';
 
-const API = '';
-let currentAgent = null;
-let currentWindow = '5m';
-let ws = null;
-let charts = {};
-let refreshTimer = null;
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = {
+  agent: '',
+  win: '5m',
+  panel: 'overview',
+  jarvis: {
+    severity: 'all',
+    search: '',
+    page: 0,
+    pageSize: 20,
+    total: 0,
+    findings: [],
+  },
+  openFindingId: null,
+  ws: null,
+  charts: {},
+};
 
-// ── Chart defaults ─────────────────────────────────────────────────────────────
-Chart.defaults.color = '#94a3b8';
-Chart.defaults.borderColor = '#e2e8f0';
-Chart.defaults.font.family = "'Inter', system-ui, sans-serif";
-Chart.defaults.font.size = 11;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const API = path => fetch(path).then(r => r.ok ? r.json() : Promise.reject(r));
 
-function makeChart(id, label, color, isCount) {
-  const ctx = document.getElementById(id).getContext('2d');
-  return new Chart(ctx, {
+function fmtTs(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const now = Date.now();
+  const diff = now - d.getTime();
+  if (diff < 60000)     return 'just now';
+  if (diff < 3600000)   return Math.floor(diff/60000) + 'm ago';
+  if (diff < 86400000)  return Math.floor(diff/3600000) + 'h ago';
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+}
+
+function sevColor(sev) {
+  const map = {critical:'var(--sev-critical)',high:'var(--sev-high)',medium:'var(--sev-medium)',low:'var(--sev-low)',info:'var(--sev-info)'};
+  return map[sev] || 'var(--sev-info)';
+}
+
+function escH(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function winSeconds() {
+  const map = {'5m':300,'15m':900,'1h':3600,'8h':28800,'1d':86400,'7d':604800,'30d':2592000};
+  return map[state.win] || 300;
+}
+
+// ── Panel switching ───────────────────────────────────────────────────────────
+function showPanel(name, btn) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  $('panel-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+  state.panel = name;
+
+  if (name === 'jarvis' && state.agent) loadJarvis();
+  if (name === 'timeline' && state.agent) loadTimeline();
+  if (name === 'rawdata' && state.agent) loadRawSections();
+  if (name === 'agents') loadAgents();
+  if (name === 'overview') loadOverview();
+}
+
+// ── Agent select ──────────────────────────────────────────────────────────────
+function onAgentChange(aid) {
+  state.agent = aid;
+  connectWS(aid);
+  // Reload whatever panel is active
+  if (state.panel === 'jarvis')    loadJarvis();
+  if (state.panel === 'timeline')  loadTimeline();
+  if (state.panel === 'rawdata')   loadRawSections();
+  if (state.panel === 'overview')  loadOverview();
+}
+
+async function populateAgentSelect() {
+  try {
+    const data = await API('/api/v1/agents');
+    const agents = data.agents || data || [];
+    const sel = $('agentSelect');
+    agents.forEach(a => {
+      const o = document.createElement('option');
+      o.value = a.agent_id;
+      o.textContent = (a.name || a.agent_id) + (a.agent_id !== a.name ? ' (' + a.agent_id + ')' : '');
+      sel.appendChild(o);
+    });
+    // Auto-select first agent
+    if (agents.length && !state.agent) {
+      sel.value = agents[0].agent_id;
+      onAgentChange(agents[0].agent_id);
+    }
+    $('ov-agents').textContent = agents.length;
+  } catch (e) { console.warn('agents load:', e); }
+}
+
+// ── Time range ────────────────────────────────────────────────────────────────
+function setWin(w, btn) {
+  state.win = w;
+  document.querySelectorAll('.tr-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (state.panel === 'rawdata') loadRawSections();
+}
+
+// ── Manual refresh ────────────────────────────────────────────────────────────
+function manualRefresh() {
+  const btn = $('refreshBtn');
+  btn.classList.add('spinning');
+  setTimeout(() => btn.classList.remove('spinning'), 800);
+  if (state.panel === 'overview')  loadOverview();
+  if (state.panel === 'jarvis')    loadJarvis();
+  if (state.panel === 'timeline')  loadTimeline();
+  if (state.panel === 'rawdata')   loadRawSections();
+  if (state.panel === 'agents')    loadAgents();
+}
+
+// ══ OVERVIEW ══════════════════════════════════════════════════════════════════
+
+async function loadOverview() {
+  if (!state.agent) return;
+  try {
+    const sum = await API('/api/v1/jarvis/' + state.agent + '/summary');
+    $('ov-critical').textContent = sum.critical || 0;
+    $('ov-high').textContent     = sum.high || 0;
+    $('ov-total').textContent    = sum.total || 0;
+    // Show 5 most recent findings
+    const data = await API('/api/v1/jarvis/' + state.agent + '/findings?limit=5&offset=0');
+    const list = (data.findings || []).slice(0,5);
+    $('ov-findings-list').innerHTML = list.length
+      ? list.map(f => findingCard(f, true)).join('')
+      : '<div class="empty"><div class="ei">✓</div><p>No active findings</p></div>';
+  } catch(e) { console.warn('overview load:', e); }
+
+  loadCharts();
+}
+
+async function loadCharts() {
+  if (!state.agent) return;
+  try {
+    const since = Math.floor(Date.now()/1000) - winSeconds();
+    const data = await API('/api/v1/agents/' + state.agent + '/metrics?since=' + since).catch(() => null);
+    if (!data) return;
+    // CPU chart
+    renderLineChart('cpuChart', data.labels || [], data.cpu || [], '#2563EB');
+    // Mem chart
+    renderLineChart('memChart', data.labels || [], data.memory || [], '#10B981');
+  } catch(e) {}
+}
+
+function renderLineChart(canvasId, labels, vals, color) {
+  const canvas = $(canvasId);
+  if (!canvas) return;
+  if (state.charts[canvasId]) { state.charts[canvasId].destroy(); }
+  state.charts[canvasId] = new Chart(canvas, {
     type: 'line',
     data: {
-      labels: [],
+      labels,
       datasets: [{
-        label, data: [],
+        data: vals,
         borderColor: color,
         backgroundColor: color + '18',
         borderWidth: 2,
         pointRadius: 0,
-        pointHoverRadius: 4,
         fill: true,
         tension: 0.4,
       }]
     },
     options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: { duration: 400 },
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: '#fff',
-          borderColor: '#e2e8f0',
-          borderWidth: 1,
-          titleColor: '#475569',
-          bodyColor: '#0f172a',
-          padding: 10,
-          boxShadow: '0 4px 6px rgba(0,0,0,.07)',
-        }
-      },
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
       scales: {
         x: { display: false },
-        y: {
-          min: 0,
-          grid: { color: '#f1f5f9' },
-          ticks: {
-            maxTicksLimit: 4,
-            callback: v => isCount ? v : v + '%'
-          }
-        }
-      }
+        y: { beginAtZero: true, grid: { color: '#E2E8F0' }, ticks: { color: '#94A3B8', font: { size: 11 } } }
+      },
     }
   });
 }
 
-function initCharts() {
-  charts.cpu  = makeChart('cpuChart',  'CPU %',        '#3b82f6', false);
-  charts.mem  = makeChart('memChart',  'Memory %',     '#8b5cf6', false);
-  charts.conn = makeChart('connChart', 'Connections',  '#16a34a', true);
-}
+// ══ AGENTS TABLE ══════════════════════════════════════════════════════════════
 
-// ── Time window ────────────────────────────────────────────────────────────────
-function setWindow(w, btn) {
-  currentWindow = w;
-  document.querySelectorAll('.tr-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  if (currentAgent) loadDashboard(currentAgent);
-}
-
-// ── Agent select ───────────────────────────────────────────────────────────────
-function selectAgent(id) {
-  if (!id) return;
-  currentAgent = id;
-  document.getElementById('welcomeState').style.display = 'none';
-  const dash = document.getElementById('dashboard');
-  dash.style.display = 'flex';
-
-  document.querySelectorAll('.sb-item[data-agent]').forEach(el =>
-    el.classList.toggle('active', el.dataset.agent === id)
-  );
-
-  connectWS(id);
-  loadDashboard(id);
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => loadDashboard(currentAgent), 20000);
-}
-
-// ── Load all dashboard data ────────────────────────────────────────────────────
-async function loadDashboard(agentId) {
+async function loadAgents() {
   try {
-    const [agentInfo] = await Promise.all([
-      fetch(`${API}/api/v1/agents/${agentId}`).then(r => r.ok ? r.json() : null),
-    ]);
-    if (!agentInfo) return;
-
-    const online = agentInfo.online || false;
-    document.getElementById('offlineBanner').style.display = online ? 'none' : 'flex';
-    setConnStatus(online ? 'ok' : 'warn', online ? 'Agent online' : 'Agent offline');
-    document.getElementById('lastUpd').textContent = 'Updated ' + new Date().toLocaleTimeString();
-    renderTimeline(agentInfo.sections || {});
-
-    await Promise.allSettled([
-      loadSection(agentId, 'security',    renderSecurity),
-      loadSection(agentId, 'metrics',     renderMetrics),
-      loadSection(agentId, 'battery',     renderBattery),
-      loadSection(agentId, 'processes',   renderProcesses),
-      loadSection(agentId, 'ports',       renderPorts),
-      loadSection(agentId, 'connections', renderConnections),
-      loadSection(agentId, 'network',     renderNetwork),
-      loadSection(agentId, 'arp',         renderArp),
-      loadSection(agentId, 'services',    renderServices),
-      loadSection(agentId, 'users',       renderUsers),
-      loadSection(agentId, 'hardware',    renderHardware),
-      loadSection(agentId, 'containers',  renderContainers),
-      loadSection(agentId, 'storage',     renderStorage),
-      loadSection(agentId, 'tasks',       renderTasks),
-      loadSection(agentId, 'apps',        renderApps),
-      loadSection(agentId, 'packages',    renderPackages),
-      loadSection(agentId, 'sbom',        renderSbom),
-    ]);
-
-    loadHistory(agentId);
-  } catch(e) { console.error('loadDashboard:', e); }
+    const data = await API('/api/v1/agents');
+    const agents = data.agents || data || [];
+    const now = Date.now() / 1000;
+    $('agentsTableBody').innerHTML = agents.length
+      ? agents.map(a => {
+          const online = a.last_seen && (now - a.last_seen) < 300;
+          return `<tr onclick="openAgentDetail('${escH(a.agent_id)}')">
+            <td><span class="online-dot ${online?'is-online':'is-offline'}"></span>${online?'Online':'Offline'}</td>
+            <td class="font-mono">${escH(a.agent_id)}</td>
+            <td>${escH(a.name||'—')}</td>
+            <td class="font-mono">${escH(a.last_ip||'—')}</td>
+            <td>${fmtTs(a.last_seen)}</td>
+            <td>${a.section_count||'—'}</td>
+          </tr>`;
+        }).join('')
+      : '<tr><td colspan="6" style="text-align:center;color:var(--text-faint);padding:30px">No agents enrolled</td></tr>';
+  } catch(e) { console.warn('agents load:', e); }
 }
 
-async function loadSection(agentId, section, renderer) {
+async function openAgentDetail(aid) {
+  $('agents-list-view').style.display = 'none';
+  $('agent-detail-view').style.display = 'block';
+  $('detail-agent-title').textContent = aid;
+  // Load sections
   try {
-    const r = await fetch(`${API}/api/v1/agents/${agentId}/${section}?window=${currentWindow}&limit=1`);
-    if (!r.ok) return;
-    const rows = await r.json();
-    if (rows && rows.length > 0) renderer(rows[0].data);
-  } catch(e) {}
+    const data = await API('/api/v1/agents/' + aid + '/sections');
+    const sections = data.sections || [];
+    $('sectionTabs').innerHTML = sections.map((s,i) =>
+      `<button class="sec-tab${i===0?' active':''}" onclick="loadAgentSection('${escH(aid)}','${escH(s)}',this)">${escH(s)}</button>`
+    ).join('');
+    if (sections.length) loadAgentSection(aid, sections[0], $('sectionTabs').querySelector('.sec-tab'));
+  } catch(e) { $('sectionTabs').innerHTML = '<span class="text-faint" style="padding:6px 8px;font-size:12px">No sections</span>'; }
 }
 
-async function loadHistory(agentId) {
+function closeAgentDetail() {
+  $('agents-list-view').style.display = 'block';
+  $('agent-detail-view').style.display = 'none';
+}
+
+async function loadAgentSection(aid, section, btn) {
+  document.querySelectorAll('.sec-tab').forEach(t => t.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  $('sectionData').innerHTML = '<div class="empty"><div class="ei">⟳</div><p>Loading…</p></div>';
   try {
-    const [mRows, cRows] = await Promise.all([
-      fetch(`${API}/api/v1/agents/${agentId}/metrics?window=${currentWindow}&limit=80`).then(r => r.ok ? r.json() : []),
-      fetch(`${API}/api/v1/agents/${agentId}/connections?window=${currentWindow}&limit=80`).then(r => r.ok ? r.json() : []),
-    ]);
-    updateChart(charts.cpu,  mRows, r => _num(r.data?.cpu_pct));
-    updateChart(charts.mem,  mRows, r => _num(r.data?.mem_pct));
-    updateChart(charts.conn, cRows, r => Array.isArray(r.data) ? r.data.length : 0);
-  } catch(e) {}
+    const since = Math.floor(Date.now()/1000) - winSeconds();
+    const data = await API('/api/v1/agents/' + aid + '/' + section + '?since=' + since);
+    const rows = data.data || data.rows || (Array.isArray(data) ? data : []);
+    if (!rows.length) {
+      $('sectionData').innerHTML = '<div class="empty"><div class="ei">▦</div><p>No data in time range</p></div>';
+      return;
+    }
+    const keys = Object.keys(rows[0]);
+    $('sectionData').innerHTML = `
+      <div class="table-wrap">
+        <table>
+          <thead><tr>${keys.map(k=>`<th>${escH(k)}</th>`).join('')}</tr></thead>
+          <tbody>${rows.map(r=>
+            `<tr>${keys.map(k=>`<td class="truncate" style="max-width:220px" title="${escH(JSON.stringify(r[k]))}">${escH(typeof r[k]==='object'?JSON.stringify(r[k]):r[k])}</td>`).join('')}</tr>`
+          ).join('')}</tbody>
+        </table>
+      </div>`;
+  } catch(e) { $('sectionData').innerHTML = '<div class="empty"><div class="ei">✗</div><p>Failed to load section</p></div>'; }
 }
 
-function updateChart(chart, rows, extractor) {
-  if (!rows || !rows.length) return;
-  chart.data.labels = rows.map(r => {
-    const ts = r.collected_at || r.ts || 0;
-    return new Date(ts * 1000).toLocaleTimeString();
-  });
-  chart.data.datasets[0].data = rows.map(extractor);
-  chart.update();
+// ══ JARVIS FINDINGS ═══════════════════════════════════════════════════════════
+
+async function loadJarvis() {
+  if (!state.agent) {
+    $('findingsList').innerHTML = '<div class="empty"><div class="ei">⬡</div><p>Select an agent first</p></div>';
+    return;
+  }
+  await Promise.all([loadJarvisSummary(), fetchFindings()]);
 }
 
-// ══ RENDERERS ══════════════════════════════════════════════════════════════════
+async function loadJarvisSummary() {
+  try {
+    const s = await API('/api/v1/jarvis/' + state.agent + '/summary');
+    $('sev-critical').textContent = s.critical || 0;
+    $('sev-high').textContent     = s.high || 0;
+    $('sev-medium').textContent   = s.medium || 0;
+    $('sev-low').textContent      = s.low || 0;
+    $('sev-info').textContent     = s.info || 0;
+    $('ji-active').textContent    = s.active || s.total || 0;
+    $('ji-critical-high').textContent = (s.critical||0) + (s.high||0);
+    $('ji-scans').textContent     = s.total_scans || s.total || 0;
 
-// ── Security ──
-function renderSecurity(data) {
-  if (!data) return;
-  const checks = [
-    { id: 'pi-sip', val: data.sip,         good: /enabled/i },
-    { id: 'pi-gk',  val: data.gatekeeper,  good: /enabled/i },
-    { id: 'pi-fv',  val: data.filevault,   good: /on|enabled/i },
-    { id: 'pi-fw',  val: data.firewall,    good: /on|enabled/i },
-    { id: 'pi-xp',  val: data.xprotect,   good: /enabled/i },
-    { id: 'pi-sb',  val: data.secure_boot, good: /full|medium/i },
-  ];
-  let score = 0;
-  checks.forEach(c => {
-    const el = document.getElementById(c.id);
-    if (!el) return;
-    const v = (c.val || '').trim();
-    const ok = v ? c.good.test(v) : null;
-    if (ok) score += 100 / checks.length;
-    el.className = 'pi ' + (v ? (ok ? 'ok' : 'bad') : '');
-    el.querySelector('.pi-val').textContent = v || '—';
-  });
-  document.getElementById('postureAge').textContent = new Date().toLocaleTimeString();
-  setSecurityScore(Math.round(score));
+    // Score ring
+    const score = parseFloat(s.max_score || 0).toFixed(1);
+    const pct   = Math.min(score / 10, 1);
+    const circ  = 2 * Math.PI * 51;
+    const offset = circ * (1 - pct);
+    const ring = $('scoreRingVal');
+    ring.style.strokeDashoffset = offset;
+    // Color by score
+    const strokeColor = score >= 9 ? 'var(--sev-critical)' : score >= 7 ? 'var(--sev-high)' : score >= 4 ? 'var(--sev-medium)' : score >= 2 ? 'var(--sev-low)' : '#10B981';
+    ring.style.stroke = strokeColor;
+    $('scoreNum').textContent = score;
+
+    const status = score >= 9 ? 'Critical Risk' : score >= 7 ? 'High Risk' : score >= 4 ? 'Medium Risk' : score >= 2 ? 'Low Risk' : 'Clean';
+    const bgMap = {
+      'Critical Risk': 'background:var(--sev-critical-bg);color:var(--sev-critical)',
+      'High Risk':     'background:var(--sev-high-bg);color:var(--sev-high)',
+      'Medium Risk':   'background:var(--sev-medium-bg);color:var(--sev-medium)',
+      'Low Risk':      'background:var(--sev-low-bg);color:var(--sev-low)',
+      'Clean':         'background:#D1FAE5;color:#065F46',
+    };
+    $('scoreStatus').setAttribute('style', (bgMap[status]||'background:var(--sev-info-bg);color:var(--sev-info)') + ';font-size:12px;font-weight:600;padding:3px 12px;border-radius:20px;text-align:center;');
+    $('scoreStatus').textContent = status;
+
+    // Update sidebar badge
+    const urgent = (s.critical||0) + (s.high||0);
+    const badge = $('jarvis-badge');
+    if (urgent > 0) { badge.style.display='inline'; badge.textContent=urgent; }
+    else { badge.style.display='none'; }
+  } catch(e) { console.warn('jarvis summary:', e); }
 }
 
-function setSecurityScore(score) {
-  document.getElementById('scoreNum').textContent = score;
-  const circ = 2 * Math.PI * 36;
-  const offset = circ - (score / 100) * circ;
-  const ring = document.getElementById('scoreRing');
-  ring.style.strokeDashoffset = offset;
-  ring.style.stroke = score >= 80 ? '#16a34a' : score >= 50 ? '#d97706' : '#dc2626';
-  document.getElementById('scoreLabel').textContent =
-    score >= 80 ? '✅ Secure' : score >= 50 ? '⚠ Needs Attention' : '🚨 Critical Issues';
-}
+async function fetchFindings() {
+  const { agent, jarvis } = state;
+  if (!agent) return;
+  const sev    = jarvis.severity !== 'all' ? '&severity=' + jarvis.severity : '';
+  const q      = jarvis.search ? '&q=' + encodeURIComponent(jarvis.search) : '';
+  const offset = jarvis.page * jarvis.pageSize;
 
-// ── Metrics ──
-function renderMetrics(data) {
-  if (!data) return;
-  const cpu = _num(data.cpu_pct);
-  const mem = _num(data.mem_pct);
-  set('statCpu', cpu != null ? cpu.toFixed(1) + '%' : '—');
-  setCard('sc-cpu', cpu, 70, 90);
-  set('statLoad', data.load_1m != null ? `load ${data.load_1m.toFixed(2)}` : 'load —');
-  set('statMem', mem != null ? mem.toFixed(1) + '%' : '—');
-  setCard('sc-mem', mem, 70, 90);
-  if (data.mem_used_mb && data.mem_total_mb) {
-    set('statSwap', `${Math.round(data.mem_used_mb/1024)}GB / ${Math.round(data.mem_total_mb/1024)}GB`);
+  $('findingsList').innerHTML = '<div class="empty"><div class="ei">⟳</div><p>Loading…</p></div>';
+
+  try {
+    let url, data;
+    if (jarvis.search) {
+      url  = '/api/v1/jarvis/' + agent + '/search?limit=' + jarvis.pageSize + q;
+      data = await API(url);
+      state.jarvis.findings = data.results || [];
+      state.jarvis.total    = data.count || 0;
+    } else {
+      url  = '/api/v1/jarvis/' + agent + '/findings?limit=' + jarvis.pageSize + '&offset=' + offset + sev;
+      data = await API(url);
+      state.jarvis.findings = data.findings || [];
+      state.jarvis.total    = data.count || 0;
+    }
+
+    renderFindings(state.jarvis.findings);
+
+    // Pagination
+    const pag = $('findingsPagination');
+    if (state.jarvis.total > jarvis.pageSize) {
+      pag.style.display = 'flex';
+      const totalPages = Math.ceil(state.jarvis.total / jarvis.pageSize);
+      $('pageInfo').textContent = 'Page ' + (jarvis.page+1) + ' / ' + totalPages;
+      $('prevPage').disabled = jarvis.page <= 0;
+      $('nextPage').disabled = (jarvis.page+1) >= totalPages;
+    } else {
+      pag.style.display = 'none';
+    }
+
+    // Update last updated
+    if (state.jarvis.findings.length) {
+      const ts = state.jarvis.findings[0].last_detected_at;
+      $('ji-updated').textContent = fmtTs(ts);
+    }
+  } catch(e) {
+    $('findingsList').innerHTML = '<div class="empty"><div class="ei">✗</div><p>Failed to load findings</p></div>';
+    console.warn('jarvis findings:', e);
   }
 }
 
-function renderBattery(data) {
-  if (!data) return;
-  if (!data.present) { set('statBatt', 'N/A'); set('statPower', 'Desktop'); return; }
-  set('statBatt', data.charge_pct != null ? data.charge_pct + '%' : '—');
-  set('statPower', data.charging ? '⚡ Charging' : '🔋 Battery');
-  const pct = data.charge_pct;
-  setCard('sc-batt', pct, 20, 10, true); // reversed: low = bad
+function renderFindings(findings) {
+  if (!findings.length) {
+    $('findingsList').innerHTML = '<div class="empty"><div class="ei">✓</div><p>No findings in this filter</p></div>';
+    return;
+  }
+  $('findingsList').innerHTML = findings.map((f,i) => findingCard(f, false, i)).join('');
 }
 
-// ── Processes ──
-function renderProcesses(data) {
-  if (!Array.isArray(data)) return;
-  set('statProcs', data.length);
-  set('procCount', data.length);
-  const tbody = document.getElementById('procBody');
-  tbody.innerHTML = data.slice(0, 100).map(p => {
-    const cpu = _num(p.cpu_pct) || 0;
-    const mem = _num(p.mem_pct) || 0;
-    const cpuCls = cpu > 50 ? 'c' : cpu > 20 ? 'w' : '';
-    const memCls = mem > 50 ? 'c' : mem > 30 ? 'w' : '';
-    const name = esc(p.name || '');
-    const cmd = esc((p.cmdline || '').substring(0, 60));
-    const status = p.status || '';
-    const statusBadge = status === 'running' ? '<span class="badge badge-ok">running</span>'
-                      : status ? `<span class="badge badge-gray">${esc(status)}</span>` : '—';
-    return `<tr>
-      <td class="mono dim">${p.pid || ''}</td>
-      <td><strong>${name}</strong></td>
-      <td class="dim">${esc(p.user || '—')}</td>
-      <td>
-        <div class="mbar">
-          <div class="mbar-track"><div class="mbar-fill ${cpuCls}" style="width:${Math.min(cpu,100)}%"></div></div>
-          <span class="mbar-pct">${cpu.toFixed(1)}</span>
+function findingCard(f, compact, idx=0) {
+  const sev  = f.severity || 'info';
+  const score = parseFloat(f.score||0);
+  const scoreW = Math.max(2, (score/10)*100).toFixed(0);
+  const mitre  = f.mitre_technique ? `<span class="chip chip-blue">${escH(f.mitre_technique)}</span>` : '';
+  const cves   = (f.cve_ids||[]).slice(0,2).map(c=>`<span class="chip chip-ora">${escH(c)}</span>`).join('');
+  const cat    = f.category ? `<span class="chip">${escH(f.category)}</span>` : '';
+  const src    = f.source ? `<span class="chip">${escH(f.source)}</span>` : '';
+  const delay  = (idx*0.03).toFixed(2);
+
+  return `<div class="finding-card" data-sev="${escH(sev)}" data-id="${f.id||''}"
+    style="animation-delay:${delay}s" onclick="openFinding(${f.id||0})">
+    <div class="fc-row">
+      <span class="sev-pill" data-sev="${escH(sev)}">${escH(sev)}</span>
+      <div class="fc-body">
+        <div class="fc-title">${escH(f.title||'Untitled')}</div>
+        ${!compact ? `<div class="fc-desc">${escH(f.description||'')}</div>` : ''}
+        <div class="fc-meta">
+          ${cat}${src}${mitre}${cves}
+          ${f.scan_count ? `<span class="chip">Scan #${f.scan_count}</span>` : ''}
         </div>
-      </td>
-      <td>
-        <div class="mbar">
-          <div class="mbar-track"><div class="mbar-fill ${memCls}" style="width:${Math.min(mem,100)}%"></div></div>
-          <span class="mbar-pct">${mem.toFixed(1)}</span>
+        <div class="fc-score">
+          <div class="score-bar-bg"><div class="score-bar-fill" data-sev="${escH(sev)}" style="width:${scoreW}%"></div></div>
+          <span class="score-num-sm">${score.toFixed(1)}</span>
         </div>
-      </td>
-      <td class="mono dim">${fmtBytes(p.mem_rss_mb ? p.mem_rss_mb * 1024 * 1024 : 0)}</td>
-      <td>${statusBadge}</td>
-      <td class="mono dim" title="${cmd}" style="max-width:180px">${cmd || '—'}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Connections ──
-function renderConnections(data) {
-  if (!Array.isArray(data)) return;
-  set('statConn', data.length);
-  set('connCount', data.length);
-  const tbody = document.getElementById('connBody');
-  tbody.innerHTML = data.slice(0, 100).map(c => {
-    const proto = c.proto || 'tcp';
-    const state = c.state || '';
-    const stateClass = state === 'ESTABLISHED' ? 'badge-est' : state === 'LISTEN' ? 'badge-lst' : 'badge-gray';
-    return `<tr>
-      <td><span class="badge badge-tcp">${esc(proto.toUpperCase())}</span></td>
-      <td class="mono">${esc(c.local_addr||'')}:${c.local_port||''}</td>
-      <td class="mono">${c.remote_addr ? esc(c.remote_addr)+':'+(c.remote_port||'') : '—'}</td>
-      <td><span class="badge ${stateClass}">${esc(state)||'—'}</span></td>
-      <td class="mono dim">${c.pid||'—'}</td>
-      <td class="dim">${esc(c.process||'—')}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Ports ──
-function renderPorts(data) {
-  if (!Array.isArray(data)) return;
-  const listen = data.filter(p => p.state === 'LISTEN' || !p.state);
-  set('portsCount', listen.length);
-  set('statPorts', listen.length);
-  const RISKY = new Set([22,23,25,80,443,3306,5432,6379,27017,5900,3389,8080,8443,2375,2376]);
-  const tbody = document.getElementById('portsBody');
-  tbody.innerHTML = listen.slice(0, 60).map(p => {
-    const isRisky = RISKY.has(p.port);
-    const risk = isRisky ? '<span class="badge badge-bad">⚠ known</span>'
-                         : '<span class="badge badge-ok">low</span>';
-    return `<tr>
-      <td><span class="badge badge-tcp">${esc((p.proto||'tcp').toUpperCase())}</span></td>
-      <td class="mono"><strong>${p.port||''}</strong></td>
-      <td class="mono dim">${esc(p.bind_addr||'0.0.0.0')}</td>
-      <td>${esc(p.process||'—')}</td>
-      <td class="mono dim">${p.pid||'—'}</td>
-      <td>${risk}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Network ──
-function renderNetwork(data) {
-  if (!data) return;
-  const grid = document.getElementById('netGrid');
-  const ifaces = data.interfaces || [];
-  let html = '';
-  ifaces.forEach(iface => {
-    html += `<div class="info-row">
-      <div class="info-key">${esc(iface.name)} ${iface.status === 'up' ? '🟢' : '⚫'}</div>
-      ${iface.ipv4 ? `<div class="info-val">${esc(iface.ipv4)}</div>` : ''}
-      ${iface.mac  ? `<div class="info-val mono" style="font-size:11px">${esc(iface.mac)}</div>` : ''}
-    </div>`;
-  });
-  if (data.default_gw)
-    html += `<div class="info-row"><div class="info-key">Default GW</div><div class="info-val mono">${esc(data.default_gw)}</div></div>`;
-  if (data.dns_servers?.length)
-    html += `<div class="info-row"><div class="info-key">DNS</div><div class="info-val mono">${data.dns_servers.slice(0,4).map(esc).join(', ')}</div></div>`;
-  if (data.wifi_ssid)
-    html += `<div class="info-row"><div class="info-key">WiFi</div><div class="info-val">${esc(data.wifi_ssid)} ${data.wifi_rssi ? data.wifi_rssi+'dBm' : ''}</div></div>`;
-  grid.innerHTML = html || '<div class="card-body dim">No data</div>';
-}
-
-// ── ARP ──
-function renderArp(data) {
-  if (!Array.isArray(data)) return;
-  set('arpCount', data.length);
-  const tbody = document.getElementById('arpBody');
-  tbody.innerHTML = data.slice(0, 60).map(a =>
-    `<tr>
-      <td class="mono">${esc(a.ip||'—')}</td>
-      <td class="mono dim">${esc(a.mac||'—')}</td>
-      <td class="dim">${esc(a.interface||'—')}</td>
-      <td><span class="badge badge-gray">${esc(a.state||'—')}</span></td>
-    </tr>`
-  ).join('');
-}
-
-// ── Services ──
-function renderServices(data) {
-  if (!Array.isArray(data)) return;
-  set('servicesCount', data.length);
-  const tbody = document.getElementById('servicesBody');
-  tbody.innerHTML = data.slice(0, 80).map(s => {
-    const running = s.status === 'running';
-    const statusBadge = running
-      ? '<span class="badge badge-ok">running</span>'
-      : s.status === 'stopped'
-        ? '<span class="badge badge-gray">stopped</span>'
-        : `<span class="badge badge-bad">${esc(s.status||'?')}</span>`;
-    return `<tr>
-      <td title="${esc(s.name||'')}" style="max-width:220px">${esc(s.name||'—')}</td>
-      <td>${statusBadge}</td>
-      <td class="mono dim">${s.pid||'—'}</td>
-      <td class="dim">${esc(s.type||'—')}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Users ──
-function renderUsers(data) {
-  if (!Array.isArray(data)) return;
-  set('usersCount', data.length);
-  const tbody = document.getElementById('usersBody');
-  tbody.innerHTML = data.map(u =>
-    `<tr>
-      <td><strong>${esc(u.name||'—')}</strong></td>
-      <td class="mono dim">${u.uid??'—'}</td>
-      <td class="mono dim">${u.gid??'—'}</td>
-      <td class="mono dim">${esc(u.shell||'—')}</td>
-      <td class="dim" title="${esc(u.home||'')}">${esc((u.home||'').substring(0,30))}</td>
-      <td class="dim">${u.last_login ? new Date(u.last_login*1000).toLocaleDateString() : '—'}</td>
-      <td>${u.admin === true ? '<span class="badge badge-bad">Admin</span>' : u.admin === false ? '<span class="badge badge-ok">User</span>' : '—'}</td>
-      <td>${u.locked === true ? '<span class="badge badge-gray">Locked</span>' : u.locked === false ? '<span class="badge badge-ok">Active</span>' : '—'}</td>
-    </tr>`
-  ).join('');
-}
-
-// ── Hardware ──
-function renderHardware(data) {
-  if (!Array.isArray(data)) return;
-  set('hwCount', data.length);
-  const tbody = document.getElementById('hwBody');
-  tbody.innerHTML = data.slice(0, 60).map(d =>
-    `<tr>
-      <td><span class="badge badge-info">${esc((d.bus||'').toUpperCase())}</span></td>
-      <td><strong>${esc(d.name||'—')}</strong></td>
-      <td class="dim">${esc(d.vendor||'—')}</td>
-      <td class="mono dim">${esc(d.product_id||'—')}</td>
-      <td class="mono dim">${esc(d.serial||'—')}</td>
-      <td>${d.connected !== null && d.connected !== undefined
-            ? (d.connected ? '<span class="badge badge-ok">Connected</span>' : '<span class="badge badge-gray">Disconnected</span>')
-            : '—'}</td>
-    </tr>`
-  ).join('');
-}
-
-// ── Containers ──
-function renderContainers(data) {
-  if (!Array.isArray(data)) return;
-  set('containerCount', data.length);
-  const tbody = document.getElementById('containerBody');
-  tbody.innerHTML = data.map(c => {
-    const running = c.status === 'running';
-    const statusBadge = running
-      ? '<span class="badge badge-ok">running</span>'
-      : `<span class="badge badge-bad">${esc(c.status||'?')}</span>`;
-    return `<tr>
-      <td class="mono dim">${esc((c.id||'').substring(0,12))}</td>
-      <td><strong>${esc(c.name||'—')}</strong></td>
-      <td class="dim" style="max-width:160px" title="${esc(c.image||'')}">${esc((c.image||'').substring(0,30))}</td>
-      <td>${statusBadge}</td>
-      <td><span class="badge badge-info">${esc(c.runtime||'docker')}</span></td>
-      <td class="mono dim">${(c.ports||[]).slice(0,3).map(esc).join(', ')||'—'}</td>
-      <td class="dim">${c.created_at ? new Date(c.created_at*1000).toLocaleDateString() : '—'}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Storage ──
-function renderStorage(data) {
-  if (!Array.isArray(data)) return;
-  set('storageCount', data.length);
-  const grid = document.getElementById('storageGrid');
-  grid.innerHTML = data.map(v => {
-    const pct = _num(v.pct) || 0;
-    const cls = pct > 90 ? 'crit' : pct > 70 ? 'warn' : 'ok';
-    return `<div style="display:flex;flex-direction:column;gap:5px;padding:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--r-sm)">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <div>
-          <span style="font-weight:600;font-size:12px">${esc(v.mountpoint||'/')}</span>
-          <span class="badge badge-gray" style="margin-left:6px">${esc(v.fstype||'—')}</span>
-        </div>
-        <span style="font-size:13px;font-weight:700;color:var(--${cls === 'crit' ? 'crit' : cls === 'warn' ? 'warn' : 'ok'})">${pct.toFixed(1)}%</span>
       </div>
-      <div class="storage-bar"><div class="storage-bar-fill ${cls}" style="width:${pct}%"></div></div>
-      <div style="font-size:11px;color:var(--text-3)">${esc(v.device||'')} · ${(v.used_gb||0).toFixed(1)} GB used of ${(v.total_gb||0).toFixed(1)} GB</div>
-    </div>`;
-  }).join('');
+      <div class="fc-time">${fmtTs(f.last_detected_at||f.first_detected_at)}</div>
+    </div>
+  </div>`;
 }
 
-// ── Scheduled Tasks ──
-function renderTasks(data) {
-  if (!Array.isArray(data)) return;
-  set('tasksCount', data.length);
-  const tbody = document.getElementById('tasksBody');
-  tbody.innerHTML = data.slice(0, 100).map(t =>
-    `<tr>
-      <td><span class="badge badge-pkg">${esc(t.type||'cron')}</span></td>
-      <td style="max-width:180px" title="${esc(t.name||'')}">${esc((t.name||'—').substring(0,30))}</td>
-      <td class="mono dim">${esc(t.schedule||'—')}</td>
-      <td class="mono dim" title="${esc(t.command||'')}" style="max-width:200px">${esc((t.command||'—').substring(0,40))}</td>
-      <td class="dim">${esc(t.user||'—')}</td>
-      <td>${t.enabled === true ? '<span class="badge badge-ok">Yes</span>' : t.enabled === false ? '<span class="badge badge-gray">No</span>' : '—'}</td>
-      <td class="dim">${t.last_run ? new Date(t.last_run*1000).toLocaleString() : '—'}</td>
-    </tr>`
+// Severity filter via sev cards
+function filterSev(sev, card) {
+  document.querySelectorAll('.sev-card').forEach(c => c.classList.remove('active-filter'));
+  if (state.jarvis.severity === sev) {
+    state.jarvis.severity = 'all';
+    // Also reset pill
+    document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+    document.querySelector('.pill[data-sev=all]')?.classList.add('active');
+  } else {
+    state.jarvis.severity = sev;
+    card.classList.add('active-filter');
+    document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+    document.querySelector(`.pill[data-sev=${sev}]`)?.classList.add('active');
+  }
+  state.jarvis.page = 0;
+  fetchFindings();
+}
+
+// Severity filter via pills
+function filterPill(sev, pill) {
+  document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  pill.classList.add('active');
+  document.querySelectorAll('.sev-card').forEach(c => c.classList.remove('active-filter'));
+  state.jarvis.severity = sev === 'all' ? 'all' : sev;
+  state.jarvis.page = 0;
+  fetchFindings();
+}
+
+// Search
+let _searchTimer;
+function onSearchInput(val) {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => {
+    state.jarvis.search = val.trim();
+    state.jarvis.page = 0;
+    fetchFindings();
+  }, 320);
+}
+
+// Pagination
+function changePage(dir) {
+  state.jarvis.page = Math.max(0, state.jarvis.page + dir);
+  fetchFindings();
+}
+
+function refreshJarvis() { loadJarvis(); }
+
+// ══ FINDING DETAIL MODAL ══════════════════════════════════════════════════════
+
+async function openFinding(id) {
+  if (!id) return;
+  state.openFindingId = id;
+  // Find in local state first
+  let f = state.jarvis.findings.find(x => x.id === id);
+  if (!f) {
+    try { f = await API('/api/v1/jarvis/' + state.agent + '/findings/' + id); }
+    catch(e) { return; }
+  }
+  showModal(f);
+}
+
+function showModal(f) {
+  const sev = f.severity || 'info';
+  $('modalSevPill').innerHTML = `<span class="sev-pill" data-sev="${escH(sev)}">${escH(sev)}</span>`;
+  $('modalTitle').textContent = f.title || 'Finding Detail';
+
+  const rows = [
+    ['Category',    f.category],
+    ['Source',      f.source],
+    ['MITRE',       f.mitre_technique || '—'],
+    ['Tactic',      f.mitre_tactic || '—'],
+    ['Score',       (f.score||0).toFixed(1) + ' / 10'],
+    ['CVEs',        (f.cve_ids||[]).join(', ') || '—'],
+    ['CVSS',        f.cvss_score ? f.cvss_score.toFixed(1) : '—'],
+    ['First seen',  fmtTs(f.first_detected_at)],
+    ['Last seen',   fmtTs(f.last_detected_at)],
+    ['Scan count',  f.scan_count || 1],
+  ];
+
+  $('modalDetails').innerHTML = rows.map(([l,v]) =>
+    `<div class="dl">${escH(l)}</div><div class="dv">${escH(String(v||'—'))}</div>`
   ).join('');
+
+  let ev = f.evidence || {};
+  $('modalEvidence').textContent = typeof ev === 'string' ? ev : JSON.stringify(ev, null, 2);
+
+  $('findingModal').classList.add('open');
 }
 
-// ── Apps ──
-function renderApps(data) {
-  if (!Array.isArray(data)) return;
-  set('appsCount', data.length);
-  const tbody = document.getElementById('appsBody');
-  tbody.innerHTML = data.slice(0, 100).map(a =>
-    `<tr>
-      <td><strong>${esc(a.name||'—')}</strong></td>
-      <td class="mono dim">${esc(a.version||'—')}</td>
-      <td class="dim">${esc(a.vendor||'—')}</td>
-      <td>${a.signed === true ? '<span class="badge badge-ok">✓ Signed</span>'
-           : a.signed === false ? '<span class="badge badge-bad">✗ Unsigned</span>' : '—'}</td>
-      <td class="mono dim" style="max-width:180px">${esc(a.bundle_id||'—')}</td>
-      <td class="dim" title="${esc(a.path||'')}" style="max-width:160px">${esc((a.path||'—').substring(0,40))}</td>
-    </tr>`
-  ).join('');
+function closeModal(e) {
+  if (e && e.target !== $('findingModal')) return;
+  $('findingModal').classList.remove('open');
+  state.openFindingId = null;
 }
 
-// ── Packages ──
-function renderPackages(data) {
-  if (!Array.isArray(data)) return;
-  set('pkgCount', data.length);
-  const tbody = document.getElementById('pkgBody');
-  const MANAGER_COLORS = {
-    brew: 'badge-info', pip: 'badge-pkg', npm: 'badge-tcp',
-    gem: 'badge-bad', apt: 'badge-ok', rpm: 'badge-ok', winget: 'badge-gray',
-  };
-  tbody.innerHTML = data.slice(0, 200).map(p => {
-    const mgr = (p.manager||'').toLowerCase();
-    const cls = MANAGER_COLORS[mgr] || 'badge-gray';
-    return `<tr>
-      <td><span class="badge ${cls}">${esc(p.manager||'—')}</span></td>
-      <td><strong>${esc(p.name||'—')}</strong></td>
-      <td class="mono dim">${esc(p.version||'—')}</td>
-      <td class="mono dim">${esc(p.latest||'—')}</td>
-      <td>${p.outdated === true ? '<span class="badge badge-bad">Outdated</span>'
-           : p.outdated === false ? '<span class="badge badge-ok">Current</span>' : '—'}</td>
-    </tr>`;
-  }).join('');
-}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-// ── SBOM ──
-function renderSbom(data) {
-  if (!Array.isArray(data)) return;
-  set('sbomCount', data.length);
-  const tbody = document.getElementById('sbomBody');
-  tbody.innerHTML = data.slice(0, 200).map(c =>
-    `<tr>
-      <td><span class="badge badge-gray">${esc(c.type||'library')}</span></td>
-      <td><strong>${esc(c.name||'—')}</strong></td>
-      <td class="mono dim">${esc(c.version||'—')}</td>
-      <td><span class="badge badge-info">${esc(c.source||'—')}</span></td>
-      <td class="dim">${esc(c.license||'—')}</td>
-      <td class="mono dim" style="max-width:160px" title="${esc(c.purl||'')}">${esc((c.purl||'—').substring(0,40))}</td>
-    </tr>`
-  ).join('');
-}
-
-// ── Timeline ──
-function renderTimeline(sections) {
-  const now = Date.now() / 1000;
-  const el = document.getElementById('timelineItems');
-  const entries = Object.entries(sections).sort((a,b) => b[1]-a[1]);
-  el.innerHTML = entries.map(([name, ts], i) => {
-    const age = now - ts;
-    const cls = age < 30 ? 'fresh' : age < 120 ? 'recent' : age < 3600 ? 'stale' : 'old';
-    return `<div class="tl-item" style="animation-delay:${i*0.03}s">
-      <div class="tl-dot ${cls}"></div>
-      <span class="tl-name">${name}</span>
-      <span class="tl-ago">${fmtAge(age)}</span>
-    </div>`;
-  }).join('');
-}
-
-// ── WebSocket ──────────────────────────────────────────────────────────────────
-function connectWS(agentId) {
-  if (ws) { ws.close(); ws = null; }
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/${agentId}?token=`);
-
-  ws.onopen  = () => setConnStatus('ok', 'Live');
-  ws.onclose = () => { setConnStatus('warn', 'Reconnecting…'); setTimeout(() => connectWS(agentId), 5000); };
-  ws.onerror = () => setConnStatus('warn', 'WS error');
-
-  ws.onmessage = e => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type !== 'payload' || msg.agent_id !== currentAgent) return;
-      const handlers = {
-        security: renderSecurity, metrics: renderMetrics,
-        battery: renderBattery, processes: renderProcesses,
-        ports: renderPorts, connections: renderConnections,
-        network: renderNetwork, arp: renderArp,
-        services: renderServices, users: renderUsers,
-        hardware: renderHardware, containers: renderContainers,
-        storage: renderStorage, tasks: renderTasks,
-        apps: renderApps, packages: renderPackages, sbom: renderSbom,
-      };
-      if (handlers[msg.section]) handlers[msg.section](msg.data);
-      set('lastUpd', 'Live · ' + new Date().toLocaleTimeString());
-    } catch {}
-  };
-}
-
-function setConnStatus(state, label) {
-  document.getElementById('connPulse').className = 'pulse ' + (state === 'ok' ? '' : state);
-  set('connStatus', label);
-}
-
-// ── Agent list ─────────────────────────────────────────────────────────────────
-async function loadAgents() {
+async function resolveCurrentFinding() {
+  if (!state.openFindingId || !state.agent) return;
   try {
-    const agents = await fetch(`${API}/api/v1/agents`).then(r => r.json());
-    const sel  = document.getElementById('agentSelect');
-    const list = document.getElementById('agentList');
+    await fetch('/api/v1/jarvis/' + state.agent + '/resolve/' + state.openFindingId, {method:'POST'});
+    closeModal();
+    loadJarvis();
+  } catch(e) { console.warn('resolve:', e); }
+}
 
-    while (sel.options.length > 1) sel.remove(1);
-    list.innerHTML = '';
+// ══ TIMELINE ══════════════════════════════════════════════════════════════════
 
-    agents.forEach(a => {
-      const opt = document.createElement('option');
-      opt.value = a.agent_id;
-      opt.textContent = a.name || a.agent_id;
-      sel.appendChild(opt);
-
-      const item = document.createElement('div');
-      item.className = 'sb-item';
-      item.dataset.agent = a.agent_id;
-      item.innerHTML = `<span class="sb-dot ${a.online?'on':'off'}"></span>
-        <span style="flex:1">${esc(a.name||a.agent_id)}</span>
-        ${!a.online ? '<span class="sb-badge">OFF</span>' : ''}`;
-      item.onclick = () => { sel.value = a.agent_id; selectAgent(a.agent_id); };
-      list.appendChild(item);
-    });
-
-    if (!currentAgent && agents.length > 0) {
-      const first = agents.find(a => a.online) || agents[0];
-      sel.value = first.agent_id;
-      selectAgent(first.agent_id);
-    } else if (currentAgent) {
-      sel.value = currentAgent;
+async function loadTimeline() {
+  if (!state.agent) {
+    $('timelineList').innerHTML = '<div class="empty"><div class="ei">◷</div><p>Select an agent first</p></div>';
+    return;
+  }
+  if (state.panel !== 'timeline') showPanel('timeline', document.querySelector('.nav-item[onclick*="timeline"]'));
+  $('timelineList').innerHTML = '<div class="empty"><div class="ei">⟳</div><p>Loading…</p></div>';
+  try {
+    const data = await API('/api/v1/jarvis/' + state.agent + '/timeline?limit=100');
+    const events = data.events || [];
+    if (!events.length) {
+      $('timelineList').innerHTML = '<div class="empty"><div class="ei">◷</div><p>No changes recorded yet</p></div>';
+      return;
     }
-  } catch(e) { setConnStatus('off', 'Manager offline'); }
+    $('timelineList').innerHTML = events.map((ev, i) => {
+      const delay = (i*0.025).toFixed(2);
+      return `<div class="tl-item" style="animation-delay:${delay}s">
+        <div class="tl-dot" data-ev="${escH(ev.event_type||'modified')}"></div>
+        <div class="tl-card">
+          <div class="tl-hdr">
+            <span class="tl-tag" data-ev="${escH(ev.event_type||'modified')}">${escH(ev.event_type||'modified')}</span>
+            <span class="tl-title">${escH(ev.title||ev.category||'Change')}</span>
+            <span class="tl-time">${fmtTs(ev.ts||ev.timestamp)}</span>
+          </div>
+          ${ev.description ? `<div class="tl-desc">${escH(ev.description)}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    $('timelineList').innerHTML = '<div class="empty"><div class="ei">✗</div><p>Failed to load timeline</p></div>';
+  }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-function set(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = val;
+// ══ RAW TELEMETRY ═════════════════════════════════════════════════════════════
+
+async function loadRawSections() {
+  if (!state.agent) return;
+  try {
+    const data = await API('/api/v1/agents/' + state.agent + '/sections');
+    const sections = data.sections || [];
+    $('rawSectionTabs').innerHTML = sections.map((s,i) =>
+      `<button class="sec-tab${i===0?' active':''}" onclick="loadRawSection('${escH(s)}',this)">${escH(s)}</button>`
+    ).join('') || '<span class="text-faint" style="padding:6px 8px;font-size:12px">No sections</span>';
+    if (sections.length) loadRawSection(sections[0], $('rawSectionTabs').querySelector('.sec-tab'));
+  } catch(e) { console.warn('rawSections:', e); }
 }
 
-function esc(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+async function loadRawSection(section, btn) {
+  document.querySelectorAll('#rawSectionTabs .sec-tab').forEach(t => t.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  $('rawSectionData').innerHTML = '<div class="empty"><div class="ei">⟳</div><p>Loading…</p></div>';
+  try {
+    const since = Math.floor(Date.now()/1000) - winSeconds();
+    const data  = await API('/api/v1/agents/' + state.agent + '/' + section + '?since=' + since);
+    const rows  = data.data || data.rows || (Array.isArray(data) ? data : []);
+    if (!rows.length) {
+      $('rawSectionData').innerHTML = '<div class="empty"><div class="ei">▦</div><p>No data in time range</p></div>';
+      return;
+    }
+    const keys = Object.keys(rows[0]);
+    $('rawSectionData').innerHTML = `<div class="table-wrap">
+      <table>
+        <thead><tr>${keys.map(k=>`<th>${escH(k)}</th>`).join('')}</tr></thead>
+        <tbody>${rows.map(r=>
+          `<tr>${keys.map(k=>`<td class="truncate" style="max-width:240px" title="${escH(JSON.stringify(r[k]))}">${escH(typeof r[k]==='object'?JSON.stringify(r[k]):String(r[k]??''))}</td>`).join('')}</tr>`
+        ).join('')}</tbody>
+      </table>
+    </div>`;
+  } catch(e) { $('rawSectionData').innerHTML = '<div class="empty"><div class="ei">✗</div><p>Failed to load section data</p></div>'; }
 }
 
-function _num(v) {
-  const n = parseFloat(v);
-  return isNaN(n) ? null : n;
+// ══ WEBSOCKET ════════════════════════════════════════════════════════════════
+
+function connectWS(aid) {
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  if (!aid) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  // Try API key from meta tag or URL param
+  const token = (document.cookie.match(/api_key=([^;]*)/) || [])[1] || '';
+  const url   = `${proto}://${location.host}/ws/${encodeURIComponent(aid)}${token ? '?token='+encodeURIComponent(token) : ''}`;
+  try {
+    const ws = new WebSocket(url);
+    state.ws = ws;
+
+    ws.onopen = () => {
+      setConn('live', 'Live');
+    };
+
+    ws.onmessage = ev => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'payload') {
+          if (state.panel === 'jarvis') {
+            setTimeout(() => loadJarvisSummary(), 500);
+          }
+        }
+      } catch(e) {}
+    };
+
+    ws.onclose = () => setConn('', 'Disconnected');
+    ws.onerror = () => setConn('error', 'Error');
+  } catch(e) { setConn('error', 'WS unavailable'); }
 }
 
-function setCard(id, val, warnThr, critThr, invert) {
-  const el = document.getElementById(id);
-  if (!el || val == null) return;
-  el.classList.remove('ok','warn','crit');
-  const bad = invert ? val < critThr : val > critThr;
-  const mid = invert ? val < warnThr : val > warnThr;
-  if (bad)      el.classList.add('crit');
-  else if (mid) el.classList.add('warn');
+function setConn(cls, text) {
+  const dot  = $('connDot');
+  const span = $('connText');
+  dot.className  = 'conn-dot ' + cls;
+  span.textContent = text;
 }
 
-function fmtAge(sec) {
-  if (sec < 60)    return Math.round(sec) + 's';
-  if (sec < 3600)  return Math.round(sec/60) + 'm';
-  if (sec < 86400) return Math.round(sec/3600) + 'h';
-  return Math.round(sec/86400) + 'd';
+// ══ INIT ══════════════════════════════════════════════════════════════════════
+
+async function init() {
+  await populateAgentSelect();
+  loadOverview();
+  // Auto-refresh every 60s
+  setInterval(() => {
+    if (state.panel === 'jarvis' && state.agent) loadJarvisSummary();
+  }, 60000);
 }
 
-function fmtBytes(n) {
-  n = parseInt(n) || 0;
-  if (n > 1073741824) return (n/1073741824).toFixed(1) + 'GB';
-  if (n > 1048576)    return (n/1048576).toFixed(0) + 'MB';
-  if (n > 1024)       return (n/1024).toFixed(0) + 'KB';
-  return n + 'B';
-}
-
-function nav(id) {
-  const el = document.getElementById(id);
-  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-function filterTable(tbodyId, query) {
-  const q = query.toLowerCase();
-  const rows = document.getElementById(tbodyId)?.querySelectorAll('tr');
-  rows?.forEach(row => {
-    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
-  });
-}
-
-// ── Init ───────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-  initCharts();
-  loadAgents();
-  setInterval(loadAgents, 30000);
-});
+init();
 </script>
 </body>
 </html>

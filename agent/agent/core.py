@@ -33,14 +33,42 @@ except ImportError:
 import platform
 import socket
 
-from .crypto import derive_keys, encrypt
-from .collectors import COLLECTORS   # modular collector registry
+from .crypto     import derive_keys, encrypt
+from .enrollment import enroll, EnrollmentError
+from .keystore   import load_key, store_key
 
-try:
-    from .normalizer import normalize as _normalize
-    _HAS_NORMALIZER = True
-except Exception:
-    _HAS_NORMALIZER = False
+# ── OS-aware collector + normalizer loading ───────────────────────────────────
+if sys.platform == "win32":
+    try:
+        from agent.os.windows.collectors import COLLECTORS
+        from agent.os.windows.normalizer import normalize as _normalize
+        _HAS_NORMALIZER = True
+    except Exception as _e:
+        log_init = logging.getLogger("agent")
+        log_init.warning("Windows collectors unavailable (%s) — using empty registry", _e)
+        COLLECTORS: dict = {}
+        _HAS_NORMALIZER = False
+elif sys.platform == "darwin":
+    try:
+        from agent.os.macos.collectors import COLLECTORS
+        from agent.os.macos.normalizer import normalize as _normalize
+        _HAS_NORMALIZER = True
+    except Exception as _e:
+        log_init = logging.getLogger("agent")
+        log_init.warning("macOS collectors unavailable (%s) — falling back to generic", _e)
+        from .collectors import COLLECTORS
+        try:
+            from .normalizer import normalize as _normalize
+            _HAS_NORMALIZER = True
+        except Exception:
+            _HAS_NORMALIZER = False
+else:
+    from .collectors import COLLECTORS   # Linux / generic collector registry
+    try:
+        from .normalizer import normalize as _normalize
+        _HAS_NORMALIZER = True
+    except Exception:
+        _HAS_NORMALIZER = False
 
 # Cached at startup — never changes during the process lifetime
 _OS_NAME   = "macos" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else "windows")
@@ -175,6 +203,79 @@ def load_config(path: str) -> dict:
         return tomllib.load(f)
 
 
+def _resolve_security_dir(cfg: dict, config_path: str) -> str:
+    """Absolute path as-is; relative paths resolve next to the config file."""
+    raw = cfg.get("paths", {}).get(
+        "security_dir",
+        "/Library/Application Support/MacIntel/security",
+    )
+    if os.path.isabs(raw):
+        return raw
+    base = os.path.dirname(os.path.abspath(config_path))
+    return os.path.normpath(os.path.join(base, raw))
+
+
+def _hex64(s: str) -> bool:
+    s = s.strip().lower()
+    return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+
+def _obtain_api_key(cfg: dict, config_path: str) -> str:
+    """
+    Resolution order:
+      1) [manager] api_key in agent.toml if set to a valid 64-hex key (dev / explicit)
+         — wins over keystore so bootstrap + make keygen stay in sync with manager
+      2) Keystore (keychain or file under security_dir)
+      3) enroll() using [enrollment] token
+    """
+    agent_id     = cfg["agent"]["id"]
+    backend      = cfg.get("enrollment", {}).get("keystore", "keychain")
+    security_dir = _resolve_security_dir(cfg, config_path)
+    cfg.setdefault("paths", {})["security_dir"] = security_dir
+
+    raw = (cfg.get("manager") or {}).get("api_key")
+    if isinstance(raw, str):
+        k = raw.strip()
+        if k and k != "REPLACE_ME" and _hex64(k):
+            try:
+                store_key(agent_id, k, backend=backend, security_dir=security_dir)
+                log.info(
+                    "Using [manager] api_key from %s; synced to keystore (%s)",
+                    os.path.basename(config_path),
+                    backend,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not persist key to keystore (%s); using config key this run",
+                    exc,
+                )
+            return k
+
+    k = load_key(agent_id, backend=backend, security_dir=security_dir)
+    if k:
+        return k
+
+    if isinstance(raw, str):
+        k = raw.strip()
+        if k and k != "REPLACE_ME":
+            try:
+                store_key(agent_id, k, backend=backend, security_dir=security_dir)
+                log.info(
+                    "Loaded API key from [manager] api_key in %s; saved to keystore (%s)",
+                    os.path.basename(config_path),
+                    backend,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not persist key to keystore (%s); using [manager] api_key this run",
+                    exc,
+                )
+            return k
+
+    log.info("No API key in keystore or config — starting first-run enrollment...")
+    return enroll(cfg)
+
+
 def main():
     parser = argparse.ArgumentParser(description="mac_intel agent")
     parser.add_argument("--config", default="agent.toml")
@@ -184,13 +285,28 @@ def main():
     setup_logging(cfg)
     log.info("Starting mac_intel agent id=%s", cfg["agent"]["id"])
 
-    api_key = cfg["manager"]["api_key"]
-    if not api_key or api_key.startswith("REPLACE"):
-        log.error("api_key not configured in agent.toml. "
-                  "Run: python3 scripts/keygen.py"); sys.exit(1)
+    agent_id = cfg["agent"]["id"]
+    backend  = cfg.get("enrollment", {}).get("keystore", "keychain")
+
+    try:
+        api_key = _obtain_api_key(cfg, args.config)
+    except EnrollmentError as exc:
+        log.critical("Enrollment failed: %s", exc)
+        log.critical(
+            "Set [manager] api_key in %s (same 64-hex as manager DB / make keygen), "
+            "or set [enrollment] token and run again. Stale key?  make reset-agent-key",
+            os.path.basename(args.config),
+        )
+        sys.exit(1)
+
+    if not api_key:
+        log.critical("No API key for agent_id=%s", agent_id)
+        sys.exit(1)
+
+    log.info("API key ready (keystore backend=%s, agent_id=%s)", backend, agent_id)
 
     enc_key, mac_key = derive_keys(api_key)
-    log.info("Crypto keys derived (api_key=...%s)", api_key[-4:])
+    log.info("Crypto keys derived (tail=...%s)", api_key[-4:])
 
     send_queue: queue.Queue = queue.Queue()
 
@@ -202,20 +318,6 @@ def main():
     orch = Orchestrator(cfg, enc_key, mac_key, send_queue)
     orch_thread  = orch.start()
 
-    # Reload config on SIGHUP
-    def _reload(signum, frame):
-        nonlocal cfg
-        try:
-            cfg = load_config(args.config)
-            log.info("Config reloaded on SIGHUP")
-            orch.stop()
-            orch.__init__(cfg, enc_key, mac_key, send_queue)
-            orch.start()
-        except Exception as exc:
-            log.error("Config reload failed: %s", exc)
-
-    signal.signal(signal.SIGHUP, _reload)
-
     def _shutdown(signum, frame):
         log.info("Shutting down (signal %d)", signum)
         orch.stop()
@@ -224,6 +326,20 @@ def main():
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
+
+    # SIGHUP — POSIX only (reload config); not available on Windows
+    if sys.platform != "win32":
+        def _reload(signum, frame):
+            nonlocal cfg
+            try:
+                cfg = load_config(args.config)
+                log.info("Config reloaded on SIGHUP")
+                orch.stop()
+                orch.__init__(cfg, enc_key, mac_key, send_queue)
+                orch.start()
+            except Exception as exc:
+                log.error("Config reload failed: %s", exc)
+        signal.signal(signal.SIGHUP, _reload)
 
     log.info("Agent running. tick=%ss. SIGHUP to reload, SIGTERM to stop.",
              cfg["collection"].get("tick_sec", 5))
