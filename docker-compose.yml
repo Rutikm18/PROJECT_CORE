@@ -1,14 +1,43 @@
 # =============================================================================
-#  docker-compose.yml — mac_intel manager in Docker
+#  docker-compose.yml — Jarvis Manager (self-signed TLS, port 8443)
 #
-#  Quick start:
-#    export API_KEY="$(python3 scripts/keygen.py | grep 'API Key' | awk '{print $NF}')"
-#    make certs             # generate self-signed TLS (dev only)
+#  Use for:
+#    • Local development
+#    • Cloud VMs accessed by public IP (no domain name required)
+#    • Quick production deploy
+#
+#  On FIRST RUN the entrypoint auto-generates:
+#    - Self-signed TLS certificate (valid for PUBLIC_IP + 127.0.0.1)
+#    - Enrollment token  → shown in: docker compose logs manager
+#    - Admin token       → shown in: docker compose logs manager
+#  All secrets are persisted in ./data/.secrets and survive restarts.
+#
+#  QUICK START (cloud VM with public IP):
+#    export PUBLIC_IP=$(curl -s https://api.ipify.org)
 #    docker compose up -d
-#    open https://localhost:8443
+#    docker compose logs manager           # copy the tokens
 #
-#  The agent runs natively on macOS — it uses host system APIs that
-#  cannot be accessed from inside a container.
+#  AGENT CONFIG (agent.toml on the Mac):
+#    [manager]
+#    url        = "https://<PUBLIC_IP>:8443"
+#    tls_verify = false           # self-signed cert — set true if using a CA cert
+#    [enrollment]
+#    token = "<ENROLLMENT_TOKEN from logs>"
+#
+#  KEY MANAGEMENT API (with ADMIN_TOKEN from logs):
+#    # List all agent keys
+#    curl -sk -H "X-Admin-Token: <ADMIN_TOKEN>" https://<IP>:8443/api/v1/keys
+#    # Rotate a key
+#    curl -sk -X POST -H "X-Admin-Token: <ADMIN_TOKEN>" \
+#         https://<IP>:8443/api/v1/keys/<agent_id>/rotate
+#    # Set expiry (30 days from now)
+#    curl -sk -X PATCH -H "X-Admin-Token: <ADMIN_TOKEN>" \
+#         -H "Content-Type: application/json" \
+#         -d '{"expires_in_days": 30}' \
+#         https://<IP>:8443/api/v1/keys/<agent_id>/expiry
+#    # Revoke immediately
+#    curl -sk -X POST -H "X-Admin-Token: <ADMIN_TOKEN>" \
+#         https://<IP>:8443/api/v1/keys/<agent_id>/revoke
 # =============================================================================
 
 services:
@@ -16,31 +45,41 @@ services:
     build:
       context: .
       dockerfile: manager/Dockerfile
-    container_name: mac-intel-manager
+    image: jarvis-manager:latest
+    container_name: jarvis-manager
     restart: unless-stopped
+
     ports:
-      - "8443:8443"
-    volumes:
-      - manager_data:/app/data
-      - manager_logs:/app/logs
-      - ./certs:/app/certs:ro          # TLS certificates (read-only)
+      - "${BIND_PORT:-8443}:${BIND_PORT:-8443}"
+
     environment:
-      API_KEY:    ${API_KEY:?API_KEY environment variable is required}
-      BIND_HOST:  "0.0.0.0"
-      BIND_PORT:  "8443"
-      TLS_CERT:   "/app/certs/server.crt"
-      TLS_KEY:    "/app/certs/server.key"
-      LOG_LEVEL:  "${LOG_LEVEL:-INFO}"
-      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      # Your server's public IP — added to the TLS cert SAN so agents trust it.
+      # Run: export PUBLIC_IP=$(curl -s https://api.ipify.org)
+      PUBLIC_IP:               "${PUBLIC_IP:-}"
+      DOMAIN:                  "${DOMAIN:-}"
+      BIND_PORT:               "${BIND_PORT:-8443}"
+
+      # Leave blank to auto-generate on first boot (recommended).
+      # Override here or in a .env file to pin specific values.
+      ENROLLMENT_TOKENS:       "${ENROLLMENT_TOKENS:-}"
+      ADMIN_TOKEN:             "${ADMIN_TOKEN:-}"
+
+      # Default key lifetime in days. 0 = keys never expire.
+      DEFAULT_KEY_EXPIRY_DAYS: "${DEFAULT_KEY_EXPIRY_DAYS:-0}"
+
+      LOG_LEVEL:               "${LOG_LEVEL:-info}"
+      LOG_FILE:                "/app/logs/manager.log"
+      DATA_DIR:                "/app/data"
+      CORS_ORIGINS:            "${CORS_ORIGINS:-*}"
+
+    volumes:
+      - ./data:/app/data      # SQLite DBs, hot/warm/cold store, .secrets
+      - ./certs:/app/certs    # TLS cert (auto-generated if missing)
+      - ./logs:/app/logs      # Rotating log files
+
     healthcheck:
-      test: ["CMD", "curl", "-fsk", "https://localhost:8443/health"]
+      test: ["CMD", "curl", "-fsk", "https://localhost:${BIND_PORT:-8443}/health"]
       interval: 30s
       timeout:  10s
       retries:  3
-      start_period: 15s
-
-volumes:
-  manager_data:
-    driver: local
-  manager_logs:
-    driver: local
+      start_period: 20s

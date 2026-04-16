@@ -1,199 +1,158 @@
 # =============================================================================
-#  agent.toml.example — mac_intel Agent Configuration Reference
+#  mac_intel Agent Configuration
 #
-#  HOW TO USE:
-#    1. Copy this file:  cp agent.toml.example agent.toml
-#    2. Generate API key: python3 scripts/keygen.py
-#    3. Fill in [manager] url and api_key
-#    4. Run setup:        bash scripts/setup.sh agent
+#  QUICK START — only two fields are required:
+#  ─────────────────────────────────────────────────────────────────────────
+#  1. Set [manager] url to your manager's IP/domain
+#  2. Set [agent] name (optional — defaults to hostname)
 #
-#  SECURITY:
-#    - agent.toml is in .gitignore — NEVER commit it (contains your API key)
-#    - The API key is a 256-bit secret shared between agent and manager
-#    - All data is encrypted with AES-256-GCM + HMAC-SHA256 before transit
+#  The installer writes this file automatically when you run:
+#    sudo bash install.sh --manager-url https://1.2.3.4:8443
+#
+#  INSTALLATION PATHS (set by install.sh)
+#  ─────────────────────────────────────────────────────────────────────────
+#  /Library/Jarvis/bin/                    ← macintel-agent, macintel-watchdog
+#  /Library/Jarvis/
+#    agent.toml                          ← this file
+#    security/  (chmod 700)              ← API key (never put key here manually)
+#    data/                               ← telemetry queue
+#    spool/                              ← offline send queue (auto-drains)
+#  /Library/Jarvis/logs/              ← agent.log, watchdog.log
+#  /Library/LaunchDaemons/
+#    com.macintel.agent.plist
+#    com.macintel.watchdog.plist
+#
+#  SECURITY
+#  ─────────────────────────────────────────────────────────────────────────
+#  • API key is auto-generated at enrollment and stored in macOS Keychain
+#  • Never set api_key here — use the enrollment flow
+#  • Payloads: AES-256-GCM encrypted + HMAC-SHA256 signed, over TLS 1.3
+#  • Key stored under Keychain service: com.macintel.agent
 # =============================================================================
 
-# ── Agent Identity ────────────────────────────────────────────────────────────
+# ── Agent identity ────────────────────────────────────────────────────────────
 [agent]
-id          = "agent-001"           # unique ID per machine (any slug you want)
-name        = "My MacBook Air"      # human label shown on dashboard
-description = "M4 MacBook Air"      # free-text description
+id   = ""         # auto-set by installer from hardware UUID — do not change
+name = ""         # friendly name shown on dashboard (default: ComputerName)
 
-# ── Manager Connection ────────────────────────────────────────────────────────
-# api_key is NOT set here — it is auto-generated on first run and stored in
-# the macOS Keychain (or security_dir file). Never paste a key into this file.
+# ── Manager connection ────────────────────────────────────────────────────────
 [manager]
-url              = "https://YOUR_SERVER_IP:8443"  # manager public IP + port
-tls_verify       = true              # set false ONLY for self-signed cert in dev
-timeout_sec      = 30               # HTTP request timeout
-retry_attempts   = 3                # how many times to retry on 5xx / network error
-retry_delay_sec  = 5                # initial delay between retries (exponential backoff)
-max_queue_size   = 500              # drop oldest payloads if outbound backlog exceeds this
+url             = "https://YOUR_MANAGER_IP:8443"
+tls_verify      = true         # set to false only for self-signed certs (dev)
+timeout_sec     = 30
+retry_attempts  = 3
+retry_delay_sec = 5
+max_queue_size  = 1000
 
-# ── First-Run Enrollment ──────────────────────────────────────────────────────
-# On first run the agent generates a 256-bit key, stores it in the keystore,
-# and registers with the manager using this one-time token.
-# After successful enrollment this token is no longer needed (clear it).
+# ── Enrollment ────────────────────────────────────────────────────────────────
 [enrollment]
-token    = ""                  # set to enrollment token from manager operator
-                               # get tokens from: ENROLLMENT_TOKENS env on manager
-keystore = "keychain"          # "keychain" = macOS Keychain (recommended)
-                               # "file"     = /Library/Application Support/MacIntel/security/
+token    = ""          # leave empty for open-enrollment managers (default)
+                       # set to sk-enroll-xxx only if manager requires tokens
+keystore = "keychain"  # "keychain" (recommended) or "file"
 
-# ── Watchdog (process monitor) ────────────────────────────────────────────────
+# ── Watchdog ──────────────────────────────────────────────────────────────────
 [watchdog]
-enabled             = true
-check_interval_sec  = 30       # how often watchdog checks agent health
-max_restarts        = 5        # max auto-restarts within restart_window_sec
-restart_window_sec  = 300      # sliding window for restart rate limit
+enabled            = true
+check_interval_sec = 30
+max_restarts       = 5
+restart_window_sec = 300
 
-# ── Filesystem Paths (macOS production) ──────────────────────────────────────
+# ── Paths (set by installer — do not change unless you know what you're doing) ─
 [paths]
-install_dir  = "/opt/macintel"
-config_dir   = "/Library/Application Support/MacIntel"
-log_dir      = "/Library/Logs/MacIntel"
-data_dir     = "/Library/Application Support/MacIntel/data"
-security_dir = "/Library/Application Support/MacIntel/security"
-pid_file     = "/var/run/macintel-agent.pid"
+install_dir  = "/Library/Jarvis"
+config_dir   = "/Library/Jarvis"
+log_dir      = "/Library/Jarvis/logs"
+data_dir     = "/Library/Jarvis/data"
+security_dir = "/Library/Jarvis/security"
+spool_dir    = "/Library/Jarvis/spool"
+pid_file     = "/Library/Jarvis/jarvis-agent.pid"
 
-# ── Managed Binary Paths ──────────────────────────────────────────────────────
 [binaries]
-agent    = "/opt/macintel/bin/macintel-agent"
-watchdog = "/opt/macintel/bin/macintel-watchdog"
+agent    = "/Library/Jarvis/bin/macintel-agent"
+watchdog = "/Library/Jarvis/bin/macintel-watchdog"
 
-# ── Collection Engine ─────────────────────────────────────────────────────────
-#  tick_sec: how often the scheduler wakes to check what sections are due.
-#  Keep tick_sec ≤ smallest interval_sec across all enabled sections.
+# ── Collection schedule ───────────────────────────────────────────────────────
+# All 22 sections enabled by default with appropriate intervals.
+# Circuit breakers auto-disable sections that fail repeatedly.
 [collection]
-enabled   = true
-tick_sec  = 5
+enabled  = true
+tick_sec = 5           # orchestrator tick — how often to check if a section is due
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Per-Section Settings
-#    enabled      — true/false to activate this section
-#    interval_sec — how often to collect (in seconds)
-#    send         — true = transmit to manager | false = collect locally only
-# ──────────────────────────────────────────────────────────────────────────────
+# VOLATILE — every 10 s (CPU, memory, active connections, process list)
+[collection.sections.metrics]
+enabled = true; interval_sec = 10; send = true
 
-# ── CRITICAL: Volatile metrics (every 10 s) ───────────────────────────────────
-[collection.sections.metrics]       # CPU, RAM, swap, battery charge
-enabled      = true
-interval_sec = 10
-send         = true
+[collection.sections.connections]
+enabled = true; interval_sec = 10; send = true
 
-[collection.sections.connections]   # Established TCP connections
-enabled      = true
-interval_sec = 10
-send         = true
+[collection.sections.processes]
+enabled = true; interval_sec = 10; send = true
 
-[collection.sections.processes]     # Top processes by CPU/RAM
-enabled      = true
-interval_sec = 10
-send         = true
+# NETWORK — 30 s – 2 min
+[collection.sections.ports]
+enabled = true; interval_sec = 30; send = true
 
-# ── HIGH: Network activity (every 30 s) ──────────────────────────────────────
-[collection.sections.ports]         # All LISTEN sockets (process, PID, proto, addr:port)
-enabled      = true
-interval_sec = 30
-send         = true
+[collection.sections.network]
+enabled = true; interval_sec = 120; send = true
 
-# ── HIGH: System state (every 2 min) ─────────────────────────────────────────
-[collection.sections.network]       # Interface IPs, MACs, DNS, WiFi SSID, routes
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.arp]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.battery]       # Charge %, cycle count, condition, power source
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.mounts]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.openfiles]     # Top processes by open file descriptor count
-enabled      = true
-interval_sec = 120
-send         = true
+# SYSTEM — every 2 min
+[collection.sections.battery]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.services]      # Running launchd daemons, plist paths, login items
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.openfiles]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.users]         # Local users, admins, groups, login history
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.services]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.hardware]      # USB, Thunderbolt, Bluetooth, displays, audio
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.users]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.containers]    # Docker / Podman running containers and images
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.hardware]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.arp]           # ARP table (hosts visible on local network)
-enabled      = true
-interval_sec = 120
-send         = true
+[collection.sections.containers]
+enabled = true; interval_sec = 120; send = true
 
-[collection.sections.mounts]        # Active filesystem mounts (NFS, SMB, APFS, etc.)
-enabled      = true
-interval_sec = 120
-send         = true
+# INVENTORY — every 10 min
+[collection.sections.storage]
+enabled = true; interval_sec = 600; send = true
 
-# ── MEDIUM: Slower-changing state (every 10 min) ─────────────────────────────
-[collection.sections.storage]       # Disk usage per volume, diskutil list
-enabled      = true
-interval_sec = 600
-send         = true
+[collection.sections.tasks]
+enabled = true; interval_sec = 600; send = true
 
-[collection.sections.tasks]         # Crontabs, periodic scripts, launchd timers
-enabled      = true
-interval_sec = 600
-send         = true
+# SECURITY POSTURE — hourly
+[collection.sections.security]
+enabled = true; interval_sec = 3600; send = true
 
-# ── LOW: Security posture (hourly) ───────────────────────────────────────────
-[collection.sections.security]      # SIP, Gatekeeper, FileVault, Firewall, pf rules, TCC
-enabled      = true
-interval_sec = 3600
-send         = true
+[collection.sections.sysctl]
+enabled = true; interval_sec = 3600; send = true
 
-[collection.sections.sysctl]        # Kernel parameters (net.*, security.*, kern.*)
-enabled      = true
-interval_sec = 3600
-send         = true
+[collection.sections.configs]
+enabled = true; interval_sec = 3600; send = true
 
-[collection.sections.configs]       # Shell rc, SSH config, authorized_keys, /etc/hosts
-enabled      = true
-interval_sec = 3600
-send         = true
+# FULL INVENTORY — daily
+[collection.sections.apps]
+enabled = true; interval_sec = 86400; send = true
 
-# ── LOW: Software inventory (daily) ──────────────────────────────────────────
-[collection.sections.apps]          # Installed .app bundles + versions
-enabled      = true
-interval_sec = 86400
-send         = true
+[collection.sections.packages]
+enabled = true; interval_sec = 86400; send = true
 
-[collection.sections.packages]      # brew, pip, npm, gems, go bins, cargo bins
-enabled      = true
-interval_sec = 86400
-send         = true
+[collection.sections.binaries]
+enabled = false; interval_sec = 86400; send = false   # large — opt-in
 
-[collection.sections.binaries]      # All executables in Homebrew + /usr/local + ~/bin
-enabled      = false                # disabled by default — can produce large payloads
-interval_sec = 86400
-send         = false
-
-[collection.sections.sbom]          # Full SBOM: all components with version + source
-enabled      = true
-interval_sec = 86400
-send         = true
+[collection.sections.sbom]
+enabled = true; interval_sec = 86400; send = true
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 [logging]
-level    = "INFO"            # DEBUG | INFO | WARNING | ERROR
-file     = "agent/logs/agent.log"  # path relative to project root
-max_mb   = 10                # rotate at this size
-backups  = 3                 # keep this many rotated files
+level   = "INFO"
+file    = "/Library/Jarvis/logs/agent.log"
+max_mb  = 10
+backups = 5

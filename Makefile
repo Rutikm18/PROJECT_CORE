@@ -112,16 +112,7 @@ enroll-token: ## Generate a fresh enrollment token and write it to agent.toml
 	 if [ ! -f agent.toml ]; then \
 	   echo "  ERROR: agent.toml not found. Run: cp agent/config/agent.toml.example agent.toml"; exit 1; \
 	 fi; \
-	 python3 -c " \
-import re, sys \
-token = sys.argv[1] \
-txt   = open('agent.toml').read() \
-if '[enrollment]' in txt: \
-    txt = re.sub(r'(^\s*token\s*=\s*)\"[^\"]*\"', r'\1\"' + token + '\"', txt, flags=re.MULTILINE) \
-else: \
-    txt += '\n[enrollment]\ntoken    = \"' + token + '\"\nkeystore = \"file\"\n' \
-open('agent.toml', 'w').write(txt) \
-" "$$TOKEN"; \
+	 python3 -c "import re,sys; token=sys.argv[1]; txt=open('agent.toml').read(); result=re.sub(r'(^\s*token\s*=\s*)\"[^\"]*\"', r'\1\"'+token+'\"', txt, flags=re.MULTILINE) if '[enrollment]' in txt else txt+'\n[enrollment]\ntoken    = \"'+token+'\"\nkeystore = \"file\"\n'; open('agent.toml','w').write(result)" "$$TOKEN"; \
 	 echo ""; \
 	 echo "  New enrollment token: $$TOKEN"; \
 	 echo "  Written to:           agent.toml [enrollment] token"; \
@@ -168,6 +159,10 @@ stop-manager: ## Kill any process running on port 8443
 .PHONY: reset-agent-key
 reset-agent-key: ## Delete locally stored agent API key (forces re-enroll or use [manager] api_key)
 	@rm -vf agent/security/*.key 2>/dev/null || true
+	@AGENT_ID=$$(python3 -c "import tomllib; f=open('agent.toml','rb'); print(tomllib.load(f)['agent']['id'])" 2>/dev/null || echo "agent-001"); \
+	 security delete-generic-password -s com.macintel.agent -a "$$AGENT_ID" 2>/dev/null && \
+	   echo "  Keychain entry removed for agent_id=$$AGENT_ID" || \
+	   echo "  No Keychain entry found for agent_id=$$AGENT_ID (already clean)"
 	@echo "  Stale keys removed. Next: set [manager] api_key from \`make keygen\` or run enrollment with a valid token."
 
 .PHONY: run-agent
@@ -175,6 +170,11 @@ run-agent: ## Start the agent (requires agent.toml)
 	@test -f agent.toml || (echo ""; echo "  ERROR: agent.toml not found."; echo "  Run:   cp agent/config/agent.toml.example agent.toml"; echo ""; exit 1)
 	@grep -q "REPLACE_ME" agent.toml 2>/dev/null && (echo ""; echo "  ERROR: agent.toml still has placeholder api_key."; echo "  Run:   make keygen  then paste the key into agent.toml"; echo ""; exit 1) || true
 	PYTHONPATH=. $(PYTHON) -m agent.agent.core --config agent.toml
+
+.PHONY: run-agent-v2
+run-agent-v2: ## Start hardened agent v2 (circuit breakers, self-test, disk spool)
+	@test -f agent.toml || (echo ""; echo "  ERROR: agent.toml not found."; echo "  Run:   cp agent/config/agent.toml.example agent.toml"; echo ""; exit 1)
+	PYTHONPATH=. $(PYTHON) agent_v2.py --config agent.toml
 
 # ── Windows build ─────────────────────────────────────────────────────────────
 .PHONY: install-windows

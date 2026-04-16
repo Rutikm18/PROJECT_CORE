@@ -1,0 +1,54 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist/
+build/
+.eggs/
+
+# Tests / dev tools
+*/tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Runtime data (mounted as volumes)
+data/
+certs/
+logs/
+agent/logs/
+agent/data/
+agent/security/
+agent/spool/
+
+# Secrets
+.env
+.secrets
+*.key
+*.pem
+*.p12
+
+# Agent binary build artifacts
+agent/build/
+agent/dist/
+*.spec
+
+# Windows artifacts
+agent/os/windows/pkg/*.msi
+agent/os/windows/pkg/*.wixobj

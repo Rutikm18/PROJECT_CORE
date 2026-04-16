@@ -181,7 +181,9 @@ if _HAS_WIN32:
             "Monitors the mac_intel Agent service and restarts it if it stops. "
             "Rate-limited to prevent restart storms."
         )
-        _svc_deps_         = ["MacIntelAgent"]
+        # No dependency on MacIntelAgent — the watchdog must start even when
+        # the agent is down (that is precisely when it does its job).
+        _svc_deps_         = ["Tcpip"]
 
         def __init__(self, args):
             win32serviceutil.ServiceFramework.__init__(self, args)

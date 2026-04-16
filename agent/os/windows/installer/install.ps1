@@ -9,10 +9,11 @@
     agent.toml, and registers both services with the Service Control Manager.
 
 .PARAMETER InstallDir
-    Where binaries are installed. Default: C:\Program Files\MacIntel
+    Root installation directory. Default: C:\Program Files (x86)\Jarvis
+    All subdirectories (bin, config, data, logs, security, spool) are created here.
 
 .PARAMETER DataDir
-    Writable data/config directory. Default: C:\ProgramData\MacIntel
+    Writable data directory root. Defaults to InstallDir (single-tree install).
 
 .PARAMETER ManagerUrl
     Manager HTTPS URL, e.g. https://192.168.1.100:8443
@@ -40,8 +41,8 @@
 #>
 
 param(
-    [string] $InstallDir     = "C:\Program Files\MacIntel",
-    [string] $DataDir        = "C:\ProgramData\MacIntel",
+    [string] $InstallDir     = "C:\Program Files (x86)\Jarvis",
+    [string] $DataDir        = "",
     [string] $ManagerUrl     = "https://YOUR_MANAGER_IP:8443",
     [string] $EnrollToken    = "",
     [string] $AgentId        = $env:COMPUTERNAME.ToLower(),
@@ -53,6 +54,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Consolidate everything under $InstallDir when no separate DataDir given
+if (-not $DataDir) { $DataDir = $InstallDir }
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  mac_intel Agent Installer" -ForegroundColor Cyan
@@ -60,11 +64,11 @@ Write-Host "  ──────────────────────
 Write-Host ""
 
 # ── Validate ──────────────────────────────────────────────────────────────────
-if (-not (Test-Path ".\macintel-agent.exe")) {
-    Write-Error "macintel-agent.exe not found in current directory."
+if (-not (Test-Path ".\jarvis-agent.exe")) {
+    Write-Error "jarvis-agent.exe not found in current directory."
 }
-if (-not (Test-Path ".\macintel-watchdog.exe")) {
-    Write-Error "macintel-watchdog.exe not found in current directory."
+if (-not (Test-Path ".\jarvis-watchdog.exe")) {
+    Write-Error "jarvis-watchdog.exe not found in current directory."
 }
 if ($ManagerUrl -like "*YOUR_MANAGER*") {
     Write-Warning "ManagerUrl still set to placeholder. Edit agent.toml after install."
@@ -72,12 +76,15 @@ if ($ManagerUrl -like "*YOUR_MANAGER*") {
 
 # ── Create directories ────────────────────────────────────────────────────────
 $BinDir      = "$InstallDir\bin"
+$ConfigDir   = "$DataDir\config"
 $LogDir      = "$DataDir\logs"
 $SecurityDir = "$DataDir\security"
-$ConfigFile  = "$DataDir\agent.toml"
+$SpoolDir    = "$DataDir\spool"
+$SubDataDir  = "$DataDir\data"
+$ConfigFile  = "$ConfigDir\agent.toml"
 
 Write-Host "  Creating directories..." -NoNewline
-foreach ($dir in @($BinDir, $LogDir, $SecurityDir)) {
+foreach ($dir in @($BinDir, $ConfigDir, $LogDir, $SecurityDir, $SpoolDir, $SubDataDir)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 Write-Host " done" -ForegroundColor Green
@@ -91,13 +98,13 @@ Write-Host " done" -ForegroundColor Green
 
 # ── Copy binaries ─────────────────────────────────────────────────────────────
 Write-Host "  Installing binaries to $BinDir..." -NoNewline
-Copy-Item ".\macintel-agent.exe"   -Destination $BinDir -Force
-Copy-Item ".\macintel-watchdog.exe" -Destination $BinDir -Force
+Copy-Item ".\jarvis-agent.exe"   -Destination $BinDir -Force
+Copy-Item ".\jarvis-watchdog.exe" -Destination $BinDir -Force
 # Restrict write access on binaries (read + execute only for service account)
-icacls "$BinDir\macintel-agent.exe"    /inheritance:r `
+icacls "$BinDir\jarvis-agent.exe"    /inheritance:r `
     /grant:r "NT AUTHORITY\SYSTEM:(RX)" `
     /grant:r "BUILTIN\Administrators:(RX)" 2>&1 | Out-Null
-icacls "$BinDir\macintel-watchdog.exe" /inheritance:r `
+icacls "$BinDir\jarvis-watchdog.exe" /inheritance:r `
     /grant:r "NT AUTHORITY\SYSTEM:(RX)" `
     /grant:r "BUILTIN\Administrators:(RX)" 2>&1 | Out-Null
 Write-Host " done" -ForegroundColor Green
@@ -133,16 +140,17 @@ max_restarts       = 5
 restart_window_sec = 300
 
 [paths]
-install_dir  = "$($InstallDir -replace '\\', '\\')"
-config_dir   = "$($DataDir -replace '\\', '\\')"
+install_dir  = "$($BinDir -replace '\\', '\\')"
+config_dir   = "$($ConfigDir -replace '\\', '\\')"
 log_dir      = "$($LogDir -replace '\\', '\\')"
-data_dir     = "$($DataDir -replace '\\', '\\')\\data"
+data_dir     = "$($SubDataDir -replace '\\', '\\')"
 security_dir = "$($SecurityDir -replace '\\', '\\')"
-pid_file     = "$($DataDir -replace '\\', '\\')\\agent.pid"
+spool_dir    = "$($SpoolDir -replace '\\', '\\')"
+pid_file     = "$($InstallDir -replace '\\', '\\')\\jarvis-agent.pid"
 
 [binaries]
-agent    = "$($BinDir -replace '\\', '\\')\\macintel-agent.exe"
-watchdog = "$($BinDir -replace '\\', '\\')\\macintel-watchdog.exe"
+agent    = "$($BinDir -replace '\\', '\\')\\jarvis-agent.exe"
+watchdog = "$($BinDir -replace '\\', '\\')\\jarvis-watchdog.exe"
 
 [collection]
 enabled  = true
@@ -224,7 +232,7 @@ foreach ($svc in @("MacIntelAgent", "MacIntelWatchdog")) {
 
 # Agent service
 & sc.exe create MacIntelAgent `
-    binpath= "`"$BinDir\macintel-agent.exe`"" `
+    binpath= "`"$BinDir\jarvis-agent.exe`"" `
     DisplayName= "mac_intel Agent" `
     start= auto `
     obj= $ServiceAccount | Out-Null
@@ -234,7 +242,7 @@ foreach ($svc in @("MacIntelAgent", "MacIntelWatchdog")) {
 
 # Watchdog service
 & sc.exe create MacIntelWatchdog `
-    binpath= "`"$BinDir\macintel-watchdog.exe`"" `
+    binpath= "`"$BinDir\jarvis-watchdog.exe`"" `
     DisplayName= "mac_intel Watchdog" `
     start= auto `
     depend= MacIntelAgent | Out-Null

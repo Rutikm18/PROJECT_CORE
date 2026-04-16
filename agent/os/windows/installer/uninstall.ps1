@@ -8,10 +8,10 @@
     deletes binaries, optionally wipes config and key material.
 
 .PARAMETER InstallDir
-    Installation directory. Default: C:\Program Files\MacIntel
+    Root installation directory. Default: C:\Program Files (x86)\Jarvis
 
 .PARAMETER DataDir
-    Data/config directory. Default: C:\ProgramData\MacIntel
+    Data/config directory. Defaults to InstallDir (single-tree install).
 
 .PARAMETER KeepConfig
     Preserve agent.toml and the enrolled API key (for re-install). Default: $false
@@ -22,10 +22,12 @@
 #>
 
 param(
-    [string] $InstallDir  = "C:\Program Files\MacIntel",
-    [string] $DataDir     = "C:\ProgramData\MacIntel",
+    [string] $InstallDir  = "C:\Program Files (x86)\Jarvis",
+    [string] $DataDir     = "",
     [bool]   $KeepConfig  = $false
 )
+
+if (-not $DataDir) { $DataDir = $InstallDir }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"

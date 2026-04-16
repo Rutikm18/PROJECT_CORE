@@ -1,0 +1,75 @@
+# =============================================================================
+#  docker-compose.prod.yml — Jarvis M
+#    docker compose -f docker-compose.prod.yml up -d
+#    docker compose -f docker-compose.prod.ymlanager with Caddy (auto TLS via Let's Encrypt)
+#
+#  Use when you have a domain name pointing to your server.
+#  Caddy handles HTTPS automatically — no manual cert management needed.
+#
+#  QUICK START:
+#    # Set your domain (DNS A record must already point to this server)
+#    export DOMAIN=jarvis.yourdomain.com
+#    export ADMIN_EMAIL=you@yourdomain.com logs manager   # get tokens
+#
+#  AGENT CONFIG (agent.toml on the Mac):
+#    [manager]
+#    url        = "https://jarvis.yourdomain.com"
+#    tls_verify = true            # real CA cert from Let's Encrypt
+#    [enrollment]
+#    token = "<ENROLLMENT_TOKEN from logs>"
+# =============================================================================
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: jarvis-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN:       "${DOMAIN:?Set DOMAIN=yourserver.com}"
+      ADMIN_EMAIL:  "${ADMIN_EMAIL:-admin@example.com}"
+    depends_on:
+      - manager
+
+  manager:
+    build:
+      context: .
+      dockerfile: manager/Dockerfile
+    image: jarvis-manager:latest
+    container_name: jarvis-manager
+    restart: unless-stopped
+    # No ports exposed directly — Caddy proxies to :8080
+    expose:
+      - "8080"
+    environment:
+      DOMAIN:                  "${DOMAIN:-}"
+      BIND_PORT:               "8080"
+      ENROLLMENT_TOKENS:       "${ENROLLMENT_TOKENS:-}"
+      ADMIN_TOKEN:             "${ADMIN_TOKEN:-}"
+      DEFAULT_KEY_EXPIRY_DAYS: "${DEFAULT_KEY_EXPIRY_DAYS:-0}"
+      LOG_LEVEL:               "${LOG_LEVEL:-info}"
+      LOG_FILE:                "/app/logs/manager.log"
+      DATA_DIR:                "/app/data"
+      CORS_ORIGINS:            "${CORS_ORIGINS:-*}"
+      # Plain HTTP — Caddy terminates TLS
+      TLS_DISABLED:            "1"
+    volumes:
+      - ./data:/app/data
+      - ./certs:/app/certs
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 20s
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -70,7 +70,7 @@ def test_run_does_not_raise_on_error():
 
 # ── Collector mock tests ──────────────────────────────────────────────────────
 
-@patch("agent.agent.collectors.base._run", return_value="")
+@patch("agent.agent.collectors.volatile._run", return_value="")
 def test_metrics_collector_calls_run(mock_run):
     from agent.agent.collectors.volatile import MetricsCollector
     result = MetricsCollector()()
@@ -78,7 +78,7 @@ def test_metrics_collector_calls_run(mock_run):
     assert mock_run.call_count >= 1
 
 
-@patch("agent.agent.collectors.base._run", return_value="")
+@patch("agent.agent.collectors.posture._run", return_value="")
 def test_security_collector_returns_dict(mock_run):
     from agent.agent.collectors.posture import SecurityCollector
     result = SecurityCollector()()
@@ -88,7 +88,7 @@ def test_security_collector_returns_dict(mock_run):
     assert "filevault" in result
 
 
-@patch("agent.agent.collectors.base._run", return_value="")
+@patch("agent.agent.collectors.volatile._run", return_value="")
 def test_connections_collector_returns_list(mock_run):
     from agent.agent.collectors.volatile import ConnectionsCollector
     result = ConnectionsCollector()()

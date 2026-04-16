@@ -7,17 +7,17 @@ Rate-limits restarts: if the agent crashes more than max_restarts times
 in restart_window_sec, the watchdog backs off and logs a critical alert
 instead of looping endlessly.
 
-Managed by the com.macintel.agent LaunchDaemon plist.
+Managed by the com.jarvis.watchdog LaunchDaemon plist.
 The LaunchDaemon launches *this process*, which in turn manages the agent:
 
   launchd
-    └── macintel-watchdog (KeepAlive=true — launchd restarts watchdog if it dies)
-          └── macintel-agent  (watchdog restarts agent if it crashes)
+    └── jarvis-watchdog (KeepAlive=true — launchd restarts watchdog if it dies)
+          └── jarvis-agent  (watchdog restarts agent if it crashes)
 
 Usage
 ─────
-  /opt/macintel/bin/macintel-watchdog \\
-      --config "/Library/Application Support/MacIntel/agent.conf"
+  /Library/Jarvis/bin/macintel-watchdog \\
+      --config "/Library/Jarvis/agent.toml"
 """
 from __future__ import annotations
 
@@ -57,9 +57,9 @@ class Watchdog:
         bins   = cfg.get("binaries", {})
         paths  = cfg.get("paths",    {})
 
-        self.agent_bin       = bins.get("agent", "/opt/macintel/bin/macintel-agent")
+        self.agent_bin       = bins.get("agent", "/Library/Jarvis/bin/macintel-agent")
         self.config_path     = cfg.get("_config_path", "")
-        self.pid_file        = paths.get("pid_file", "/var/run/macintel-agent.pid")
+        self.pid_file        = paths.get("pid_file", "/Library/Jarvis/jarvis-agent.pid")
         self.check_interval  = int(wdcfg.get("check_interval_sec", 30))
         self.max_restarts    = int(wdcfg.get("max_restarts", 5))
         self.restart_window  = int(wdcfg.get("restart_window_sec", 300))
@@ -204,7 +204,7 @@ class Watchdog:
 def setup_logging(cfg: dict) -> None:
     lcfg    = cfg.get("logging", {})
     level   = getattr(logging, lcfg.get("level", "INFO").upper(), logging.INFO)
-    log_dir = cfg.get("paths", {}).get("log_dir", "/Library/Logs/MacIntel")
+    log_dir = cfg.get("paths", {}).get("log_dir", "/Library/Jarvis/logs")
     logfile = os.path.join(log_dir, "watchdog.log")
     os.makedirs(log_dir, exist_ok=True)
     fmt     = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -230,8 +230,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="mac_intel process watchdog")
     parser.add_argument(
         "--config",
-        default="/Library/Application Support/MacIntel/agent.conf",
-        help="Path to agent.conf",
+        default="/Library/Jarvis/agent.toml",
+        help="Path to agent.toml",
     )
     args = parser.parse_args()
 

@@ -104,20 +104,34 @@ class WatchdogConfig:
 
 @dataclass
 class PathsConfig:
-    """Canonical filesystem paths for a production macOS installation."""
-    install_dir:  str = "/opt/macintel"
-    config_dir:   str = "/Library/Application Support/MacIntel"
-    log_dir:      str = "/Library/Logs/MacIntel"
-    data_dir:     str = "/Library/Application Support/MacIntel/data"
-    security_dir: str = "/Library/Application Support/MacIntel/security"
-    pid_file:     str = "/var/run/macintel-agent.pid"
+    """
+    Canonical filesystem paths for a production macOS installation.
+
+    Layout (set by agent/os/macos/installer/install.sh):
+      /Library/Jarvis/
+        bin/                         — macintel-agent, macintel-watchdog binaries
+      /Library/Jarvis/
+        agent.toml                   — configuration (this file)
+        security/                    — API keys (chmod 700, root only)
+        data/                        — telemetry queue
+        spool/                       — disk spool for offline sends
+      /Library/Jarvis/logs/        — rotating log files
+      /Library/Jarvis/jarvis-agent.pid    — PID file
+    """
+    install_dir:  str = "/Library/Jarvis"
+    config_dir:   str = "/Library/Jarvis"
+    log_dir:      str = "/Library/Jarvis/logs"
+    data_dir:     str = "/Library/Jarvis/data"
+    security_dir: str = "/Library/Jarvis/security"
+    spool_dir:    str = "/Library/Jarvis/spool"
+    pid_file:     str = "/Library/Jarvis/jarvis-agent.pid"
 
 
 @dataclass
 class BinariesConfig:
     """Paths to compiled binaries managed by the watchdog."""
-    agent:    str = "/opt/macintel/bin/macintel-agent"
-    watchdog: str = "/opt/macintel/bin/macintel-watchdog"
+    agent:    str = "/Library/Jarvis/bin/macintel-agent"
+    watchdog: str = "/Library/Jarvis/bin/macintel-watchdog"
 
 
 @dataclass
@@ -137,7 +151,7 @@ class CollectionConfig:
 @dataclass
 class LoggingConfig:
     level:   str = "INFO"
-    file:    str = "/Library/Logs/MacIntel/agent.log"
+    file:    str = "/Library/Jarvis/logs/agent.log"
     max_mb:  int = 10
     backups: int = 3
 
@@ -229,6 +243,7 @@ class AgentConfig:
                       "log_dir": self.paths.log_dir,
                       "data_dir": self.paths.data_dir,
                       "security_dir": self.paths.security_dir,
+                      "spool_dir": self.paths.spool_dir,
                       "pid_file": self.paths.pid_file},
             "binaries": {"agent": self.binaries.agent,
                          "watchdog": self.binaries.watchdog},

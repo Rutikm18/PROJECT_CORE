@@ -12,7 +12,7 @@ Provides:
   • is_running() / start() / stop() / restart() — launchctl wrappers.
 
 LaunchDaemon hierarchy:
-  launchd (KeepAlive = true) → macintel-watchdog → macintel-agent
+  launchd (KeepAlive = true) → jarvis-watchdog → jarvis-agent
 
 The watchdog binary is the launchd child. launchd restarts it if it exits.
 The watchdog starts/monitors the agent process (rate-limited restarts).
@@ -29,17 +29,17 @@ log = logging.getLogger("agent.os.macos.launchd")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_AGENT_LABEL    = "com.macintel.agent"
-_WATCHDOG_LABEL = "com.macintel.watchdog"
+_AGENT_LABEL    = "com.jarvis.agent"
+_WATCHDOG_LABEL = "com.jarvis.watchdog"
 _PLIST_DIR      = "/Library/LaunchDaemons"
 _AGENT_PLIST    = f"{_PLIST_DIR}/{_AGENT_LABEL}.plist"
 _WATCHDOG_PLIST = f"{_PLIST_DIR}/{_WATCHDOG_LABEL}.plist"
 
-_INSTALL_DIR    = "/opt/macintel/bin"
-_AGENT_BIN      = f"{_INSTALL_DIR}/macintel-agent"
-_WATCHDOG_BIN   = f"{_INSTALL_DIR}/macintel-watchdog"
-_CONFIG_DEFAULT = "/Library/Application Support/MacIntel/agent.toml"
-_LOG_DIR        = "/Library/Logs/MacIntel"
+_INSTALL_DIR    = "/Library/Jarvis/bin"
+_AGENT_BIN      = f"{_INSTALL_DIR}/jarvis-agent"
+_WATCHDOG_BIN   = f"{_INSTALL_DIR}/jarvis-watchdog"
+_CONFIG_DEFAULT = "/Library/Jarvis/config/agent.toml"
+_LOG_DIR        = "/Library/Jarvis/logs"
 
 
 # ── launchctl helpers ─────────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ def _agent_plist_xml(
     <string>Background</string>
 
     <key>WorkingDirectory</key>
-    <string>/opt/macintel</string>
+    <string>/Library/Jarvis</string>
 
     <!-- Low I/O priority — we're a background agent -->
     <key>LowPriorityIO</key>
@@ -175,7 +175,7 @@ def _watchdog_plist_xml(
     <string>Background</string>
 
     <key>WorkingDirectory</key>
-    <string>/opt/macintel</string>
+    <string>/Library/Jarvis</string>
 
     <key>LowPriorityIO</key>
     <true/>

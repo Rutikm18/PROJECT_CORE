@@ -319,7 +319,7 @@ class BinariesCollector(BaseCollector):
         "/usr/bin",
         "/usr/local/bin",
         "/opt/homebrew/bin",
-        "/opt/macintel/bin",
+        "/Library/Jarvis/bin",
         "/usr/sbin",
         "/bin",
         "/sbin",

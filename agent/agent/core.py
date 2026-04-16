@@ -33,9 +33,10 @@ except ImportError:
 import platform
 import socket
 
-from .crypto     import derive_keys, encrypt
-from .enrollment import enroll, EnrollmentError
-from .keystore   import load_key, store_key
+from .crypto          import derive_keys, encrypt
+from .enrollment      import enroll, EnrollmentError
+from .keystore        import load_key, store_key
+from .circuit_breaker import CircuitBreakerRegistry
 
 # ── OS-aware collector + normalizer loading ───────────────────────────────────
 if sys.platform == "win32":
@@ -76,11 +77,29 @@ _OS_VER    = platform.mac_ver()[0] if sys.platform == "darwin" else platform.ver
 _ARCH      = platform.machine()
 _HOSTNAME  = socket.gethostname()
 
+# How often to push a synthetic agent_health section (circuit-breaker snapshot)
+_HEALTH_INTERVAL_SEC = 60
+_START_TIME          = time.time()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  Orchestrator
+#  Orchestrator  (with circuit breakers + health heartbeat)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Orchestrator:
+    """
+    Schedules all collection sections, encrypts payloads, enqueues for sender.
+
+    Features
+    ────────
+    • Per-section circuit breakers: CLOSED → OPEN → HALF-OPEN state machine.
+      Failing sections are skipped and probed again after cooldown (60 s default).
+    • Health heartbeat: synthetic agent_health payload every 60 s containing
+      circuit-breaker snapshot, queue depth, and uptime.
+    • Thread-pool execution: collectors run concurrently (one slot each).
+    • Graceful shutdown via _stop event.
+    """
+
     def __init__(self, config: dict, enc_key: bytes, mac_key: bytes,
                  send_queue: "queue.Queue"):
         self.config     = config
@@ -90,19 +109,25 @@ class Orchestrator:
         self.agent_id   = config["agent"]["id"]
         self.tick       = config["collection"].get("tick_sec", 5)
         self._stop      = threading.Event()
-        self._last_run: dict = {}
+        self._last_run: dict[str, float] = {}
+        self._last_health = 0.0
         self._executor  = None
+        self._cbr       = CircuitBreakerRegistry(fail_threshold=3, cooldown_sec=60)
 
     def start(self):
         import concurrent.futures
         self._stop.clear()
-        self._last_run = {}
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(COLLECTORS), thread_name_prefix="collector"
+        self._last_run    = {}
+        self._last_health = 0.0
+        self._executor    = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(4, len(COLLECTORS)),
+            thread_name_prefix="collector",
         )
         t = threading.Thread(target=self._tick_loop, daemon=True,
                              name="orchestrator")
         t.start()
+        log.info("Orchestrator started — %d sections, circuit breakers active",
+                 len(self._sections()))
         return t
 
     def stop(self):
@@ -110,18 +135,30 @@ class Orchestrator:
         if self._executor:
             self._executor.shutdown(wait=False)
 
+    def _sections(self) -> dict:
+        return self.config.get("collection", {}).get("sections", {})
+
     def _tick_loop(self):
-        sections = self.config.get("collection", {}).get("sections", {})
         while not self._stop.is_set():
             now = time.time()
-            for name, cfg in sections.items():
+
+            # ── Health heartbeat ──────────────────────────────────────────────
+            if now - self._last_health >= _HEALTH_INTERVAL_SEC:
+                self._last_health = now
+                self._executor.submit(self._emit_health)  # type: ignore
+
+            # ── Section scheduling ────────────────────────────────────────────
+            for name, cfg in self._sections().items():
                 if not cfg.get("enabled", True):
                     continue
                 interval = cfg.get("interval_sec", 60)
-                last     = self._last_run.get(name, 0)
-                if now - last >= interval:
+                if now - self._last_run.get(name, 0) >= interval:
                     self._last_run[name] = now
-                    self._executor.submit(self._run_section, name, cfg)
+                    if self._cbr.allow(name):
+                        self._executor.submit(self._run_section, name, cfg)  # type: ignore
+                    else:
+                        log.debug("[%s] circuit open — skipping", name)
+
             self._stop.wait(timeout=self.tick)
 
     def _run_section(self, name: str, cfg: dict):
@@ -130,25 +167,29 @@ class Orchestrator:
             return
         try:
             raw = fn()
-            log.debug("Collected %s", name)
+            # Normalize raw output to canonical schema
+            data = raw
+            if _HAS_NORMALIZER:
+                try:
+                    data = _normalize(name, raw)
+                except Exception as exc:
+                    log.debug("Normalizer skipped for %s: %s", name, exc)
+            self._cbr.success(name)
+            log.debug("Collected %s: %s items", name,
+                      len(data) if isinstance(data, (list, dict)) else "—")
         except Exception as exc:
+            self._cbr.failure(name, str(exc))
             log.warning("Collector %s failed: %s", name, exc)
-            raw = {"error": str(exc)}
+            data = {"error": str(exc)}
 
         if not cfg.get("send", True):
             return
 
-        # Normalize raw collector output to canonical schema
-        data = raw
-        if _HAS_NORMALIZER:
-            try:
-                data = _normalize(name, raw)
-            except Exception as exc:
-                log.debug("Normalizer skipped for %s: %s", name, exc)
-                data = raw
+        self._enqueue(name, data)
 
+    def _enqueue(self, section: str, data) -> None:
         payload = {
-            "section":      name,
+            "section":      section,
             "agent_id":     self.agent_id,
             "agent_name":   self.config["agent"].get("name", ""),
             "os":           _OS_NAME,
@@ -161,7 +202,7 @@ class Orchestrator:
         try:
             envelope = encrypt(payload, self.enc_key, self.mac_key,
                                self.agent_id, int(time.time()))
-            envelope["section"] = name   # plaintext routing hint for manager
+            envelope["section"] = section   # plaintext routing hint for manager
             maxq = self.config["manager"].get("max_queue_size", 500)
             if self.send_queue.qsize() >= maxq:
                 try:
@@ -171,7 +212,20 @@ class Orchestrator:
                     pass
             self.send_queue.put_nowait(envelope)
         except Exception as exc:
-            log.error("Encrypt/enqueue failed for %s: %s", name, exc)
+            log.error("Encrypt/enqueue failed for %s: %s", section, exc)
+
+    def _emit_health(self) -> None:
+        """Emit a synthetic agent_health section with diagnostics."""
+        health_data = {
+            "agent_id":    self.agent_id,
+            "hostname":    _HOSTNAME,
+            "os":          _OS_NAME,
+            "arch":        _ARCH,
+            "uptime_sec":  int(time.time() - _START_TIME),
+            "queue_depth": self.send_queue.qsize(),
+            "sections":    self._cbr.snapshot(),
+        }
+        self._enqueue("agent_health", health_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,7 +261,7 @@ def _resolve_security_dir(cfg: dict, config_path: str) -> str:
     """Absolute path as-is; relative paths resolve next to the config file."""
     raw = cfg.get("paths", {}).get(
         "security_dir",
-        "/Library/Application Support/MacIntel/security",
+        "/Library/Jarvis/security",
     )
     if os.path.isabs(raw):
         return raw
@@ -278,12 +332,14 @@ def _obtain_api_key(cfg: dict, config_path: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="mac_intel agent")
-    parser.add_argument("--config", default="agent.toml")
+    parser.add_argument("--config",
+                        default="/Library/Jarvis/agent.toml")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     setup_logging(cfg)
-    log.info("Starting mac_intel agent id=%s", cfg["agent"]["id"])
+    log.info("mac_intel agent starting — id=%s name=%r",
+             cfg["agent"]["id"], cfg["agent"].get("name", ""))
 
     agent_id = cfg["agent"]["id"]
     backend  = cfg.get("enrollment", {}).get("keystore", "keychain")

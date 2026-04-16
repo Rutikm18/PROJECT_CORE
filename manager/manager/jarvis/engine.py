@@ -36,9 +36,10 @@ from .rules import (
     MALICIOUS_PORTS, PROCESS_RULES, SUSPICIOUS_PATHS, CONFIG_RULES,
     RISKY_PACKAGES, SUSPICIOUS_SERVICE_PATTERNS, get_tactic, severity_to_score,
 )
-from .behavioral import BehavioralAnalyzer
-from .feeds      import FeedManager
-from .nvd        import CVELookup
+from .behavioral  import BehavioralAnalyzer
+from .feeds       import FeedManager
+from .nvd         import CVELookup
+from .correlator  import CorrelationEngine
 
 log = logging.getLogger("manager.jarvis.engine")
 
@@ -67,8 +68,11 @@ class JarvisEngine:
         self._feeds   = FeedManager(intel_db)
         self._nvd     = CVELookup(intel_db)
         self._behav   = BehavioralAnalyzer(intel_db)
+        self._corr    = CorrelationEngine(intel_db)
         self._ready   = False
         self._nvd_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        # Per-agent payload counter — run correlation every 3 payloads
+        self._payload_count: dict[str, int] = {}
 
     async def start(self) -> None:
         """Call once at startup."""
@@ -92,9 +96,32 @@ class JarvisEngine:
             for f in findings:
                 f["agent_id"] = agent_id
                 await self._idb.upsert_finding(f, ts)
+
+            # Run cross-section correlation every 3 payloads per agent
+            count = self._payload_count.get(agent_id, 0) + 1
+            self._payload_count[agent_id] = count
+            if count % 3 == 0:
+                asyncio.create_task(self._run_correlations(agent_id))
         except Exception as exc:
             log.warning("Jarvis.process error agent=%s section=%s: %s",
                         agent_id, section, exc)
+
+    async def _run_correlations(self, agent_id: str) -> None:
+        """Evaluate cross-section correlation rules and store results."""
+        try:
+            correlations = await self._corr.correlate(agent_id)
+            ts = time.time()
+            for c in correlations:
+                await self._idb.upsert_correlation(c, ts)
+        except Exception as exc:
+            log.warning("Correlation error agent=%s: %s", agent_id, exc)
+
+    async def get_correlations(self, agent_id: str) -> list[dict]:
+        """Return current correlations for an agent (called by API)."""
+        try:
+            return await self._idb.get_correlations(agent_id)
+        except Exception:
+            return []
 
     # ── Dispatcher ────────────────────────────────────────────────────────────
 

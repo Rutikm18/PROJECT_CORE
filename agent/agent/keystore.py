@@ -35,7 +35,7 @@ def store_key(
     agent_id: str,
     key_hex: str,
     backend: str = "keychain",
-    security_dir: str = "/Library/Application Support/MacIntel/security",
+    security_dir: str = "/Library/Jarvis/security",
 ) -> None:
     """Persist the API key. Raises on failure."""
     if backend == "keychain":
@@ -53,7 +53,7 @@ def store_key(
 def load_key(
     agent_id: str,
     backend: str = "keychain",
-    security_dir: str = "/Library/Application Support/MacIntel/security",
+    security_dir: str = "/Library/Jarvis/security",
 ) -> str | None:
     """Return the stored API key, or None if not found."""
     if backend == "keychain":
@@ -71,7 +71,7 @@ def load_key(
 def delete_key(
     agent_id: str,
     backend: str = "keychain",
-    security_dir: str = "/Library/Application Support/MacIntel/security",
+    security_dir: str = "/Library/Jarvis/security",
 ) -> None:
     """Remove the stored key (for re-enrollment or uninstall)."""
     if backend == "keychain":

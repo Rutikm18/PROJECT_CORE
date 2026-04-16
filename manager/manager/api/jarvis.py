@@ -17,7 +17,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 
-def make_jarvis_router(intel_db) -> APIRouter:
+def make_jarvis_router(intel_db, jarvis_engine=None) -> APIRouter:
     router = APIRouter()
 
     # ── Global stats ──────────────────────────────────────────────────────────
@@ -93,5 +93,24 @@ def make_jarvis_router(intel_db) -> APIRouter:
     async def resolve(agent_id: str, finding_id: int):
         await intel_db.mark_resolved(agent_id, finding_id)
         return {"status": "resolved", "finding_id": finding_id}
+
+    # ── Correlations ──────────────────────────────────────────────────────────
+    @router.get("/{agent_id}/correlations")
+    async def correlations(agent_id: str):
+        """Return cross-section attack-chain correlations for an agent."""
+        rows = await intel_db.get_correlations(agent_id)
+        critical = sum(1 for r in rows if r.get("severity") == "critical")
+        high     = sum(1 for r in rows if r.get("severity") == "high")
+        max_score = max((r.get("score", 0) for r in rows), default=0)
+        return {
+            "correlations": rows,
+            "count": len(rows),
+            "summary": {
+                "total":     len(rows),
+                "critical":  critical,
+                "high":      high,
+                "max_score": round(max_score, 1),
+            },
+        }
 
     return router

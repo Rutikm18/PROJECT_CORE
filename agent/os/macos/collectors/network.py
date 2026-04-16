@@ -10,7 +10,14 @@ from __future__ import annotations
 
 import re
 
+import logging
+import threading
 from .base import BaseCollector, CollectorResult, _run, _run_json
+
+log = logging.getLogger(__name__)
+
+# Shared with volatile.py — but imported separately, so we use a module-level lock here too
+_NET_LOCK = threading.Lock()
 
 try:
     import psutil as _psutil
@@ -24,9 +31,10 @@ class PortsCollector(BaseCollector):
     name = "ports"
 
     def collect(self) -> list:
-        if _HAS_PSUTIL:
-            return self._collect_psutil()
-        return self._collect_lsof()
+        with _NET_LOCK:
+            if _HAS_PSUTIL:
+                return self._collect_psutil()
+            return self._collect_lsof()
 
     def _collect_psutil(self) -> list:
         pid_name: dict[int, str] = {}
@@ -38,7 +46,14 @@ class PortsCollector(BaseCollector):
 
         rows = []
         try:
-            for c in _psutil.net_connections(kind="inet"):
+            conns = _psutil.net_connections(kind="inet")
+        except Exception:
+            # macOS requires elevated privileges for net_connections — use lsof
+            log.debug("psutil.net_connections unavailable (permission denied?) — using lsof")
+            return self._collect_lsof()
+
+        for c in conns:
+            try:
                 if c.status not in ("LISTEN", "BOUND") and not (
                     c.type and c.type.name == "SOCK_DGRAM"
                 ):
@@ -58,8 +73,8 @@ class PortsCollector(BaseCollector):
                     "pid":        c.pid,
                     "process":    pid_name.get(c.pid or -1, ""),
                 })
-        except Exception:
-            pass
+            except Exception:
+                continue
         return rows
 
     def _collect_lsof(self) -> list:

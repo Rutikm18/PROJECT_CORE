@@ -149,6 +149,9 @@ def create_app() -> FastAPI:
         asyncio.create_task(_cleanup_store())
         log.info("Manager started. DB=%s  Intel=%s  Data=%s",
                  db_path, intel_path, data_dir)
+        log.info("Enrollment mode: %s",
+                 "OPEN (no token required)" if open_enrollment else
+                 f"TOKEN ({len(enrollment_tokens)} token(s) configured)")
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -160,19 +163,30 @@ def create_app() -> FastAPI:
     from .api.agents  import make_agents_router
     from .api.enroll  import make_enroll_router
     from .api.jarvis  import make_jarvis_router
+    from .api.keys    import make_keys_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
 
+    # Open enrollment: accept any agent without a token.
+    # Default: True (no token needed — just provide manager IP on agent install).
+    # Set OPEN_ENROLLMENT=false in env to require tokens.
+    _open_env     = os.environ.get("OPEN_ENROLLMENT", "true").lower()
+    open_enrollment = _open_env not in ("false", "0", "no", "off")
+
+    admin_token = os.environ.get("ADMIN_TOKEN", "").strip()
+
     ingest_router  = make_ingest_router(db, store, hub, nonce_cache, jarvis)
     agents_router  = make_agents_router(db, store)
-    enroll_router  = make_enroll_router(db, enrollment_tokens)
-    jarvis_router  = make_jarvis_router(intel_db)
+    enroll_router  = make_enroll_router(db, enrollment_tokens, open_enrollment)
+    jarvis_router  = make_jarvis_router(intel_db, jarvis)
+    keys_router    = make_keys_router(db, admin_token)
 
     app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(agents_router, prefix="/api/v1/agents")
     app.include_router(enroll_router, prefix="/api/v1")
     app.include_router(jarvis_router, prefix="/api/v1/jarvis")
+    app.include_router(keys_router,   prefix="/api/v1/keys")
 
     # ── Health ────────────────────────────────────────────────────────────────
     @app.get("/health")

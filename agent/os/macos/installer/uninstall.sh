@@ -15,9 +15,9 @@
 # =============================================================================
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/macintel}"
-DATA_DIR="${DATA_DIR:-/Library/Application Support/MacIntel}"
-LOG_DIR="${LOG_DIR:-/Library/Logs/MacIntel}"
+INSTALL_DIR="${INSTALL_DIR:-/Library/Jarvis}"
+DATA_DIR="${DATA_DIR:-/Library/Jarvis}"
+LOG_DIR="${LOG_DIR:-/Library/Jarvis/logs}"
 SECURITY_DIR="${DATA_DIR}/security"
 LAUNCHDAEMON_DIR="/Library/LaunchDaemons"
 
@@ -106,7 +106,7 @@ rmdir "${DATA_DIR}/data"    2>/dev/null || true
 rmdir "${DATA_DIR}"         2>/dev/null || true
 
 # ── Remove pid file ───────────────────────────────────────────────────────────
-rm -f /var/run/macintel-agent.pid 2>/dev/null || true
+rm -f /Library/Jarvis/jarvis-agent.pid 2>/dev/null || true
 
 echo ""
 echo "  Uninstall complete."

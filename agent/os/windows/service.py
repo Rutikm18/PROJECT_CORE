@@ -33,7 +33,7 @@ Dependencies (Windows only)
   pip install pywin32
   python Scripts/pywin32_postinstall.py -install  (only needed once after pip install)
 
-Default config path: C:\\ProgramData\\MacIntel\\agent.toml
+Default config path: C:\\Program Files (x86)\\Jarvis\\config\\agent.toml
 Override:            set MACINTEL_CONFIG env var before starting the service.
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ import threading
 log = logging.getLogger("agent.windows.service")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = r"C:\ProgramData\MacIntel\agent.toml"
+DEFAULT_CONFIG = r"C:\Program Files (x86)\Jarvis\config\agent.toml"
 
 
 # ── pywin32 availability guard ────────────────────────────────────────────────

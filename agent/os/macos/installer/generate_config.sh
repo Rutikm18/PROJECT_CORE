@@ -18,16 +18,16 @@
 #    ENROLL_TOKEN     — sk-enroll-<hex>  (first-run enrollment)
 #    MANAGER_API_KEY  — 64-hex key (skip enrollment)
 #    TLS_VERIFY       — true/false (default: true)
-#    INSTALL_DIR      — default: /opt/macintel
-#    DATA_DIR         — default: /Library/Application Support/MacIntel
-#    LOG_DIR          — default: /Library/Logs/MacIntel
+#    INSTALL_DIR      — default: /Library/Jarvis
+#    DATA_DIR         — default: /Library/Jarvis
+#    LOG_DIR          — default: /Library/Jarvis/logs
 #    SECURITY_DIR     — default: $DATA_DIR/security
 # =============================================================================
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/macintel}"
-DATA_DIR="${DATA_DIR:-/Library/Application Support/MacIntel}"
-LOG_DIR="${LOG_DIR:-/Library/Logs/MacIntel}"
+INSTALL_DIR="${INSTALL_DIR:-/Library/Jarvis}"
+DATA_DIR="${DATA_DIR:-/Library/Jarvis}"
+LOG_DIR="${LOG_DIR:-/Library/Jarvis/logs}"
 SECURITY_DIR="${SECURITY_DIR:-${DATA_DIR}/security}"
 MANAGER_URL="${MANAGER_URL:-https://localhost:8443}"
 ENROLL_TOKEN="${ENROLL_TOKEN:-}"
@@ -39,10 +39,15 @@ TLS_VERIFY="${TLS_VERIFY:-true}"
 CONFIG_PATH="${DATA_DIR}/agent.toml"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Resolve agent ID
+# Resolve agent ID — prefer hardware UUID for stability across reinstalls
 if [[ -z "$AGENT_ID" ]]; then
-  AGENT_ID=$(python3 -c "import uuid; print(str(uuid.uuid4()))" 2>/dev/null \
-    || uuidgen | tr '[:upper:]' '[:lower:]')
+  HW_UUID=$(system_profiler SPHardwareDataType 2>/dev/null \
+    | awk '/Hardware UUID/{print tolower($NF)}')
+  if [[ -n "$HW_UUID" ]]; then
+    AGENT_ID="mac-${HW_UUID}"
+  else
+    AGENT_ID="mac-$(hostname | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')"
+  fi
 fi
 
 # Ensure data dir exists
@@ -89,7 +94,7 @@ config_dir   = "${DATA_DIR}"
 log_dir      = "${LOG_DIR}"
 data_dir     = "${DATA_DIR}/data"
 security_dir = "${SECURITY_DIR}"
-pid_file     = "/var/run/macintel-agent.pid"
+pid_file     = "/Library/Jarvis/jarvis-agent.pid"
 
 [binaries]
 agent    = "${INSTALL_DIR}/bin/macintel-agent"

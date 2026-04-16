@@ -21,8 +21,8 @@
     AGENT_ID          — unique agent identifier (default: generated UUID)
     AGENT_NAME        — human-readable label
     TLS_VERIFY        — true / false
-    INSTALL_DIR       — default C:\Program Files\MacIntel
-    DATA_DIR          — default C:\ProgramData\MacIntel
+    INSTALL_DIR       — default C:\Program Files (x86)\Jarvis
+    DATA_DIR          — default C:\Program Files (x86)\Jarvis (same tree)
 
   Silent install example:
     msiexec /i macintel-agent.msi /qn ^
@@ -347,10 +347,13 @@
             }
         }
 
-        var dataDir     = p("DATA_DIR",     "C:\\ProgramData\\MacIntel");
-        var installDir  = p("INSTALL_DIR",  "C:\\Program Files\\MacIntel");
+        var installDir  = p("INSTALL_DIR",  "C:\\Program Files (x86)\\Jarvis");
+        var dataDir     = p("DATA_DIR",     installDir);
+        var binDir      = installDir + "\\bin";
+        var configDir   = dataDir + "\\config";
         var logDir      = p("LOG_DIR",      dataDir + "\\logs");
         var securityDir = p("SECURITY_DIR", dataDir + "\\security");
+        var spoolDir    = dataDir + "\\spool";
         var managerUrl  = p("MANAGER_URL",  "https://localhost:8443");
         var enrollToken = p("ENROLL_TOKEN", "");
         var apiKey      = p("MANAGER_API_KEY", "");
@@ -395,16 +398,17 @@
             "restart_window_sec   = 300",
             "",
             "[paths]",
-            'install_dir  = "' + toFwd(installDir)  + '"',
-            'config_dir   = "' + toFwd(dataDir)     + '"',
-            'log_dir      = "' + toFwd(logDir)      + '"',
+            'install_dir  = "' + toFwd(binDir)      + '"',
+            'config_dir   = "' + toFwd(configDir)   + '"',
+            'log_dir      = "' + toFwd(logDir)       + '"',
             'data_dir     = "' + toFwd(dataDir + "\\data") + '"',
-            'security_dir = "' + toFwd(securityDir) + '"',
-            'pid_file     = "' + toFwd(dataDir + "\\agent.pid") + '"',
+            'security_dir = "' + toFwd(securityDir)  + '"',
+            'spool_dir    = "' + toFwd(spoolDir)     + '"',
+            'pid_file     = "' + toFwd(installDir + "\\jarvis-agent.pid") + '"',
             "",
             "[binaries]",
-            'agent    = "' + toFwd(installDir + "\\bin\\macintel-agent.exe") + '"',
-            'watchdog = "' + toFwd(installDir + "\\bin\\macintel-watchdog.exe") + '"',
+            'agent    = "' + toFwd(binDir + "\\jarvis-agent.exe") + '"',
+            'watchdog = "' + toFwd(binDir + "\\jarvis-watchdog.exe") + '"',
             "",
             "[logging]",
             'level   = "INFO"',
@@ -576,10 +580,10 @@
             var idx = pair.indexOf("=");
             if (idx > 0) props[pair.slice(0, idx)] = pair.slice(idx + 1);
         });
-        var dataDir = props["DATA_DIR"] || "C:\\ProgramData\\MacIntel";
+        var dataDir = props["DATA_DIR"] || "C:\\Program Files (x86)\\Jarvis";
         var fso = new ActiveXObject("Scripting.FileSystemObject");
         // Remove agent.toml
-        var cfg = dataDir + "\\agent.toml";
+        var cfg = dataDir + "\\config\\agent.toml";
         if (fso.FileExists(cfg)) { try { fso.DeleteFile(cfg, true); } catch(e){} }
         // Remove key files in security dir (plain + dpapi)
         var sec = dataDir + "\\security";

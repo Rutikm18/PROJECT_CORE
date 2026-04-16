@@ -30,7 +30,7 @@ import subprocess
 
 log = logging.getLogger("agent.os.macos.keystore")
 
-_KEYRING_SERVICE = "com.macintel.agent"
+_KEYRING_SERVICE = "com.jarvis.agent"
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -38,7 +38,7 @@ def store_key(
     agent_id: str,
     key_hex: str,
     backend: str = "keychain",
-    security_dir: str = "/Library/Application Support/MacIntel/security",
+    security_dir: str = "/Library/Jarvis/security",
 ) -> None:
     """Persist the API key. Raises on total failure."""
     if backend == "keychain":
@@ -52,7 +52,7 @@ def store_key(
 def load_key(
     agent_id: str,
     backend: str = "keychain",
-    security_dir: str = "/Library/Application Support/MacIntel/security",
+    security_dir: str = "/Library/Jarvis/security",
 ) -> str | None:
     """Return the stored API key, or None if not found."""
     if backend == "keychain":
@@ -68,7 +68,7 @@ def load_key(
 def delete_key(
     agent_id: str,
     backend: str = "keychain",
-    security_dir: str = "/Library/Application Support/MacIntel/security",
+    security_dir: str = "/Library/Jarvis/security",
 ) -> None:
     """Remove all stored copies of the key."""
     _kr_delete(agent_id)

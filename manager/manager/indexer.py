@@ -145,6 +145,27 @@ CREATE TABLE IF NOT EXISTS entity_state (
     PRIMARY KEY(agent_id, category, entity_key)
 );
 
+-- ── Correlation chains ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS correlations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id        TEXT    NOT NULL,
+    rule_id         TEXT    NOT NULL,
+    severity        TEXT    NOT NULL DEFAULT 'high',
+    score           REAL    NOT NULL DEFAULT 0,
+    confidence      INTEGER NOT NULL DEFAULT 0,
+    title           TEXT    NOT NULL DEFAULT '',
+    description     TEXT,
+    recommendation  TEXT,
+    attack_chain    TEXT,
+    signals         TEXT,
+    signal_count    INTEGER DEFAULT 0,
+    first_detected  REAL    NOT NULL,
+    last_detected   REAL    NOT NULL,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(agent_id, rule_id)
+);
+CREATE INDEX IF NOT EXISTS idx_corr_agent ON correlations(agent_id, is_active, score DESC);
+
 -- ── Change timeline ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS change_timeline (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -358,6 +379,67 @@ class IntelDB:
             "VALUES(?,?,?,?,?,?,?,?)",
             (agent_id, category, change_type, item_key, title, item_data, prev_fp, ts),
         )
+
+    # ── Correlations ──────────────────────────────────────────────────────────
+
+    async def upsert_correlation(self, c: dict, ts: float) -> None:
+        """Upsert a cross-section correlation finding."""
+        agent_id = c["agent_id"]
+        rule_id  = c["rule_id"]
+        chain_j  = json.dumps(c.get("attack_chain") or [], default=str)
+        sigs_j   = json.dumps(c.get("signals") or [], default=str)
+
+        async with self._lock:
+            existing = await self._fetchone(
+                "SELECT id, first_detected FROM correlations WHERE agent_id=? AND rule_id=?",
+                (agent_id, rule_id),
+            )
+            if existing is None:
+                await self._conn.execute("""
+                    INSERT INTO correlations
+                    (agent_id, rule_id, severity, score, confidence, title, description,
+                     recommendation, attack_chain, signals, signal_count,
+                     first_detected, last_detected, is_active)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                """, (agent_id, rule_id,
+                      c.get("severity", "high"), c.get("score", 0),
+                      c.get("confidence", 0), c.get("title", ""),
+                      c.get("description", ""), c.get("recommendation", ""),
+                      chain_j, sigs_j, c.get("signal_count", 0), ts, ts))
+            else:
+                await self._conn.execute("""
+                    UPDATE correlations SET
+                        severity=?, score=?, confidence=?, title=?, description=?,
+                        recommendation=?, attack_chain=?, signals=?,
+                        signal_count=?, last_detected=?, is_active=1
+                    WHERE agent_id=? AND rule_id=?
+                """, (c.get("severity", "high"), c.get("score", 0),
+                      c.get("confidence", 0), c.get("title", ""),
+                      c.get("description", ""), c.get("recommendation", ""),
+                      chain_j, sigs_j, c.get("signal_count", 0), ts,
+                      agent_id, rule_id))
+            await self._conn.commit()
+
+    async def get_correlations(self, agent_id: str) -> list[dict]:
+        """Return active correlations for an agent, highest score first."""
+        rows = await self._fetchall(
+            "SELECT * FROM correlations WHERE agent_id=? AND is_active=1 "
+            "ORDER BY score DESC, last_detected DESC",
+            (agent_id,),
+        )
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["attack_chain"] = json.loads(d.get("attack_chain") or "[]")
+            except Exception:
+                d["attack_chain"] = []
+            try:
+                d["signals"] = json.loads(d.get("signals") or "[]")
+            except Exception:
+                d["signals"] = []
+            result.append(d)
+        return result
 
     # ── IOC cache ─────────────────────────────────────────────────────────────
 

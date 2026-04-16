@@ -7,9 +7,13 @@ agent/os/macos/collectors/volatile.py — High-frequency collectors (10 s interv
 """
 from __future__ import annotations
 
+import threading
 import time
 
 from .base import BaseCollector, CollectorResult, _run
+
+# Shared lock so psutil/lsof calls don't race on the same socket table
+_NET_LOCK = threading.Lock()
 
 # psutil is optional but strongly recommended (ARM64 native wheel available)
 try:
@@ -65,9 +69,10 @@ class ConnectionsCollector(BaseCollector):
     name = "connections"
 
     def collect(self) -> list:
-        if _HAS_PSUTIL:
-            return self._collect_psutil()
-        return self._collect_lsof()
+        with _NET_LOCK:
+            if _HAS_PSUTIL:
+                return self._collect_psutil()
+            return self._collect_lsof()
 
     def _collect_psutil(self) -> list:
         # Build pid→name map once
@@ -78,9 +83,15 @@ class ConnectionsCollector(BaseCollector):
         except Exception:
             pass
 
-        rows = []
         try:
-            for c in _psutil.net_connections(kind="tcp"):
+            conns = _psutil.net_connections(kind="tcp")
+        except Exception:
+            # macOS requires elevated privileges — fall back to lsof
+            return self._collect_lsof()
+
+        rows = []
+        for c in conns:
+            try:
                 if c.status != "ESTABLISHED":
                     continue
                 if not c.raddr:
@@ -95,17 +106,21 @@ class ConnectionsCollector(BaseCollector):
                     "pid":         c.pid,
                     "process":     pid_name.get(c.pid or -1, ""),
                 })
-        except Exception:
-            pass
+            except Exception:
+                continue
         return rows
 
     def _collect_lsof(self) -> list:
         out  = _run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"])
         rows = []
         for line in out.splitlines()[1:]:
-            parts = line.split(None, 9)
-            if len(parts) >= 9:
-                rows.append({"proc": parts[0], "pid": parts[1], "addr": parts[-1]})
+            # Columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME (STATUS)
+            parts = line.split()
+            if len(parts) < 9:
+                continue
+            # NAME is col 8, strip trailing (ESTABLISHED) if present
+            name = parts[8].split(" ")[0]  # drop any status suffix attached
+            rows.append({"proc": parts[0], "pid": parts[1], "addr": name})
         return rows
 
 
@@ -122,12 +137,14 @@ class ProcessesCollector(BaseCollector):
                  "memory_percent", "memory_info", "status", "create_time", "cmdline"]
         procs = []
         try:
-            # Warm-up pass for accurate cpu_percent
+            # Warm-up pass for accurate cpu_percent (system-wide)
             _psutil.cpu_percent(interval=None)
             for p in _psutil.process_iter(attrs):
                 try:
                     i = p.info
-                    rss = (i.get("memory_info") or _psutil._common.pmem(0, 0)).rss
+                    mem_info = i.get("memory_info")
+                    # Avoid private _common.pmem — just check for .rss attribute safely
+                    rss = getattr(mem_info, "rss", 0) or 0
                     cmd = " ".join(i.get("cmdline") or []) or i.get("name") or ""
                     procs.append({
                         "pid":        i["pid"],
@@ -143,8 +160,10 @@ class ProcessesCollector(BaseCollector):
                     })
                 except (_psutil.NoSuchProcess, _psutil.AccessDenied):
                     pass
+                except Exception:
+                    pass
         except Exception:
-            pass
+            return self._collect_ps()
         return sorted(procs, key=lambda x: x["cpu_pct"], reverse=True)[:80]
 
     def _collect_ps(self) -> list:

@@ -227,15 +227,15 @@ class SysctlCollector(WinBaseCollector):
     timeout = 15
 
     _HIVE_PATHS = [
-        (_HKLM := None, r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",                   True),
-        (None,           r"SYSTEM\CurrentControlSet\Control\Lsa",                                True),
-        (None,           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",           True),
-        (None,           r"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters",           True),
-        (None,           r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0",                        True),
-        (None,           r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",               False),
-        (None,           r"SYSTEM\CurrentControlSet\Control\SecureBoot\State",                  True),
-        (None,           r"SYSTEM\CurrentControlSet\Services\MrxSmb10",                         True),
-        (None,           r"SYSTEM\CurrentControlSet\Control\Terminal Server",                    False),
+        (None, r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",                True),
+        (None, r"SYSTEM\CurrentControlSet\Control\Lsa",                             True),
+        (None, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",        True),
+        (None, r"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters",        True),
+        (None, r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0",                     True),
+        (None, r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",            False),
+        (None, r"SYSTEM\CurrentControlSet\Control\SecureBoot\State",               True),
+        (None, r"SYSTEM\CurrentControlSet\Services\MrxSmb10",                      True),
+        (None, r"SYSTEM\CurrentControlSet\Control\Terminal Server",                False),
     ]
 
     def collect(self) -> list:
@@ -307,8 +307,9 @@ class ConfigsCollector(WinBaseCollector):
             if not os.path.isfile(path):
                 continue
             try:
-                st   = os.stat(path)
-                data = open(path, "rb").read(self._CAP)
+                st = os.stat(path)
+                with open(path, "rb") as fh:
+                    data = fh.read(self._CAP)
                 sha  = hashlib.sha256(data).hexdigest()
                 text = data.decode("utf-8", errors="replace")
                 suspicious, note = self._check(ftype, text, path)
@@ -367,10 +368,10 @@ class ConfigsCollector(WinBaseCollector):
         return False, None
 
 
-# Module-level sentinel replaced at use time
-_HKLM = None  # populated inside methods via `import winreg`
-
-# ── Re-export _HKLM correctly ─────────────────────────────────────────────────
-# SysctlCollector._HIVE_PATHS uses None as hive placeholder; actual hklm
-# handle is obtained inside collect() via `import winreg`.  The placeholder
-# approach keeps the file importable on non-Windows (e.g., CI runners).
+# Module-level HKLM handle — winreg only exists on Windows; on other platforms
+# this stays None and reg_get() will silently return None (safe fallback).
+try:
+    import winreg as _winreg
+    _HKLM = _winreg.HKEY_LOCAL_MACHINE
+except ImportError:
+    _HKLM = None

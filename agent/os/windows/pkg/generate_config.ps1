@@ -10,10 +10,11 @@
     22 collector sections pre-configured.
 
 .PARAMETER InstallDir
-    Root installation directory. Default: C:\Program Files\MacIntel
+    Root installation directory. Default: C:\Program Files (x86)\Jarvis
+    All subdirs (bin, config, data, logs, security, spool) created here.
 
 .PARAMETER DataDir
-    ProgramData directory for config, logs, keys. Default: C:\ProgramData\MacIntel
+    Data/config root. Defaults to InstallDir (single-tree install).
 
 .PARAMETER ManagerUrl
     Manager HTTPS endpoint. Required.
@@ -46,8 +47,8 @@
 #>
 
 param(
-    [string] $InstallDir    = "C:\Program Files\MacIntel",
-    [string] $DataDir       = "C:\ProgramData\MacIntel",
+    [string] $InstallDir    = "C:\Program Files (x86)\Jarvis",
+    [string] $DataDir       = "",
     [string] $ManagerUrl    = "https://localhost:8443",
     [string] $EnrollToken   = "",
     [string] $ManagerApiKey = "",
@@ -59,14 +60,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Consolidate under $InstallDir when no separate DataDir given
+if (-not $DataDir) { $DataDir = $InstallDir }
+
 # ── Derived paths ─────────────────────────────────────────────────────────────
+$BinDir      = Join-Path $InstallDir "bin"
+$ConfigDir   = Join-Path $DataDir "config"
 $LogDir      = Join-Path $DataDir "logs"
 $SecurityDir = Join-Path $DataDir "security"
+$SpoolDir    = Join-Path $DataDir "spool"
 $SubDataDir  = Join-Path $DataDir "data"
-$PidFile     = Join-Path $DataDir "agent.pid"
-$ConfigPath  = Join-Path $DataDir "agent.toml"
-$AgentExe    = Join-Path $InstallDir "bin\macintel-agent.exe"
-$WatchdogExe = Join-Path $InstallDir "bin\macintel-watchdog.exe"
+$PidFile     = Join-Path $DataDir "jarvis-agent.pid"
+$ConfigPath  = Join-Path $ConfigDir "agent.toml"
+$AgentExe    = Join-Path $BinDir "jarvis-agent.exe"
+$WatchdogExe = Join-Path $BinDir "jarvis-watchdog.exe"
 
 # ── Resolve agent identity ────────────────────────────────────────────────────
 if (-not $AgentId) {
@@ -93,7 +100,7 @@ if (-not $ManagerUrl) {
 }
 
 # Ensure data directories exist
-foreach ($dir in @($DataDir, $LogDir, $SecurityDir, $SubDataDir)) {
+foreach ($dir in @($BinDir, $ConfigDir, $LogDir, $SecurityDir, $SpoolDir, $SubDataDir)) {
     if (-not (Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         Write-Verbose "Created: $dir"
@@ -137,11 +144,12 @@ $lines += @(
     "restart_window_sec  = 300",
     "",
     "[paths]",
-    "install_dir  = `"$(ConvertTo-TomlPath $InstallDir)`"",
-    "config_dir   = `"$(ConvertTo-TomlPath $DataDir)`"",
+    "install_dir  = `"$(ConvertTo-TomlPath $BinDir)`"",
+    "config_dir   = `"$(ConvertTo-TomlPath $ConfigDir)`"",
     "log_dir      = `"$(ConvertTo-TomlPath $LogDir)`"",
     "data_dir     = `"$(ConvertTo-TomlPath $SubDataDir)`"",
     "security_dir = `"$(ConvertTo-TomlPath $SecurityDir)`"",
+    "spool_dir    = `"$(ConvertTo-TomlPath $SpoolDir)`"",
     "pid_file     = `"$(ConvertTo-TomlPath $PidFile)`"",
     "",
     "[binaries]",

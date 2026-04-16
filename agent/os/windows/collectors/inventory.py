@@ -10,13 +10,15 @@ Design notes
 • tasks    — Get-ScheduledTask PowerShell; schtasks /query CSV fallback.
 • packages — pip, npm, choco, winget, scoop — each is optional; missing tools are
              silently skipped.
-• binaries — walks %ProgramFiles%, %ProgramFiles(x86)%, %SystemRoot%\System32 for
+• binaries — walks %ProgramFiles%, %ProgramFiles(x86)%, %SystemRoot%\\System32 for
              .exe files; SHA-256 computed on first 4 MiB only (performance cap).
 • sbom     — aggregates pip, npm, choco, winget into purl-formatted records.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import logging
 import os
@@ -111,29 +113,33 @@ class TasksCollector(WinBaseCollector):
                 })
         except Exception as exc:
             log.debug("tasks PS: %s", exc)
-            # CSV fallback
+            # CSV fallback — use csv.reader so quoted commas inside fields
+            # (e.g. cmd.exe /c "echo hello, world") are handled correctly.
             raw = self._run(["schtasks", "/query", "/fo", "CSV", "/v"])
-            lines = raw.splitlines()
-            if lines:
-                header = [h.strip('"') for h in lines[0].split(",")]
-                for line in lines[1:]:
-                    if not line.strip():
-                        continue
-                    parts = [p.strip('"') for p in line.split(",")]
-                    if len(parts) < len(header):
-                        continue
-                    row = dict(zip(header, parts))
-                    status = (row.get("Status") or "").lower()
-                    tasks.append({
-                        "name":     row.get("TaskName", ""),
-                        "type":     "schtasks",
-                        "schedule": row.get("Schedule Type"),
-                        "command":  row.get("Task To Run"),
-                        "user":     row.get("Run As User"),
-                        "enabled":  status not in ("disabled",),
-                        "last_run": None,
-                        "next_run": None,
-                    })
+            try:
+                reader = csv.reader(io.StringIO(raw))
+                rows   = list(reader)
+                if len(rows) >= 2:
+                    header = rows[0]
+                    for row in rows[1:]:
+                        if not any(row):
+                            continue
+                        if len(row) < len(header):
+                            continue
+                        r      = dict(zip(header, row))
+                        status = (r.get("Status") or "").lower()
+                        tasks.append({
+                            "name":     r.get("TaskName", ""),
+                            "type":     "schtasks",
+                            "schedule": r.get("Schedule Type"),
+                            "command":  r.get("Task To Run"),
+                            "user":     r.get("Run As User"),
+                            "enabled":  status not in ("disabled",),
+                            "last_run": None,
+                            "next_run": None,
+                        })
+            except Exception as csv_exc:
+                log.debug("tasks CSV fallback failed: %s", csv_exc)
 
         return tasks
 
@@ -260,7 +266,8 @@ class PackagesCollector(WinBaseCollector):
                          "--accept-source-agreements", "--disable-interactivity"])
         results: list[dict] = []
         lines  = out.splitlines()
-        # Skip two header lines (name/version/id row + dashes row)
+        # winget list column order: Name | Id | Version | Available | Source
+        # Find the separator row (dashes) to locate data rows.
         data_start = next(
             (i for i, l in enumerate(lines) if re.match(r"^-{3,}", l.strip())), -1
         )
@@ -270,13 +277,15 @@ class PackagesCollector(WinBaseCollector):
             line = line.strip()
             if not line:
                 continue
-            # winget columns are fixed-width; split on 2+ spaces is more reliable
+            # Fixed-width columns; split on 2+ spaces is more reliable than
+            # fixed offsets because localized column headers vary in width.
             parts = re.split(r"\s{2,}", line)
             if len(parts) < 2:
                 continue
+            # parts[0]=Name, parts[1]=Id, parts[2]=Version (if present)
             results.append({
                 "manager": "winget", "name": parts[0],
-                "version": parts[1] if len(parts) > 1 else None,
+                "version": parts[2] if len(parts) > 2 else None,
                 "latest": None, "outdated": None, "installed_at": None,
             })
         return results

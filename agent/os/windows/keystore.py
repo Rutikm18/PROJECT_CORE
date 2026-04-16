@@ -38,7 +38,7 @@ _CRYPTPROTECT_LOCAL_MACHINE = 0x4   # any account on this machine can decrypt
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def store_key(agent_id: str, key_hex: str,
-              security_dir: str = r"C:\ProgramData\MacIntel\security") -> None:
+              security_dir: str = r"C:\Program Files (x86)\Jarvis\security") -> None:
     """Persist API key with DPAPI. Falls back to ACL-restricted file."""
     # Try Credential Manager first
     if _cm_store(agent_id, key_hex):
@@ -54,7 +54,7 @@ def store_key(agent_id: str, key_hex: str,
 
 
 def load_key(agent_id: str,
-             security_dir: str = r"C:\ProgramData\MacIntel\security") -> str | None:
+             security_dir: str = r"C:\Program Files (x86)\Jarvis\security") -> str | None:
     """Load API key. Returns None if no key found."""
     # Credential Manager
     key = _cm_load(agent_id)
@@ -69,7 +69,7 @@ def load_key(agent_id: str,
 
 
 def delete_key(agent_id: str,
-               security_dir: str = r"C:\ProgramData\MacIntel\security") -> None:
+               security_dir: str = r"C:\Program Files (x86)\Jarvis\security") -> None:
     """Remove stored key (re-enrollment / uninstall)."""
     _cm_delete(agent_id)
     for path in [
