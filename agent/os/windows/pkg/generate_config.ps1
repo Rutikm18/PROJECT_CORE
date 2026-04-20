@@ -76,9 +76,17 @@ $AgentExe    = Join-Path $BinDir "jarvis-agent.exe"
 $WatchdogExe = Join-Path $BinDir "jarvis-watchdog.exe"
 
 # ── Resolve agent identity ────────────────────────────────────────────────────
+# Auto-derive from Windows MachineGuid for stable identity across reinstalls
 if (-not $AgentId) {
-    $AgentId = [System.Guid]::NewGuid().ToString()
-    Write-Verbose "Generated agent ID: $AgentId"
+    try {
+        $regKey  = "HKLM:\SOFTWARE\Microsoft\Cryptography"
+        $MachineGuid = (Get-ItemProperty -Path $regKey -Name MachineGuid).MachineGuid
+        $AgentId = "win-$($MachineGuid.ToLower())"
+        Write-Verbose "Agent ID from MachineGuid: $AgentId"
+    } catch {
+        $AgentId = "win-$([System.Guid]::NewGuid().ToString())"
+        Write-Verbose "Agent ID fallback (UUID): $AgentId"
+    }
 }
 
 if (-not $AgentName) {
@@ -111,19 +119,20 @@ foreach ($dir in @($BinDir, $ConfigDir, $LogDir, $SecurityDir, $SpoolDir, $SubDa
 $timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
 
 $lines = @(
-    "# agent.toml — mac_intel Agent Configuration",
+    "# mac_intel Agent Configuration",
     "# Generated: $timestamp",
-    "# Edit this file to change agent behaviour; restart the MacIntelAgent service to apply.",
+    "#",
+    "# Only [manager] url is required.",
+    "# Agent ID is auto-derived from Windows MachineGuid by the binary.",
+    "# All collection schedules, paths, and logging use built-in defaults.",
+    "# Restart the MacIntelAgent service to apply changes.",
     "",
     "[agent]",
-    "id   = `"$AgentId`"",
     "name = `"$AgentName`"",
     "",
     "[manager]",
-    "url            = `"$ManagerUrl`"",
-    "tls_verify     = $($TlsVerify.ToLower())",
-    "timeout_sec    = 30",
-    "max_queue_size = 500"
+    "url        = `"$ManagerUrl`"",
+    "tls_verify = $($TlsVerify.ToLower())"
 )
 
 # Write api_key only if a valid 64-hex key was provided (skips enrollment)
@@ -131,76 +140,12 @@ if ($ManagerApiKey -match '^[0-9a-fA-F]{64}$') {
     $lines += "api_key = `"$($ManagerApiKey.ToLower())`""
 }
 
-$lines += @(
-    "",
-    "[enrollment]",
-    "token    = `"$EnrollToken`"",
-    "keystore = `"$Keystore`"",
-    "",
-    "[watchdog]",
-    "enabled             = true",
-    "check_interval_sec  = 30",
-    "max_restarts        = 5",
-    "restart_window_sec  = 300",
-    "",
-    "[paths]",
-    "install_dir  = `"$(ConvertTo-TomlPath $BinDir)`"",
-    "config_dir   = `"$(ConvertTo-TomlPath $ConfigDir)`"",
-    "log_dir      = `"$(ConvertTo-TomlPath $LogDir)`"",
-    "data_dir     = `"$(ConvertTo-TomlPath $SubDataDir)`"",
-    "security_dir = `"$(ConvertTo-TomlPath $SecurityDir)`"",
-    "spool_dir    = `"$(ConvertTo-TomlPath $SpoolDir)`"",
-    "pid_file     = `"$(ConvertTo-TomlPath $PidFile)`"",
-    "",
-    "[binaries]",
-    "agent    = `"$(ConvertTo-TomlPath $AgentExe)`"",
-    "watchdog = `"$(ConvertTo-TomlPath $WatchdogExe)`"",
-    "",
-    "[logging]",
-    "level   = `"INFO`"",
-    "file    = `"$(ConvertTo-TomlPath (Join-Path $LogDir 'agent.log'))`"",
-    "max_mb  = 10",
-    "backups = 3",
-    "",
-    "[collection]",
-    "tick_sec = 5",
-    ""
-)
-
-# ── Collection sections ───────────────────────────────────────────────────────
-# Format: name, interval_seconds
-$sections = @(
-    @{ name = "metrics";     interval = 60    },
-    @{ name = "connections"; interval = 60    },
-    @{ name = "processes";   interval = 60    },
-    @{ name = "ports";       interval = 60    },
-    @{ name = "network";     interval = 300   },
-    @{ name = "arp";         interval = 300   },
-    @{ name = "mounts";      interval = 300   },
-    @{ name = "battery";     interval = 300   },
-    @{ name = "open_files";  interval = 120   },
-    @{ name = "services";    interval = 300   },
-    @{ name = "users";       interval = 600   },
-    @{ name = "hardware";    interval = 3600  },
-    @{ name = "containers";  interval = 120   },
-    @{ name = "security";    interval = 600   },
-    @{ name = "sysctl";      interval = 3600  },
-    @{ name = "configs";     interval = 3600  },
-    @{ name = "storage";     interval = 300   },
-    @{ name = "tasks";       interval = 3600  },
-    @{ name = "apps";        interval = 3600  },
-    @{ name = "packages";    interval = 3600  },
-    @{ name = "binaries";    interval = 86400 },
-    @{ name = "sbom";        interval = 86400 }
-)
-
-foreach ($s in $sections) {
+# Write enrollment token only if provided
+if ($EnrollToken) {
     $lines += @(
-        "[collection.sections.$($s.name)]",
-        "enabled      = true",
-        "interval_sec = $($s.interval)",
-        "send         = true",
-        ""
+        "",
+        "[enrollment]",
+        "token = `"$EnrollToken`""
     )
 }
 

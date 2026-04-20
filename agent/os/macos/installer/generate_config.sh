@@ -53,128 +53,42 @@ fi
 # Ensure data dir exists
 mkdir -p "${DATA_DIR}" "${SECURITY_DIR}" "${LOG_DIR}" "${DATA_DIR}/data"
 
-# ── Write agent.toml ──────────────────────────────────────────────────────────
+# ── Write agent.toml (minimal — binary auto-applies all other defaults) ───────
 {
 cat <<EOF
-# agent.toml — mac_intel Agent Configuration
+# mac_intel Agent Configuration
 # Generated: ${TIMESTAMP}
-# Edit this file to change agent behaviour; send SIGHUP or restart to apply.
+#
+# Only these two fields are required:
+#   [manager] url  — your manager's HTTPS address
+#   [agent]   name — friendly name shown on dashboard (optional)
+#
+# The agent binary auto-detects its ID from the Mac's hardware UUID.
+# All collection schedules, paths, and logging use built-in defaults.
+# Edit and send SIGHUP (or restart) to apply changes.
 
 [agent]
-id   = "${AGENT_ID}"
 name = "${AGENT_NAME}"
 
 [manager]
-url            = "${MANAGER_URL}"
-tls_verify     = ${TLS_VERIFY}
-timeout_sec    = 30
-max_queue_size = 500
+url        = "${MANAGER_URL}"
+tls_verify = ${TLS_VERIFY}
 EOF
 
-# Only write api_key if a 64-hex key was provided
+# Only write api_key if a valid 64-hex key was provided
 if [[ ${#MANAGER_API_KEY} -eq 64 && "$MANAGER_API_KEY" =~ ^[0-9a-fA-F]+$ ]]; then
   echo "api_key = \"${MANAGER_API_KEY}\""
 fi
 
+# Only write enrollment token if provided
+if [[ -n "${ENROLL_TOKEN}" ]]; then
 cat <<EOF
 
 [enrollment]
-token    = "${ENROLL_TOKEN}"
-keystore = "keychain"
-
-[watchdog]
-enabled            = true
-check_interval_sec = 30
-max_restarts       = 5
-restart_window_sec = 300
-
-[paths]
-install_dir  = "${INSTALL_DIR}"
-config_dir   = "${DATA_DIR}"
-log_dir      = "${LOG_DIR}"
-data_dir     = "${DATA_DIR}/data"
-security_dir = "${SECURITY_DIR}"
-pid_file     = "/Library/Jarvis/jarvis-agent.pid"
-
-[binaries]
-agent    = "${INSTALL_DIR}/bin/macintel-agent"
-watchdog = "${INSTALL_DIR}/bin/macintel-watchdog"
-
-[logging]
-level   = "INFO"
-file    = "${LOG_DIR}/agent.log"
-max_mb  = 10
-backups = 3
-
-[collection]
-tick_sec = 5
-
-[collection.sections.metrics]
-enabled = true; interval_sec = 60;    send = true
-
-[collection.sections.connections]
-enabled = true; interval_sec = 60;    send = true
-
-[collection.sections.processes]
-enabled = true; interval_sec = 60;    send = true
-
-[collection.sections.ports]
-enabled = true; interval_sec = 60;    send = true
-
-[collection.sections.network]
-enabled = true; interval_sec = 300;   send = true
-
-[collection.sections.arp]
-enabled = true; interval_sec = 300;   send = true
-
-[collection.sections.mounts]
-enabled = true; interval_sec = 300;   send = true
-
-[collection.sections.battery]
-enabled = true; interval_sec = 300;   send = true
-
-[collection.sections.openfiles]
-enabled = true; interval_sec = 120;   send = true
-
-[collection.sections.services]
-enabled = true; interval_sec = 300;   send = true
-
-[collection.sections.users]
-enabled = true; interval_sec = 600;   send = true
-
-[collection.sections.hardware]
-enabled = true; interval_sec = 3600;  send = true
-
-[collection.sections.containers]
-enabled = true; interval_sec = 120;   send = true
-
-[collection.sections.security]
-enabled = true; interval_sec = 600;   send = true
-
-[collection.sections.sysctl]
-enabled = true; interval_sec = 3600;  send = true
-
-[collection.sections.configs]
-enabled = true; interval_sec = 3600;  send = true
-
-[collection.sections.storage]
-enabled = true; interval_sec = 300;   send = true
-
-[collection.sections.tasks]
-enabled = true; interval_sec = 3600;  send = true
-
-[collection.sections.apps]
-enabled = true; interval_sec = 3600;  send = true
-
-[collection.sections.packages]
-enabled = true; interval_sec = 3600;  send = true
-
-[collection.sections.binaries]
-enabled = true; interval_sec = 86400; send = true
-
-[collection.sections.sbom]
-enabled = true; interval_sec = 86400; send = true
+token = "${ENROLL_TOKEN}"
 EOF
+fi
+
 } > "${CONFIG_PATH}"
 
 chown root:wheel "${CONFIG_PATH}" 2>/dev/null || true

@@ -130,7 +130,7 @@ PYTHONPATH="${REPO_ROOT}" python3 -m PyInstaller \
     --distpath "${BUILD_DIR}/bin" \
     --workpath "${BUILD_DIR}/pyinstaller/agent" \
     --specpath "${BUILD_DIR}" \
-    agent/agent/core.py
+    agent/agent_entry.py
 
 echo "  [1/6] DONE — $(du -sh "${BUILD_DIR}/bin/macintel-agent" | cut -f1)"
 

@@ -180,9 +180,56 @@ CREATE TABLE IF NOT EXISTS change_timeline (
 );
 CREATE INDEX IF NOT EXISTS idx_tl_agent ON change_timeline(agent_id, detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tl_cat   ON change_timeline(agent_id, category, detected_at DESC);
+
+-- ── SOC workflow: analyst activity log ───────────────────────────────────
+-- Records every analyst action on a finding (status change, assignment, etc.)
+CREATE TABLE IF NOT EXISTS soc_activity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id  INTEGER NOT NULL,
+    agent_id    TEXT    NOT NULL,
+    action      TEXT    NOT NULL,   -- 'created','status_change','assigned','commented','escalated','resolved','false_positive','accepted_risk'
+    actor       TEXT    DEFAULT 'system',
+    old_value   TEXT    DEFAULT '',
+    new_value   TEXT    DEFAULT '',
+    detail      TEXT    DEFAULT '',
+    created_at  REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_act_finding ON soc_activity(finding_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_agent   ON soc_activity(agent_id,   created_at DESC);
+
+-- ── SOC workflow: analyst comments ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS soc_comments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id  INTEGER NOT NULL,
+    agent_id    TEXT    NOT NULL,
+    analyst     TEXT    NOT NULL DEFAULT 'analyst',
+    comment     TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cmt_finding ON soc_comments(finding_id, created_at DESC);
 """
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+# SLA hours by severity (Critical=4h, High=24h, Medium=7d, Low=30d, Info=90d)
+_SLA_HOURS = {"critical": 4, "high": 24, "medium": 168, "low": 720, "info": 2160}
+
+# Valid SOC workflow statuses
+_SOC_STATUSES = {
+    "new", "triaging", "investigating", "in_remediation",
+    "remediated", "verified", "closed", "false_positive",
+    "accepted_risk", "duplicate",
+}
+
+# Migrations: add SOC workflow columns to existing findings table
+_SOC_MIGRATIONS = [
+    ("findings",     "status",        "TEXT    DEFAULT 'new'"),
+    ("findings",     "assignee",      "TEXT    DEFAULT ''"),
+    ("findings",     "sla_due",       "REAL    DEFAULT 0"),
+    ("findings",     "closed_at",     "REAL    DEFAULT NULL"),
+    ("findings",     "priority",      "INTEGER DEFAULT 0"),
+    ("findings",     "analyst_notes", "TEXT    DEFAULT ''"),
+]
 
 
 class IntelDB:
@@ -199,6 +246,15 @@ class IntelDB:
         async with self._conn.executescript(_SCHEMA):
             pass
         await self._conn.commit()
+        # Apply SOC column migrations on existing databases
+        for table, col, defn in _SOC_MIGRATIONS:
+            try:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {defn}"
+                )
+                await self._conn.commit()
+            except Exception:
+                pass  # column already exists
         log.info("IntelDB initialised at %s", self._path)
 
     async def close(self) -> None:
@@ -228,21 +284,37 @@ class IntelDB:
                 (agent_id, category, item_key),
             )
             if row is None:
+                sev = f.get("severity", "info")
+                sla_hours = _SLA_HOURS.get(sev, 2160)
+                sla_due = ts + sla_hours * 3600
                 await self._conn.execute("""
                     INSERT INTO findings
                     (agent_id,category,item_key,fingerprint,severity,score,
                      title,description,evidence,source,rule_id,cve_ids,
                      cvss_score,cvss_vector,mitre_technique,mitre_tactic,
-                     first_detected_at,last_detected_at,scan_count,is_active,tags)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?)
+                     first_detected_at,last_detected_at,scan_count,is_active,tags,
+                     status,assignee,sla_due,priority,analyst_notes)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
+                           'new','',?,0,'')
                 """, (agent_id, category, item_key, fp,
-                      f.get("severity","info"), f.get("score",0),
+                      sev, f.get("score",0),
                       f.get("title",""), f.get("description",""),
                       evidence_j, f.get("source",""), f.get("rule_id",""),
                       cve_j, f.get("cvss_score"), f.get("cvss_vector",""),
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
-                      ts, ts, tags_j))
+                      ts, ts, tags_j, sla_due))
                 await self._conn.commit()
+                # Log creation in SOC activity
+                cur2 = await self._conn.execute(
+                    "SELECT id FROM findings WHERE agent_id=? AND category=? AND item_key=?",
+                    (agent_id, category, item_key),
+                )
+                new_row = await cur2.fetchone()
+                if new_row:
+                    await self._log_activity(
+                        new_row["id"], agent_id, "created", "system",
+                        "", sev, f.get("title",""), ts,
+                    )
                 await self._append_timeline(agent_id, category, "added",
                                             item_key, f.get("title",""),
                                             evidence_j, None, ts)
@@ -556,6 +628,319 @@ class IntelDB:
         """, (agent_id, category, entity_key, fingerprint, ts))
         await self._conn.commit()
 
+    # ── SOC workflow ──────────────────────────────────────────────────────────
+
+    async def get_soc_findings(
+        self, *,
+        agent_id: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        category: str | None = None,
+        assignee: str | None = None,
+        sla_breached: bool = False,
+        active_only: bool = True,
+        search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+        sort_by: str = "score",
+    ) -> list[dict]:
+        """Global findings list with full SOC filters."""
+        parts: list[str] = []
+        args: list = []
+        if agent_id:
+            parts.append("f.agent_id=?"); args.append(agent_id)
+        if severity:
+            parts.append("f.severity=?"); args.append(severity)
+        if status:
+            parts.append("f.status=?"); args.append(status)
+        if category:
+            parts.append("f.category=?"); args.append(category)
+        if assignee:
+            parts.append("f.assignee=?"); args.append(assignee)
+        if sla_breached:
+            parts.append("f.sla_due > 0 AND f.sla_due < ?")
+            args.append(time.time())
+        if active_only:
+            parts.append("f.is_active=1")
+
+        where = ("WHERE " + " AND ".join(parts)) if parts else ""
+        valid_sorts = {"score": "f.score DESC", "last_detected_at": "f.last_detected_at DESC",
+                       "severity": "CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",
+                       "sla_due": "f.sla_due ASC"}
+        order = valid_sorts.get(sort_by, "f.score DESC")
+
+        if search:
+            # Full-text search path
+            rows = await self._fetchall(
+                f"SELECT f.*, a.name AS agent_name FROM findings f "
+                f"JOIN findings_fts fts ON f.id=fts.rowid "
+                f"LEFT JOIN (SELECT agent_id, name FROM (SELECT DISTINCT agent_id, "
+                f"(SELECT name FROM agents WHERE agents.agent_id=f2.agent_id LIMIT 1) AS name "
+                f"FROM findings f2) sub) a ON f.agent_id=a.agent_id "
+                f"{where} {'AND' if where else 'WHERE'} findings_fts MATCH ? "
+                f"ORDER BY rank LIMIT ? OFFSET ?",
+                (*args, search, limit, offset),
+            )
+        else:
+            rows = await self._fetchall(
+                f"SELECT f.* FROM findings f {where} "
+                f"ORDER BY {order} LIMIT ? OFFSET ?",
+                (*args, limit, offset),
+            )
+
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["sla_status"] = _sla_status(d.get("sla_due", 0), d.get("status", "new"))
+            result.append(d)
+        return result
+
+    async def get_finding_by_id(self, finding_id: int) -> dict | None:
+        row = await self._fetchone(
+            "SELECT * FROM findings WHERE id=?", (finding_id,)
+        )
+        return dict(row) if row else None
+
+    async def update_finding(
+        self, finding_id: int, *,
+        status: str | None = None,
+        assignee: str | None = None,
+        analyst_notes: str | None = None,
+        priority: int | None = None,
+        actor: str = "analyst",
+    ) -> dict | None:
+        """Update SOC workflow fields and log activity."""
+        row = await self._fetchone(
+            "SELECT * FROM findings WHERE id=?", (finding_id,)
+        )
+        if not row:
+            return None
+        old = dict(row)
+        ts = time.time()
+
+        sets: list[str] = []
+        vals: list = []
+        if status is not None and status in _SOC_STATUSES:
+            sets.append("status=?"); vals.append(status)
+            if status in ("closed", "false_positive", "accepted_risk", "verified"):
+                sets.append("closed_at=?"); vals.append(ts)
+                sets.append("is_active=0")
+            elif old.get("status") in ("closed", "false_positive", "accepted_risk"):
+                # Re-opening
+                sets.append("closed_at=NULL")
+                sets.append("is_active=1")
+        if assignee is not None:
+            sets.append("assignee=?"); vals.append(assignee)
+        if analyst_notes is not None:
+            sets.append("analyst_notes=?"); vals.append(analyst_notes)
+        if priority is not None:
+            sets.append("priority=?"); vals.append(priority)
+
+        if not sets:
+            return old
+
+        async with self._lock:
+            await self._conn.execute(
+                f"UPDATE findings SET {', '.join(sets)} WHERE id=?",
+                (*vals, finding_id),
+            )
+            await self._conn.commit()
+
+            # Log activities
+            if status is not None and status != old.get("status"):
+                await self._log_activity(
+                    finding_id, old["agent_id"], "status_change", actor,
+                    old.get("status",""), status, "", ts,
+                )
+                if status in ("closed", "false_positive", "verified"):
+                    await self._append_timeline(
+                        old["agent_id"], old["category"], "resolved",
+                        old["item_key"], old["title"], None, None, ts,
+                    )
+            if assignee is not None and assignee != old.get("assignee",""):
+                await self._log_activity(
+                    finding_id, old["agent_id"], "assigned", actor,
+                    old.get("assignee",""), assignee, "", ts,
+                )
+
+        return await self.get_finding_by_id(finding_id)
+
+    async def bulk_update_findings(
+        self, finding_ids: list[int], *,
+        status: str | None = None,
+        assignee: str | None = None,
+        priority: int | None = None,
+        actor: str = "analyst",
+    ) -> int:
+        """Bulk update SOC workflow fields. Returns number of rows updated."""
+        updated = 0
+        for fid in finding_ids:
+            result = await self.update_finding(
+                fid, status=status, assignee=assignee,
+                priority=priority, actor=actor,
+            )
+            if result:
+                updated += 1
+        return updated
+
+    async def add_comment(
+        self, finding_id: int, agent_id: str,
+        analyst: str, comment: str,
+    ) -> dict:
+        ts = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO soc_comments(finding_id,agent_id,analyst,comment,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (finding_id, agent_id, analyst, comment, ts),
+            )
+            await self._conn.commit()
+            await self._log_activity(
+                finding_id, agent_id, "commented", analyst, "", "", comment[:100], ts,
+            )
+        return {"finding_id": finding_id, "analyst": analyst, "comment": comment,
+                "created_at": ts}
+
+    async def get_comments(self, finding_id: int) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM soc_comments WHERE finding_id=? ORDER BY created_at ASC",
+            (finding_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_activity(self, finding_id: int) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM soc_activity WHERE finding_id=? ORDER BY created_at ASC",
+            (finding_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def _log_activity(
+        self, finding_id: int, agent_id: str, action: str,
+        actor: str, old_val: str, new_val: str, detail: str, ts: float,
+    ) -> None:
+        await self._conn.execute(
+            "INSERT INTO soc_activity(finding_id,agent_id,action,actor,old_value,new_value,detail,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (finding_id, agent_id, action, actor, old_val, new_val, detail, ts),
+        )
+
+    # ── Dashboard & SLA analytics ─────────────────────────────────────────────
+
+    async def get_dashboard_stats(self) -> dict:
+        """Comprehensive stats for the SOC dashboard."""
+        now = time.time()
+        today_start = now - (now % 86400)  # approximate
+
+        # KPI row
+        kpi_row = await self._fetchone("""
+            SELECT
+                SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END)                                          AS total_active,
+                SUM(CASE WHEN severity='critical' AND is_active=1 THEN 1 ELSE 0 END)                  AS critical,
+                SUM(CASE WHEN severity='high'     AND is_active=1 THEN 1 ELSE 0 END)                  AS high,
+                SUM(CASE WHEN severity='medium'   AND is_active=1 THEN 1 ELSE 0 END)                  AS medium,
+                SUM(CASE WHEN severity='low'      AND is_active=1 THEN 1 ELSE 0 END)                  AS low,
+                SUM(CASE WHEN severity='info'     AND is_active=1 THEN 1 ELSE 0 END)                  AS info,
+                SUM(CASE WHEN sla_due > 0 AND sla_due < ? AND is_active=1 THEN 1 ELSE 0 END)          AS sla_breached,
+                SUM(CASE WHEN closed_at >= ? THEN 1 ELSE 0 END)                                       AS resolved_today,
+                COUNT(DISTINCT CASE WHEN is_active=1 THEN agent_id END)                               AS agents_with_findings
+            FROM findings
+        """, (now, today_start))
+
+        # Severity distribution (all active)
+        sev_rows = await self._fetchall(
+            "SELECT severity, COUNT(*) AS cnt FROM findings WHERE is_active=1 "
+            "GROUP BY severity", ()
+        )
+
+        # Status distribution (all active)
+        status_rows = await self._fetchall(
+            "SELECT status, COUNT(*) AS cnt FROM findings WHERE is_active=1 "
+            "GROUP BY status", ()
+        )
+
+        # Category distribution
+        cat_rows = await self._fetchall(
+            "SELECT category, COUNT(*) AS cnt FROM findings WHERE is_active=1 "
+            "GROUP BY category ORDER BY cnt DESC LIMIT 10", ()
+        )
+
+        # Top 5 agents by active finding count
+        agent_rows = await self._fetchall("""
+            SELECT f.agent_id,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN f.severity='critical' THEN 1 ELSE 0 END) AS critical,
+                   SUM(CASE WHEN f.severity='high'     THEN 1 ELSE 0 END) AS high
+            FROM findings f WHERE f.is_active=1
+            GROUP BY f.agent_id ORDER BY total DESC LIMIT 5
+        """, ())
+
+        # 7-day trend (approximate using last_detected_at)
+        trend = []
+        for i in range(6, -1, -1):
+            day_start = now - (i + 1) * 86400
+            day_end   = now - i * 86400
+            day_row = await self._fetchone("""
+                SELECT
+                    SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical,
+                    SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) AS high,
+                    SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) AS medium,
+                    SUM(CASE WHEN severity='low'      THEN 1 ELSE 0 END) AS low
+                FROM findings WHERE first_detected_at >= ? AND first_detected_at < ?
+            """, (day_start, day_end))
+            import datetime
+            date_str = datetime.datetime.utcfromtimestamp(day_end).strftime("%m/%d")
+            trend.append({
+                "date": date_str,
+                "critical": day_row["critical"] or 0 if day_row else 0,
+                "high":     day_row["high"]     or 0 if day_row else 0,
+                "medium":   day_row["medium"]   or 0 if day_row else 0,
+                "low":      day_row["low"]      or 0 if day_row else 0,
+            })
+
+        # SLA compliance by severity
+        sla_compliance: dict = {}
+        for sev in ("critical", "high", "medium", "low"):
+            row = await self._fetchone("""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN sla_due=0 OR sla_due >= ? THEN 1 ELSE 0 END) AS on_time,
+                    SUM(CASE WHEN sla_due > 0 AND sla_due < ?  THEN 1 ELSE 0 END) AS breached
+                FROM findings WHERE severity=? AND is_active=1
+            """, (now, now, sev))
+            if row:
+                sla_compliance[sev] = {
+                    "total":   row["total"]   or 0,
+                    "on_time": row["on_time"] or 0,
+                    "breached":row["breached"]or 0,
+                }
+
+        return {
+            "kpi": dict(kpi_row) if kpi_row else {},
+            "severity_dist":  [{"severity": r["severity"], "count": r["cnt"]} for r in sev_rows],
+            "status_dist":    [{"status":   r["status"],   "count": r["cnt"]} for r in status_rows],
+            "category_dist":  [{"category": r["category"], "count": r["cnt"]} for r in cat_rows],
+            "top_agents":     [dict(r) for r in agent_rows],
+            "daily_trend":    trend,
+            "sla_compliance": sla_compliance,
+        }
+
+    async def get_sla_report(self) -> list[dict]:
+        """Return all active findings breaching or at risk of breaching SLA."""
+        now = time.time()
+        warn_threshold = now + 3600  # findings due in next 1 hour
+        rows = await self._fetchall("""
+            SELECT * FROM findings
+            WHERE is_active=1 AND sla_due > 0 AND sla_due < ?
+            ORDER BY sla_due ASC
+        """, (warn_threshold,))
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["sla_status"] = _sla_status(d.get("sla_due", 0), d.get("status", "new"))
+            result.append(d)
+        return result
+
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def stats(self) -> dict:
@@ -578,6 +963,23 @@ class IntelDB:
     async def _fetchall(self, sql: str, args: tuple) -> list[aiosqlite.Row]:
         async with self._conn.execute(sql, args) as cur:
             return await cur.fetchall()
+
+
+def _sla_status(sla_due: float, status: str) -> str:
+    """Return 'ok' | 'warning' | 'breached' | 'closed' based on SLA due time."""
+    if status in ("closed", "false_positive", "accepted_risk", "verified", "duplicate"):
+        return "closed"
+    if not sla_due:
+        return "ok"
+    now = time.time()
+    remaining = sla_due - now
+    if remaining < 0:
+        return "breached"
+    # Warning when less than 20% of original window remains
+    # Use a heuristic: warn if < 2 hours remaining
+    if remaining < 7200:
+        return "warning"
+    return "ok"
 
 
 def _fingerprint(f: dict) -> str:

@@ -159,11 +159,12 @@ def create_app() -> FastAPI:
         await intel_db.close()
 
     # ── Mount routers ─────────────────────────────────────────────────────────
-    from .api.ingest  import make_ingest_router
-    from .api.agents  import make_agents_router
-    from .api.enroll  import make_enroll_router
-    from .api.jarvis  import make_jarvis_router
-    from .api.keys    import make_keys_router
+    from .api.ingest    import make_ingest_router
+    from .api.agents    import make_agents_router
+    from .api.enroll    import make_enroll_router
+    from .api.jarvis    import make_jarvis_router
+    from .api.keys      import make_keys_router
+    from .api.findings  import make_findings_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
@@ -176,17 +177,19 @@ def create_app() -> FastAPI:
 
     admin_token = os.environ.get("ADMIN_TOKEN", "").strip()
 
-    ingest_router  = make_ingest_router(db, store, hub, nonce_cache, jarvis)
-    agents_router  = make_agents_router(db, store)
-    enroll_router  = make_enroll_router(db, enrollment_tokens, open_enrollment)
-    jarvis_router  = make_jarvis_router(intel_db, jarvis)
-    keys_router    = make_keys_router(db, admin_token)
+    ingest_router    = make_ingest_router(db, store, hub, nonce_cache, jarvis)
+    agents_router    = make_agents_router(db, store)
+    enroll_router    = make_enroll_router(db, enrollment_tokens, open_enrollment)
+    jarvis_router    = make_jarvis_router(intel_db, jarvis)
+    keys_router      = make_keys_router(db, admin_token)
+    findings_router  = make_findings_router(intel_db)
 
-    app.include_router(ingest_router, prefix="/api/v1")
-    app.include_router(agents_router, prefix="/api/v1/agents")
-    app.include_router(enroll_router, prefix="/api/v1")
-    app.include_router(jarvis_router, prefix="/api/v1/jarvis")
-    app.include_router(keys_router,   prefix="/api/v1/keys")
+    app.include_router(ingest_router,   prefix="/api/v1")
+    app.include_router(agents_router,   prefix="/api/v1/agents")
+    app.include_router(enroll_router,   prefix="/api/v1")
+    app.include_router(jarvis_router,   prefix="/api/v1/jarvis")
+    app.include_router(keys_router,     prefix="/api/v1/keys")
+    app.include_router(findings_router, prefix="/api/v1/soc")
 
     # ── Health ────────────────────────────────────────────────────────────────
     @app.get("/health")

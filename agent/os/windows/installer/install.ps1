@@ -41,13 +41,15 @@
 #>
 
 param(
+    # REQUIRED: manager HTTPS URL
+    [string] $ManagerUrl     = "",
+    # OPTIONAL: friendly name shown on dashboard (defaults to computer name)
+    [string] $AgentName      = $env:COMPUTERNAME,
+    # Advanced overrides — safe to leave at defaults
     [string] $InstallDir     = "C:\Program Files (x86)\Jarvis",
     [string] $DataDir        = "",
-    [string] $ManagerUrl     = "https://YOUR_MANAGER_IP:8443",
-    [string] $EnrollToken    = "",
-    [string] $AgentId        = $env:COMPUTERNAME.ToLower(),
-    [string] $AgentName      = $env:COMPUTERNAME,
-    [bool]   $TlsVerify      = $true,
+    [string] $EnrollToken    = "",          # only if manager requires token-mode
+    [bool]   $TlsVerify      = $true,       # set $false for self-signed certs
     [string] $ServiceAccount = "NT AUTHORITY\NetworkService"
 )
 

@@ -16,3 +16,6 @@ jinja2>=3.1.0
 
 # For serving static files
 python-multipart>=0.0.9
+
+# Async HTTP client (threat feed fetching)
+aiohttp>=3.9.0

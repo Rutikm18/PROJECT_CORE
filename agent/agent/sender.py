@@ -110,10 +110,14 @@ class Sender:
         # Disk spool — persists payloads when manager is unreachable.
         # NOTE: never derive this from __file__; PyInstaller bundles the module
         # inside a temp directory whose path changes between runs.
-        spool_dir = config.get("paths", {}).get(
-            "spool_dir",
-            "/Library/Jarvis/spool",
-        )
+        import sys as _sys
+        if _sys.platform == "darwin":
+            _default_spool = "/Library/Jarvis/spool"
+        elif _sys.platform == "win32":
+            _default_spool = r"C:\Program Files (x86)\Jarvis\spool"
+        else:
+            _default_spool = "/var/lib/jarvis/spool"
+        spool_dir = config.get("paths", {}).get("spool_dir", _default_spool)
         self._spool = DiskSpool(os.path.join(spool_dir, "unsent.ndjson"))
 
     # ── SSL ───────────────────────────────────────────────────────────────────

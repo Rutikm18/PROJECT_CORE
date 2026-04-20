@@ -38,6 +38,49 @@ from .enrollment      import enroll, EnrollmentError
 from .keystore        import load_key, store_key
 from .circuit_breaker import CircuitBreakerRegistry
 
+# ── OS-aware path defaults ────────────────────────────────────────────────────
+if sys.platform == "darwin":
+    _DEFAULT_LOG_FILE  = "/Library/Jarvis/logs/agent.log"
+    _DEFAULT_SPOOL_DIR = "/Library/Jarvis/spool"
+    _DEFAULT_SECURITY  = "/Library/Jarvis/security"
+    _DEFAULT_CONFIG    = "/Library/Jarvis/agent.toml"
+elif sys.platform == "win32":
+    _DEFAULT_LOG_FILE  = r"C:\Program Files (x86)\Jarvis\logs\agent.log"
+    _DEFAULT_SPOOL_DIR = r"C:\Program Files (x86)\Jarvis\spool"
+    _DEFAULT_SECURITY  = r"C:\Program Files (x86)\Jarvis\security"
+    _DEFAULT_CONFIG    = r"C:\Program Files (x86)\Jarvis\config\agent.toml"
+else:
+    _DEFAULT_LOG_FILE  = "/var/log/jarvis/agent.log"
+    _DEFAULT_SPOOL_DIR = "/var/lib/jarvis/spool"
+    _DEFAULT_SECURITY  = "/var/lib/jarvis/security"
+    _DEFAULT_CONFIG    = "/etc/jarvis/agent.toml"
+
+# ── Built-in default collection schedule (used when [collection.sections] absent) ──
+_DEFAULT_SECTIONS: dict = {
+    "metrics":     {"enabled": True,  "interval_sec": 60,    "send": True},
+    "connections": {"enabled": True,  "interval_sec": 60,    "send": True},
+    "processes":   {"enabled": True,  "interval_sec": 60,    "send": True},
+    "ports":       {"enabled": True,  "interval_sec": 30,    "send": True},
+    "network":     {"enabled": True,  "interval_sec": 120,   "send": True},
+    "arp":         {"enabled": True,  "interval_sec": 120,   "send": True},
+    "mounts":      {"enabled": True,  "interval_sec": 120,   "send": True},
+    "battery":     {"enabled": True,  "interval_sec": 120,   "send": True},
+    "openfiles":   {"enabled": True,  "interval_sec": 120,   "send": True},
+    "services":    {"enabled": True,  "interval_sec": 120,   "send": True},
+    "users":       {"enabled": True,  "interval_sec": 120,   "send": True},
+    "hardware":    {"enabled": True,  "interval_sec": 120,   "send": True},
+    "containers":  {"enabled": True,  "interval_sec": 120,   "send": True},
+    "storage":     {"enabled": True,  "interval_sec": 600,   "send": True},
+    "tasks":       {"enabled": True,  "interval_sec": 600,   "send": True},
+    "security":    {"enabled": True,  "interval_sec": 3600,  "send": True},
+    "sysctl":      {"enabled": True,  "interval_sec": 3600,  "send": True},
+    "configs":     {"enabled": True,  "interval_sec": 3600,  "send": True},
+    "apps":        {"enabled": True,  "interval_sec": 86400, "send": True},
+    "packages":    {"enabled": True,  "interval_sec": 86400, "send": True},
+    "binaries":    {"enabled": False, "interval_sec": 86400, "send": False},
+    "sbom":        {"enabled": True,  "interval_sec": 86400, "send": True},
+}
+
 # ── OS-aware collector + normalizer loading ───────────────────────────────────
 if sys.platform == "win32":
     try:
@@ -107,7 +150,7 @@ class Orchestrator:
         self.mac_key    = mac_key
         self.send_queue = send_queue
         self.agent_id   = config["agent"]["id"]
-        self.tick       = config["collection"].get("tick_sec", 5)
+        self.tick       = config.get("collection", {}).get("tick_sec", 5)
         self._stop      = threading.Event()
         self._last_run: dict[str, float] = {}
         self._last_health = 0.0
@@ -136,7 +179,11 @@ class Orchestrator:
             self._executor.shutdown(wait=False)
 
     def _sections(self) -> dict:
-        return self.config.get("collection", {}).get("sections", {})
+        cfg_sections = self.config.get("collection", {}).get("sections", {})
+        if cfg_sections:
+            return cfg_sections
+        # No [collection.sections] in config — use built-in defaults
+        return _DEFAULT_SECTIONS
 
     def _tick_loop(self):
         while not self._stop.is_set():
@@ -238,7 +285,7 @@ log = logging.getLogger("agent")
 def setup_logging(cfg: dict):
     lcfg    = cfg.get("logging", {})
     level   = getattr(logging, lcfg.get("level", "INFO").upper(), logging.INFO)
-    logfile = lcfg.get("file", "agent/logs/agent.log")
+    logfile = lcfg.get("file", _DEFAULT_LOG_FILE)
     os.makedirs(os.path.dirname(logfile), exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
         logfile,
@@ -252,6 +299,54 @@ def setup_logging(cfg: dict):
     )
 
 
+def _auto_agent_id() -> str:
+    """
+    Derive a stable hardware-bound agent ID.
+    macOS  → Hardware UUID from system_profiler  → mac-<uuid>
+    Windows→ MachineGuid from registry           → win-<guid>
+    Linux  → /etc/machine-id                     → linux-<id>
+    Fallback → hostname-based deterministic ID
+    """
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            out = subprocess.check_output(
+                ["system_profiler", "SPHardwareDataType"],
+                text=True, timeout=10,
+            )
+            for line in out.splitlines():
+                if "Hardware UUID" in line:
+                    uuid = line.split(":")[-1].strip().lower()
+                    return f"mac-{uuid}"
+        elif sys.platform == "win32":
+            import subprocess
+            out = subprocess.check_output(
+                ["reg", "query",
+                 r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                 "/v", "MachineGuid"],
+                text=True, timeout=10,
+            )
+            for line in out.splitlines():
+                if "MachineGuid" in line:
+                    guid = line.split()[-1].strip().lower()
+                    return f"win-{guid}"
+        else:
+            try:
+                with open("/etc/machine-id") as f:
+                    mid = f.read().strip()
+                if mid:
+                    return f"linux-{mid[:32]}"
+            except OSError:
+                pass
+    except Exception:
+        pass
+    # Fallback: hostname-based
+    h = socket.gethostname().lower()
+    import re
+    h = re.sub(r"[^a-z0-9-]", "-", h)[:48]
+    return f"host-{h}"
+
+
 def load_config(path: str) -> dict:
     with open(path, "rb") as f:
         return tomllib.load(f)
@@ -259,10 +354,7 @@ def load_config(path: str) -> dict:
 
 def _resolve_security_dir(cfg: dict, config_path: str) -> str:
     """Absolute path as-is; relative paths resolve next to the config file."""
-    raw = cfg.get("paths", {}).get(
-        "security_dir",
-        "/Library/Jarvis/security",
-    )
+    raw = cfg.get("paths", {}).get("security_dir", _DEFAULT_SECURITY)
     if os.path.isabs(raw):
         return raw
     base = os.path.dirname(os.path.abspath(config_path))
@@ -332,12 +424,18 @@ def _obtain_api_key(cfg: dict, config_path: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="mac_intel agent")
-    parser.add_argument("--config",
-                        default="/Library/Jarvis/agent.toml")
+    parser.add_argument("--config", default=_DEFAULT_CONFIG)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     setup_logging(cfg)
+
+    # ── Auto-populate agent ID from hardware if not set in config ─────────────
+    cfg.setdefault("agent", {})
+    if not cfg["agent"].get("id"):
+        cfg["agent"]["id"] = _auto_agent_id()
+        log.info("Agent ID auto-derived: %s", cfg["agent"]["id"])
+
     log.info("mac_intel agent starting — id=%s name=%r",
              cfg["agent"]["id"], cfg["agent"].get("name", ""))
 
@@ -398,7 +496,7 @@ def main():
         signal.signal(signal.SIGHUP, _reload)
 
     log.info("Agent running. tick=%ss. SIGHUP to reload, SIGTERM to stop.",
-             cfg["collection"].get("tick_sec", 5))
+             cfg.get("collection", {}).get("tick_sec", 5))
     orch_thread.join()
 
 

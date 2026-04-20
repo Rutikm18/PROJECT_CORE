@@ -109,6 +109,15 @@ pyinstaller `
     --hidden-import agent.os.windows.collectors `
     --hidden-import agent.os.windows.normalizer `
     --hidden-import agent.os.windows.keystore `
+    --hidden-import agent.agent.circuit_breaker `
+    --hidden-import agent.os.windows.collectors `
+    --hidden-import agent.os.windows.collectors.volatile `
+    --hidden-import agent.os.windows.collectors.network `
+    --hidden-import agent.os.windows.collectors.system `
+    --hidden-import agent.os.windows.collectors.posture `
+    --hidden-import agent.os.windows.collectors.inventory `
+    --hidden-import agent.os.windows.normalizer `
+    --hidden-import agent.os.windows.keystore `
     --hidden-import agent.os.windows.service `
     --hidden-import win32service `
     --hidden-import win32serviceutil `
@@ -117,7 +126,8 @@ pyinstaller `
     --hidden-import win32crypt `
     --hidden-import psutil `
     --hidden-import cryptography `
-    agent\os\windows\service.py
+    --hidden-import cryptography.hazmat.primitives.ciphers.aead `
+    agent\os\windows\agent_win_entry.py
 
 if ($LASTEXITCODE -ne 0) {
     Pop-Location
@@ -191,7 +201,9 @@ Get-ChildItem $DistDir -Filter "*.exe" | ForEach-Object {
     Write-Host "    $($_.Name) — ${size} MB"
 }
 Write-Host ""
-Write-Host "  To install:" -ForegroundColor Cyan
+Write-Host "  To install (Run as Administrator):" -ForegroundColor Cyan
 Write-Host "    cd $DistDir"
-Write-Host "    .\install.ps1 -ManagerUrl https://YOUR_MANAGER:8443 -EnrollToken sk-enroll-..."
+Write-Host "    .\install.ps1 -ManagerUrl https://YOUR_MANAGER:8443"
+Write-Host "    # With agent name:"
+Write-Host "    .\install.ps1 -ManagerUrl https://YOUR_MANAGER:8443 -AgentName 'Alice Laptop' -TlsVerify `$false"
 Write-Host ""

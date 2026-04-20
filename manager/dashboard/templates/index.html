@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>mac_intel — Security Intelligence</title>
+<title>mac_intel — SOC Intelligence Platform</title>
 <link rel="stylesheet" href="/static/css/dashboard.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
@@ -22,15 +22,20 @@
     </div>
     <div>
       <div class="logo-name">mac_intel</div>
-      <div class="logo-sub">Jarvis Intelligence</div>
+      <div class="logo-sub">SOC Intelligence</div>
     </div>
   </div>
 
   <div class="sidebar-nav">
-    <div class="nav-group-label">Workspace</div>
-    <button class="nav-item active" id="nav-overview" onclick="showPanel('overview',this)">
-      <svg class="nav-icon" viewBox="0 0 16 16"><rect x="1" y="1" width="6" height="6" rx="1.5"/><rect x="9" y="1" width="6" height="6" rx="1.5"/><rect x="1" y="9" width="6" height="6" rx="1.5"/><rect x="9" y="9" width="6" height="6" rx="1.5"/></svg>
-      <span>Overview</span>
+    <div class="nav-group-label">Operations</div>
+    <button class="nav-item active" id="nav-dashboard" onclick="showPanel('dashboard',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16"><rect x="1" y="1" width="6" height="6" rx="1.5"/><rect x="9" y="1" width="6" height="3" rx="1.5"/><rect x="9" y="6" width="6" height="3" rx="1.5"/><rect x="1" y="9" width="6" height="6" rx="1.5"/><rect x="9" y="11" width="6" height="4" rx="1.5"/></svg>
+      <span>Dashboard</span>
+    </button>
+    <button class="nav-item" id="nav-findings" onclick="showPanel('findings',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 1L14 4v5c0 4-6 6-6 6S2 13 2 9V4z"/><line x1="8" y1="6" x2="8" y2="9"/><circle cx="8" cy="11" r=".8" fill="currentColor"/></svg>
+      <span>Findings</span>
+      <span class="nav-badge nav-badge-red" id="findings-badge" style="display:none">0</span>
     </button>
     <button class="nav-item" id="nav-agents" onclick="showPanel('agents',this)">
       <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
@@ -38,11 +43,6 @@
     </button>
 
     <div class="nav-group-label">Intelligence</div>
-    <button class="nav-item" id="nav-jarvis" onclick="showPanel('jarvis',this)">
-      <svg class="nav-icon" viewBox="0 0 16 16"><polygon points="8,1 15,4.5 15,11.5 8,15 1,11.5 1,4.5"/></svg>
-      <span>Jarvis Findings</span>
-      <span class="nav-badge" id="jarvis-badge" style="display:none">0</span>
-    </button>
     <button class="nav-item" id="nav-correlations" onclick="showPanel('correlations',this)">
       <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="3" cy="8" r="2"/><circle cx="13" cy="4" r="2"/><circle cx="13" cy="12" r="2"/><path d="M5 8 L11 4 M5 8 L11 12"/></svg>
       <span>Attack Chains</span>
@@ -63,12 +63,12 @@
   <div class="sidebar-footer">
     <div class="conn-row">
       <span class="conn-dot" id="connDot"></span>
-      <span id="connText" style="font-size:11px;color:#64748B">Connecting…</span>
+      <span id="connText" style="font-size:11px;color:var(--text-sub)">Connecting…</span>
     </div>
     <div class="agent-select-wrap">
-      <svg width="12" height="12" viewBox="0 0 12 12" style="flex-shrink:0;color:#64748B"><circle cx="6" cy="4" r="2.5" fill="none" stroke="currentColor"/><path d="M1 11c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="currentColor" fill="none"/></svg>
+      <svg width="12" height="12" viewBox="0 0 12 12" style="flex-shrink:0;color:var(--text-sub)"><circle cx="6" cy="4" r="2.5" fill="none" stroke="currentColor"/><path d="M1 11c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="currentColor" fill="none"/></svg>
       <select id="agentSelect" onchange="onAgentChange(this.value)">
-        <option value="">— select agent —</option>
+        <option value="">— all agents —</option>
       </select>
     </div>
   </div>
@@ -80,17 +80,16 @@
   <!-- Topbar -->
   <div class="topbar">
     <div class="topbar-left">
-      <div class="topbar-title" id="topbar-title">Overview</div>
-      <div class="topbar-breadcrumb" id="topbar-agent">No agent selected</div>
+      <div class="topbar-title" id="topbar-title">Dashboard</div>
+      <div class="topbar-breadcrumb" id="topbar-agent">All Agents</div>
     </div>
     <div class="topbar-right">
       <div class="time-pills">
-        <button class="tp active" onclick="setWin('5m',this)">5m</button>
-        <button class="tp" onclick="setWin('15m',this)">15m</button>
-        <button class="tp" onclick="setWin('1h',this)">1h</button>
+        <button class="tp active" onclick="setWin('1h',this)">1h</button>
         <button class="tp" onclick="setWin('8h',this)">8h</button>
         <button class="tp" onclick="setWin('1d',this)">1d</button>
         <button class="tp" onclick="setWin('7d',this)">7d</button>
+        <button class="tp" onclick="setWin('30d',this)">30d</button>
       </div>
       <button class="refresh-btn" onclick="manualRefresh()">
         <svg id="refreshSvg" width="14" height="14" viewBox="0 0 16 16"><path d="M13.7 6.3A6 6 0 1 0 14 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><polyline points="14,2 14,6.5 9.5,6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -101,1157 +100,1412 @@
 
   <div class="content">
 
-    <!-- ── OVERVIEW ─────────────────────────────────────────────────────── -->
-    <div class="panel active" id="panel-overview">
-      <div class="kpi-grid" id="kpi-grid">
+    <!-- ══ DASHBOARD PANEL ════════════════════════════════════════════════ -->
+    <div class="panel active" id="panel-dashboard">
+
+      <!-- KPI Cards -->
+      <div class="kpi-grid" id="dash-kpi-grid">
         <div class="kpi-card kpi-blue">
-          <div class="kpi-icon"><svg viewBox="0 0 20 20"><circle cx="10" cy="7" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 18c0-3.9 3.1-7 7-7s7 3.1 7 7" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></div>
-          <div class="kpi-val" id="ov-agents">—</div>
-          <div class="kpi-label">Enrolled Agents</div>
+          <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 3L17 17H3z"/><line x1="10" y1="9" x2="10" y2="13"/><circle cx="10" cy="15" r=".8" fill="currentColor"/></svg></div>
+          <div class="kpi-val" id="kpi-total">—</div>
+          <div class="kpi-label">Active Findings</div>
         </div>
         <div class="kpi-card kpi-red">
-          <div class="kpi-icon"><svg viewBox="0 0 20 20"><path d="M10 3L18 17H2z" fill="none" stroke="currentColor" stroke-width="1.8"/><line x1="10" y1="9" x2="10" y2="13" stroke="currentColor" stroke-width="1.8"/><circle cx="10" cy="15" r="0.8" fill="currentColor"/></svg></div>
-          <div class="kpi-val" id="ov-critical">—</div>
+          <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><line x1="10" y1="6" x2="10" y2="11"/><circle cx="10" cy="14" r=".8" fill="currentColor"/></svg></div>
+          <div class="kpi-val" id="kpi-critical">—</div>
           <div class="kpi-label">Critical</div>
         </div>
         <div class="kpi-card kpi-orange">
-          <div class="kpi-icon"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><line x1="10" y1="7" x2="10" y2="11" stroke="currentColor" stroke-width="1.8"/><circle cx="10" cy="13" r="0.8" fill="currentColor"/></svg></div>
-          <div class="kpi-val" id="ov-high">—</div>
+          <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 2l2.4 4.8 5.3.8-3.8 3.7.9 5.2L10 14l-4.7 2.5.9-5.2L2.3 7.6l5.3-.8z"/></svg></div>
+          <div class="kpi-val" id="kpi-high">—</div>
           <div class="kpi-label">High</div>
         </div>
+        <div class="kpi-card kpi-breach" id="kpi-breach-card">
+          <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><path d="M10 5v4"/><path d="M6 8l4-3 4 3"/></svg></div>
+          <div class="kpi-val" id="kpi-sla-breached">—</div>
+          <div class="kpi-label">SLA Breached</div>
+        </div>
         <div class="kpi-card kpi-green">
-          <div class="kpi-icon"><svg viewBox="0 0 20 20"><polyline points="4,10 8,14 16,6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
-          <div class="kpi-val" id="ov-total">—</div>
-          <div class="kpi-label">Total Findings</div>
+          <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="4,10 8,14 16,6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="kpi-val" id="kpi-resolved-today">—</div>
+          <div class="kpi-label">Resolved Today</div>
+        </div>
+        <div class="kpi-card kpi-purple">
+          <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="7" r="3.5"/><path d="M3 18c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg></div>
+          <div class="kpi-val" id="kpi-agents">—</div>
+          <div class="kpi-label">Active Agents</div>
         </div>
       </div>
 
-      <div class="charts-row">
-        <div class="chart-card">
-          <div class="chart-hdr"><span class="chart-title">CPU Usage</span><span class="chart-sub" id="cpu-latest"></span></div>
-          <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+      <!-- Charts Row 1: Trend + Severity Distribution -->
+      <div class="charts-31" style="margin-bottom:14px">
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">Finding Trend — Last 7 Days</span>
+            <span class="card-sub" id="trend-sub"></span>
+          </div>
+          <div class="card-body"><div class="chart-wrap chart-wrap-lg"><canvas id="trendChart"></canvas></div></div>
         </div>
-        <div class="chart-card">
-          <div class="chart-hdr"><span class="chart-title">Memory Usage</span><span class="chart-sub" id="mem-latest"></span></div>
-          <div class="chart-wrap"><canvas id="memChart"></canvas></div>
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">Severity Distribution</span></div>
+          <div class="card-body">
+            <div class="chart-wrap" style="height:160px"><canvas id="severityChart"></canvas></div>
+            <div id="sev-legend" style="display:flex;flex-direction:column;gap:5px;margin-top:10px"></div>
+          </div>
         </div>
       </div>
 
+      <!-- Charts Row 2: Status + Top Agents + Category -->
+      <div class="charts-3col" style="margin-bottom:14px">
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">Finding Status</span></div>
+          <div class="card-body">
+            <div class="chart-wrap chart-wrap-sm"><canvas id="statusChart"></canvas></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">Top Affected Agents</span></div>
+          <div class="card-body"><div class="chart-wrap chart-wrap-sm"><canvas id="agentsChart"></canvas></div></div>
+        </div>
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">Category Breakdown</span></div>
+          <div class="card-body"><div class="chart-wrap chart-wrap-sm"><canvas id="categoryChart"></canvas></div></div>
+        </div>
+      </div>
+
+      <!-- SLA Compliance -->
+      <div class="charts-2col" style="margin-bottom:20px">
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">SLA Compliance by Severity</span></div>
+          <div class="card-body" id="sla-bars">
+            <div class="empty-state" style="padding:20px"><p>Loading SLA data…</p></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">SLA Breach — Urgent Findings</span>
+            <button class="link-btn" onclick="showPanel('findings',document.getElementById('nav-findings'));filterSLABreach()">View all →</button>
+          </div>
+          <div class="card-body" id="sla-breach-list">
+            <div class="empty-state" style="padding:20px"><p>No SLA breaches</p></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recent Critical Findings -->
       <div class="section-hdr-row">
-        <span class="section-hdr-title">Recent Findings</span>
-        <button class="link-btn" onclick="showPanel('jarvis',document.getElementById('nav-jarvis'))">View all →</button>
+        <span class="section-hdr-title">Recent Critical & High Findings</span>
+        <button class="link-btn" onclick="showPanel('findings',document.getElementById('nav-findings'))">View all findings →</button>
       </div>
-      <div id="ov-findings-list">
-        <div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view findings</p></div>
+      <div id="dash-recent-findings">
+        <div class="empty-state"><div class="empty-icon">⬡</div><p>Loading findings…</p></div>
       </div>
     </div>
 
-    <!-- ── AGENTS ────────────────────────────────────────────────────────── -->
+    <!-- ══ FINDINGS PANEL ═════════════════════════════════════════════════ -->
+    <div class="panel" id="panel-findings">
+
+      <!-- Filter Bar -->
+      <div class="filter-bar" id="findings-filter-bar">
+        <input type="text" id="flt-search" placeholder="Search findings, CVEs, IPs…" oninput="debounceFindingsLoad()">
+        <select id="flt-severity" onchange="loadFindings()">
+          <option value="">All Severities</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+          <option value="info">Info</option>
+        </select>
+        <select id="flt-status" onchange="loadFindings()">
+          <option value="">All Statuses</option>
+          <option value="new">New</option>
+          <option value="triaging">Triaging</option>
+          <option value="investigating">Investigating</option>
+          <option value="in_remediation">In Remediation</option>
+          <option value="remediated">Remediated</option>
+          <option value="verified">Verified</option>
+          <option value="false_positive">False Positive</option>
+          <option value="accepted_risk">Accepted Risk</option>
+        </select>
+        <select id="flt-category" onchange="loadFindings()">
+          <option value="">All Categories</option>
+          <option value="port">Port</option>
+          <option value="process">Process</option>
+          <option value="connection">Connection</option>
+          <option value="service">Service</option>
+          <option value="app">App</option>
+          <option value="package">Package</option>
+          <option value="user">User</option>
+          <option value="binary">Binary</option>
+          <option value="config">Config</option>
+          <option value="task">Task</option>
+          <option value="security">Security</option>
+        </select>
+        <select id="flt-sla" onchange="loadFindings()">
+          <option value="">SLA: All</option>
+          <option value="breached">SLA Breached</option>
+        </select>
+        <div class="filter-sep"></div>
+        <button class="filter-clear" onclick="clearFilters()">✕ Clear</button>
+        <span class="filter-count" id="findings-count-label">Loading…</span>
+      </div>
+
+      <!-- Bulk Action Bar (hidden until rows selected) -->
+      <div class="bulk-bar" id="bulk-bar" style="display:none">
+        <span class="bulk-sel-count" id="bulk-count">0 selected</span>
+        <div class="bulk-actions-row">
+          <button class="bulk-btn" onclick="bulkAssign()">Assign</button>
+          <button class="bulk-btn" onclick="bulkStatus()">Change Status</button>
+          <button class="bulk-btn" onclick="bulkEscalate()">🔴 Escalate</button>
+          <button class="bulk-btn" onclick="bulkFalsePositive()">Mark FP</button>
+          <button class="bulk-btn bulk-btn-danger" onclick="bulkClose()">Close All</button>
+        </div>
+        <button class="bulk-clear" onclick="clearSelection()" title="Clear selection">×</button>
+      </div>
+
+      <!-- Findings Table -->
+      <div class="findings-table-wrap">
+        <table class="findings-tbl" id="findings-table">
+          <thead>
+            <tr>
+              <th class="tbl-check"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)"></th>
+              <th onclick="setSortBy('severity')">Severity</th>
+              <th class="tbl-title" onclick="setSortBy('score')">Finding <span style="color:var(--text-dim)">▼</span></th>
+              <th>Agent</th>
+              <th>Category</th>
+              <th>MITRE</th>
+              <th>Assignee</th>
+              <th onclick="setSortBy('sla_due')">SLA</th>
+              <th>Status</th>
+              <th>First Seen</th>
+              <th style="text-align:right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="findings-tbody">
+            <tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text-dim)">Loading findings…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pagination-row">
+        <span id="findings-page-info" style="color:var(--text-sub);font-size:12px"></span>
+        <div class="page-btns" id="findings-pagination"></div>
+      </div>
+    </div>
+
+    <!-- ══ AGENTS PANEL ═══════════════════════════════════════════════════ -->
     <div class="panel" id="panel-agents">
-      <div id="agents-list-view">
-        <div class="section-hdr-row mb-16"><span class="section-hdr-title">Enrolled Agents</span></div>
-        <div class="table-wrap">
-          <table class="data-table">
-            <thead><tr><th>Status</th><th>Agent ID</th><th>Name</th><th>IP</th><th>Last Seen</th><th>Sections</th></tr></thead>
-            <tbody id="agentsTableBody"><tr><td colspan="6" class="td-loading">Loading…</td></tr></tbody>
-          </table>
-        </div>
+      <div class="section-hdr-row" style="margin-top:0">
+        <span class="section-hdr-title">Enrolled Agents</span>
+        <span id="agent-count-label" style="font-size:12px;color:var(--text-sub)"></span>
       </div>
-      <div id="agent-detail-view" style="display:none">
-        <div class="detail-nav">
-          <button class="back-btn" onclick="closeAgentDetail()">
-            <svg width="14" height="14" viewBox="0 0 14 14"><path d="M9 2L4 7l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-            Back
-          </button>
-          <span class="detail-title" id="detail-agent-title"></span>
+      <div class="agent-grid" id="agent-grid">
+        <div class="empty-state"><div class="empty-icon">⬡</div><p>Loading agents…</p></div>
+      </div>
+
+      <!-- Agent detail section -->
+      <div id="agent-detail" style="display:none;margin-top:20px">
+        <div class="section-hdr-row">
+          <span class="section-hdr-title" id="agent-detail-name">Agent Details</span>
+          <button class="link-btn" onclick="document.getElementById('agent-detail').style.display='none'">Hide ×</button>
         </div>
-        <div class="sec-tabs" id="sectionTabs"></div>
-        <div id="sectionData">
-          <div class="empty-state"><div class="empty-icon">▦</div><p>Select a section</p></div>
+        <div class="charts-2col">
+          <div class="card">
+            <div class="card-hdr"><span class="card-title">CPU Usage</span><span class="card-sub" id="cpu-latest"></span></div>
+            <div class="card-body"><div class="chart-wrap"><canvas id="cpuChart"></canvas></div></div>
+          </div>
+          <div class="card">
+            <div class="card-hdr"><span class="card-title">Memory Usage</span><span class="card-sub" id="mem-latest"></span></div>
+            <div class="card-body"><div class="chart-wrap"><canvas id="memChart"></canvas></div></div>
+          </div>
         </div>
+        <div class="section-hdr-row" style="margin-top:16px">
+          <span class="section-hdr-title">Agent Findings Summary</span>
+        </div>
+        <div id="agent-findings-summary"></div>
       </div>
     </div>
 
-    <!-- ── JARVIS FINDINGS ───────────────────────────────────────────────── -->
-    <div class="panel" id="panel-jarvis">
-      <!-- Hero row -->
-      <div class="jarvis-hero">
-        <div class="risk-ring-card">
-          <svg class="risk-svg" viewBox="0 0 120 120">
-            <circle class="ring-bg" cx="60" cy="60" r="52"/>
-            <circle class="ring-fill" id="riskRing" cx="60" cy="60" r="52"
-              stroke-dasharray="326.7" stroke-dashoffset="326.7"/>
-          </svg>
-          <div class="ring-center">
-            <div class="ring-score" id="riskScore">0.0</div>
-            <div class="ring-label">/ 10</div>
-          </div>
-          <div class="risk-status" id="riskStatus">—</div>
-        </div>
-        <div class="hero-stats">
-          <div class="hero-stat">
-            <div class="hs-val" id="ji-active">—</div>
-            <div class="hs-label">Active Findings</div>
-          </div>
-          <div class="hero-stat">
-            <div class="hs-val hs-red" id="ji-crithigh">—</div>
-            <div class="hs-label">Critical + High</div>
-          </div>
-          <div class="hero-stat">
-            <div class="hs-val" id="ji-scans">—</div>
-            <div class="hs-label">Total Scans</div>
-          </div>
-          <div class="hero-stat">
-            <div class="hs-val hs-sm" id="ji-updated">—</div>
-            <div class="hs-label">Last Updated</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Severity pills -->
-      <div class="sev-bar">
-        <div class="sev-pill-card sev-critical" onclick="filterPill('critical',this)" data-sev="critical">
-          <div class="spc-count" id="sev-critical">0</div>
-          <div class="spc-label">Critical</div>
-        </div>
-        <div class="sev-pill-card sev-high" onclick="filterPill('high',this)" data-sev="high">
-          <div class="spc-count" id="sev-high">0</div>
-          <div class="spc-label">High</div>
-        </div>
-        <div class="sev-pill-card sev-medium" onclick="filterPill('medium',this)" data-sev="medium">
-          <div class="spc-count" id="sev-medium">0</div>
-          <div class="spc-label">Medium</div>
-        </div>
-        <div class="sev-pill-card sev-low" onclick="filterPill('low',this)" data-sev="low">
-          <div class="spc-count" id="sev-low">0</div>
-          <div class="spc-label">Low</div>
-        </div>
-        <div class="sev-pill-card sev-info" onclick="filterPill('info',this)" data-sev="info">
-          <div class="spc-count" id="sev-info">0</div>
-          <div class="spc-label">Info</div>
-        </div>
-      </div>
-
-      <!-- Controls -->
-      <div class="findings-controls">
-        <div class="search-box">
-          <svg width="14" height="14" viewBox="0 0 16 16" style="color:#94A3B8;flex-shrink:0"><circle cx="6.5" cy="6.5" r="4.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 10l3.5 3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-          <input type="text" id="findingSearch" placeholder="Search findings…" oninput="onSearchInput(this.value)">
-        </div>
-        <button class="btn-ghost" onclick="refreshJarvis()">↻ Refresh</button>
-      </div>
-
-      <div id="findingsList">
-        <div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view findings</p></div>
-      </div>
-
-      <div class="pager" id="findingsPager" style="display:none">
-        <button class="pager-btn" id="prevPage" onclick="changePage(-1)">← Prev</button>
-        <span class="pager-info" id="pageInfo"></span>
-        <button class="pager-btn" id="nextPage" onclick="changePage(1)">Next →</button>
-      </div>
-    </div>
-
-    <!-- ── ATTACK CHAINS ─────────────────────────────────────────────────── -->
+    <!-- ══ CORRELATIONS PANEL ═════════════════════════════════════════════ -->
     <div class="panel" id="panel-correlations">
-      <div class="section-hdr-row mb-16">
+      <div class="section-hdr-row" style="margin-top:0">
         <span class="section-hdr-title">Attack Chain Correlations</span>
-        <span class="section-hdr-sub">Multi-signal threats detected by the cross-section correlation engine</span>
+        <span id="corr-count-label" style="font-size:12px;color:var(--text-sub)"></span>
       </div>
-      <div class="corr-kpi-row" id="corr-kpi-row" style="display:none">
-        <div class="corr-kpi" id="ck-total"><div class="ck-val">—</div><div class="ck-label">Active Chains</div></div>
-        <div class="corr-kpi corr-kpi-red" id="ck-critical"><div class="ck-val">—</div><div class="ck-label">Critical</div></div>
-        <div class="corr-kpi corr-kpi-orange" id="ck-high"><div class="ck-val">—</div><div class="ck-label">High</div></div>
-        <div class="corr-kpi" id="ck-score"><div class="ck-val">—</div><div class="ck-label">Max Score</div></div>
-      </div>
-      <div id="corrList">
-        <div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view attack chains</p></div>
+      <div id="corr-list">
+        <div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view correlations</p></div>
       </div>
     </div>
 
-    <!-- ── TIMELINE ──────────────────────────────────────────────────────── -->
+    <!-- ══ TIMELINE PANEL ═════════════════════════════════════════════════ -->
     <div class="panel" id="panel-timeline">
-      <div class="section-hdr-row mb-16"><span class="section-hdr-title">Change Timeline</span></div>
-      <div id="timelineList">
-        <div class="empty-state"><div class="empty-icon">◷</div><p>Select an agent to view timeline</p></div>
-      </div>
-    </div>
-
-    <!-- ── RAW TELEMETRY ─────────────────────────────────────────────────── -->
-    <div class="panel" id="panel-rawdata">
-      <div class="raw-topbar">
-        <div>
-          <div class="section-hdr-title">Raw Telemetry</div>
-          <div class="section-hdr-sub">All ingested agent data before Jarvis — every field, every snapshot</div>
-        </div>
-        <div class="raw-controls">
-          <select id="rawViewMode" onchange="onRawViewChange()" class="raw-mode-select">
-            <option value="table">Table</option>
-            <option value="cards">Field Cards</option>
-            <option value="json">Raw JSON</option>
+      <div class="section-hdr-row" style="margin-top:0">
+        <span class="section-hdr-title">Change Timeline</span>
+        <div style="display:flex;gap:8px">
+          <select id="tl-category" style="padding:4px 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text-sub);font-size:12px" onchange="loadTimeline()">
+            <option value="">All Categories</option>
+            <option value="port">Ports</option>
+            <option value="process">Processes</option>
+            <option value="connection">Connections</option>
+            <option value="service">Services</option>
+            <option value="app">Apps</option>
+            <option value="package">Packages</option>
+            <option value="user">Users</option>
+            <option value="binary">Binaries</option>
+            <option value="security">Security</option>
           </select>
         </div>
       </div>
-
-      <!-- Section tabs -->
-      <div class="sec-tabs" id="rawSectionTabs">
-        <span class="text-faint" style="padding:6px 0;font-size:12px">Select an agent first</span>
+      <div id="tl-list">
+        <div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view timeline</p></div>
       </div>
+    </div>
 
-      <!-- Meta + snapshot navigator -->
-      <div id="rawMetaBar" class="raw-meta-bar" style="display:none">
-        <div class="rmb-item"><span class="rmb-key">Section</span><span class="rmb-val" id="rawMetaSection">—</span></div>
-        <div class="rmb-item"><span class="rmb-key">Snapshots</span><span class="rmb-val" id="rawMetaCount">—</span></div>
-        <div class="rmb-item"><span class="rmb-key">Collected</span><span class="rmb-val" id="rawMetaTs">—</span></div>
-        <div class="rmb-item"><span class="rmb-key">OS</span><span class="rmb-val" id="rawMetaOs">—</span></div>
-        <div class="rmb-item"><span class="rmb-key">Host</span><span class="rmb-val" id="rawMetaHost">—</span></div>
-        <div class="rmb-item" style="margin-left:auto">
-          <div class="snap-nav">
-            <button class="snap-btn" id="snapPrev" onclick="changeSnap(-1)">‹</button>
-            <span class="snap-info" id="snapInfo">1 / 1</span>
-            <button class="snap-btn" id="snapNext" onclick="changeSnap(1)">›</button>
-            <button class="snap-btn snap-all" id="snapAll" onclick="toggleAllSnapshots()">All</button>
-          </div>
-        </div>
+    <!-- ══ RAW TELEMETRY PANEL ════════════════════════════════════════════ -->
+    <div class="panel" id="panel-rawdata">
+      <div class="section-hdr-row" style="margin-top:0">
+        <span class="section-hdr-title">Raw Telemetry</span>
       </div>
-
-      <div id="rawSectionData">
-        <div class="empty-state"><div class="empty-icon">▦</div><p>Select an agent to view raw telemetry</p></div>
+      <div class="section-picker" id="section-picker"></div>
+      <div id="rawdata-content">
+        <div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent and a section</p></div>
       </div>
     </div>
 
   </div><!-- /content -->
 </div><!-- /main -->
+
 </div><!-- /shell -->
 
-<!-- ══ FINDING MODAL ════════════════════════════════════════════════════════ -->
-<div class="modal-backdrop" id="findingModal" onclick="closeModal(event)">
-  <div class="modal-box">
-    <div class="modal-top">
-      <div class="modal-top-left">
-        <span class="sev-tag" id="modalSevTag">info</span>
-        <span class="modal-category" id="modalCategory"></span>
-      </div>
-      <button class="modal-x" onclick="closeModal()">✕</button>
+<!-- ══ WORKBENCH (Analyst slide-in) ══════════════════════════════════════════ -->
+<div id="workbench-overlay" onclick="closeWorkbench()"></div>
+<div id="workbench">
+  <div class="wb-header">
+    <div class="wb-header-row1">
+      <span id="wb-sev-badge" class="badge badge-critical">CRITICAL</span>
+      <span id="wb-priority-badge" class="priority-badge" style="display:none">🔴 ESCALATED</span>
+      <button class="wb-close" onclick="closeWorkbench()" title="Close">×</button>
     </div>
-    <div class="modal-title" id="modalTitle">Finding Detail</div>
-    <div class="modal-desc" id="modalDesc"></div>
-
-    <div class="modal-grid" id="modalGrid"></div>
-
-    <div id="modalMitre" style="display:none" class="modal-section">
-      <div class="modal-section-label">MITRE ATT&CK</div>
-      <div id="modalMitreContent"></div>
+    <div id="wb-title" class="wb-title">Finding Title</div>
+    <div class="wb-meta-row" style="margin-top:8px">
+      <span id="wb-status-badge" class="status-badge sb-new">new</span>
+      <span id="wb-category-tag" class="wb-tag"></span>
+      <span id="wb-mitre-tag" class="wb-tag mono"></span>
+      <span id="wb-sla-pill" class="sla-pill sla-ok">SLA OK</span>
     </div>
-
-    <div id="modalRec" style="display:none" class="modal-section">
-      <div class="modal-section-label">Recommendation</div>
-      <div class="rec-box" id="modalRecText"></div>
-    </div>
-
-    <div class="modal-section">
-      <div class="modal-section-label">Evidence</div>
-      <pre class="evidence-pre" id="modalEvidence"></pre>
-    </div>
-
-    <div class="modal-footer">
-      <button class="btn-resolve" onclick="resolveCurrentFinding()">Mark Resolved</button>
-      <button class="btn-close-modal" onclick="closeModal()">Close</button>
+    <div class="wb-actions-row">
+      <select id="wb-status-select" class="wb-select" onchange="wbUpdateStatus(this.value)">
+        <option value="">Change Status…</option>
+        <option value="triaging">→ Triaging</option>
+        <option value="investigating">→ Investigating</option>
+        <option value="in_remediation">→ In Remediation</option>
+        <option value="remediated">→ Remediated</option>
+        <option value="verified">→ Verified</option>
+        <option value="closed">→ Close</option>
+        <option value="false_positive">→ False Positive</option>
+        <option value="accepted_risk">→ Accept Risk</option>
+        <option value="duplicate">→ Duplicate</option>
+      </select>
+      <button class="wb-action-btn" onclick="wbAssignModal()">Assign Analyst</button>
+      <button class="wb-action-btn" onclick="wbToggleEscalate()">Escalate</button>
+      <button class="wb-action-btn wb-action-primary" onclick="wbTab('comments')">Add Note</button>
     </div>
   </div>
-</div>
 
-<!-- ══ SCRIPTS ═══════════════════════════════════════════════════════════════ -->
+  <div class="wb-tabs">
+    <button class="wb-tab active" id="wbt-overview"  onclick="wbTab('overview')">Overview</button>
+    <button class="wb-tab"        id="wbt-evidence"  onclick="wbTab('evidence')">Evidence</button>
+    <button class="wb-tab"        id="wbt-activity"  onclick="wbTab('activity')">Activity <span id="wb-act-count" class="nav-badge" style="margin-left:4px">0</span></button>
+    <button class="wb-tab"        id="wbt-comments"  onclick="wbTab('comments')">Comments <span id="wb-cmt-count" class="nav-badge" style="margin-left:4px">0</span></button>
+  </div>
+
+  <!-- Overview Tab -->
+  <div class="wb-tab-content active" id="wbc-overview">
+    <div class="wb-grid-2">
+      <div class="wb-field">
+        <div class="wb-field-label">First Detected</div>
+        <div class="wb-field-val" id="wb-first-seen">—</div>
+      </div>
+      <div class="wb-field">
+        <div class="wb-field-label">Last Detected</div>
+        <div class="wb-field-val" id="wb-last-seen">—</div>
+      </div>
+      <div class="wb-field">
+        <div class="wb-field-label">Agent</div>
+        <div class="wb-field-val" id="wb-agent">—</div>
+      </div>
+      <div class="wb-field">
+        <div class="wb-field-label">Detection Source</div>
+        <div class="wb-field-val mono" id="wb-source">—</div>
+      </div>
+    </div>
+    <div class="wb-field">
+      <div class="wb-field-label">Risk Score</div>
+      <div class="wb-score-bar">
+        <div class="score-bar" style="flex:1"><div class="score-fill" id="wb-score-fill" style="width:0%;background:var(--c-crit)"></div></div>
+        <span id="wb-score-val" style="font-size:13px;font-weight:700;color:var(--text);min-width:28px;text-align:right">0</span>
+        <span style="font-size:11px;color:var(--text-dim)">/10</span>
+      </div>
+    </div>
+    <div class="wb-field">
+      <div class="wb-field-label">Description</div>
+      <div class="wb-field-val" id="wb-description" style="line-height:1.6"></div>
+    </div>
+    <div class="wb-field" id="wb-rec-wrap">
+      <div class="wb-field-label">Recommendation</div>
+      <div class="wb-field-val" id="wb-recommendation" style="line-height:1.6;color:var(--text-sub)"></div>
+    </div>
+    <div class="wb-field">
+      <div class="wb-field-label">Tags</div>
+      <div class="wb-field-tags" id="wb-tags"></div>
+    </div>
+    <div class="wb-field" id="wb-cve-wrap" style="display:none">
+      <div class="wb-field-label">CVE IDs</div>
+      <div class="wb-field-val mono" id="wb-cve-ids" style="color:var(--c-crit)"></div>
+    </div>
+    <div class="divider"></div>
+    <div class="wb-field">
+      <div class="wb-field-label">Analyst Notes</div>
+      <textarea class="wb-textarea" id="wb-notes-input" placeholder="Add investigation notes…" onblur="wbSaveNotes()"></textarea>
+    </div>
+    <div class="wb-field">
+      <div class="wb-field-label">Assigned Analyst</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input class="wb-input" id="wb-assignee-input" placeholder="analyst@company.com" style="max-width:280px" onblur="wbSaveAssignee()">
+        <button class="row-btn row-btn-primary" onclick="wbSaveAssignee()">Save</button>
+      </div>
+    </div>
+    <div class="wb-field">
+      <div class="wb-field-label">SLA Deadline</div>
+      <div class="wb-field-val" id="wb-sla-detail">—</div>
+    </div>
+  </div>
+
+  <!-- Evidence Tab -->
+  <div class="wb-tab-content" id="wbc-evidence">
+    <div class="wb-field-label" style="margin-bottom:8px">Raw Evidence Data</div>
+    <pre class="json-viewer" id="wb-evidence-json">{}</pre>
+  </div>
+
+  <!-- Activity Tab -->
+  <div class="wb-tab-content" id="wbc-activity">
+    <div class="activity-list" id="wb-activity-list">
+      <div class="empty-state" style="padding:30px"><p>No activity yet</p></div>
+    </div>
+  </div>
+
+  <!-- Comments Tab -->
+  <div class="wb-tab-content" id="wbc-comments">
+    <div class="comment-list" id="wb-comment-list">
+      <div class="empty-state" style="padding:20px"><p>No comments yet</p></div>
+    </div>
+    <div class="divider"></div>
+    <div class="comment-form">
+      <div class="wb-field-label">Add Analyst Note</div>
+      <div class="comment-form-row">
+        <input class="wb-input" id="wb-cmt-analyst" placeholder="Your name" style="max-width:160px" value="Analyst">
+      </div>
+      <textarea class="wb-textarea" id="wb-cmt-text" placeholder="Write your analysis, remediation steps, or notes…" style="min-height:100px"></textarea>
+      <div>
+        <button class="submit-btn" onclick="wbSubmitComment()">Add Note</button>
+      </div>
+    </div>
+  </div>
+</div><!-- /workbench -->
+
+<!-- Toast Container -->
+<div id="toast-container"></div>
+
+<!-- ══ JAVASCRIPT ═════════════════════════════════════════════════════════════ -->
 <script>
-'use strict';
-
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── State ──────────────────────────────────────────────────────────────────
 const S = {
-  agent: '', win: '1h', panel: 'overview',
-  jarvis: { severity: 'all', search: '', page: 0, pageSize: 20, total: 0, findings: [] },
-  openFindingId: null, ws: null, charts: {},
+  agents: [],
+  selectedAgent: '',
+  timeWindow: '1h',
+  ws: null,
+  charts: {},
+  currentFinding: null,
+  selectedFindingIds: new Set(),
+  findingsOffset: 0,
+  findingsTotal: 0,
+  findingsPageSize: 50,
+  sortBy: 'score',
+  debounceTimer: null,
+  refreshTimer: null,
 };
 
-const $ = id => document.getElementById(id);
-const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const SEV_COLORS = {
+  critical: '#EF4444', high: '#F97316', medium: '#EAB308',
+  low: '#22C55E', info: '#64748B',
+};
+const STATUS_LABELS = {
+  new: 'New', triaging: 'Triaging', investigating: 'Investigating',
+  in_remediation: 'In Remediation', remediated: 'Remediated',
+  verified: 'Verified', closed: 'Closed', false_positive: 'False Positive',
+  accepted_risk: 'Accepted Risk', duplicate: 'Duplicate',
+};
 
-function safeJson(s, fallback = null) {
-  if (s === null || s === undefined) return fallback;
-  if (typeof s !== 'string') return s;
-  try { return JSON.parse(s); } catch(e) { return fallback; }
+// ── API helpers ────────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch('/api/v1' + path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+const GET   = (p)    => api('GET',   p);
+const PATCH = (p, b) => api('PATCH', p, b);
+const POST  = (p, b) => api('POST',  p, b);
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function toast(msg, type = 'info', duration = 3000) {
+  const c = document.getElementById('toast-container');
+  const t = document.createElement('div');
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(() => { t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(() => t.remove(), 300); }, duration);
 }
 
-function API(path) {
-  return fetch(path).then(r => {
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
-  });
-}
-
+// ── Time helpers ──────────────────────────────────────────────────────────
 function fmtTs(ts) {
   if (!ts) return '—';
-  const d = new Date(ts * 1000), now = Date.now(), diff = now - d.getTime();
-  if (diff < 60000) return 'just now';
-  if (diff < 3600000) return Math.floor(diff/60000) + 'm ago';
-  if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
-  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  const d = new Date(ts * 1000);
+  return d.toLocaleString(undefined, { month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+}
+function relTime(ts) {
+  if (!ts) return '—';
+  const diff = Date.now()/1000 - ts;
+  if (diff < 60)   return Math.round(diff)+'s ago';
+  if (diff < 3600) return Math.round(diff/60)+'m ago';
+  if (diff < 86400) return Math.round(diff/3600)+'h ago';
+  return Math.round(diff/86400)+'d ago';
+}
+function fmtSLADue(sla_due, status) {
+  const closed = ['closed','false_positive','accepted_risk','verified','duplicate'];
+  if (closed.includes(status)) return { label:'—', cls:'sla-closed' };
+  if (!sla_due) return { label:'—', cls:'sla-ok' };
+  const rem = sla_due - Date.now()/1000;
+  if (rem < 0) return { label:'BREACHED '+fmtRemaining(-rem)+' ago', cls:'sla-breached' };
+  if (rem < 7200) return { label:'⚠ '+fmtRemaining(rem), cls:'sla-warning' };
+  return { label: fmtRemaining(rem), cls:'sla-ok' };
+}
+function fmtRemaining(secs) {
+  if (secs < 3600) return Math.round(secs/60)+'m';
+  if (secs < 86400) return Math.round(secs/3600)+'h';
+  return Math.round(secs/86400)+'d';
 }
 
-function winSecs() {
-  return {'5m':300,'15m':900,'1h':3600,'8h':28800,'1d':86400,'7d':604800,'30d':2592000}[S.win]||3600;
-}
-
-const SEV_COLOR = {critical:'#EF4444',high:'#F97316',medium:'#EAB308',low:'#3B82F6',info:'#64748B'};
-const SEV_BG    = {critical:'rgba(239,68,68,0.1)',high:'rgba(249,115,22,0.1)',medium:'rgba(234,179,8,0.1)',low:'rgba(59,130,246,0.1)',info:'rgba(100,116,139,0.1)'};
-
-// ── Navigation ─────────────────────────────────────────────────────────────────
-const PANEL_TITLES = {overview:'Overview',agents:'Agents',jarvis:'Jarvis Findings',correlations:'Attack Chains',timeline:'Timeline',rawdata:'Raw Telemetry'};
-
-function showPanel(name, btn) {
+// ── Navigation ────────────────────────────────────────────────────────────
+function showPanel(id, btn) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  const panel = $('panel-' + name);
-  if (panel) { panel.classList.add('active'); panel.classList.add('panel-enter'); setTimeout(()=>panel.classList.remove('panel-enter'),400); }
+  document.getElementById('panel-'+id).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
-  S.panel = name;
-  $('topbar-title').textContent = PANEL_TITLES[name] || name;
-  if (name === 'jarvis' && S.agent)       loadJarvis();
-  if (name === 'timeline' && S.agent)     loadTimeline();
-  if (name === 'rawdata' && S.agent)      loadRawSections();
-  if (name === 'correlations' && S.agent) loadCorrelations();
-  if (name === 'agents')   loadAgents();
-  if (name === 'overview') loadOverview();
+  const titles = { dashboard:'Dashboard', findings:'Findings', agents:'Agents',
+                   correlations:'Attack Chains', timeline:'Timeline', rawdata:'Raw Telemetry' };
+  document.getElementById('topbar-title').textContent = titles[id] || id;
+  if (id === 'dashboard') loadDashboard();
+  if (id === 'findings')  loadFindings();
+  if (id === 'agents')    loadAgents();
+  if (id === 'correlations') loadCorrelations();
+  if (id === 'timeline')  loadTimeline();
 }
 
-// ── Agent select ──────────────────────────────────────────────────────────────
-async function populateAgentSelect() {
-  try {
-    const agents = await API('/api/v1/agents');
-    const list = Array.isArray(agents) ? agents : (agents.agents || []);
-    const sel = $('agentSelect');
-    list.forEach(a => {
-      const o = document.createElement('option');
-      o.value = a.agent_id;
-      o.textContent = (a.name || a.agent_id);
-      sel.appendChild(o);
-    });
-    $('ov-agents').textContent = list.length;
-    if (list.length) { sel.value = list[0].agent_id; onAgentChange(list[0].agent_id); }
-  } catch(e) { console.warn('agents:', e); }
-}
-
+// ── Agent selector ────────────────────────────────────────────────────────
 function onAgentChange(aid) {
-  S.agent = aid;
-  $('topbar-agent').textContent = aid || 'No agent selected';
-  connectWS(aid);
-  if (S.panel === 'overview')     loadOverview();
-  if (S.panel === 'jarvis')       loadJarvis();
-  if (S.panel === 'timeline')     loadTimeline();
-  if (S.panel === 'rawdata')      loadRawSections();
-  if (S.panel === 'correlations') loadCorrelations();
+  S.selectedAgent = aid;
+  const a = S.agents.find(x => x.agent_id === aid);
+  document.getElementById('topbar-agent').textContent = a ? a.name || aid : 'All Agents';
+  // Refresh current panel
+  const active = document.querySelector('.panel.active');
+  if (active) {
+    const id = active.id.replace('panel-','');
+    if (id === 'correlations') loadCorrelations();
+    if (id === 'timeline')     loadTimeline();
+    if (id === 'rawdata')      loadSections();
+    if (id === 'agents')       loadAgentDetail(aid);
+    if (id === 'findings')     loadFindings();
+  }
 }
 
+// ── Time window ────────────────────────────────────────────────────────────
 function setWin(w, btn) {
-  S.win = w;
+  S.timeWindow = w;
   document.querySelectorAll('.tp').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  if (S.panel === 'rawdata' && S.agent) loadRawSections();
-  if (S.panel === 'overview') loadCharts();
+  if (btn) btn.classList.add('active');
+  manualRefresh();
+}
+function winToSecs() {
+  const m = { '1h':3600,'8h':28800,'1d':86400,'7d':604800,'30d':2592000 };
+  return m[S.timeWindow] || 3600;
 }
 
-function manualRefresh() {
-  const svg = $('refreshSvg');
-  svg.style.animation = 'spin 0.7s linear';
-  setTimeout(()=>svg.style.animation='',700);
-  if (S.panel === 'overview')     loadOverview();
-  if (S.panel === 'jarvis')       loadJarvis();
-  if (S.panel === 'timeline')     loadTimeline();
-  if (S.panel === 'rawdata' && S.agent) { const t = document.querySelector('#rawSectionTabs .sec-tab.active'); if(t) t.click(); }
-  if (S.panel === 'correlations') loadCorrelations();
-  if (S.panel === 'agents')       loadAgents();
-}
-
-// ══ OVERVIEW ══════════════════════════════════════════════════════════════════
-async function loadOverview() {
-  if (!S.agent) return;
+// ── Dashboard ─────────────────────────────────────────────────────────────
+async function loadDashboard() {
   try {
-    const sum = await API('/api/v1/jarvis/' + S.agent + '/summary');
-    $('ov-critical').textContent = sum.critical || 0;
-    $('ov-high').textContent     = sum.high || 0;
-    $('ov-total').textContent    = sum.total || 0;
-    animateNum('ov-critical'); animateNum('ov-high'); animateNum('ov-total');
-    const data = await API('/api/v1/jarvis/' + S.agent + '/findings?limit=5&offset=0');
-    const list = (data.findings || []).slice(0,5);
-    $('ov-findings-list').innerHTML = list.length
-      ? list.map((f,i) => miniCard(f,i)).join('')
-      : '<div class="empty-state"><div class="empty-icon">✓</div><p>No active findings</p></div>';
-  } catch(e) { console.warn('overview:', e); }
-  loadCharts();
+    const data = await GET('/soc/dashboard');
+    renderDashboardKPI(data.kpi || {});
+    renderTrendChart(data.daily_trend || []);
+    renderSeverityChart(data.severity_dist || []);
+    renderStatusChart(data.status_dist || []);
+    renderTopAgentsChart(data.top_agents || []);
+    renderCategoryChart(data.category_dist || []);
+    renderSLABars(data.sla_compliance || {});
+    renderSLABreachList();
+    renderRecentFindings();
+  } catch(e) {
+    console.warn('Dashboard load error:', e);
+  }
 }
 
-function animateNum(id) {
-  const el = $(id); if (!el) return;
-  const end = parseInt(el.textContent)||0;
-  let cur = 0; const step = Math.ceil(end/20);
-  const t = setInterval(()=>{ cur=Math.min(cur+step,end); el.textContent=cur; if(cur>=end)clearInterval(t); },30);
+function renderDashboardKPI(k) {
+  const set = (id, v) => { const el = document.getElementById(id); if(el) el.textContent = v ?? '0'; };
+  set('kpi-total',         k.total_active ?? 0);
+  set('kpi-critical',      k.critical ?? 0);
+  set('kpi-high',          k.high ?? 0);
+  set('kpi-sla-breached',  k.sla_breached ?? 0);
+  set('kpi-resolved-today',k.resolved_today ?? 0);
+  set('kpi-agents',        k.agents_with_findings ?? 0);
+
+  // Update nav badge
+  const crit = (k.critical||0) + (k.high||0);
+  const badge = document.getElementById('findings-badge');
+  if (badge) {
+    badge.textContent = crit;
+    badge.style.display = crit > 0 ? 'flex' : 'none';
+  }
+  if ((k.sla_breached||0) > 0) {
+    document.getElementById('kpi-breach-card')?.classList.add('kpi-breach');
+  }
 }
 
-async function loadCharts() {
-  if (!S.agent) return;
-  try {
-    const start = Math.floor(Date.now()/1000) - winSecs();
-    const rows = await API('/api/v1/agents/' + S.agent + '/metrics?start=' + start + '&window=' + S.win).catch(()=>null);
-    if (!rows || !rows.length) return;
-    const cpuVals = [], memVals = [], labels = [];
-    rows.forEach(r => {
-      const d = (r.data && typeof r.data === 'object') ? r.data : {};
-      cpuVals.push(parseFloat(d.cpu_pct || d.cpu || 0));
-      memVals.push(parseFloat(d.mem_pct || d.memory_pct || d.memory || 0));
-      labels.push(fmtTs(r.collected_at));
-    });
-    const latest_cpu = cpuVals[cpuVals.length-1];
-    const latest_mem = memVals[memVals.length-1];
-    if ($('cpu-latest')) $('cpu-latest').textContent = isNaN(latest_cpu)?'':'Current: '+latest_cpu.toFixed(1)+'%';
-    if ($('mem-latest')) $('mem-latest').textContent = isNaN(latest_mem)?'':'Current: '+latest_mem.toFixed(1)+'%';
-    renderChart('cpuChart', labels, cpuVals, '#3B82F6', 'CPU %');
-    renderChart('memChart', labels, memVals, '#10B981', 'Memory %');
-  } catch(e) {}
-}
-
-function renderChart(id, labels, data, color, label) {
-  const canvas = $(id); if (!canvas) return;
-  if (S.charts[id]) S.charts[id].destroy();
-  S.charts[id] = new Chart(canvas, {
-    type: 'line',
-    data: { labels, datasets: [{ data, label, borderColor: color, backgroundColor: color+'18', borderWidth: 2, pointRadius: 0, fill: true, tension: 0.4 }] },
+function renderTrendChart(trend) {
+  const ctx = document.getElementById('trendChart');
+  if (!ctx) return;
+  if (S.charts.trend) { S.charts.trend.destroy(); }
+  S.charts.trend = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: trend.map(t => t.date),
+      datasets: [
+        { label:'Critical', data: trend.map(t=>t.critical), backgroundColor:'rgba(239,68,68,.7)',   borderRadius:2 },
+        { label:'High',     data: trend.map(t=>t.high),     backgroundColor:'rgba(249,115,22,.7)',  borderRadius:2 },
+        { label:'Medium',   data: trend.map(t=>t.medium),   backgroundColor:'rgba(234,179,8,.7)',   borderRadius:2 },
+        { label:'Low',      data: trend.map(t=>t.low),      backgroundColor:'rgba(34,197,94,.5)',   borderRadius:2 },
+      ]
+    },
     options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false, backgroundColor: '#1E293B', titleColor: '#F1F5F9', bodyColor: '#94A3B8', borderColor: '#334155', borderWidth: 1, padding: 10 } },
+      responsive:true, maintainAspectRatio:false,
+      plugins: { legend:{ labels:{ color:'#94A3B8', font:{size:11}, boxWidth:10 } } },
       scales: {
-        x: { display: false },
-        y: { beginAtZero: true, max: 100, grid: { color: '#1E293B' }, ticks: { color: '#64748B', font: { size: 11 }, callback: v => v + '%' } }
-      },
+        x: { stacked:true, grid:{color:'rgba(255,255,255,.04)'}, ticks:{color:'#94A3B8',font:{size:10}} },
+        y: { stacked:true, grid:{color:'rgba(255,255,255,.04)'}, ticks:{color:'#94A3B8',font:{size:10}} },
+      }
+    }
+  });
+  const total = trend.reduce((s,t) => s + t.critical + t.high + t.medium + t.low, 0);
+  const el = document.getElementById('trend-sub');
+  if (el) el.textContent = total + ' new in 7 days';
+}
+
+function renderSeverityChart(dist) {
+  const ctx = document.getElementById('severityChart'); if(!ctx) return;
+  if (S.charts.severity) S.charts.severity.destroy();
+  const order = ['critical','high','medium','low','info'];
+  const data = order.map(s => dist.find(d=>d.severity===s)?.count || 0);
+  S.charts.severity = new Chart(ctx, {
+    type:'doughnut',
+    data: { labels:['Critical','High','Medium','Low','Info'],
+            datasets:[{ data, backgroundColor: order.map(s=>SEV_COLORS[s]+'cc'), borderWidth:0, hoverOffset:4 }] },
+    options: { responsive:true, maintainAspectRatio:false, cutout:'68%',
+               plugins:{ legend:{display:false}, tooltip:{callbacks:{label:c=>` ${c.label}: ${c.parsed}`}} } }
+  });
+  // Legend
+  const leg = document.getElementById('sev-legend');
+  if (leg) {
+    leg.innerHTML = order.map((s,i) => `
+      <div style="display:flex;align-items:center;justify-content:space-between;font-size:12px">
+        <span style="display:flex;align-items:center;gap:6px">
+          <span style="width:8px;height:8px;border-radius:2px;background:${SEV_COLORS[s]};flex-shrink:0"></span>
+          <span style="color:var(--text-sub)">${s.charAt(0).toUpperCase()+s.slice(1)}</span>
+        </span>
+        <span style="font-weight:600;color:var(--text)">${data[i]}</span>
+      </div>`).join('');
+  }
+}
+
+function renderStatusChart(dist) {
+  const ctx = document.getElementById('statusChart'); if(!ctx) return;
+  if (S.charts.status) S.charts.status.destroy();
+  const colors = { new:'#64748B', triaging:'#3B82F6', investigating:'#8B5CF6',
+    in_remediation:'#F97316', remediated:'#10B981', verified:'#22C55E',
+    closed:'#374151', false_positive:'#94A3B8', accepted_risk:'#F59E0B', duplicate:'#4B5563' };
+  S.charts.status = new Chart(ctx, {
+    type:'doughnut',
+    data: { labels: dist.map(d=>STATUS_LABELS[d.status]||d.status),
+            datasets:[{ data:dist.map(d=>d.count),
+              backgroundColor:dist.map(d=>(colors[d.status]||'#64748B')+'cc'), borderWidth:0 }] },
+    options:{ responsive:true, maintainAspectRatio:false, cutout:'60%',
+              plugins:{legend:{labels:{color:'#94A3B8',font:{size:10},boxWidth:8}}} }
+  });
+}
+
+function renderTopAgentsChart(agents) {
+  const ctx = document.getElementById('agentsChart'); if(!ctx) return;
+  if (S.charts.agents) S.charts.agents.destroy();
+  S.charts.agents = new Chart(ctx, {
+    type:'bar',
+    data: {
+      labels: agents.map(a => a.agent_id.length>12 ? a.agent_id.slice(-12) : a.agent_id),
+      datasets: [
+        { label:'Critical', data:agents.map(a=>a.critical||0), backgroundColor:'rgba(239,68,68,.7)', borderRadius:2 },
+        { label:'High',     data:agents.map(a=>a.high||0),     backgroundColor:'rgba(249,115,22,.7)', borderRadius:2 },
+        { label:'Other',    data:agents.map(a=>(a.total||0)-(a.critical||0)-(a.high||0)), backgroundColor:'rgba(59,130,246,.5)', borderRadius:2 },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false, indexAxis:'y',
+      plugins:{legend:{labels:{color:'#94A3B8',font:{size:10},boxWidth:8}}},
+      scales:{
+        x:{stacked:true,grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#94A3B8',font:{size:10}}},
+        y:{stacked:true,grid:{display:false},ticks:{color:'#94A3B8',font:{size:10}}},
+      }
     }
   });
 }
 
-// ══ AGENTS ════════════════════════════════════════════════════════════════════
+function renderCategoryChart(dist) {
+  const ctx = document.getElementById('categoryChart'); if(!ctx) return;
+  if (S.charts.category) S.charts.category.destroy();
+  const palette = ['#3B82F6','#8B5CF6','#F97316','#EF4444','#EAB308','#22C55E','#10B981','#06B6D4','#F59E0B','#84CC16'];
+  S.charts.category = new Chart(ctx, {
+    type:'doughnut',
+    data: { labels:dist.map(d=>d.category), datasets:[{ data:dist.map(d=>d.count),
+      backgroundColor:dist.map((_,i)=>palette[i%palette.length]+'cc'), borderWidth:0 }] },
+    options:{ responsive:true, maintainAspectRatio:false, cutout:'55%',
+              plugins:{legend:{labels:{color:'#94A3B8',font:{size:10},boxWidth:8}}} }
+  });
+}
+
+function renderSLABars(compliance) {
+  const container = document.getElementById('sla-bars');
+  if (!container) return;
+  const sevs = ['critical','high','medium','low'];
+  if (!Object.keys(compliance).length) {
+    container.innerHTML = '<div class="empty-state" style="padding:20px"><p>No SLA data</p></div>';
+    return;
+  }
+  const colors = { critical:'#EF4444', high:'#F97316', medium:'#EAB308', low:'#22C55E' };
+  container.innerHTML = '<div class="sla-bar-row">' + sevs.map(sev => {
+    const d = compliance[sev] || { total:0, on_time:0, breached:0 };
+    const pct = d.total > 0 ? Math.round(d.on_time / d.total * 100) : 100;
+    const barColor = pct >= 90 ? '#22C55E' : pct >= 70 ? '#EAB308' : '#EF4444';
+    return `<div class="sla-bar-item">
+      <div class="sla-bar-label" style="color:${colors[sev]}">${sev.charAt(0).toUpperCase()+sev.slice(1)}</div>
+      <div class="sla-bar-track"><div class="sla-bar-fill" style="width:${pct}%;background:${barColor}"></div></div>
+      <div class="sla-bar-pct">${pct}% (${d.breached||0} breach)</div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
+async function renderSLABreachList() {
+  const container = document.getElementById('sla-breach-list');
+  if (!container) return;
+  try {
+    const data = await GET('/soc/sla');
+    const items = [...(data.breached||[]), ...(data.warning||[])].slice(0, 6);
+    if (!items.length) {
+      container.innerHTML = '<div style="padding:12px;text-align:center;color:var(--text-dim);font-size:12px">✓ No SLA breaches</div>';
+      return;
+    }
+    container.innerHTML = items.map(f => `
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="openWorkbench(${f.id})">
+        <span class="badge badge-${f.severity}">${f.severity.toUpperCase().slice(0,4)}</span>
+        <span style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.title||'')}</span>
+        <span class="sla-pill ${f.sla_status==='breached'?'sla-breached':'sla-warning'}" style="font-size:10px">${f.sla_status==='breached'?'BREACH':'WARN'}</span>
+      </div>`).join('');
+  } catch(e) { container.innerHTML = '<div style="padding:12px;color:var(--text-dim);font-size:12px">Unable to load</div>'; }
+}
+
+async function renderRecentFindings() {
+  const container = document.getElementById('dash-recent-findings');
+  if (!container) return;
+  try {
+    const data = await GET('/soc/findings?severity=critical&limit=5&active_only=true');
+    const highs = await GET('/soc/findings?severity=high&limit=5&active_only=true');
+    const items = [...(data.findings||[]), ...(highs.findings||[])].slice(0,8);
+    if (!items.length) {
+      container.innerHTML = '<div class="empty-state"><div class="empty-icon">✓</div><p>No critical or high findings</p></div>';
+      return;
+    }
+    container.innerHTML = `<div style="display:flex;flex-direction:column;gap:6px">` +
+      items.map(f => renderFindingRow(f)).join('') + `</div>`;
+  } catch(e) {}
+}
+
+function renderFindingRow(f) {
+  const sla = fmtSLADue(f.sla_due, f.status);
+  return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r2);cursor:pointer;transition:var(--t)" onmouseenter="this.style.borderColor='var(--border2)'" onmouseleave="this.style.borderColor='var(--border)'" onclick="openWorkbench(${f.id})">
+    <span class="badge badge-${f.severity}">${f.severity.toUpperCase().slice(0,4)}</span>
+    <div style="flex:1;min-width:0">
+      <div class="ellipsis" style="font-size:12.5px;font-weight:500;color:var(--text)">${escHtml(f.title||'')}</div>
+      <div style="font-size:11px;color:var(--text-sub)">${escHtml(f.agent_id||'')} · ${escHtml(f.category||'')}</div>
+    </div>
+    <span class="status-badge sb-${f.status||'new'}">${STATUS_LABELS[f.status||'new']||f.status}</span>
+    <span class="sla-pill ${sla.cls}" style="font-size:10.5px">${sla.label}</span>
+  </div>`;
+}
+
+// ── Findings ──────────────────────────────────────────────────────────────
+let _findingsDebounce;
+function debounceFindingsLoad() {
+  clearTimeout(_findingsDebounce);
+  _findingsDebounce = setTimeout(loadFindings, 350);
+}
+
+function clearFilters() {
+  document.getElementById('flt-search').value = '';
+  document.getElementById('flt-severity').value = '';
+  document.getElementById('flt-status').value = '';
+  document.getElementById('flt-category').value = '';
+  document.getElementById('flt-sla').value = '';
+  S.findingsOffset = 0;
+  loadFindings();
+}
+
+function filterSLABreach() {
+  document.getElementById('flt-sla').value = 'breached';
+  loadFindings();
+}
+
+function setSortBy(col) {
+  S.sortBy = col; S.findingsOffset = 0;
+  loadFindings();
+}
+
+async function loadFindings() {
+  const search   = document.getElementById('flt-search')?.value.trim() || '';
+  const severity = document.getElementById('flt-severity')?.value || '';
+  const status   = document.getElementById('flt-status')?.value || '';
+  const category = document.getElementById('flt-category')?.value || '';
+  const slaFlt   = document.getElementById('flt-sla')?.value || '';
+
+  let url = `/soc/findings?limit=${S.findingsPageSize}&offset=${S.findingsOffset}&sort_by=${S.sortBy}&active_only=false`;
+  if (search)   url += `&search=${encodeURIComponent(search)}`;
+  if (severity) url += `&severity=${severity}`;
+  if (status)   url += `&status=${status}`;
+  if (category) url += `&category=${category}`;
+  if (slaFlt === 'breached') url += `&sla_breached=true`;
+  if (S.selectedAgent) url += `&agent_id=${encodeURIComponent(S.selectedAgent)}`;
+
+  const tbody = document.getElementById('findings-tbody');
+  tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:30px;color:var(--text-dim)">Loading…</td></tr>`;
+
+  try {
+    const data = await GET(url);
+    const rows = data.findings || [];
+    S.findingsTotal = data.count || rows.length;
+    renderFindingsTable(rows);
+    updateFindingsPagination(data.count);
+    const lbl = document.getElementById('findings-count-label');
+    if (lbl) lbl.textContent = `${S.findingsTotal} findings`;
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:30px;color:var(--c-crit)">Error loading findings</td></tr>`;
+  }
+}
+
+function renderFindingsTable(rows) {
+  const tbody = document.getElementById('findings-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text-dim)">No findings match the current filters</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(f => {
+    const sla = fmtSLADue(f.sla_due, f.status);
+    const sel = S.selectedFindingIds.has(f.id);
+    const assignee = f.assignee ? `<div style="display:flex;align-items:center;gap:5px"><span class="tbl-assignee-avatar">${(f.assignee||'?')[0].toUpperCase()}</span><span class="tbl-assignee ellipsis" style="max-width:80px">${escHtml(f.assignee)}</span></div>` : `<span style="color:var(--text-dim)">—</span>`;
+    const mitre = f.mitre_technique ? `<span class="tbl-mitre">${escHtml(f.mitre_technique)}</span>` : '—';
+    const priority = f.priority ? '<span title="Escalated" style="color:var(--c-crit);margin-right:4px">🔴</span>' : '';
+    return `<tr class="${sel?'selected':''}" data-id="${f.id}">
+      <td class="tbl-check"><input type="checkbox" ${sel?'checked':''} onchange="toggleFindingSelect(${f.id},this.checked)"></td>
+      <td><span class="badge badge-${f.severity}">${f.severity.toUpperCase().slice(0,4)}</span></td>
+      <td class="tbl-title">
+        ${priority}<span class="tbl-title-text">${escHtml(f.title||'')}</span>
+        <span class="tbl-title-sub">${escHtml(f.agent_id||'')} · score ${(f.score||0).toFixed(1)}</span>
+      </td>
+      <td style="font-size:11.5px;color:var(--text-sub)">${escHtml(f.agent_id||'')}</td>
+      <td><span class="wb-tag" style="font-size:11px">${escHtml(f.category||'')}</span></td>
+      <td>${mitre}</td>
+      <td>${assignee}</td>
+      <td><span class="sla-pill ${sla.cls}" style="font-size:11px">${sla.label}</span></td>
+      <td><span class="status-badge sb-${f.status||'new'}">${STATUS_LABELS[f.status||'new']||f.status}</span></td>
+      <td style="font-size:11px;color:var(--text-sub);white-space:nowrap">${relTime(f.first_detected_at)}</td>
+      <td>
+        <div class="tbl-row-actions">
+          <button class="row-btn row-btn-primary" onclick="openWorkbench(${f.id})">Investigate</button>
+          <button class="row-btn" onclick="quickAssign(${f.id})">Assign</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function updateFindingsPagination(total) {
+  const info = document.getElementById('findings-page-info');
+  const pages = document.getElementById('findings-pagination');
+  if (!info || !pages) return;
+  const start = S.findingsOffset + 1;
+  const end   = Math.min(S.findingsOffset + S.findingsPageSize, total || 0);
+  info.textContent = total ? `Showing ${start}–${end} of ${total}` : '';
+  const totalPages = Math.ceil((total||0) / S.findingsPageSize);
+  const curPage    = Math.floor(S.findingsOffset / S.findingsPageSize);
+  let html = `<button class="page-btn" onclick="findingsPage(${curPage-1})" ${curPage===0?'disabled':''}>‹ Prev</button>`;
+  for (let i = Math.max(0,curPage-2); i < Math.min(totalPages, curPage+3); i++) {
+    html += `<button class="page-btn ${i===curPage?'active':''}" onclick="findingsPage(${i})">${i+1}</button>`;
+  }
+  html += `<button class="page-btn" onclick="findingsPage(${curPage+1})" ${curPage>=totalPages-1?'disabled':''}>Next ›</button>`;
+  pages.innerHTML = html;
+}
+
+function findingsPage(page) {
+  const totalPages = Math.ceil(S.findingsTotal / S.findingsPageSize);
+  if (page < 0 || page >= totalPages) return;
+  S.findingsOffset = page * S.findingsPageSize;
+  loadFindings();
+}
+
+// Selection & Bulk Actions
+function toggleSelectAll(cb) {
+  document.querySelectorAll('#findings-tbody input[type=checkbox]').forEach(c => {
+    const id = parseInt(c.closest('tr').dataset.id);
+    if (cb.checked) { S.selectedFindingIds.add(id); c.checked = true; c.closest('tr').classList.add('selected'); }
+    else { S.selectedFindingIds.delete(id); c.checked = false; c.closest('tr').classList.remove('selected'); }
+  });
+  updateBulkBar();
+}
+
+function toggleFindingSelect(id, checked) {
+  if (checked) S.selectedFindingIds.add(id); else S.selectedFindingIds.delete(id);
+  document.querySelector(`tr[data-id="${id}"]`)?.classList.toggle('selected', checked);
+  updateBulkBar();
+}
+
+function clearSelection() {
+  S.selectedFindingIds.clear();
+  document.querySelectorAll('#findings-tbody input[type=checkbox]').forEach(c => {
+    c.checked = false; c.closest('tr').classList.remove('selected');
+  });
+  document.getElementById('select-all').checked = false;
+  updateBulkBar();
+}
+
+function updateBulkBar() {
+  const bar = document.getElementById('bulk-bar');
+  const cnt = document.getElementById('bulk-count');
+  const n = S.selectedFindingIds.size;
+  if (bar) bar.style.display = n > 0 ? 'flex' : 'none';
+  if (cnt) cnt.textContent = `${n} finding${n!==1?'s':''} selected`;
+}
+
+async function bulkAssign() {
+  const analyst = prompt('Assign to (analyst name):');
+  if (!analyst) return;
+  await executeBulk('assign', analyst);
+}
+async function bulkStatus() {
+  const s = prompt('Set status (triaging/investigating/in_remediation/remediated/verified/closed):');
+  if (!s) return;
+  await executeBulk('status', s);
+}
+async function bulkEscalate() { await executeBulk('escalate', null); }
+async function bulkClose()    { if (!confirm(`Close ${S.selectedFindingIds.size} findings?`)) return; await executeBulk('close', null); }
+async function bulkFalsePositive() { if (!confirm('Mark as false positive?')) return; await executeBulk('false_positive', null); }
+
+async function executeBulk(action, value) {
+  if (!S.selectedFindingIds.size) return;
+  try {
+    const r = await POST('/soc/bulk', {
+      finding_ids: [...S.selectedFindingIds],
+      action, value: value || undefined,
+    });
+    toast(`Updated ${r.updated} findings`, 'success');
+    clearSelection();
+    loadFindings();
+    loadDashboard();
+  } catch(e) {
+    toast('Bulk action failed: ' + e.message, 'error');
+  }
+}
+
+async function quickAssign(id) {
+  const analyst = prompt('Assign to (analyst name):');
+  if (!analyst) return;
+  try {
+    await PATCH(`/soc/findings/${id}`, { assignee: analyst });
+    toast('Assigned to ' + analyst, 'success');
+    loadFindings();
+  } catch(e) { toast('Assign failed', 'error'); }
+}
+
+// ── Workbench ─────────────────────────────────────────────────────────────
+async function openWorkbench(id) {
+  try {
+    const f = await GET(`/soc/findings/${id}`);
+    S.currentFinding = f;
+    populateWorkbench(f);
+    document.getElementById('workbench-overlay').classList.add('open');
+    document.getElementById('workbench').classList.add('open');
+    wbTab('overview');
+  } catch(e) {
+    toast('Failed to load finding', 'error');
+  }
+}
+
+function closeWorkbench() {
+  document.getElementById('workbench-overlay').classList.remove('open');
+  document.getElementById('workbench').classList.remove('open');
+  S.currentFinding = null;
+}
+
+function populateWorkbench(f) {
+  const sla = fmtSLADue(f.sla_due, f.status);
+  setText('wb-title', f.title || '');
+  setHtml('wb-sev-badge', `<span class="badge badge-${f.severity}">${f.severity.toUpperCase()}</span>`);
+  setHtml('wb-status-badge', `<span class="status-badge sb-${f.status||'new'}">${STATUS_LABELS[f.status||'new']||f.status}</span>`);
+  setText('wb-category-tag', f.category || '');
+  document.getElementById('wb-category-tag').className = 'wb-tag';
+  setText('wb-mitre-tag', f.mitre_technique || '');
+  document.getElementById('wb-mitre-tag').style.display = f.mitre_technique ? 'inline' : 'none';
+  setHtml('wb-sla-pill', `<span class="sla-pill ${sla.cls}">${sla.label}</span>`);
+  document.getElementById('wb-priority-badge').style.display = f.priority ? 'inline' : 'none';
+  setText('wb-first-seen', fmtTs(f.first_detected_at));
+  setText('wb-last-seen',  fmtTs(f.last_detected_at));
+  setText('wb-agent',  f.agent_id || '—');
+  setText('wb-source', f.source || '—');
+  setText('wb-description', f.description || '—');
+  const rec = document.getElementById('wb-recommendation');
+  if (rec) {
+    rec.textContent = f.recommendation || 'No specific recommendation available.';
+    document.getElementById('wb-rec-wrap').style.display = f.recommendation ? '' : 'none';
+  }
+  // Score
+  const score = Math.min(10, f.score || 0);
+  const fill = document.getElementById('wb-score-fill');
+  if (fill) {
+    fill.style.width = (score / 10 * 100) + '%';
+    fill.style.background = score >= 8 ? 'var(--c-crit)' : score >= 6 ? 'var(--c-high)' : score >= 4 ? 'var(--c-med)' : 'var(--c-low)';
+  }
+  setText('wb-score-val', score.toFixed(1));
+  // Tags
+  const tags = safeJsonParse(f.tags, []);
+  setHtml('wb-tags', tags.map(t=>`<span class="wb-tag">${escHtml(t)}</span>`).join('') || '<span class="text-muted">—</span>');
+  // CVE
+  const cves = safeJsonParse(f.cve_ids, []);
+  if (cves.length) {
+    document.getElementById('wb-cve-wrap').style.display = '';
+    setText('wb-cve-ids', cves.join(', '));
+  } else {
+    document.getElementById('wb-cve-wrap').style.display = 'none';
+  }
+  // Evidence
+  const ev = safeJsonParse(f.evidence, f.evidence || {});
+  document.getElementById('wb-evidence-json').textContent = JSON.stringify(ev, null, 2);
+  // Notes & Assignee
+  document.getElementById('wb-notes-input').value   = f.analyst_notes || '';
+  document.getElementById('wb-assignee-input').value = f.assignee || '';
+  // SLA detail
+  setText('wb-sla-detail', f.sla_due ? fmtTs(f.sla_due) + ' (' + sla.label + ')' : 'No SLA set');
+  // Activity & Comments
+  renderWBActivity(f.activity || []);
+  renderWBComments(f.comments || []);
+}
+
+function setText(id, v) { const el = document.getElementById(id); if(el) el.textContent = v; }
+function setHtml(id, v) { const el = document.getElementById(id); if(el) el.innerHTML = v; }
+
+function wbTab(tab) {
+  ['overview','evidence','activity','comments'].forEach(t => {
+    document.getElementById('wbt-'+t)?.classList.toggle('active', t===tab);
+    document.getElementById('wbc-'+t)?.classList.toggle('active', t===tab);
+  });
+}
+
+async function wbUpdateStatus(status) {
+  if (!status || !S.currentFinding) return;
+  document.getElementById('wb-status-select').value = '';
+  try {
+    const f = await PATCH(`/soc/findings/${S.currentFinding.id}`, { status });
+    S.currentFinding = { ...S.currentFinding, ...f };
+    populateWorkbench(S.currentFinding);
+    toast(`Status → ${STATUS_LABELS[status]||status}`, 'success');
+    loadFindings(); loadDashboard();
+  } catch(e) { toast('Update failed', 'error'); }
+}
+
+async function wbSaveNotes() {
+  if (!S.currentFinding) return;
+  const notes = document.getElementById('wb-notes-input').value;
+  try {
+    await PATCH(`/soc/findings/${S.currentFinding.id}`, { analyst_notes: notes });
+  } catch(e) {}
+}
+
+async function wbSaveAssignee() {
+  if (!S.currentFinding) return;
+  const assignee = document.getElementById('wb-assignee-input').value.trim();
+  try {
+    await PATCH(`/soc/findings/${S.currentFinding.id}`, { assignee });
+    toast('Assignee saved', 'success');
+    loadFindings();
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+async function wbToggleEscalate() {
+  if (!S.currentFinding) return;
+  const priority = S.currentFinding.priority ? 0 : 1;
+  try {
+    const f = await PATCH(`/soc/findings/${S.currentFinding.id}`, { priority });
+    S.currentFinding = { ...S.currentFinding, priority };
+    document.getElementById('wb-priority-badge').style.display = priority ? 'inline' : 'none';
+    toast(priority ? '🔴 Escalated' : 'De-escalated', priority ? 'info' : 'success');
+    loadFindings();
+  } catch(e) { toast('Failed', 'error'); }
+}
+
+async function wbSubmitComment() {
+  if (!S.currentFinding) return;
+  const analyst = document.getElementById('wb-cmt-analyst').value.trim() || 'Analyst';
+  const comment = document.getElementById('wb-cmt-text').value.trim();
+  if (!comment) return;
+  try {
+    await POST(`/soc/findings/${S.currentFinding.id}/comments`, { analyst, comment });
+    document.getElementById('wb-cmt-text').value = '';
+    // Reload activity + comments
+    const f = await GET(`/soc/findings/${S.currentFinding.id}`);
+    S.currentFinding = f;
+    renderWBActivity(f.activity || []);
+    renderWBComments(f.comments || []);
+    toast('Note added', 'success');
+  } catch(e) { toast('Failed to add comment', 'error'); }
+}
+
+function renderWBActivity(activity) {
+  const list = document.getElementById('wb-activity-list');
+  const count = document.getElementById('wb-act-count');
+  if (count) count.textContent = activity.length;
+  if (!list) return;
+  if (!activity.length) {
+    list.innerHTML = '<div class="empty-state" style="padding:20px"><p>No activity yet</p></div>';
+    return;
+  }
+  const icons = { created:'🔵', status_change:'🔄', assigned:'👤', commented:'💬', escalated:'🔴', resolved:'✅' };
+  const actClasses = { created:'act-created', status_change:'act-status', assigned:'act-assigned',
+                       commented:'act-commented', escalated:'act-escalated', resolved:'act-resolved' };
+  list.innerHTML = [...activity].reverse().map(a => {
+    const icon = icons[a.action] || '•';
+    const cls  = actClasses[a.action] || 'act-created';
+    let detail = '';
+    if (a.action === 'status_change') detail = `${STATUS_LABELS[a.old_value]||a.old_value} → ${STATUS_LABELS[a.new_value]||a.new_value}`;
+    else if (a.action === 'assigned') detail = `to ${a.new_value}`;
+    else if (a.action === 'commented') detail = a.detail ? a.detail.slice(0,80) + (a.detail.length>80?'…':'') : '';
+    else if (a.new_value) detail = a.new_value;
+    return `<div class="activity-item">
+      <div class="activity-dot ${cls}">${icon}</div>
+      <div class="activity-body">
+        <div class="activity-action"><strong>${escHtml(a.actor||'system')}</strong> ${escHtml(a.action.replace('_',' '))}</div>
+        ${detail?`<div class="activity-detail">${escHtml(detail)}</div>`:''}
+      </div>
+      <div class="activity-time">${relTime(a.created_at)}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderWBComments(comments) {
+  const list = document.getElementById('wb-comment-list');
+  const count = document.getElementById('wb-cmt-count');
+  if (count) count.textContent = comments.length;
+  if (!list) return;
+  if (!comments.length) {
+    list.innerHTML = '<div class="empty-state" style="padding:20px"><p>No comments yet</p></div>';
+    return;
+  }
+  list.innerHTML = comments.map(c => `
+    <div class="comment-item">
+      <div class="comment-header">
+        <div class="comment-avatar">${(c.analyst||'?')[0].toUpperCase()}</div>
+        <div class="comment-analyst">${escHtml(c.analyst||'analyst')}</div>
+        <div class="comment-time">${relTime(c.created_at)}</div>
+      </div>
+      <div class="comment-text">${escHtml(c.comment||'')}</div>
+    </div>`).join('');
+}
+
+// ── Agents Panel ──────────────────────────────────────────────────────────
 async function loadAgents() {
   try {
-    const agents = await API('/api/v1/agents');
-    const list = Array.isArray(agents) ? agents : (agents.agents || []);
+    const data = await GET('/agents');
+    const agents = Array.isArray(data) ? data : (data.agents || data || []);
+    S.agents = agents;
+    updateAgentSelect(agents);
+    const grid = document.getElementById('agent-grid');
+    const lbl  = document.getElementById('agent-count-label');
+    if (lbl) lbl.textContent = agents.length + ' agents';
+    if (!agents.length) {
+      grid.innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>No agents enrolled yet</p></div>';
+      return;
+    }
     const now = Date.now()/1000;
-    $('agentsTableBody').innerHTML = list.length
-      ? list.map(a => {
-          const online = a.last_seen && (now - a.last_seen) < 300;
-          return `<tr class="tr-link" onclick="openAgentDetail('${esc(a.agent_id)}')">
-            <td><span class="status-dot ${online?'online':'offline'}"></span>${online?'Online':'Offline'}</td>
-            <td class="mono">${esc(a.agent_id)}</td>
-            <td>${esc(a.name||'—')}</td>
-            <td class="mono">${esc(a.last_ip||'—')}</td>
-            <td>${fmtTs(a.last_seen)}</td>
-            <td>${a.section_count||'—'}</td>
-          </tr>`;
-        }).join('')
-      : '<tr><td colspan="6" class="td-empty">No agents enrolled</td></tr>';
-  } catch(e) {}
-}
-
-async function openAgentDetail(aid) {
-  $('agents-list-view').style.display = 'none';
-  $('agent-detail-view').style.display = 'block';
-  $('detail-agent-title').textContent = aid;
-  try {
-    const data = await API('/api/v1/agents/' + aid + '/sections');
-    const sections = Array.isArray(data.sections) ? data.sections : Object.keys(data);
-    $('sectionTabs').innerHTML = sections.map((s,i) =>
-      `<button class="sec-tab${i===0?' active':''}" onclick="loadAgentSection('${esc(aid)}','${esc(s)}',this)">${esc(s)}</button>`
-    ).join('');
-    if (sections.length) loadAgentSection(aid, sections[0], $('sectionTabs').querySelector('.sec-tab'));
-  } catch(e) { $('sectionTabs').innerHTML = '<span class="text-faint" style="font-size:12px">No sections</span>'; }
-}
-
-function closeAgentDetail() {
-  $('agents-list-view').style.display = 'block';
-  $('agent-detail-view').style.display = 'none';
-}
-
-async function loadAgentSection(aid, section, btn) {
-  document.querySelectorAll('#sectionTabs .sec-tab').forEach(t => t.classList.remove('active'));
-  if (btn) btn.classList.add('active');
-  $('sectionData').innerHTML = '<div class="empty-state"><div class="empty-icon spin-icon">⟳</div><p>Loading…</p></div>';
-  try {
-    const start = Math.floor(Date.now()/1000) - winSecs();
-    const rows = await API('/api/v1/agents/' + aid + '/' + section + '?start=' + start + '&window=' + S.win);
-    const arr = Array.isArray(rows) ? rows : (rows.data || rows.rows || []);
-    if (!arr.length) {
-      $('sectionData').innerHTML = '<div class="empty-state"><div class="empty-icon">▦</div><p>No data in this time range — try a wider window</p></div>';
-      return;
-    }
-    const latest = arr[0];
-    const payload = latest.data;
-    renderSectionTable('sectionData', payload, latest);
-  } catch(e) {
-    $('sectionData').innerHTML = '<div class="empty-state"><div class="empty-icon">✗</div><p>Failed to load section</p></div>';
-  }
-}
-
-// Renders section payload — handles array (list) vs object
-function renderSectionTable(targetId, payload, meta) {
-  const el = $(targetId);
-  // Section metadata bar
-  const metaHtml = `<div class="section-meta-row">
-    <span class="smr-item"><span class="smr-k">Collected</span><span class="smr-v">${fmtTs(meta.collected_at)}</span></span>
-    ${meta.os ? `<span class="smr-item"><span class="smr-k">OS</span><span class="smr-v">${esc(meta.os)}</span></span>` : ''}
-    ${meta.hostname ? `<span class="smr-item"><span class="smr-k">Host</span><span class="smr-v">${esc(meta.hostname)}</span></span>` : ''}
-  </div>`;
-
-  if (Array.isArray(payload)) {
-    if (!payload.length) { el.innerHTML = metaHtml + '<div class="empty-state" style="margin-top:12px"><p>Empty list</p></div>'; return; }
-    const keySet = new Set();
-    payload.forEach(r => { if (typeof r==='object'&&r) Object.keys(r).forEach(k=>keySet.add(k)); });
-    const keys = [...keySet];
-    el.innerHTML = metaHtml + `<div class="table-wrap"><table class="data-table">
-      <thead><tr>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}</tr></thead>
-      <tbody>${payload.map(r => `<tr>${keys.map(k=>{
-        const v = r[k];
-        if (v===null||v===undefined) return '<td class="td-null">—</td>';
-        if (typeof v==='object') return `<td class="td-obj" title="${esc(JSON.stringify(v))}">{${Object.keys(v).length} keys}</td>`;
-        const sv = String(v);
-        return `<td title="${esc(sv)}">${esc(sv.length>80?sv.slice(0,80)+'…':sv)}</td>`;
-      }).join('')}</tr>`).join('')}
-      </tbody></table></div>`;
-  } else if (payload && typeof payload === 'object') {
-    // Key-value grid
-    const entries = Object.entries(payload);
-    el.innerHTML = metaHtml + `<div class="kv-grid">${entries.map(([k,v])=>{
-      let display = '';
-      if (v===null||v===undefined) display = '<span class="kv-null">null</span>';
-      else if (typeof v==='boolean') display = `<span class="kv-bool ${v?'kv-true':'kv-false'}">${v}</span>`;
-      else if (typeof v==='number') display = `<span class="kv-num">${v}</span>`;
-      else if (typeof v==='object') {
-        const j = JSON.stringify(v,null,2);
-        display = `<details class="kv-obj-details"><summary>${Array.isArray(v)?v.length+' items':Object.keys(v).length+' keys'}</summary><pre class="kv-pre">${esc(j.length>400?j.slice(0,400)+'…':j)}</pre></details>`;
-      } else {
-        const sv = String(v);
-        display = `<span title="${esc(sv)}">${esc(sv.length>120?sv.slice(0,120)+'…':sv)}</span>`;
-      }
-      return `<div class="kv-row"><div class="kv-key">${esc(k)}</div><div class="kv-val">${display}</div></div>`;
-    }).join('')}</div>`;
-  } else {
-    el.innerHTML = metaHtml + `<pre class="raw-pre">${esc(String(payload))}</pre>`;
-  }
-}
-
-// ══ JARVIS FINDINGS ═══════════════════════════════════════════════════════════
-async function loadJarvis() {
-  if (!S.agent) { $('findingsList').innerHTML = '<div class="empty-state"><p>Select an agent first</p></div>'; return; }
-  await Promise.all([loadJarvisSummary(), fetchFindings()]);
-}
-
-async function loadJarvisSummary() {
-  try {
-    const s = await API('/api/v1/jarvis/' + S.agent + '/summary');
-    $('sev-critical').textContent = s.critical||0;
-    $('sev-high').textContent     = s.high||0;
-    $('sev-medium').textContent   = s.medium||0;
-    $('sev-low').textContent      = s.low||0;
-    $('sev-info').textContent     = s.info||0;
-    $('ji-active').textContent    = s.active||s.total||0;
-    $('ji-crithigh').textContent  = (s.critical||0)+(s.high||0);
-    $('ji-scans').textContent     = s.total||0;
-
-    const score = parseFloat(s.max_score||0);
-    $('riskScore').textContent = score.toFixed(1);
-    const pct = Math.min(score/10,1);
-    const circ = 2*Math.PI*52;
-    $('riskRing').style.strokeDashoffset = circ*(1-pct);
-    const c = score>=9?'#EF4444':score>=7?'#F97316':score>=4?'#EAB308':score>=2?'#3B82F6':'#10B981';
-    $('riskRing').style.stroke = c;
-    $('riskScore').style.color = c;
-    const labels = score>=9?'Critical Risk':score>=7?'High Risk':score>=4?'Medium Risk':score>=2?'Low Risk':'Clean';
-    $('riskStatus').textContent = labels;
-    $('riskStatus').style.background = SEV_BG[score>=9?'critical':score>=7?'high':score>=4?'medium':score>=2?'low':'info'];
-    $('riskStatus').style.color = c;
-
-    const urgent = (s.critical||0)+(s.high||0);
-    const badge = $('jarvis-badge');
-    if (urgent>0){ badge.style.display='inline'; badge.textContent=urgent; } else badge.style.display='none';
-  } catch(e) {}
-}
-
-async function fetchFindings() {
-  if (!S.agent) return;
-  const { severity, search, page, pageSize } = S.jarvis;
-  const offset = page * pageSize;
-  $('findingsList').innerHTML = '<div class="empty-state"><div class="empty-icon spin-icon">⟳</div><p>Loading…</p></div>';
-  try {
-    let data;
-    if (search) {
-      data = await API('/api/v1/jarvis/' + S.agent + '/search?q=' + encodeURIComponent(search) + '&limit=' + pageSize);
-      S.jarvis.findings = data.results||[];
-      S.jarvis.total    = data.count||0;
-    } else {
-      const sevQ = severity!=='all'?'&severity='+severity:'';
-      data = await API('/api/v1/jarvis/' + S.agent + '/findings?limit=' + pageSize + '&offset=' + offset + sevQ);
-      S.jarvis.findings = data.findings||[];
-      S.jarvis.total    = data.count||0;
-    }
-    renderFindings(S.jarvis.findings);
-    const pag = $('findingsPager');
-    if (S.jarvis.total > pageSize) {
-      pag.style.display='flex';
-      const tot = Math.ceil(S.jarvis.total/pageSize);
-      $('pageInfo').textContent = 'Page '+(page+1)+' / '+tot;
-      $('prevPage').disabled = page<=0;
-      $('nextPage').disabled = (page+1)>=tot;
-    } else pag.style.display='none';
-    if (S.jarvis.findings.length) $('ji-updated').textContent = fmtTs(S.jarvis.findings[0].last_detected_at);
-  } catch(e) {
-    $('findingsList').innerHTML = '<div class="empty-state"><p>Failed to load findings</p></div>';
-  }
-}
-
-function renderFindings(findings) {
-  if (!findings.length) {
-    $('findingsList').innerHTML = '<div class="empty-state"><div class="empty-icon">✓</div><p>No findings match this filter</p></div>';
-    return;
-  }
-  $('findingsList').innerHTML = findings.map((f,i) => findingCard(f,i)).join('');
-}
-
-function findingCard(f, idx) {
-  const sev   = f.severity||'info';
-  const score = parseFloat(f.score||0);
-  const tags  = safeJson(f.tags, []);
-  const cves  = safeJson(f.cve_ids, []);
-  const color = SEV_COLOR[sev]||'#64748B';
-  const delay = (idx*0.04).toFixed(2);
-  const scoreW = Math.max(4,(score/10)*100).toFixed(0);
-  const mitre = f.mitre_technique ? `<span class="chip chip-blue">${esc(f.mitre_technique)}</span>` : '';
-  const cveChips = cves.slice(0,2).map(c=>`<span class="chip chip-red">${esc(c)}</span>`).join('');
-  const tagChips = (tags||[]).slice(0,3).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
-
-  return `<div class="finding-card" data-sev="${esc(sev)}" style="animation-delay:${delay}s;--sev-c:${color}" onclick="openFinding(${f.id||0})">
-    <div class="fc-sev-bar"></div>
-    <div class="fc-body">
-      <div class="fc-top">
-        <span class="sev-tag sev-tag-${esc(sev)}">${esc(sev)}</span>
-        <span class="fc-category">${esc(f.category||'')}</span>
-        <span class="fc-time">${fmtTs(f.last_detected_at)}</span>
-      </div>
-      <div class="fc-title">${esc(f.title||'Untitled')}</div>
-      <div class="fc-desc">${esc((f.description||'').slice(0,160))}${(f.description||'').length>160?'…':''}</div>
-      <div class="fc-chips">${mitre}${cveChips}${tagChips}</div>
-      <div class="fc-score-row">
-        <div class="score-track"><div class="score-fill" style="width:${scoreW}%;background:${color}"></div></div>
-        <span class="score-label">${score.toFixed(1)}</span>
-      </div>
-    </div>
-  </div>`;
-}
-
-function miniCard(f, idx) {
-  const sev = f.severity||'info';
-  const color = SEV_COLOR[sev]||'#64748B';
-  return `<div class="mini-card" style="animation-delay:${(idx*0.06).toFixed(2)}s;border-left:3px solid ${color}">
-    <span class="sev-tag sev-tag-${esc(sev)}">${esc(sev)}</span>
-    <span class="mini-title">${esc(f.title||'')}</span>
-    <span class="mini-score" style="color:${color}">${parseFloat(f.score||0).toFixed(1)}</span>
-  </div>`;
-}
-
-function filterPill(sev, el) {
-  document.querySelectorAll('.sev-pill-card').forEach(c => c.classList.remove('active'));
-  S.jarvis.severity = S.jarvis.severity===sev ? 'all' : sev;
-  if (S.jarvis.severity !== 'all') el.classList.add('active');
-  S.jarvis.page = 0;
-  fetchFindings();
-}
-
-let _st;
-function onSearchInput(v) {
-  clearTimeout(_st);
-  _st = setTimeout(()=>{ S.jarvis.search=v.trim(); S.jarvis.page=0; fetchFindings(); }, 320);
-}
-
-function changePage(d) { S.jarvis.page=Math.max(0,S.jarvis.page+d); fetchFindings(); }
-function refreshJarvis() { loadJarvis(); }
-
-// ══ FINDING MODAL ═════════════════════════════════════════════════════════════
-async function openFinding(id) {
-  if (!id) return;
-  S.openFindingId = id;
-  let f = S.jarvis.findings.find(x=>x.id===id);
-  if (!f) { try { f = await API('/api/v1/jarvis/'+S.agent+'/findings/'+id); } catch(e){ return; } }
-  showModal(f);
-}
-
-function showModal(f) {
-  const sev = f.severity||'info';
-  $('modalSevTag').textContent = sev;
-  $('modalSevTag').className = 'sev-tag sev-tag-'+sev;
-  $('modalCategory').textContent = f.category||'';
-  $('modalTitle').textContent = f.title||'Finding';
-  $('modalDesc').textContent  = f.description||'';
-
-  const rows = [
-    ['Score',      (f.score||0).toFixed(1)+' / 10'],
-    ['Source',     f.source||'—'],
-    ['First seen', fmtTs(f.first_detected_at)],
-    ['Last seen',  fmtTs(f.last_detected_at)],
-    ['Scan count', f.scan_count||1],
-    ['CVEs',       (safeJson(f.cve_ids,[])||[]).join(', ')||'—'],
-    ['CVSS',       f.cvss_score ? f.cvss_score.toFixed(1) : '—'],
-  ];
-  $('modalGrid').innerHTML = rows.map(([l,v])=>`<div class="mg-label">${esc(l)}</div><div class="mg-val">${esc(String(v||'—'))}</div>`).join('');
-
-  const mitre = $('modalMitre'), mitreC = $('modalMitreContent');
-  if (f.mitre_technique) {
-    mitre.style.display='block';
-    mitreC.innerHTML = `<span class="chip chip-blue">${esc(f.mitre_technique)}</span> <span class="chip">${esc(f.mitre_tactic||'')}</span>`;
-  } else mitre.style.display='none';
-
-  const rec = $('modalRec'), recT = $('modalRecText');
-  if (f.recommendation) { rec.style.display='block'; recT.textContent=f.recommendation; }
-  else rec.style.display='none';
-
-  const ev = safeJson(f.evidence, f.evidence||{});
-  $('modalEvidence').textContent = typeof ev==='object' ? JSON.stringify(ev,null,2) : String(ev||'—');
-  $('findingModal').classList.add('open');
-}
-
-function closeModal(e) {
-  if (e && e.target !== $('findingModal')) return;
-  $('findingModal').classList.remove('open');
-  S.openFindingId = null;
-}
-document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
-
-async function resolveCurrentFinding() {
-  if (!S.openFindingId||!S.agent) return;
-  try {
-    await fetch('/api/v1/jarvis/'+S.agent+'/resolve/'+S.openFindingId,{method:'POST'});
-    closeModal(); loadJarvis();
-  } catch(e) {}
-}
-
-// ══ TIMELINE ══════════════════════════════════════════════════════════════════
-async function loadTimeline() {
-  if (!S.agent) { $('timelineList').innerHTML='<div class="empty-state"><p>Select an agent first</p></div>'; return; }
-  $('timelineList').innerHTML='<div class="empty-state"><div class="empty-icon spin-icon">⟳</div><p>Loading…</p></div>';
-  try {
-    const data = await API('/api/v1/jarvis/'+S.agent+'/timeline?limit=100');
-    const events = data.events||[];
-    if (!events.length) { $('timelineList').innerHTML='<div class="empty-state"><p>No changes recorded yet</p></div>'; return; }
-    $('timelineList').innerHTML = `<div class="tl-track">${events.map((ev,i)=>{
-      const t = ev.change_type||ev.event_type||'modified';
-      return `<div class="tl-item" style="animation-delay:${(i*0.03).toFixed(2)}s">
-        <div class="tl-line"></div>
-        <div class="tl-dot tl-dot-${esc(t)}"></div>
-        <div class="tl-card">
-          <div class="tl-top">
-            <span class="tl-badge tl-badge-${esc(t)}">${esc(t)}</span>
-            <span class="tl-title">${esc(ev.title||ev.category||'Change')}</span>
-            <span class="tl-time">${fmtTs(ev.detected_at||ev.ts)}</span>
-          </div>
-          ${ev.description?`<div class="tl-desc">${esc(ev.description)}</div>`:''}
+    grid.innerHTML = agents.map(a => {
+      const online = a.last_seen && (now - a.last_seen) < 120;
+      return `<div class="agent-card ${online?'online':'offline'}" onclick="loadAgentDetail('${a.agent_id}')">
+        <div class="agent-name">${escHtml(a.name||a.agent_id)}</div>
+        <div class="agent-id">${escHtml(a.agent_id)}</div>
+        <div class="agent-last-seen">${relTime(a.last_seen)}</div>
+        <div class="agent-stats-row">
+          <span class="agent-stat-pill" style="background:var(--bg-info);color:var(--c-info)">${a.last_ip||'—'}</span>
+          <span class="agent-stat-pill ${online?'':''}">
+            <span style="width:6px;height:6px;border-radius:50%;display:inline-block;background:${online?'var(--c-low)':'var(--c-crit)'};margin-right:4px"></span>
+            ${online?'Online':'Offline'}
+          </span>
         </div>
       </div>`;
-    }).join('')}</div>`;
-  } catch(e) { $('timelineList').innerHTML='<div class="empty-state"><p>Failed to load timeline</p></div>'; }
+    }).join('');
+  } catch(e) { console.warn(e); }
 }
 
-// ══ RAW TELEMETRY ═════════════════════════════════════════════════════════════
-let _rawSection = '';
-let _rawSnapshots = [];   // all fetched snapshots [{collected_at, data, os, hostname}]
-let _rawSnapIdx   = 0;    // which snapshot is shown
-let _rawShowAll   = false;// show all snapshots flattened
-
-async function loadRawSections() {
-  if (!S.agent) return;
-  try {
-    const data = await API('/api/v1/agents/'+S.agent+'/sections');
-    const sections = Array.isArray(data.sections) ? data.sections : Object.keys(data);
-    $('rawSectionTabs').innerHTML = sections.length
-      ? sections.map((s,i)=>`<button class="sec-tab${i===0?' active':''}" onclick="loadRawSection('${esc(s)}',this)">${esc(s)}</button>`).join('')
-      : '<span class="text-faint" style="font-size:12px">No sections</span>';
-    if (sections.length) loadRawSection(sections[0], $('rawSectionTabs').querySelector('.sec-tab'));
-  } catch(e) { console.warn('rawSections:', e); }
+function updateAgentSelect(agents) {
+  const sel = document.getElementById('agentSelect');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— all agents —</option>' +
+    agents.map(a => `<option value="${a.agent_id}" ${a.agent_id===cur?'selected':''}>${escHtml(a.name||a.agent_id)}</option>`).join('');
 }
 
-function onRawViewChange() {
-  if (_rawSnapshots.length) renderRawSnapshot();
-}
-
-async function loadRawSection(section, btn) {
-  _rawSection   = section;
-  _rawSnapshots = [];
-  _rawSnapIdx   = 0;
-  _rawShowAll   = false;
-  document.querySelectorAll('#rawSectionTabs .sec-tab').forEach(t=>t.classList.remove('active'));
-  if (btn) btn.classList.add('active');
-  $('rawSectionData').innerHTML = '<div class="empty-state"><div class="empty-icon spin-icon">⟳</div><p>Loading…</p></div>';
-  const meta = $('rawMetaBar');
-  if (meta) meta.style.display = 'none';
-
-  try {
-    const start = Math.floor(Date.now()/1000) - winSecs();
-    const rows  = await API('/api/v1/agents/'+S.agent+'/'+section+'?start='+start+'&window='+S.win+'&limit=200');
-    _rawSnapshots = Array.isArray(rows) ? rows : (rows.data||rows.rows||[]);
-
-    if (!_rawSnapshots.length) {
-      $('rawSectionData').innerHTML = `<div class="empty-state"><div class="empty-icon">▦</div>
-        <p>No data in <strong>${S.win}</strong> window</p>
-        <p style="font-size:11px;margin-top:4px">Try a wider time range above</p></div>`;
-      return;
-    }
-
-    // Sort newest first
-    _rawSnapshots.sort((a,b) => (b.collected_at||0) - (a.collected_at||0));
-    _rawSnapIdx = 0;
-    updateSnapMeta();
-    renderRawSnapshot();
-  } catch(e) {
-    $('rawSectionData').innerHTML = '<div class="empty-state"><p>Failed to load: '+esc(String(e))+'</p></div>';
-    console.warn('rawSection error:', e);
-  }
-}
-
-function updateSnapMeta() {
-  const snap = _rawSnapshots[_rawSnapIdx] || {};
-  const meta = $('rawMetaBar');
-  if (!meta) return;
-  meta.style.display = 'flex';
-  $('rawMetaSection').textContent = _rawSection;
-  $('rawMetaCount').textContent   = _rawSnapshots.length;
-  $('rawMetaTs').textContent      = fmtTs(snap.collected_at);
-  $('rawMetaOs').textContent      = snap.os || '—';
-  $('rawMetaHost').textContent    = snap.hostname || '—';
-  $('snapInfo').textContent       = _rawShowAll ? 'All' : (_rawSnapIdx+1)+' / '+_rawSnapshots.length;
-  $('snapPrev').disabled          = _rawShowAll || _rawSnapIdx <= 0;
-  $('snapNext').disabled          = _rawShowAll || _rawSnapIdx >= _rawSnapshots.length - 1;
-  $('snapAll').classList.toggle('active', _rawShowAll);
-}
-
-function changeSnap(dir) {
-  _rawSnapIdx = Math.max(0, Math.min(_rawSnapshots.length-1, _rawSnapIdx + dir));
-  _rawShowAll = false;
-  updateSnapMeta();
-  renderRawSnapshot();
-}
-
-function toggleAllSnapshots() {
-  _rawShowAll = !_rawShowAll;
-  updateSnapMeta();
-  renderRawSnapshot();
-}
-
-function renderRawSnapshot() {
-  const viewMode = ($('rawViewMode')||{}).value || 'table';
-
-  if (_rawShowAll) {
-    renderRawAllSnapshots(viewMode);
-    return;
-  }
-
-  const snap = _rawSnapshots[_rawSnapIdx];
-  if (!snap) return;
-  const payload = snap.data;
-
-  if (viewMode === 'json') {
-    $('rawSectionData').innerHTML = `<pre class="json-pre">${esc(JSON.stringify(snap, null, 2))}</pre>`;
-  } else if (viewMode === 'cards') {
-    renderRawCards(payload, snap);
-  } else {
-    renderRawTable(payload, snap);
-  }
-}
-
-// ── Render list data as a proper sortable table ────────────────────────────
-function renderRawTable(payload, meta) {
-  const el = $('rawSectionData');
-
-  if (Array.isArray(payload)) {
-    if (!payload.length) { el.innerHTML = '<div class="empty-state"><p>Empty snapshot</p></div>'; return; }
-    const keySet = new Set();
-    payload.forEach(r => { if(r&&typeof r==='object') Object.keys(r).forEach(k=>keySet.add(k)); });
-    const keys = [...keySet];
-
-    el.innerHTML = `<div class="raw-table-wrap">
-      <div class="raw-table-info">${payload.length} items · snapshot ${fmtTs(meta.collected_at)}</div>
-      <div class="table-wrap"><table class="data-table raw-data-table" id="rawDataTable">
-        <thead><tr>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}</tr></thead>
-        <tbody>${payload.map((row,i)=>`<tr style="animation-delay:${Math.min(i*0.01,0.5).toFixed(2)}s">
-          ${keys.map(k=>{
-            const v = row[k];
-            if (v===null||v===undefined) return '<td class="td-null">—</td>';
-            if (typeof v==='boolean') return `<td><span class="${v?'rv-true':'rv-false'}">${v}</span></td>`;
-            if (typeof v==='number')  return `<td class="td-num">${v}</td>`;
-            if (typeof v==='object') {
-              const j=JSON.stringify(v);
-              return `<td><span class="td-obj" title="${esc(j)}">${esc(j.slice(0,60))}${j.length>60?'…':''}</span></td>`;
-            }
-            const sv = String(v);
-            const cls = sv.length>80 ? 'td-long' : '';
-            return `<td class="${cls}" title="${esc(sv)}">${esc(sv.length>100?sv.slice(0,100)+'…':sv)}</td>`;
-          }).join('')}
-        </tr>`).join('')}
-        </tbody>
-      </table></div></div>`;
-  } else if (payload && typeof payload==='object') {
-    renderRawKV(payload, meta);
-  } else {
-    el.innerHTML = `<pre class="json-pre">${esc(String(payload))}</pre>`;
-  }
-}
-
-// ── Render object data as key-value ───────────────────────────────────────
-function renderRawKV(payload, meta) {
-  const el = $('rawSectionData');
-  const entries = Object.entries(payload);
-  el.innerHTML = `<div class="raw-kv-wrap">
-    <div class="raw-table-info">snapshot ${fmtTs(meta.collected_at)} · ${entries.length} fields</div>
-    <div class="kv-grid-raw">${entries.map(([k,v])=>{
-      let display='';
-      if (v===null||v===undefined) display='<span class="kv-null">null</span>';
-      else if (typeof v==='boolean') display=`<span class="${v?'rv-true':'rv-false'}">${v}</span>`;
-      else if (typeof v==='number')  display=`<span class="rv-num">${v}</span>`;
-      else if (typeof v==='object') {
-        const j=JSON.stringify(v,null,2);
-        display=`<details class="kv-obj-details">
-          <summary>${Array.isArray(v)?v.length+' items':Object.keys(v).length+' keys'} — click to expand</summary>
-          <pre class="kv-pre">${esc(j)}</pre></details>`;
-      } else {
-        const sv=String(v);
-        const isBool = sv==='true'||sv==='false';
-        display=`<span class="${isBool?(sv==='true'?'rv-true':'rv-false'):''}" title="${esc(sv)}">${esc(sv.length>200?sv.slice(0,200)+'…':sv)}</span>`;
-      }
-      return `<div class="kv-row-raw">
-        <div class="kv-key-raw">${esc(k)}</div>
-        <div class="kv-val-raw">${display}</div>
-      </div>`;
-    }).join('')}</div></div>`;
-}
-
-// ── Render field cards (list data) ────────────────────────────────────────
-function renderRawCards(payload, meta) {
-  const el = $('rawSectionData');
-  const sectionColors = {connections:'#3B82F6',processes:'#10B981',ports:'#F97316',services:'#8B5CF6',users:'#EC4899',apps:'#14B8A6'};
-  const color = sectionColors[_rawSection] || '#6366F1';
-
-  if (Array.isArray(payload)) {
-    if (!payload.length) { el.innerHTML='<div class="empty-state"><p>Empty snapshot</p></div>'; return; }
-    const keySet = new Set();
-    payload.forEach(r => { if(r&&typeof r==='object') Object.keys(r).forEach(k=>keySet.add(k)); });
-    const keys = [...keySet];
-    el.innerHTML = `<div class="raw-cards-meta">${payload.length} items · ${fmtTs(meta.collected_at)}</div>
-      <div class="raw-cards-grid">
-      ${payload.map((item,i)=>`
-        <div class="raw-item-card" style="animation-delay:${Math.min(i*0.012,0.6).toFixed(2)}s">
-          <div class="ric-idx" style="background:${color}22;color:${color}">${i+1}</div>
-          <div class="ric-fields">${keys.map(k=>{
-            const v=item[k];
-            if(v===null||v===undefined) return '';
-            let dv='';
-            if(typeof v==='object') dv=`<span class="rv-obj">{…}</span>`;
-            else if(typeof v==='boolean') dv=`<span class="${v?'rv-true':'rv-false'}">${v}</span>`;
-            else if(typeof v==='number') dv=`<span class="rv-num">${v}</span>`;
-            else { const sv=String(v); dv=`<span title="${esc(sv)}">${esc(sv.length>60?sv.slice(0,60)+'…':sv)}</span>`; }
-            return `<div class="ric-field"><span class="ric-k">${esc(k)}</span><span class="ric-v">${dv}</span></div>`;
-          }).filter(x=>x).join('')}</div>
-        </div>`).join('')}
-      </div>`;
-  } else if (payload && typeof payload==='object') {
-    renderRawKV(payload, meta);
-  } else {
-    el.innerHTML=`<pre class="json-pre">${esc(String(payload))}</pre>`;
-  }
-}
-
-// ── All snapshots: flatten all data into one big table ─────────────────────
-function renderRawAllSnapshots(viewMode) {
-  const el = $('rawSectionData');
-  if (!_rawSnapshots.length) return;
-
-  // For list sections: flatten all snapshots → one row per item + snapshot timestamp col
-  const firstPayload = _rawSnapshots[0].data;
-
-  if (Array.isArray(firstPayload)) {
-    const keySet = new Set(['snapshot_time']);
-    _rawSnapshots.forEach(snap => {
-      (Array.isArray(snap.data)?snap.data:[]).forEach(r=>{
-        if(r&&typeof r==='object') Object.keys(r).forEach(k=>keySet.add(k));
-      });
-    });
-    const keys = [...keySet];
-    const allRows = [];
-    _rawSnapshots.forEach(snap => {
-      (Array.isArray(snap.data)?snap.data:[]).forEach(r=>{
-        allRows.push({ snapshot_time: fmtTs(snap.collected_at), ...r });
-      });
-    });
-    el.innerHTML = `<div class="raw-table-info">${allRows.length} total items across ${_rawSnapshots.length} snapshots</div>
-      <div class="table-wrap"><table class="data-table raw-data-table">
-        <thead><tr>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}</tr></thead>
-        <tbody>${allRows.slice(0,500).map(row=>`<tr>
-          ${keys.map(k=>{
-            const v=row[k];
-            if(v===null||v===undefined) return '<td class="td-null">—</td>';
-            if(typeof v==='object') { const j=JSON.stringify(v); return `<td class="td-obj" title="${esc(j)}">${esc(j.slice(0,60))}…</td>`; }
-            const sv=String(v);
-            return `<td title="${esc(sv)}">${esc(sv.length>80?sv.slice(0,80)+'…':sv)}</td>`;
-          }).join('')}
-        </tr>`).join('')}
-        </tbody>
-      </table></div>
-      ${allRows.length>500?`<div class="text-center text-faint" style="padding:10px;font-size:12px">Showing first 500 of ${allRows.length} rows</div>`:''}`;
-  } else {
-    // Object section: show timeline of all snapshots as accordion
-    el.innerHTML = `<div class="raw-table-info">${_rawSnapshots.length} snapshots</div>
-      ${_rawSnapshots.map((snap,i)=>`
-        <details class="snap-accordion" ${i===0?'open':''}>
-          <summary class="snap-acc-hdr">
-            <span class="snap-acc-ts">${fmtTs(snap.collected_at)}</span>
-            <span class="snap-acc-host">${esc(snap.hostname||'')}</span>
-          </summary>
-          <div class="kv-grid-raw">${Object.entries(snap.data||{}).map(([k,v])=>`
-            <div class="kv-row-raw">
-              <div class="kv-key-raw">${esc(k)}</div>
-              <div class="kv-val-raw">${typeof v==='object'?`<pre class="kv-pre">${esc(JSON.stringify(v,null,2).slice(0,300))}</pre>`:esc(String(v))}</div>
-            </div>`).join('')}
-          </div>
-        </details>`).join('')}`;
-  }
-}
-
-// ══ CORRELATIONS ══════════════════════════════════════════════════════════════
-async function loadCorrelations() {
-  if (!S.agent) { $('corrList').innerHTML='<div class="empty-state"><p>Select an agent first</p></div>'; return; }
-  $('corrList').innerHTML='<div class="empty-state"><div class="empty-icon spin-icon">⟳</div><p>Analyzing attack chains…</p></div>';
-  try {
-    const data = await API('/api/v1/jarvis/'+S.agent+'/correlations');
-    const corrs = data.correlations||[];
-    const sum   = data.summary||{};
-    const kpiRow = $('corr-kpi-row');
-    if (kpiRow) {
-      kpiRow.style.display='flex';
-      $('ck-total').querySelector('.ck-val').textContent  = sum.total||0;
-      $('ck-critical').querySelector('.ck-val').textContent = sum.critical||0;
-      $('ck-high').querySelector('.ck-val').textContent   = sum.high||0;
-      $('ck-score').querySelector('.ck-val').textContent  = (sum.max_score||0).toFixed(1)+'/10';
-    }
-    const badge = $('corr-badge');
-    const urgent = (sum.critical||0)+(sum.high||0);
-    if (badge) { if (urgent>0){badge.style.display='inline';badge.textContent=urgent;}else badge.style.display='none'; }
-
-    if (!corrs.length) {
-      $('corrList').innerHTML='<div class="empty-state"><div class="empty-icon" style="color:#10B981">✓</div><p>No correlated attack chains — system appears clean</p></div>';
-      return;
-    }
-    $('corrList').innerHTML = corrs.map((c,i)=>corrCard(c,i)).join('');
-  } catch(e) { $('corrList').innerHTML='<div class="empty-state"><p>Failed to load correlations</p></div>'; }
-}
-
-function corrCard(c, idx) {
-  const sev   = c.severity||'high';
-  const score = parseFloat(c.score||0);
-  const conf  = c.confidence||0;
-  const chain = Array.isArray(c.attack_chain)?c.attack_chain:[];
-  const sigs  = Array.isArray(c.signals)?c.signals:[];
-  const color = SEV_COLOR[sev]||'#F97316';
-
-  const chainHtml = chain.map((step,i)=>`
-    ${i>0?'<div class="chain-arrow-v">↓</div>':''}
-    <div class="chain-step-card">
-      <div class="chain-step-dot" style="background:${color}"></div>
-      <div>
-        <div class="chain-tactic">${esc(step.tactic||'')}</div>
-        <div class="chain-tech"><span class="chip chip-blue">${esc(step.technique||'')}</span> ${esc(step.label||'')}</div>
-      </div>
-    </div>`).join('');
-
-  const sigsHtml = sigs.map(s=>`<div class="corr-sig-row">
-    <span class="sev-tag sev-tag-${esc(s.severity||'info')}">${esc(s.severity||'info')}</span>
-    <span class="corr-sig-title">${esc(s.title||'')}</span>
-    <span class="chip">${esc(s.category||'')}</span>
-  </div>`).join('');
-
-  return `<div class="corr-card" style="--cc:${color};animation-delay:${(idx*0.05).toFixed(2)}s">
-    <div class="cc-top-bar" style="background:${color}"></div>
-    <div class="cc-body">
-      <div class="cc-header">
-        <div class="cc-left">
-          <span class="sev-tag sev-tag-${esc(sev)}">${esc(sev)}</span>
-          <span class="cc-title">${esc(c.title||'Attack Chain')}</span>
-        </div>
-        <div class="cc-right">
-          <div class="conf-pill">${conf}% confidence</div>
-          <div class="cc-score" style="color:${color}">${score.toFixed(1)}</div>
-        </div>
-      </div>
-      <p class="cc-desc">${esc(c.description||'')}</p>
-
-      ${chain.length?`<div class="cc-section">
-        <div class="cc-section-label">ATT&CK Chain</div>
-        <div class="chain-flow">${chainHtml}</div>
-      </div>`:''}
-
-      ${sigs.length?`<div class="cc-section">
-        <div class="cc-section-label">Contributing Signals (${sigs.length})</div>
-        <div class="sigs-list">${sigsHtml}</div>
-      </div>`:''}
-
-      ${c.recommendation?`<div class="cc-section">
-        <div class="cc-section-label">Remediation</div>
-        <div class="rec-box">${esc(c.recommendation)}</div>
-      </div>`:''}
-
-      <div class="cc-footer">
-        <span>Last detected: ${fmtTs(c.last_detected)}</span>
-        <span>${c.signal_count||sigs.length} signals correlated</span>
-      </div>
-    </div>
-  </div>`;
-}
-
-// ══ WEBSOCKET ══════════════════════════════════════════════════════════════════
-function connectWS(aid) {
-  if (S.ws) { S.ws.close(); S.ws=null; }
+async function loadAgentDetail(aid) {
   if (!aid) return;
-  const proto = location.protocol==='https:'?'wss':'ws';
-  const url = `${proto}://${location.host}/ws/${encodeURIComponent(aid)}`;
+  document.getElementById('agent-detail').style.display = '';
+  document.getElementById('agent-detail-name').textContent = S.agents.find(a=>a.agent_id===aid)?.name || aid;
+  S.selectedAgent = aid;
+  document.getElementById('agentSelect').value = aid;
+  document.getElementById('topbar-agent').textContent = S.agents.find(a=>a.agent_id===aid)?.name || aid;
+  // Load findings summary for this agent
   try {
-    const ws = new WebSocket(url);
-    S.ws = ws;
-    ws.onopen  = ()=>setConn('live','Live');
-    ws.onmessage = ev => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type==='payload' && S.panel==='jarvis') setTimeout(loadJarvisSummary,500);
-      } catch(e){}
-    };
-    ws.onclose = ()=>setConn('','Disconnected');
-    ws.onerror = ()=>setConn('error','Error');
-  } catch(e) { setConn('error','WS unavailable'); }
+    const sumData = await GET(`/jarvis/${aid}/summary`);
+    renderAgentFindingsSummary(sumData);
+  } catch(e) {}
+  // Load metrics
+  try {
+    const end = Math.floor(Date.now()/1000);
+    const start = end - winToSecs();
+    const metrics = await GET(`/agents/${aid}/metrics?start=${start}&end=${end}&limit=60`);
+    const rows = Array.isArray(metrics) ? metrics : (metrics.data || metrics.rows || []);
+    renderMetricsCharts(rows);
+  } catch(e) {}
 }
 
-function setConn(cls, text) {
-  $('connDot').className = 'conn-dot'+(cls?' '+cls:'');
-  $('connText').textContent = text;
+function renderAgentFindingsSummary(s) {
+  const container = document.getElementById('agent-findings-summary');
+  if (!container) return;
+  container.innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      ${['critical','high','medium','low','info'].map(sev => `
+        <div style="display:flex;flex-direction:column;align-items:center;padding:10px 16px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r2);min-width:80px">
+          <div style="font-size:22px;font-weight:700;color:${SEV_COLORS[sev]}">${s[sev]||0}</div>
+          <div style="font-size:11px;color:var(--text-sub)">${sev.charAt(0).toUpperCase()+sev.slice(1)}</div>
+        </div>`).join('')}
+    </div>`;
 }
 
-// ══ INIT ══════════════════════════════════════════════════════════════════════
-async function init() {
-  await populateAgentSelect();
-  loadOverview();
-  setInterval(()=>{
-    if (S.panel==='jarvis'&&S.agent)        loadJarvisSummary();
-    if (S.panel==='overview'&&S.agent)      loadOverview();
-    if (S.panel==='correlations'&&S.agent)  loadCorrelations();
+// ── Correlations ──────────────────────────────────────────────────────────
+async function loadCorrelations() {
+  const aid = S.selectedAgent;
+  if (!aid) {
+    document.getElementById('corr-list').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view attack chains</p></div>';
+    return;
+  }
+  try {
+    const data = await GET(`/jarvis/${aid}/correlations`);
+    const rows = data.correlations || [];
+    const badge = document.getElementById('corr-badge');
+    if (badge) { badge.textContent = rows.length; badge.style.display = rows.length?'flex':'none'; }
+    document.getElementById('corr-count-label').textContent = rows.length + ' correlations';
+    if (!rows.length) {
+      document.getElementById('corr-list').innerHTML = '<div class="empty-state"><div class="empty-icon">✓</div><p>No attack chain correlations detected</p></div>';
+      return;
+    }
+    document.getElementById('corr-list').innerHTML = rows.map(c => {
+      const chain = Array.isArray(c.attack_chain) ? c.attack_chain : safeJsonParse(c.attack_chain, []);
+      const sigs  = Array.isArray(c.signals)      ? c.signals      : safeJsonParse(c.signals, []);
+      return `<div class="corr-card">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span class="badge badge-${c.severity}">${c.severity.toUpperCase().slice(0,4)}</span>
+          <span class="corr-title">${escHtml(c.title||'')}</span>
+          <span style="margin-left:auto;font-size:11px;color:var(--text-sub)">score ${(c.score||0).toFixed(1)} · ${c.confidence||0}% confidence</span>
+        </div>
+        <div class="corr-chain">${chain.map(s=>`<span class="chain-step">${escHtml(s)}</span>`).join('<span class="chain-arrow">→</span>')||'<span style="color:var(--text-dim);font-size:12px">No chain data</span>'}</div>
+        ${c.description?`<div style="font-size:12px;color:var(--text-sub);margin:6px 0">${escHtml(c.description)}</div>`:''}
+        ${sigs.length?`<div class="corr-signals">${sigs.slice(0,5).map(s=>`<span class="signal-tag">${escHtml(typeof s==='string'?s:JSON.stringify(s))}</span>`).join('')}</div>`:''}
+      </div>`;
+    }).join('');
+  } catch(e) { console.warn(e); }
+}
+
+// ── Timeline ──────────────────────────────────────────────────────────────
+async function loadTimeline() {
+  const aid = S.selectedAgent;
+  if (!aid) {
+    document.getElementById('tl-list').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view timeline</p></div>';
+    return;
+  }
+  const cat = document.getElementById('tl-category')?.value || '';
+  let url = `/jarvis/${aid}/timeline?limit=200`;
+  if (cat) url += `&category=${cat}`;
+  try {
+    const data = await GET(url);
+    const rows = data.events || [];
+    if (!rows.length) {
+      document.getElementById('tl-list').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>No timeline events</p></div>';
+      return;
+    }
+    const dotClass = { added:'tl-dot-added', modified:'tl-dot-modified', resolved:'tl-dot-resolved', removed:'tl-dot-removed' };
+    document.getElementById('tl-list').innerHTML = `<div style="display:flex;flex-direction:column">` +
+      rows.map(e => `
+        <div class="tl-event">
+          <div class="tl-dot ${dotClass[e.change_type]||'tl-dot-added'}"></div>
+          <div class="tl-body">
+            <div class="tl-title"><span class="tl-cat-badge">${escHtml(e.category||'')}</span>${escHtml(e.title||e.item_key||'')}</div>
+            <div class="tl-sub">${escHtml(e.change_type||'')} · ${escHtml(e.item_key||'')}</div>
+          </div>
+          <div class="tl-time">${relTime(e.detected_at)}</div>
+        </div>`).join('') + `</div>`;
+  } catch(e) { console.warn(e); }
+}
+
+// ── Raw Telemetry ─────────────────────────────────────────────────────────
+const SECTIONS = ['metrics','connections','processes','ports','network','battery','openfiles','services','users','hardware','containers','arp','mounts','storage','tasks','security','sysctl','configs','apps','packages','binaries','sbom','agent_health'];
+let currentSection = 'metrics';
+
+function loadSections() {
+  const aid = S.selectedAgent;
+  const picker = document.getElementById('section-picker');
+  picker.innerHTML = SECTIONS.map(s =>
+    `<button class="section-pill ${s===currentSection?'active':''}" onclick="loadSection('${s}',this)">${s}</button>`
+  ).join('');
+  if (aid) loadSection(currentSection);
+}
+
+async function loadSection(sec, btn) {
+  if (btn) {
+    document.querySelectorAll('.section-pill').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  currentSection = sec;
+  const aid = S.selectedAgent;
+  if (!aid) {
+    document.getElementById('rawdata-content').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent</p></div>';
+    return;
+  }
+  const end = Math.floor(Date.now()/1000);
+  const start = end - winToSecs();
+  try {
+    const data = await GET(`/agents/${aid}/${sec}?start=${start}&end=${end}&limit=100`);
+    const rows = Array.isArray(data) ? data : (data.data || data.rows || []);
+    if (!rows.length) {
+      document.getElementById('rawdata-content').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>No data for this section in the selected time window</p></div>';
+      return;
+    }
+    const latest = rows[0]?.data || rows[0];
+    document.getElementById('rawdata-content').innerHTML =
+      `<div class="card"><div class="card-hdr"><span class="card-title">${sec}</span><span class="card-sub">${rows.length} records · latest ${relTime(rows[0]?.collected_at)}</span></div>` +
+      `<div class="card-body"><pre class="json-viewer">${escHtml(JSON.stringify(latest, null, 2))}</pre></div></div>`;
+  } catch(e) {
+    document.getElementById('rawdata-content').innerHTML = `<div class="empty-state"><div class="empty-icon">✕</div><p>Error loading ${sec}</p></div>`;
+  }
+}
+
+// ── Metrics Charts ────────────────────────────────────────────────────────
+function renderMetricsCharts(rows) {
+  const cpuData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.cpu_percent || 0 })).reverse();
+  const memData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.mem_percent || 0 })).reverse();
+  const cpuLatest = cpuData.length ? cpuData[cpuData.length-1]?.y : null;
+  const memLatest = memData.length ? memData[memData.length-1]?.y : null;
+  if (cpuLatest !== null) document.getElementById('cpu-latest').textContent = cpuLatest.toFixed(1)+'%';
+  if (memLatest !== null) document.getElementById('mem-latest').textContent = memLatest.toFixed(1)+'%';
+  ['cpu','mem'].forEach(key => {
+    const ctx = document.getElementById(key+'Chart');
+    if (!ctx) return;
+    if (S.charts[key]) S.charts[key].destroy();
+    S.charts[key] = new Chart(ctx, {
+      type: 'line',
+      data: { datasets:[{ data: key==='cpu'?cpuData:memData, borderColor: key==='cpu'?'#3B82F6':'#8B5CF6',
+        borderWidth:1.5, fill:true, backgroundColor: key==='cpu'?'rgba(59,130,246,.08)':'rgba(139,92,246,.08)',
+        pointRadius:0, tension:0.4 }] },
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false} },
+        scales:{ x:{type:'time',display:false}, y:{min:0,max:100,grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#94A3B8',font:{size:10}}} } }
+    });
+  });
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────
+function connectWS() {
+  const aid = S.selectedAgent;
+  if (!aid || S.ws) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  S.ws = new WebSocket(`${proto}://${location.host}/ws/${aid}?token=`);
+  S.ws.onopen = () => {
+    document.getElementById('connDot').className = 'conn-dot live';
+    document.getElementById('connText').textContent = 'Connected';
+  };
+  S.ws.onclose = () => {
+    document.getElementById('connDot').className = 'conn-dot offline';
+    document.getElementById('connText').textContent = 'Disconnected';
+    S.ws = null;
+    setTimeout(connectWS, 5000);
+  };
+  S.ws.onmessage = () => {
+    const active = document.querySelector('.panel.active')?.id?.replace('panel-','');
+    if (active === 'dashboard') loadDashboard();
+    if (active === 'findings')  loadFindings();
+  };
+}
+
+// ── Init & Refresh ────────────────────────────────────────────────────────
+function manualRefresh() {
+  document.getElementById('refresh-btn')?.classList.add('spin');
+  const active = document.querySelector('.panel.active')?.id?.replace('panel-','');
+  const refreshMap = { dashboard:loadDashboard, findings:loadFindings, agents:loadAgents,
+                       correlations:loadCorrelations, timeline:loadTimeline };
+  const fn = refreshMap[active];
+  if (fn) fn().finally(() => { setTimeout(() => document.querySelector('.refresh-btn')?.classList.remove('spin'), 500); });
+  else loadDashboard().finally(() => setTimeout(() => document.querySelector('.refresh-btn')?.classList.remove('spin'), 500));
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function safeJsonParse(v, fallback) {
+  if (typeof v !== 'string') return v ?? fallback;
+  try { return JSON.parse(v); } catch { return fallback; }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    const data = await GET('/agents');
+    S.agents = Array.isArray(data) ? data : (data.agents || data || []);
+    updateAgentSelect(S.agents);
+  } catch(e) {}
+  await loadDashboard();
+  // Auto-refresh every 60s
+  setInterval(() => {
+    const active = document.querySelector('.panel.active')?.id?.replace('panel-','');
+    if (active === 'dashboard') loadDashboard();
+    if (active === 'findings')  loadFindings();
   }, 60000);
-}
-init();
+})();
 </script>
+
 </body>
 </html>
