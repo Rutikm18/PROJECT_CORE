@@ -12,9 +12,12 @@ Endpoints (mounted at /api/v1/jarvis):
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+
+log = logging.getLogger("manager.jarvis")
 
 
 def make_jarvis_router(intel_db, jarvis_engine=None) -> APIRouter:
@@ -23,12 +26,20 @@ def make_jarvis_router(intel_db, jarvis_engine=None) -> APIRouter:
     # ── Global stats ──────────────────────────────────────────────────────────
     @router.get("/stats")
     async def stats():
-        return await intel_db.stats()
+        try:
+            return await intel_db.stats()
+        except Exception as exc:
+            log.exception("stats failed")
+            raise HTTPException(500, f"Failed to load stats: {exc}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     @router.get("/{agent_id}/summary")
     async def summary(agent_id: str):
-        data = await intel_db.get_summary(agent_id)
+        try:
+            data = await intel_db.get_summary(agent_id)
+        except Exception as exc:
+            log.exception("summary failed for agent %s", agent_id)
+            raise HTTPException(500, f"Failed to load summary: {exc}")
         if not data:
             return {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0,
                     "total": 0, "active": 0, "max_score": 0}
@@ -44,20 +55,28 @@ def make_jarvis_router(intel_db, jarvis_engine=None) -> APIRouter:
         limit:       int           = Query(100, ge=1, le=1000),
         offset:      int           = Query(0, ge=0),
     ):
-        rows = await intel_db.get_findings(
-            agent_id,
-            severity=severity,
-            category=category,
-            active_only=active_only,
-            limit=limit,
-            offset=offset,
-        )
+        try:
+            rows = await intel_db.get_findings(
+                agent_id,
+                severity=severity,
+                category=category,
+                active_only=active_only,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as exc:
+            log.exception("findings list failed for agent %s", agent_id)
+            raise HTTPException(500, f"Failed to load findings: {exc}")
         return {"findings": rows, "count": len(rows), "offset": offset}
 
     # ── Single finding ────────────────────────────────────────────────────────
     @router.get("/{agent_id}/findings/{finding_id}")
     async def finding_detail(agent_id: str, finding_id: int):
-        rows = await intel_db.get_findings(agent_id, active_only=False, limit=1000)
+        try:
+            rows = await intel_db.get_findings(agent_id, active_only=False, limit=1000)
+        except Exception as exc:
+            log.exception("finding_detail failed for agent %s finding %s", agent_id, finding_id)
+            raise HTTPException(500, f"Failed to load finding: {exc}")
         match = next((r for r in rows if r["id"] == finding_id), None)
         if not match:
             raise HTTPException(404, "Finding not found")
@@ -71,8 +90,12 @@ def make_jarvis_router(intel_db, jarvis_engine=None) -> APIRouter:
         since:    float         = Query(0.0, description="Unix timestamp"),
         limit:    int           = Query(200, ge=1, le=1000),
     ):
-        rows = await intel_db.get_timeline(
-            agent_id, category=category, since=since, limit=limit)
+        try:
+            rows = await intel_db.get_timeline(
+                agent_id, category=category, since=since, limit=limit)
+        except Exception as exc:
+            log.exception("timeline failed for agent %s", agent_id)
+            raise HTTPException(500, f"Failed to load timeline: {exc}")
         return {"events": rows, "count": len(rows)}
 
     # ── FTS Search ────────────────────────────────────────────────────────────
@@ -91,16 +114,24 @@ def make_jarvis_router(intel_db, jarvis_engine=None) -> APIRouter:
     # ── Resolve ───────────────────────────────────────────────────────────────
     @router.post("/{agent_id}/resolve/{finding_id}")
     async def resolve(agent_id: str, finding_id: int):
-        await intel_db.mark_resolved(agent_id, finding_id)
+        try:
+            await intel_db.mark_resolved(agent_id, finding_id)
+        except Exception as exc:
+            log.exception("resolve failed for agent %s finding %s", agent_id, finding_id)
+            raise HTTPException(500, f"Failed to resolve finding: {exc}")
         return {"status": "resolved", "finding_id": finding_id}
 
     # ── Correlations ──────────────────────────────────────────────────────────
     @router.get("/{agent_id}/correlations")
     async def correlations(agent_id: str):
         """Return cross-section attack-chain correlations for an agent."""
-        rows = await intel_db.get_correlations(agent_id)
-        critical = sum(1 for r in rows if r.get("severity") == "critical")
-        high     = sum(1 for r in rows if r.get("severity") == "high")
+        try:
+            rows = await intel_db.get_correlations(agent_id)
+        except Exception as exc:
+            log.exception("correlations failed for agent %s", agent_id)
+            raise HTTPException(500, f"Failed to load correlations: {exc}")
+        critical  = sum(1 for r in rows if r.get("severity") == "critical")
+        high      = sum(1 for r in rows if r.get("severity") == "high")
         max_score = max((r.get("score", 0) for r in rows), default=0)
         return {
             "correlations": rows,

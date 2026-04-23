@@ -1,20 +1,16 @@
-# =============================================================================
-#  Caddyfile — Reverse proxy for Jarvis Manager
-#
-#  Caddy automatically obtains and renews TLS certs from Let's Encrypt.
-#  Used with docker-compose.prod.yml.
-# =============================================================================
+{
+    local_certs
+}
 
-{env.DOMAIN} {
-    # Auto-provision Let's Encrypt TLS cert
-    tls {env.ADMIN_EMAIL}
+:8443 {
+    tls internal
 
-    # Forward all traffic to the manager container
-    reverse_proxy manager:8080
+    reverse_proxy jarvis-manager:8080 {
+        header_up X-Real-IP {remote_host}
+    }
 
-    # Log access
     log {
         output stdout
-        format console
+        format json
     }
 }

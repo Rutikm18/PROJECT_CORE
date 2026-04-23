@@ -8,25 +8,32 @@ manager, which correlates findings and provides a full SOC workflow dashboard.
 
 ## Quick Start
 
-### 1. Deploy Manager (any Linux server / AWS EC2)
+See [docs/installation/quick-start.md](installation/quick-start.md) for the full end-to-end guide.
+
+### 1. Deploy Manager (AWS EC2)
 
 ```bash
 git clone <repo> && cd macbook_data
-
-# Interactive setup: generates .env + Caddyfile
-bash env.sh
-
-# Start everything
+bash env.sh          # interactive setup: generates .env + Caddyfile
 docker compose up -d
-
-# View tokens and manager URL
-docker compose logs manager
 ```
 
 ### 2. Install Agent — macOS
 
 ```bash
-sudo installer -pkg dist/macintel-agent-2.0.0-arm64.pkg -target /
+# Using installer script (binaries pre-built in repo)
+cd agent/os/macos/installer
+sudo bash install.sh \
+  --manager-url "https://<EC2_IP>:8443" \
+  --agent-name  "My MacBook" \
+  --tls-verify  false
+```
+
+### 3. Open Dashboard
+
+```
+http://<EC2_IP>         (HTTP, port 80)
+https://<EC2_IP>:8443   (HTTPS, self-signed — accept cert warning)
 ```
 
 Edit `/Library/Jarvis/agent.toml`:

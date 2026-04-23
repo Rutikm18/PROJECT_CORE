@@ -114,13 +114,17 @@ def make_enroll_router(
             expires_at = int(time.time()) + _DEFAULT_EXPIRY_DAYS * 86400
 
         # ── Store ─────────────────────────────────────────────────────────────
-        is_rotation = (await db.get_agent_key(agent_id)) is not None
-        await db.upsert_agent_key(
-            agent_id, key,
-            enrolled_ip=client_ip,
-            expires_at=expires_at,
-        )
-        await db.upsert_agent(agent_id, body.agent_name, client_ip)
+        try:
+            is_rotation = (await db.get_agent_key(agent_id)) is not None
+            await db.upsert_agent_key(
+                agent_id, key,
+                enrolled_ip=client_ip,
+                expires_at=expires_at,
+            )
+            await db.upsert_agent(agent_id, body.agent_name, client_ip)
+        except Exception as exc:
+            log.exception("DB error during enrollment for agent_id=%s", agent_id)
+            raise HTTPException(status_code=500, detail="Enrollment storage error")
 
         action = "re-enrolled (key rotation)" if is_rotation else "enrolled"
         mode   = "open" if open_enrollment else "token"

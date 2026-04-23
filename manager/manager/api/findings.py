@@ -21,10 +21,13 @@ SOC Workflow States:
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+
+log = logging.getLogger("manager.findings")
 
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -62,13 +65,21 @@ def make_findings_router(intel_db) -> APIRouter:
           kpi, severity_dist, status_dist, category_dist, top_agents,
           daily_trend (7 days), sla_compliance.
         """
-        return await intel_db.get_dashboard_stats()
+        try:
+            return await intel_db.get_dashboard_stats()
+        except Exception as exc:
+            log.exception("dashboard_stats failed")
+            raise HTTPException(500, f"Failed to load dashboard stats: {exc}")
 
     # ── SLA breach report ─────────────────────────────────────────────────────
     @router.get("/sla")
     async def sla_report():
         """Return active findings that are breaching or at risk of breaching SLA."""
-        findings = await intel_db.get_sla_report()
+        try:
+            findings = await intel_db.get_sla_report()
+        except Exception as exc:
+            log.exception("sla_report failed")
+            raise HTTPException(500, f"Failed to load SLA report: {exc}")
         breached = [f for f in findings if f.get("sla_status") == "breached"]
         warning  = [f for f in findings if f.get("sla_status") == "warning"]
         return {
@@ -92,19 +103,23 @@ def make_findings_router(intel_db) -> APIRouter:
         limit:        int            = Query(200, ge=1, le=1000),
         offset:       int            = Query(0, ge=0),
     ):
-        rows = await intel_db.get_soc_findings(
-            agent_id=agent_id,
-            severity=severity,
-            status=status,
-            category=category,
-            assignee=assignee,
-            sla_breached=sla_breached,
-            active_only=active_only,
-            search=search,
-            sort_by=sort_by,
-            limit=limit,
-            offset=offset,
-        )
+        try:
+            rows = await intel_db.get_soc_findings(
+                agent_id=agent_id,
+                severity=severity,
+                status=status,
+                category=category,
+                assignee=assignee,
+                sla_breached=sla_breached,
+                active_only=active_only,
+                search=search,
+                sort_by=sort_by,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as exc:
+            log.exception("list_findings failed")
+            raise HTTPException(500, f"Failed to load findings: {exc}")
         return {"findings": rows, "count": len(rows), "offset": offset}
 
     # ── Single finding ────────────────────────────────────────────────────────
@@ -219,7 +234,11 @@ def make_findings_router(intel_db) -> APIRouter:
             raise HTTPException(400, f"Unknown action: {body.action}. "
                                 "Valid: assign, status, escalate, close, false_positive, accepted_risk")
 
-        updated = await intel_db.bulk_update_findings(body.finding_ids, **kwargs)
+        try:
+            updated = await intel_db.bulk_update_findings(body.finding_ids, **kwargs)
+        except Exception as exc:
+            log.exception("bulk_action failed")
+            raise HTTPException(500, f"Bulk action failed: {exc}")
         return {
             "updated": updated,
             "requested": len(body.finding_ids),

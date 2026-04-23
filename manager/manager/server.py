@@ -26,9 +26,9 @@ import os
 import sys
 import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db        import Database
@@ -191,16 +191,36 @@ def create_app() -> FastAPI:
     app.include_router(keys_router,     prefix="/api/v1/keys")
     app.include_router(findings_router, prefix="/api/v1/soc")
 
+    # ── Global exception handler ──────────────────────────────────────────────
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error", "detail": str(exc)},
+        )
+
     # ── Health ────────────────────────────────────────────────────────────────
     @app.get("/health")
     async def health():
-        ok = await db.ping()
-        idx_stats = await store.index.stats()
+        try:
+            ok = await db.ping()
+        except Exception:
+            ok = False
+        try:
+            idx_stats = await store.index.stats()
+        except Exception:
+            idx_stats = {}
+        try:
+            intel_stats = await intel_db.stats()
+        except Exception:
+            intel_stats = {}
+        status = "ok" if ok else "degraded"
         return {
-                "status": "ok",
+            "status": status,
             "db":     "ok" if ok else "error",
             "store":  idx_stats,
-            "intel":  await intel_db.stats(),
+            "intel":  intel_stats,
         }
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
@@ -243,8 +263,15 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def dashboard():
         html_path = os.path.join(_pkg_root, "dashboard", "templates", "index.html")
-        with open(html_path) as f:
-            return f.read()
+        try:
+            with open(html_path) as f:
+                return f.read()
+        except FileNotFoundError:
+            log.error("Dashboard template not found: %s", html_path)
+            return HTMLResponse(
+                "<h1>Dashboard unavailable</h1><p>Template file not found.</p>",
+                status_code=503,
+            )
 
     return app
 

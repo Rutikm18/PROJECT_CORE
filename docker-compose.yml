@@ -64,9 +64,10 @@ services:
     container_name: jarvis-manager
     restart: unless-stopped
 
-    # Manager is INTERNAL ONLY — Caddy proxies to it, no direct internet access
-    expose:
-      - "8080"
+    # Manager exposed on 8080 for direct agent access (no TLS — use on trusted networks)
+    # Also reachable via Caddy on :8443 (HTTPS) or :80 (HTTP)
+    ports:
+      - "8080:8080"
 
     environment:
       PUBLIC_IP:               "${PUBLIC_IP:-}"

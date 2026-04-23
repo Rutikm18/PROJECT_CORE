@@ -151,11 +151,14 @@ def enroll(cfg: dict) -> str:
 
 def _post_enroll(url: str, token: str, payload: dict, tls_verify: bool) -> dict:
     """POST enrollment request and return the parsed JSON response body."""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    if not tls_verify:
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
+    if url.startswith("http://"):
+        ctx = None   # plain HTTP — no TLS context
+    else:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        if not tls_verify:
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
 
     body    = json.dumps(payload).encode()
     headers = {
@@ -173,7 +176,10 @@ def _post_enroll(url: str, token: str, payload: dict, tls_verify: bool) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        kwargs = {"timeout": 30}
+        if ctx is not None:
+            kwargs["context"] = ctx
+        with urllib.request.urlopen(req, **kwargs) as resp:
             status    = resp.status
             body_resp = resp.read()
     except urllib.error.HTTPError as exc:

@@ -122,7 +122,10 @@ class Sender:
 
     # ── SSL ───────────────────────────────────────────────────────────────────
 
-    def _build_ssl_ctx(self) -> ssl.SSLContext:
+    def _build_ssl_ctx(self):
+        if self.mgr["url"].startswith("http://"):
+            log.warning("Manager URL is plain HTTP — no TLS encryption")
+            return None   # urllib handles plain HTTP without a context
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_3
         if not self.tls_verify:
@@ -158,8 +161,10 @@ class Sender:
         """Quick HEAD/GET to /health to check manager reachability."""
         try:
             req = urllib.request.Request(self.probe_url, method="GET")
-            with urllib.request.urlopen(req, context=self._ctx,
-                                        timeout=_PROBE_TIMEOUT):
+            kwargs = {"timeout": _PROBE_TIMEOUT}
+            if self._ctx is not None:
+                kwargs["context"] = self._ctx
+            with urllib.request.urlopen(req, **kwargs):
                 return True
         except Exception:
             return False
@@ -218,8 +223,10 @@ class Sender:
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(req, context=self._ctx,
-                                            timeout=self.timeout) as resp:
+                kwargs = {"timeout": self.timeout}
+                if self._ctx is not None:
+                    kwargs["context"] = self._ctx
+                with urllib.request.urlopen(req, **kwargs) as resp:
                     if resp.status == 200:
                         if not self._online:
                             log.info("Manager connection restored")

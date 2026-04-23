@@ -12,79 +12,63 @@ of endpoint telemetry and shipping them to the manager over HTTPS.
 | macOS | 12 Monterey or later (Intel + Apple Silicon) |
 | Architecture | arm64 (Apple Silicon) or x86_64 (Intel) |
 | Privileges | Administrator (sudo) required for install |
-| Network | HTTPS outbound to manager on port 8443 (or 443) |
+| Network | HTTPS outbound to manager on port 8443 (or 80/443) |
+| Python | 3.11+ (only needed for source-based install) |
 | Disk | ~50 MB for binaries, ~200 MB spool buffer |
 
 ---
 
-## Method A — PKG Installer (Recommended)
+## Method A — Installer Script (Recommended)
 
-### Step 1 — Download the PKG
+Pre-built binaries are included in the repo. The installer sets up LaunchDaemons,
+directories, ACLs, and starts the agent automatically.
 
-Copy `macintel-agent-2.0.0-arm64.pkg` (or `x86_64`) to the target Mac.
-
-### Step 2 — Install
-
-```bash
-sudo installer -pkg macintel-agent-2.0.0-arm64.pkg -target /
-```
-
-This installs to `/Library/Jarvis/` with the following layout:
-
-```
-/Library/Jarvis/
-├── bin/
-│   ├── macintel-agent      ← main agent binary
-│   └── macintel-watchdog   ← watchdog binary
-├── agent.toml              ← configuration file
-├── logs/
-│   ├── agent.log           ← rotating log (10 MB × 3)
-│   └── agent-stderr.log    ← stderr capture
-├── spool/                  ← offline payload buffer
-└── security/               ← keychain reference (no raw key)
-
-/Library/LaunchDaemons/
-├── com.macintel.agent.plist
-└── com.macintel.watchdog.plist
-```
-
-### Step 3 — Configure
+### Step 1 — Navigate to the installer
 
 ```bash
-sudo nano /Library/Jarvis/agent.toml
+cd /path/to/macbook_data/agent/os/macos/installer
 ```
 
-Minimum required configuration:
-```toml
-[agent]
-name = "Alice MacBook Pro"      # human-readable name shown in dashboard
+### Step 2 — Run the installer
 
-[manager]
-url        = "https://54.213.44.12:8443"   # your manager URL
-tls_verify = false                          # false for self-signed cert
-                                            # true  for Let's Encrypt
+**Self-signed cert manager (most common):**
+```bash
+sudo bash install.sh \
+  --manager-url "https://<EC2_PUBLIC_IP>:8443" \
+  --agent-name  "Alice MacBook Pro" \
+  --tls-verify  false
 ```
 
-If enrollment token is required by your manager:
-```toml
-[enrollment]
-token = "sk-enroll-xxxxxxxx"
+**Let's Encrypt cert manager (domain mode):**
+```bash
+sudo bash install.sh \
+  --manager-url "https://jarvis.company.com" \
+  --agent-name  "Alice MacBook Pro" \
+  --tls-verify  true
 ```
 
-Everything else (agent ID, log paths, collection schedules) is auto-configured.
+**With enrollment token (if manager requires it):**
+```bash
+sudo bash install.sh \
+  --manager-url  "https://<EC2_PUBLIC_IP>:8443" \
+  --agent-name   "Alice MacBook Pro" \
+  --enroll-token "sk-enroll-xxxxxxxx" \
+  --tls-verify   false
+```
 
-### Step 4 — Start
+### What the installer does
+
+1. Creates `/Library/Jarvis/` directory structure
+2. Copies binaries with restricted ACLs (root:wheel only)
+3. Derives stable agent ID from hardware UUID
+4. Generates `agent.toml` with your settings
+5. Installs `com.macintel.agent` + `com.macintel.watchdog` LaunchDaemons
+6. Starts both services immediately
+
+### Step 3 — Verify
 
 ```bash
-# Load and start both services
-sudo launchctl load /Library/LaunchDaemons/com.macintel.agent.plist
-sudo launchctl load /Library/LaunchDaemons/com.macintel.watchdog.plist
-```
-
-### Step 5 — Verify
-
-```bash
-# Check services are running
+# Check services running
 sudo launchctl list | grep macintel
 
 # Expected output:
@@ -92,7 +76,7 @@ sudo launchctl list | grep macintel
 # <PID>  0  com.macintel.watchdog
 
 # Watch live logs
-sudo tail -f /Library/Jarvis/logs/agent.log
+sudo tail -f /Library/Jarvis/logs/agent-stdout.log
 
 # Look for successful enrollment:
 # INFO enrollment complete agent_id=mac-xxxx key_len=64
@@ -103,93 +87,131 @@ Once enrolled, the agent appears in the manager dashboard within 30 seconds.
 
 ---
 
-## Method B — Manual Install from Source
+## Method B — Run from Source (Dev / Testing)
 
-Use this when building from source or in CI/CD.
+No installation required. Runs the agent directly from Python in a temp directory.
+Useful for testing without setting up system-wide LaunchDaemons.
 
 ### Prerequisites
 
 ```bash
-# macOS developer tools
-xcode-select --install
+# Python 3.11+
+python3 --version
 
-# Python 3.11+ via Homebrew
-brew install python@3.11
-
-# Python dependencies
-cd macbook_data/agent
-pip3 install -r requirements.txt
+# Install agent dependencies
+cd /path/to/macbook_data
+pip3 install -r agent/requirements.txt
 ```
 
-### Build the PKG
+### Create working directory and config
 
 ```bash
-cd agent/os/macos/pkg
-bash build_pkg.sh -v 2.0.0 -a arm64
-# Output: dist/macintel-agent-2.0.0-arm64.pkg
+mkdir -p /tmp/jarvis-dev/{data,security,spool,logs}
+
+cat > /tmp/jarvis-dev/agent.toml << 'EOF'
+[agent]
+name = "Alice MacBook Pro"
+
+[manager]
+url        = "https://<EC2_PUBLIC_IP>:8443"
+tls_verify = false
+
+[enrollment]
+token    = ""
+keystore = "keychain"
+
+[paths]
+install_dir  = "/tmp/jarvis-dev"
+config_dir   = "/tmp/jarvis-dev"
+log_dir      = "/tmp/jarvis-dev/logs"
+data_dir     = "/tmp/jarvis-dev/data"
+security_dir = "/tmp/jarvis-dev/security"
+spool_dir    = "/tmp/jarvis-dev/spool"
+pid_file     = "/tmp/jarvis-dev/agent.pid"
+
+[logging]
+level   = "INFO"
+file    = "/tmp/jarvis-dev/logs/agent.log"
+max_mb  = 10
+backups = 3
+EOF
 ```
 
-Then follow Method A Step 2 onwards.
+### Run the agent
+
+```bash
+cd /path/to/macbook_data
+
+# sudo required for hardware UUID + network interface stats
+sudo python3 agent_v2.py --config /tmp/jarvis-dev/agent.toml
+```
+
+Press `Ctrl+C` to stop. The agent cleans up gracefully.
 
 ---
 
-## Configuration Reference
+## Method C — PKG Installer
 
-Full `agent.toml` with all available options:
+A pre-built PKG is included for quick deployment without any config flags.
 
+### Step 1 — Install the PKG
+
+```bash
+sudo installer -pkg \
+  /path/to/macbook_data/agent/os/macos/pkg/dist/macintel-agent-2.0.0-arm64.pkg \
+  -target /
+```
+
+### Step 2 — Configure
+
+```bash
+sudo nano /Library/Jarvis/agent.toml
+```
+
+Set at minimum:
 ```toml
-# ── Agent identity ─────────────────────────────────────────────────────────
 [agent]
-# Human-readable name shown in the dashboard
 name = "Alice MacBook Pro"
 
-# Agent ID — auto-generated from Hardware UUID if omitted
-# Format: mac-<hardware-uuid-lowercase>
-# id = "mac-a1b2c3d4-..."   # leave blank; auto-detected
-
-# ── Manager connection ──────────────────────────────────────────────────────
 [manager]
-url             = "https://YOUR_MANAGER_IP:8443"
-tls_verify      = false        # false = accept self-signed cert
-timeout_sec     = 30
-retry_attempts  = 3
-retry_delay_sec = 5
-max_queue_size  = 500
-
-# ── Enrollment ──────────────────────────────────────────────────────────────
-[enrollment]
-token    = ""          # leave blank if OPEN_ENROLLMENT=true on manager
-keystore = "keychain"  # always "keychain" on macOS
-
-# ── Watchdog ────────────────────────────────────────────────────────────────
-[watchdog]
-enabled            = true
-check_interval_sec = 30
-max_restarts       = 5
-restart_window_sec = 300
-
-# ── Collection (all intervals are optional — defaults shown) ────────────────
-[collection]
-enabled  = true
-tick_sec = 5            # orchestrator polling interval
-
-# Individual section overrides (omit section to use defaults)
-[collection.sections.metrics]
-enabled = true; interval_sec = 10; send = true
-
-[collection.sections.processes]
-enabled = true; interval_sec = 10; send = true
-
-[collection.sections.connections]
-enabled = true; interval_sec = 10; send = true
-
-# ── Logging ─────────────────────────────────────────────────────────────────
-[logging]
-level   = "INFO"             # DEBUG / INFO / WARNING / ERROR
-file    = "/Library/Jarvis/logs/agent.log"
-max_mb  = 10
-backups = 3
+url        = "https://<EC2_PUBLIC_IP>:8443"
+tls_verify = false
 ```
+
+### Step 3 — Start
+
+```bash
+sudo launchctl load /Library/LaunchDaemons/com.macintel.agent.plist
+sudo launchctl load /Library/LaunchDaemons/com.macintel.watchdog.plist
+```
+
+---
+
+## Installation Layout
+
+```
+/Library/Jarvis/
+├── bin/
+│   ├── macintel-agent        ← main agent binary
+│   └── macintel-watchdog     ← watchdog binary
+├── agent.toml                ← configuration file
+├── logs/
+│   ├── agent-stdout.log      ← main log output
+│   ├── agent-stderr.log      ← errors
+│   └── watchdog-stdout.log   ← watchdog log
+├── data/                     ← telemetry queue
+├── spool/                    ← offline payload buffer
+└── security/                 ← Keychain reference (no raw key)
+
+/Library/LaunchDaemons/
+├── com.macintel.agent.plist
+└── com.macintel.watchdog.plist
+```
+
+ACL policy:
+- `security/` — root only (Keychain reference)
+- `bin/*.exe` — root:wheel read+execute
+- `agent.toml` — root:wheel read (rw-r-----)
 
 ---
 
@@ -206,14 +228,14 @@ sudo launchctl unload /Library/LaunchDaemons/com.macintel.agent.plist
 sudo launchctl unload /Library/LaunchDaemons/com.macintel.agent.plist
 sudo launchctl load   /Library/LaunchDaemons/com.macintel.agent.plist
 
-# Status
+# Status (shows PID if running)
 sudo launchctl list | grep macintel
 
 # Live logs
-sudo tail -f /Library/Jarvis/logs/agent.log
+sudo tail -f /Library/Jarvis/logs/agent-stdout.log
 
-# Watchdog logs
-sudo tail -f /Library/Jarvis/logs/watchdog.log
+# Watchdog log
+sudo tail -f /Library/Jarvis/logs/watchdog-stdout.log
 ```
 
 ---
@@ -221,49 +243,68 @@ sudo tail -f /Library/Jarvis/logs/watchdog.log
 ## Complete Uninstall
 
 ```bash
-# 1. Stop and unload services
+# Run uninstall script
+sudo bash /path/to/macbook_data/agent/os/macos/installer/uninstall.sh
+
+# Or manually:
 sudo launchctl unload /Library/LaunchDaemons/com.macintel.agent.plist    2>/dev/null
 sudo launchctl unload /Library/LaunchDaemons/com.macintel.watchdog.plist 2>/dev/null
-
-# 2. Remove LaunchDaemon plists
 sudo rm -f /Library/LaunchDaemons/com.macintel.agent.plist
 sudo rm -f /Library/LaunchDaemons/com.macintel.watchdog.plist
-
-# 3. Remove installation directory
 sudo rm -rf /Library/Jarvis
-
-# 4. Remove Keychain entry (stored HMAC key)
 security delete-generic-password -s "com.macintel.agent" 2>/dev/null
-
 echo "Agent uninstalled cleanly."
 ```
 
 ---
 
-## Reinstall (after uninstall)
+## Reinstall / Re-enroll
 
 ```bash
-# Follow Method A from Step 1
-sudo installer -pkg macintel-agent-2.0.0-arm64.pkg -target /
-sudo nano /Library/Jarvis/agent.toml    # re-enter manager URL + name
-sudo launchctl load /Library/LaunchDaemons/com.macintel.agent.plist
-sudo launchctl load /Library/LaunchDaemons/com.macintel.watchdog.plist
+# Uninstall first
+sudo bash uninstall.sh
+
+# Reinstall
+sudo bash install.sh \
+  --manager-url "https://<EC2_PUBLIC_IP>:8443" \
+  --agent-name  "Alice MacBook Pro" \
+  --tls-verify  false
 ```
 
-On reinstall the agent automatically re-enrolls with the manager and
-receives a fresh HMAC key. No manual key management needed.
+On reinstall, the agent auto re-enrolls and receives a fresh HMAC key.
 
 ---
 
-## Upgrade
+## Configuration Reference
 
-```bash
-# Install new PKG over existing installation
-sudo installer -pkg macintel-agent-2.1.0-arm64.pkg -target /
+`/Library/Jarvis/agent.toml`
 
-# Services restart automatically via watchdog
-# Verify:
-sudo tail -10 /Library/Jarvis/logs/agent.log
+```toml
+# ── Agent identity ─────────────────────────────────────────────────────────
+[agent]
+name = "Alice MacBook Pro"      # shown in dashboard
+# id auto-generated from hardware UUID — format: mac-<uuid>
+
+# ── Manager connection ──────────────────────────────────────────────────────
+[manager]
+url             = "https://YOUR_MANAGER_IP:8443"
+tls_verify      = false        # false = self-signed cert (IP-only mode)
+                                # true  = Let's Encrypt (domain mode)
+timeout_sec     = 30
+retry_attempts  = 3
+retry_delay_sec = 5
+
+# ── Enrollment ──────────────────────────────────────────────────────────────
+[enrollment]
+token    = ""          # leave blank if OPEN_ENROLLMENT=true on manager
+keystore = "keychain"  # always "keychain" on macOS
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+[logging]
+level   = "INFO"
+file    = "/Library/Jarvis/logs/agent.log"
+max_mb  = 10
+backups = 3
 ```
 
 ---
@@ -276,8 +317,8 @@ sudo tail -10 /Library/Jarvis/logs/agent.log
 # Check services loaded
 sudo launchctl list | grep macintel
 
-# Check logs for errors
-sudo tail -50 /Library/Jarvis/logs/agent.log
+# Check logs
+sudo tail -50 /Library/Jarvis/logs/agent-stdout.log
 
 # Common causes:
 # 1. Wrong manager URL in agent.toml
@@ -286,43 +327,14 @@ sudo tail -50 /Library/Jarvis/logs/agent.log
 # 4. Wrong enrollment token
 ```
 
-### "attempted relative import" error in logs
+### "url must start with https://" error
 
-This means the binary was built with the wrong entry point.
-Rebuild with `agent/agent_entry.py` as the PyInstaller entry point:
-```bash
-cd agent/os/macos/pkg && bash build_pkg.sh -v 2.0.0 -a arm64
-```
+The agent requires HTTPS. Make sure your manager has port 8443 open
+with Caddy TLS enabled, then use `https://` in the URL.
 
-### TOML parse error at startup
+### "SSL certificate verify failed"
 
-All collection section lines must be on separate lines (semicolons are invalid TOML):
-```toml
-# WRONG:
-[collection.sections.metrics]
-enabled = true; interval_sec = 10; send = true
-
-# CORRECT:
-[collection.sections.metrics]
-enabled      = true
-interval_sec = 10
-send         = true
-```
-
-### "No such file or directory: /Library/Jarvis/logs/agent.log"
-
-```bash
-sudo mkdir -p /Library/Jarvis/logs /Library/Jarvis/spool /Library/Jarvis/security
-sudo chown -R root:wheel /Library/Jarvis
-sudo chmod 755 /Library/Jarvis
-```
-
-### Checking what key is stored in Keychain
-
-```bash
-security find-generic-password -s "com.macintel.agent" -w
-# Should print 64-character hex string (the HMAC key)
-```
+Set `tls_verify = false` in `agent.toml` if the manager uses a self-signed cert.
 
 ### Re-enroll without uninstall
 
@@ -335,6 +347,13 @@ sudo launchctl unload /Library/LaunchDaemons/com.macintel.agent.plist
 sudo launchctl load   /Library/LaunchDaemons/com.macintel.agent.plist
 ```
 
+### Check what key is stored in Keychain
+
+```bash
+security find-generic-password -s "com.macintel.agent" -w
+# Should print 64-character hex string (the HMAC key)
+```
+
 ---
 
 ## Security Notes
@@ -342,6 +361,5 @@ sudo launchctl load   /Library/LaunchDaemons/com.macintel.agent.plist
 - The agent runs as **root** (required for hardware UUID, network stats, SIP status)
 - The HMAC key is stored in the **system Keychain** — accessible only by root
 - Raw key material is **never written to disk** outside the Keychain
-- All traffic to manager is **HTTPS + HMAC-signed** (replay-protected)
-- Spool files contain telemetry JSON — stored in `/Library/Jarvis/spool/` (root-only)
-- Logs contain process names, connection destinations — no credentials or key material
+- All traffic to manager is **HTTPS + HMAC-signed** (replay-protected with nonce)
+- Spool files contain telemetry JSON stored in `/Library/Jarvis/spool/` (root-only)

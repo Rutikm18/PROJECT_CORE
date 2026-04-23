@@ -64,9 +64,15 @@ class ManagerConnectionConfig:
     api_key: str = ""
 
     def __post_init__(self) -> None:
-        if not self.url.startswith("https://"):
+        if not self.url.startswith("https://") and not self.url.startswith("http://"):
             raise ValueError(
-                f"[manager] url must start with https://, got: {self.url!r}"
+                f"[manager] url must start with http:// or https://, got: {self.url!r}"
+            )
+        if self.url.startswith("http://"):
+            import logging
+            logging.getLogger("agent.config").warning(
+                "Manager URL uses plain HTTP (http://) — no TLS encryption. "
+                "Use https:// in production."
             )
         if not self.tls_verify:
             import logging
