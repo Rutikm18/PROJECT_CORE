@@ -390,7 +390,7 @@ send         = true
 TOML
 
 chown root:wheel "${CONFIG_PATH}" 2>/dev/null || true
-chmod 640 "${CONFIG_PATH}"
+chmod 644 "${CONFIG_PATH}"   # world-readable: no secrets here (API key lives in Keychain)
 
 echo ""
 echo "  agent.toml written → ${CONFIG_PATH}"

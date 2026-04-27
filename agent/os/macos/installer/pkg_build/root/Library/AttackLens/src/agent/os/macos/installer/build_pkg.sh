@@ -133,9 +133,12 @@ chmod 644 \
     "${PKG_ROOT}${BIN_DIR}/run_agent.py" \
     "${PKG_ROOT}${BIN_DIR}/run_watchdog.py"
 
-# Bundle generate_config.sh so attacklens-service update-config works post-install
+# Bundle generate_config.sh + QUICKSTART.md
 cp  "${SCRIPT_DIR}/generate_config.sh" "${PKG_ROOT}${BIN_DIR}/generate_config.sh"
 chmod 755 "${PKG_ROOT}${BIN_DIR}/generate_config.sh"
+[[ -f "${SCRIPT_DIR}/QUICKSTART.md" ]] && \
+    cp "${SCRIPT_DIR}/QUICKSTART.md" "${PKG_ROOT}${INSTALL_DIR}/QUICKSTART.md" && \
+    chmod 644 "${PKG_ROOT}${INSTALL_DIR}/QUICKSTART.md"
 
 echo "     Done."
 
