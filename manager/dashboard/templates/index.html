@@ -605,11 +605,12 @@ function showPanel(id, btn) {
   const titles = { dashboard:'Dashboard', findings:'Findings', agents:'Agents',
                    correlations:'Attack Chains', timeline:'Timeline', rawdata:'Raw Telemetry' };
   document.getElementById('topbar-title').textContent = titles[id] || id;
-  if (id === 'dashboard') loadDashboard();
-  if (id === 'findings')  loadFindings();
-  if (id === 'agents')    loadAgents();
+  if (id === 'dashboard')    loadDashboard();
+  if (id === 'findings')     loadFindings();
+  if (id === 'agents')       loadAgents();
   if (id === 'correlations') loadCorrelations();
-  if (id === 'timeline')  loadTimeline();
+  if (id === 'timeline')     loadTimeline();
+  if (id === 'rawdata')      loadSections();
 }
 
 // ── Agent selector ────────────────────────────────────────────────────────
@@ -1382,51 +1383,223 @@ async function loadTimeline() {
 }
 
 // ── Raw Telemetry ─────────────────────────────────────────────────────────
-const SECTIONS = ['metrics','connections','processes','ports','network','battery','openfiles','services','users','hardware','containers','arp','mounts','storage','tasks','security','sysctl','configs','apps','packages','binaries','sbom','agent_health'];
+
+// Section registry: which sections produce list vs dict payloads
+const SECTIONS = [
+  'metrics','connections','processes','ports','network','battery',
+  'openfiles','services','users','hardware','containers','arp','mounts',
+  'storage','tasks','security','sysctl','configs','apps','packages',
+  'binaries','sbom','agent_health',
+];
+
+// Sections whose data field is a list of records (vs a single dict)
+const LIST_SECTIONS = new Set([
+  'connections','processes','ports','openfiles','services','users',
+  'hardware','containers','arp','mounts','storage','tasks','sysctl',
+  'configs','apps','packages','binaries','sbom',
+]);
+
+// Per-section column definitions for table rendering:
+// key → display header  (only first N cols shown in table; rest in expand)
+const SECTION_COLS = {
+  connections:  [['process','Process'],['proto','Proto'],['remote_addr','Remote IP'],['remote_port','Port'],['remote_service','Service'],['state','State'],['is_private','Private'],['user','User']],
+  processes:    [['pid','PID'],['name','Name'],['user','User'],['cpu_percent','CPU%'],['mem_percent','MEM%'],['mem_rss_mb','RSS MB'],['status','Status'],['signed','Signed']],
+  ports:        [['port','Port'],['proto','Proto'],['bind_addr','Bind Addr'],['state','State'],['process','Process'],['pid','PID']],
+  openfiles:    [['pid','PID'],['process','Process'],['fd_count','Open FDs']],
+  services:     [['name','Label'],['status','Status'],['pid','PID'],['type','Type'],['enabled','Enabled']],
+  users:        [['name','User'],['uid','UID'],['gid','GID'],['admin','Admin'],['home','Home'],['last_login','Last Login']],
+  hardware:     [['bus','Bus'],['name','Device'],['vendor','Vendor'],['serial','Serial'],['product_id','Product ID']],
+  containers:   [['name','Name'],['image','Image'],['status','Status'],['runtime','Runtime'],['ports','Ports']],
+  arp:          [['ip','IP'],['mac','MAC'],['interface','Interface'],['state','State']],
+  mounts:       [['device','Device'],['mountpoint','Mountpoint'],['fstype','FS Type'],['options','Options']],
+  storage:      [['device','Device'],['mountpoint','Mountpoint'],['fstype','FS Type'],['total_gb','Total GB'],['used_gb','Used GB'],['free_gb','Free GB'],['pct','Use%']],
+  tasks:        [['name','Name'],['type','Type'],['schedule','Schedule'],['command','Command'],['user','User'],['enabled','Enabled']],
+  sysctl:       [['key','Key'],['value','Value'],['security_relevant','Sec?']],
+  configs:      [['path','Path'],['suspicious','Suspicious']],
+  apps:         [['name','App'],['version','Version'],['vendor','Vendor'],['signed','Signed'],['notarized','Notarized'],['path','Path']],
+  packages:     [['manager','Manager'],['name','Package'],['version','Version'],['latest','Latest'],['outdated','Outdated']],
+  binaries:     [['name','Binary'],['path','Path'],['hash_sha256','SHA256'],['size_bytes','Bytes'],['suid','SUID'],['world_writable','W-World']],
+  sbom:         [['name','Name'],['version','Version'],['source','Manager'],['purl','PURL'],['license','License']],
+};
+
 let currentSection = 'metrics';
 
 function loadSections() {
-  const aid = S.selectedAgent;
+  const aid    = S.selectedAgent;
   const picker = document.getElementById('section-picker');
   picker.innerHTML = SECTIONS.map(s =>
     `<button class="section-pill ${s===currentSection?'active':''}" onclick="loadSection('${s}',this)">${s}</button>`
   ).join('');
-  if (aid) loadSection(currentSection);
+  if (aid) {
+    loadSection(currentSection);
+  } else {
+    document.getElementById('rawdata-content').innerHTML =
+      '<div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent to view raw telemetry</p></div>';
+  }
 }
 
 async function loadSection(sec, btn) {
   if (btn) {
-    document.querySelectorAll('.section-pill').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.section-pill').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
   }
   currentSection = sec;
   const aid = S.selectedAgent;
   if (!aid) {
-    document.getElementById('rawdata-content').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent</p></div>';
+    document.getElementById('rawdata-content').innerHTML =
+      '<div class="empty-state"><div class="empty-icon">⬡</div><p>Select an agent</p></div>';
     return;
   }
-  const end = Math.floor(Date.now()/1000);
+
+  const container = document.getElementById('rawdata-content');
+  container.innerHTML = '<div style="padding:20px;color:var(--text-sub);font-size:13px">Loading…</div>';
+
+  const end   = Math.floor(Date.now() / 1000);
   const start = end - winToSecs();
+
   try {
-    const data = await GET(`/agents/${aid}/${sec}?start=${start}&end=${end}&limit=100`);
+    const data = await GET(`/agents/${aid}/${sec}?start=${start}&end=${end}&limit=200`);
     const rows = Array.isArray(data) ? data : (data.data || data.rows || []);
+
     if (!rows.length) {
-      document.getElementById('rawdata-content').innerHTML = '<div class="empty-state"><div class="empty-icon">⬡</div><p>No data for this section in the selected time window</p></div>';
+      container.innerHTML =
+        '<div class="empty-state"><div class="empty-icon">⬡</div>' +
+        '<p>No data in the selected time window — try a wider range (8h / 1d)</p></div>';
       return;
     }
-    const latest = rows[0]?.data || rows[0];
-    document.getElementById('rawdata-content').innerHTML =
-      `<div class="card"><div class="card-hdr"><span class="card-title">${sec}</span><span class="card-sub">${rows.length} records · latest ${relTime(rows[0]?.collected_at)}</span></div>` +
-      `<div class="card-body"><pre class="json-viewer">${escHtml(JSON.stringify(latest, null, 2))}</pre></div></div>`;
+
+    if (LIST_SECTIONS.has(sec)) {
+      container.innerHTML = renderRawTable(sec, rows);
+    } else {
+      container.innerHTML = renderRawTimeline(sec, rows);
+    }
   } catch(e) {
-    document.getElementById('rawdata-content').innerHTML = `<div class="empty-state"><div class="empty-icon">✕</div><p>Error loading ${sec}</p></div>`;
+    container.innerHTML =
+      `<div class="empty-state"><div class="empty-icon">✕</div><p>Error: ${escHtml(String(e.message||e))}</p></div>`;
   }
+}
+
+function renderRawTable(sec, rows) {
+  const cols   = SECTION_COLS[sec] || [];
+  const latest = rows[0];
+  const allRec = Array.isArray(latest?.data) ? latest.data : [];
+
+  // Merge all records' data arrays across all time-points into one flat list (latest snapshot only)
+  const records = allRec.length ? allRec : rows.map(r => r.data || r).filter(r => typeof r === 'object');
+
+  if (!records.length) {
+    return renderRawTimeline(sec, rows);
+  }
+
+  const hdr = cols.length
+    ? cols.map(([,label]) => `<th>${escHtml(label)}</th>`).join('')
+    : Object.keys(records[0]).slice(0, 8).map(k => `<th>${escHtml(k)}</th>`).join('');
+
+  const body = records.slice(0, 500).map(rec => {
+    const cells = cols.length
+      ? cols.map(([key]) => `<td class="mono" style="font-size:11.5px">${_fmtCell(rec[key])}</td>`).join('')
+      : Object.keys(records[0]).slice(0, 8).map(k => `<td class="mono" style="font-size:11.5px">${_fmtCell(rec[k])}</td>`).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+
+  const meta = `${records.length} records · latest ${relTime(latest?.collected_at)} · ${rows.length} snapshots in window`;
+
+  return `
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">${escHtml(sec)}</span>
+        <span class="card-sub">${meta}</span>
+        <button class="link-btn" onclick="toggleRawJson('rawjson-${sec}')">JSON ↕</button>
+      </div>
+      <div class="card-body" style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="color:var(--text-sub);border-bottom:1px solid var(--border)">${hdr}</tr></thead>
+          <tbody style="color:var(--text)">${body}</tbody>
+        </table>
+      </div>
+    </div>
+    <div id="rawjson-${sec}" style="display:none;margin-top:8px">
+      <div class="card">
+        <div class="card-hdr"><span class="card-title">Latest raw payload</span></div>
+        <div class="card-body"><pre class="json-viewer" style="max-height:400px">${escHtml(JSON.stringify(latest?.data ?? latest, null, 2))}</pre></div>
+      </div>
+    </div>`;
+}
+
+function renderRawTimeline(sec, rows) {
+  const items = rows.slice(0, 100).map(r => {
+    const d   = r.data || r;
+    const ts  = r.collected_at || r.ts;
+    const sum = _dictSummary(sec, d);
+    return `
+      <div style="display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div style="flex-shrink:0;width:80px;font-size:11px;color:var(--text-sub);padding-top:2px">${relTime(ts)}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;color:var(--text-sub);margin-bottom:4px">${escHtml(sum)}</div>
+          <details style="font-size:11.5px">
+            <summary style="cursor:pointer;color:var(--text-sub);user-select:none">expand payload ▶</summary>
+            <pre class="json-viewer" style="margin-top:6px;max-height:300px">${escHtml(JSON.stringify(d, null, 2))}</pre>
+          </details>
+        </div>
+      </div>`;
+  }).join('');
+
+  const meta = `${rows.length} snapshots · latest ${relTime(rows[0]?.collected_at)}`;
+  return `
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">${escHtml(sec)}</span>
+        <span class="card-sub">${meta}</span>
+      </div>
+      <div class="card-body">${items}</div>
+    </div>`;
+}
+
+function _dictSummary(sec, d) {
+  if (!d || typeof d !== 'object') return String(d || '');
+  if (sec === 'metrics') {
+    const cpu = d.cpu_percent ?? '—';
+    const mem = d.mem_percent ?? '—';
+    const load = d.load_1m ?? '—';
+    const di  = d.disk_read_mb_s != null ? ` · disk r:${d.disk_read_mb_s} w:${d.disk_write_mb_s} MB/s` : '';
+    const ni  = d.net_sent_mb_s  != null ? ` · net ↑${d.net_sent_mb_s} ↓${d.net_recv_mb_s} MB/s` : '';
+    return `CPU ${cpu}% · MEM ${mem}% · load ${load}${di}${ni}`;
+  }
+  if (sec === 'battery') {
+    return `${d.charge_pct ?? '—'}% · ${d.charging ? 'charging' : 'on battery'} · ${d.condition ?? '—'} · cycles ${d.cycle_count ?? '—'}`;
+  }
+  if (sec === 'network') {
+    const ifaces = (d.interfaces || []).filter((i) => i.ipv4).map((i) => `${i.name}:${i.ipv4}`).join(', ');
+    return `gw:${d.default_gw ?? '—'} · wifi:${d.wifi_ssid ?? '—'} · ${ifaces}`;
+  }
+  if (sec === 'security') {
+    return `SIP:${d.sip ?? '—'} · GK:${d.gatekeeper ?? '—'} · FV:${d.filevault ?? '—'} · FW:${d.firewall ?? '—'} · SecBoot:${d.secure_boot ?? '—'}`;
+  }
+  if (sec === 'agent_health') {
+    return `uptime:${d.uptime_sec ?? '—'}s · queue:${d.queue_depth ?? '—'}`;
+  }
+  // Generic: first 3 key=value pairs
+  return Object.entries(d).slice(0, 3).map(([k, v]) => `${k}:${String(v).slice(0, 40)}`).join(' · ');
+}
+
+function _fmtCell(v) {
+  if (v === null || v === undefined) return '<span style="color:var(--text-dim)">—</span>';
+  if (typeof v === 'boolean') return v ? '<span style="color:var(--c-low)">✓</span>' : '<span style="color:var(--c-crit)">✗</span>';
+  if (typeof v === 'object')  return escHtml(JSON.stringify(v).slice(0, 60));
+  const s = String(v);
+  return escHtml(s.length > 80 ? s.slice(0, 80) + '…' : s);
+}
+
+function toggleRawJson(id) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
 }
 
 // ── Metrics Charts ────────────────────────────────────────────────────────
 function renderMetricsCharts(rows) {
-  const cpuData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.cpu_percent || 0 })).reverse();
-  const memData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.mem_percent || 0 })).reverse();
+  // Support both old field names (cpu_pct/mem_pct) and new canonical names
+  const cpuData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.cpu_percent ?? r.data?.cpu_pct ?? 0 })).reverse();
+  const memData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.mem_percent ?? r.data?.mem_pct ?? 0 })).reverse();
   const cpuLatest = cpuData.length ? cpuData[cpuData.length-1]?.y : null;
   const memLatest = memData.length ? memData[memData.length-1]?.y : null;
   if (cpuLatest !== null) document.getElementById('cpu-latest').textContent = cpuLatest.toFixed(1)+'%';

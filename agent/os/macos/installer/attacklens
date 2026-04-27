@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  attacklens — AttackLens Agent CLI
+#
+#  Usage:
+#    attacklens status                   show status (no sudo)
+#    attacklens start                    start services
+#    attacklens stop                     stop services
+#    attacklens restart                  stop then start
+#    attacklens reload                   hot reload config (SIGHUP)
+#    attacklens logs                     tail live log (no sudo)
+#    attacklens config                   print agent.toml (no sudo)
+#    attacklens set-manager <IP>         update manager IP and restart
+#    attacklens enroll                   clear key, force re-enrollment
+#    attacklens help                     this message
+# =============================================================================
+
+LAUNCHDAEMON_DIR="/Library/LaunchDaemons"
+
+# ── Detect installation ───────────────────────────────────────────────────────
+if [[ -f "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" ]]; then
+  INSTALL_DIR="/Library/AttackLens"
+  AGENT_LABEL="com.attacklens.agent"
+  WATCHDOG_LABEL="com.attacklens.watchdog"
+  KEYCHAIN_SERVICE="com.attacklens.agent"
+elif [[ -f "${LAUNCHDAEMON_DIR}/com.macintel.agent.plist" ]]; then
+  INSTALL_DIR="/Library/Jarvis"
+  AGENT_LABEL="com.macintel.agent"
+  WATCHDOG_LABEL="com.macintel.watchdog"
+  KEYCHAIN_SERVICE="com.macintel.agent"
+else
+  echo "  AttackLens is not installed."
+  echo "  Install: sudo bash install.sh <MANAGER_IP>"
+  exit 1
+fi
+
+LOG_DIR="${INSTALL_DIR}/logs"
+CONFIG_PATH="${INSTALL_DIR}/agent.toml"
+SECURITY_DIR="${INSTALL_DIR}/security"
+AGENT_PLIST="${LAUNCHDAEMON_DIR}/${AGENT_LABEL}.plist"
+WATCHDOG_PLIST="${LAUNCHDAEMON_DIR}/${WATCHDOG_LABEL}.plist"
+STDOUT_LOG="${LOG_DIR}/agent-stdout.log"
+STDERR_LOG="${LOG_DIR}/agent-stderr.log"
+
+# Best Python path — prefer what the plist actually uses
+PYTHON3=$(grep -A8 "ProgramArguments" "${AGENT_PLIST}" 2>/dev/null \
+  | grep "python" | head -1 | sed 's/.*<string>//;s/<\/string>.*//' \
+  | xargs 2>/dev/null || echo "/usr/local/bin/python3")
+[[ ! -x "$PYTHON3" ]] && PYTHON3="/usr/local/bin/python3"
+
+# Source dir where agent code lives
+SRC_DIR=$(grep "PYTHONPATH" "${AGENT_PLIST}" 2>/dev/null \
+  | sed 's/.*<string>//;s/<\/string>.*//' | head -1 \
+  || echo "/Library/AttackLens/src")
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+_svc_status() {
+  local label="$1"
+  local info pid exit_code
+  info=$(launchctl list "$label" 2>/dev/null) || { echo "not loaded"; return; }
+  pid=$(echo "$info" | grep '"PID"' | grep -o '[0-9]*' 2>/dev/null || true)
+  exit_code=$(echo "$info" | grep '"LastExitStatus"' | grep -o '[0-9-]*' 2>/dev/null || echo "?")
+  if [[ -n "$pid" ]]; then
+    echo "running  (PID ${pid})"
+  else
+    echo "stopped  (last exit: ${exit_code})"
+  fi
+}
+
+_need_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "  Requires root:  sudo attacklens ${CMD}"; exit 1
+  fi
+}
+
+# Patch plist to call python3 directly (fixes macOS 15/26 shell-script block)
+_patch_plist_if_needed() {
+  local plist="$1" module="$2"
+  # Check if first ProgramArguments entry is a shell script
+  local prog
+  prog=$(grep -A3 "ProgramArguments" "$plist" 2>/dev/null \
+    | grep "<string>" | head -1 | sed 's/.*<string>//;s/<\/string>.*//' || true)
+
+  if [[ "$prog" == *.sh ]] || { [[ -f "$prog" ]] && file "$prog" 2>/dev/null | grep -q "shell script"; }; then
+    echo "  Patching plist to use python3 directly (macOS 15+ fix)..."
+    local src_dir config python
+    src_dir=$(grep "PYTHONPATH" "$plist" 2>/dev/null \
+      | sed 's/.*<string>//;s/<\/string>.*//' | head -1 || echo "/Library/AttackLens/src")
+    config=$(grep -A3 "config" "$plist" 2>/dev/null \
+      | grep "<string>" | grep "\.toml" | sed 's/.*<string>//;s/<\/string>.*//' || echo "${CONFIG_PATH}")
+
+    # Find python
+    python=""
+    for p in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+      [[ -x "$p" ]] && { python="$p"; break; }
+    done
+    [[ -z "$python" ]] && { echo "  ERROR: python3 not found"; return 1; }
+
+    # Rewrite ProgramArguments block
+    python3 - "$plist" "$python" "$module" "$config" "$src_dir" <<'PYEOF'
+import sys, re
+
+plist_path, python, module, config, src_dir = sys.argv[1:]
+with open(plist_path) as f:
+    content = f.read()
+
+# Replace ProgramArguments block
+old_block_pattern = r'<key>ProgramArguments</key>\s*<array>.*?</array>'
+new_block = f"""<key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-m</string>
+        <string>{module}</string>
+        <string>--config</string>
+        <string>{config}</string>
+    </array>"""
+
+content = re.sub(old_block_pattern, new_block, content, flags=re.DOTALL)
+
+# Update PYTHONPATH if present
+content = re.sub(
+    r'(<key>PYTHONPATH</key>\s*<string>)[^<]*(</string>)',
+    rf'\g<1>{src_dir}\g<2>',
+    content
+)
+
+# Update WorkingDirectory if present
+content = re.sub(
+    r'(<key>WorkingDirectory</key>\s*<string>)[^<]*(</string>)',
+    rf'\g<1>{src_dir}\g<2>',
+    content
+)
+
+with open(plist_path, 'w') as f:
+    f.write(content)
+print(f"  Patched: {plist_path}")
+PYEOF
+  fi
+}
+
+_load_svc() {
+  local plist="$1" label="$2"
+  launchctl enable "system/${label}" 2>/dev/null || true
+  launchctl bootstrap system "$plist" 2>/dev/null && return 0
+  launchctl load -w "$plist" 2>/dev/null && return 0
+  return 1
+}
+
+_unload_svc() {
+  local label="$1" plist="$2"
+  launchctl bootout "system/${label}" 2>/dev/null || \
+  launchctl unload -w "$plist"        2>/dev/null || true
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+do_status() {
+  local manager_url
+  manager_url=$(grep '^url' "${CONFIG_PATH}" 2>/dev/null | awk -F'"' '{print $2}' || echo "—")
+  echo ""
+  echo "  AttackLens Agent"
+  echo "  ────────────────────────────────────────────"
+  printf "  %-10s %s\n" "Agent:"    "$(_svc_status "$AGENT_LABEL")"
+  printf "  %-10s %s\n" "Watchdog:" "$(_svc_status "$WATCHDOG_LABEL")"
+  echo ""
+  printf "  %-10s %s\n" "Manager:"  "${manager_url}"
+  printf "  %-10s %s\n" "Install:"  "${INSTALL_DIR}"
+  printf "  %-10s %s\n" "Config:"   "${CONFIG_PATH}"
+  echo ""
+  # Show recent errors if any
+  if [[ -f "${STDERR_LOG}" ]] && [[ -s "${STDERR_LOG}" ]]; then
+    echo "  Recent errors:"
+    tail -5 "${STDERR_LOG}" 2>/dev/null | sed 's/^/    /'
+    echo ""
+  elif [[ -f "${STDOUT_LOG}" ]] && [[ -s "${STDOUT_LOG}" ]]; then
+    echo "  Recent output:"
+    tail -5 "${STDOUT_LOG}" 2>/dev/null | sed 's/^/    /'
+    echo ""
+  fi
+}
+
+do_start() {
+  _need_root
+  if [[ ! -f "$AGENT_PLIST" ]]; then
+    echo "  Not installed. Run: sudo bash install.sh <MANAGER_IP>"; exit 1
+  fi
+  # Patch plists to use python3 directly if they still point to shell scripts
+  _patch_plist_if_needed "$AGENT_PLIST"    "agent.agent_entry"
+  _patch_plist_if_needed "$WATCHDOG_PLIST" "agent.agent.watchdog"
+
+  echo "  Starting AttackLens..."
+  _load_svc "$AGENT_PLIST"    "$AGENT_LABEL"    && echo "  Started: ${AGENT_LABEL}" || \
+    echo "  NOTE: ${AGENT_LABEL} may need approval in System Settings"
+  _load_svc "$WATCHDOG_PLIST" "$WATCHDOG_LABEL" && echo "  Started: ${WATCHDOG_LABEL}" || true
+  sleep 2
+  echo ""
+  do_status
+}
+
+do_stop() {
+  _need_root
+  echo "  Stopping AttackLens..."
+  _unload_svc "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"
+  _unload_svc "$AGENT_LABEL"    "$AGENT_PLIST"
+  echo "  Stopped."
+}
+
+do_restart() {
+  _need_root
+  do_stop; sleep 1; do_start
+}
+
+do_reload() {
+  _need_root
+  launchctl kill HUP "system/${AGENT_LABEL}" 2>/dev/null && \
+    echo "  Reloaded (SIGHUP sent)." || \
+    { echo "  Agent not running. Use: sudo attacklens start"; exit 1; }
+}
+
+do_logs() {
+  local logfile="${STDOUT_LOG}"
+  [[ -f "${LOG_DIR}/agent.log" ]] && [[ -s "${LOG_DIR}/agent.log" ]] && logfile="${LOG_DIR}/agent.log"
+  if [[ ! -f "${logfile}" ]] || [[ ! -s "${logfile}" ]]; then
+    echo "  No log yet. Start the agent first: sudo attacklens start"
+    exit 1
+  fi
+  echo "  Tailing ${logfile}  (Ctrl+C to stop)"
+  echo ""
+  tail -f "${logfile}"
+}
+
+do_config() {
+  [[ ! -f "${CONFIG_PATH}" ]] && { echo "  Config not found: ${CONFIG_PATH}"; exit 1; }
+  echo "  ── ${CONFIG_PATH} ──────────────────────"
+  cat "${CONFIG_PATH}"
+}
+
+do_set_manager() {
+  _need_root
+  local new_ip="${1:-}"
+  if [[ -z "$new_ip" ]]; then
+    echo "  Usage: sudo attacklens set-manager <IP_OR_URL>"
+    echo "  Example: sudo attacklens set-manager 34.224.174.38"
+    exit 1
+  fi
+
+  # Normalize to URL
+  local new_url
+  if [[ "$new_ip" == http://* || "$new_ip" == https://* ]]; then
+    new_url="$new_ip"
+  else
+    new_url="http://${new_ip}:8080"
+  fi
+
+  echo "  Updating manager URL → ${new_url}"
+
+  # Update agent.toml
+  if [[ -f "${CONFIG_PATH}" ]]; then
+    # Replace url line under [manager]
+    python3 - "${CONFIG_PATH}" "${new_url}" <<'PYEOF'
+import sys, re
+path, new_url = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    content = f.read()
+# Replace the url = "..." line
+content = re.sub(r'^url\s*=\s*"[^"]*"', f'url        = "{new_url}"', content, flags=re.MULTILINE)
+# Set tls_verify based on protocol
+tls = "false" if new_url.startswith("http://") else "true"
+content = re.sub(r'^tls_verify\s*=\s*\S+', f'tls_verify = {tls}', content, flags=re.MULTILINE)
+with open(path, 'w') as f:
+    f.write(content)
+print(f"  Config updated: {path}")
+PYEOF
+  else
+    echo "  ERROR: Config not found: ${CONFIG_PATH}"; exit 1
+  fi
+
+  # Clear stored API key so agent re-enrolls with the new manager
+  echo "  Clearing stored API key (will re-enroll with new manager)..."
+  security delete-generic-password -s "${KEYCHAIN_SERVICE}" \
+    /Library/Keychains/System.keychain 2>/dev/null || true
+  rm -f "${SECURITY_DIR}"/*.key 2>/dev/null || true
+
+  echo "  Restarting agent..."
+  do_stop; sleep 1; do_start
+}
+
+do_enroll() {
+  _need_root
+  local agent_id
+  agent_id=$(grep '^id' "${CONFIG_PATH}" 2>/dev/null | awk -F'"' '{print $2}' || true)
+  echo "  Clearing API key (agent_id=${agent_id:-unknown})..."
+  security delete-generic-password -s "${KEYCHAIN_SERVICE}" \
+    /Library/Keychains/System.keychain 2>/dev/null && \
+    echo "  Keychain entry deleted." || echo "  (no Keychain entry)"
+  rm -f "${SECURITY_DIR}"/*.key 2>/dev/null && echo "  Key files cleared." || true
+  echo "  Run: sudo attacklens restart"
+}
+
+do_help() {
+  echo ""
+  echo "  Usage: attacklens <command>"
+  echo ""
+  echo "  status                  show status (no sudo needed)"
+  echo "  start                   start agent + watchdog"
+  echo "  stop                    stop agent + watchdog"
+  echo "  restart                 stop then start"
+  echo "  reload                  hot reload config (SIGHUP)"
+  echo "  logs                    tail live log (no sudo needed)"
+  echo "  config                  print agent.toml (no sudo needed)"
+  echo "  set-manager <IP>        update manager IP and restart"
+  echo "  enroll                  clear key, force re-enrollment"
+  echo "  help                    this message"
+  echo ""
+  echo "  Installed: ${INSTALL_DIR}"
+  echo "  Config:    ${CONFIG_PATH}"
+  echo ""
+}
+
+CMD="${1:-status}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  status)           do_status          ;;
+  start)            do_start           ;;
+  stop)             do_stop            ;;
+  restart)          do_restart         ;;
+  reload)           do_reload          ;;
+  logs)             do_logs            ;;
+  config)           do_config          ;;
+  set-manager)      do_set_manager "$@" ;;
+  enroll)           do_enroll          ;;
+  help|--help|-h)   do_help            ;;
+  *) echo "  Unknown: ${CMD} — run: attacklens help"; exit 1 ;;
+esac

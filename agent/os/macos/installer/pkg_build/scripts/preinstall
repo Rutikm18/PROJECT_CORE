@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Stop any existing AttackLens (or legacy mac_intel) services before upgrade.
+set -uo pipefail
+LDIR="/Library/LaunchDaemons"
+for LABEL in \
+    com.attacklens.watchdog com.attacklens.agent \
+    com.macintel.watchdog   com.macintel.agent; do
+    launchctl bootout "system/${LABEL}" 2>/dev/null || \
+    launchctl unload -w "${LDIR}/${LABEL}.plist" 2>/dev/null || true
+done
+exit 0

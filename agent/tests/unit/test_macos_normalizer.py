@@ -32,7 +32,30 @@ from agent.os.macos.normalizer import normalize
 # ── metrics ───────────────────────────────────────────────────────────────────
 
 class TestMetrics:
-    def test_psutil_path(self):
+    def test_new_canonical_path(self):
+        raw = {
+            "cpu_percent": 42.5, "mem_percent": 60.0,
+            "cpu_per_core": [40.0, 45.0], "cpu_cores": 10, "cpu_cores_physical": 8,
+            "cpu_freq_mhz": 3200.0,
+            "mem_used_mb": 8192, "mem_total_mb": 16384, "mem_available_mb": 6000,
+            "swap_percent": 25.0, "swap_used_mb": 512, "swap_total_mb": 2048,
+            "disk_read_mb_s": 1.5, "disk_write_mb_s": 0.8,
+            "net_sent_mb_s": 0.2, "net_recv_mb_s": 1.1,
+            "load_1m": 1.2, "load_5m": 0.9, "load_15m": 0.7,
+            "uptime_sec": 3600,
+        }
+        out = normalize("metrics", raw)
+        assert isinstance(out, dict)
+        assert out["cpu_percent"] == 42.5
+        assert out["mem_percent"] == 60.0
+        assert out["mem_used_mb"] == 8192
+        assert out["load_1m"] == 1.2
+        assert out["cpu_cores"] == 10
+        assert out["uptime_sec"] == 3600
+        assert out["disk_read_mb_s"] == 1.5
+        assert out["net_recv_mb_s"] == 1.1
+
+    def test_legacy_cpu_pct_path(self):
         raw = {
             "cpu_pct": 42.5, "mem_pct": 60.0,
             "mem_used_mb": 8192, "mem_total_mb": 16384,
@@ -42,52 +65,54 @@ class TestMetrics:
         }
         out = normalize("metrics", raw)
         assert isinstance(out, dict)
-        assert out["cpu_pct"] == 42.5
-        assert out["mem_pct"] == 60.0
+        # Legacy path maps cpu_pct → cpu_percent for dashboard compatibility
+        assert out["cpu_percent"] == 42.5
+        assert out["mem_percent"] == 60.0
         assert out["mem_used_mb"] == 8192
         assert out["load_1m"] == 1.2
         assert out["cpu_cores"] == 10
         assert out["uptime_sec"] == 3600
 
-    def test_psutil_string_coercion(self):
+    def test_string_coercion(self):
         raw = {
-            "cpu_pct": "55.2", "mem_pct": "70", "mem_used_mb": "4000",
+            "cpu_percent": "55.2", "mem_percent": "70", "mem_used_mb": "4000",
             "mem_total_mb": "8000", "load_1m": "1.5", "load_5m": "1.2", "load_15m": "0.8",
         }
         out = normalize("metrics", raw)
-        assert out["cpu_pct"] == 55.2
-        assert isinstance(out["cpu_pct"], float)
+        assert out["cpu_percent"] == 55.2
+        assert isinstance(out["cpu_percent"], float)
         assert out["mem_used_mb"] == 4000
         assert isinstance(out["mem_used_mb"], int)
         assert out["load_1m"] == 1.5
 
     def test_cli_text_path(self):
         raw = {
-            "cpu":    "CPU usage: 12.3% user, 5.6% sys, 82.1% idle",
-            "load":   "{ 1.23 0.98 0.74 }",
-            "vmstat": "Pages free:         12345.\nPages wired down:    5678.\nPages active:        3456.\npage size of 16384 bytes",
-            "swap":   "vm.swapusage: total = 2048.00M  used = 512.00M  free = 1536.00M",
+            "cpu_raw":    "CPU usage: 12.3% user, 5.6% sys, 82.1% idle",
+            "load_raw":   "{ 1.23 0.98 0.74 }",
+            "vmstat_raw": "Pages free:         12345.\nPages wired down:    5678.\nPages active:        3456.\npage size of 16384 bytes",
+            "swap_raw":   "vm.swapusage: total = 2048.00M  used = 512.00M  free = 1536.00M",
         }
         out = normalize("metrics", raw)
         assert isinstance(out, dict)
-        assert abs(out["cpu_pct"] - 17.9) < 0.01   # 12.3 + 5.6
+        assert abs(out["cpu_percent"] - 17.9) < 0.01   # 12.3 + 5.6
         assert out["load_1m"] == 1.23
         assert out["load_5m"] == 0.98
         assert out["swap_total_mb"] == 2048
         assert out["swap_used_mb"] == 512
 
     def test_missing_optional_fields_are_none(self):
-        raw = {"cpu_pct": 10.0, "mem_pct": 20.0, "mem_used_mb": 100, "mem_total_mb": 200}
+        raw = {"cpu_percent": 10.0, "mem_percent": 20.0, "mem_used_mb": 100, "mem_total_mb": 200}
         out = normalize("metrics", raw)
-        for field in ("swap_pct", "swap_used_mb", "swap_total_mb", "cpu_cores", "uptime_sec"):
+        for field in ("swap_percent", "swap_used_mb", "swap_total_mb", "cpu_cores", "uptime_sec",
+                      "disk_read_mb_s", "disk_write_mb_s", "net_sent_mb_s", "net_recv_mb_s"):
             assert field in out
             assert out[field] is None, f"{field} should be None when missing"
 
     def test_bad_values_get_default(self):
-        raw = {"cpu_pct": "bad", "mem_pct": None, "mem_used_mb": "x", "mem_total_mb": "y"}
+        raw = {"cpu_percent": "bad", "mem_percent": None, "mem_used_mb": "x", "mem_total_mb": "y"}
         out = normalize("metrics", raw)
-        assert out["cpu_pct"] == 0.0
-        assert out["mem_pct"] == 0.0
+        assert out["cpu_percent"] == 0.0
+        assert out["mem_percent"] == 0.0
         assert out["mem_used_mb"] == 0
 
     def test_non_dict_returned_unchanged(self):
@@ -301,7 +326,7 @@ class TestConfigs:
 class TestServices:
     def test_status_normalisation(self):
         raw = [
-            {"name": "com.macintel.agent", "status": "running", "enabled": True,
+            {"name": "com.attacklens.agent", "status": "running", "enabled": True,
              "pid": 1234, "type": "launchd", "description": None},
             {"name": "com.apple.Spotlight", "status": "stopped", "enabled": True,
              "pid": None, "type": "launchd", "description": "Spotlight"},

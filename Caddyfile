@@ -1,16 +1,8 @@
 {
-    local_certs
+    auto_https off
+    admin off
 }
 
-:8443 {
-    tls internal
-
-    reverse_proxy jarvis-manager:8080 {
-        header_up X-Real-IP {remote_host}
-    }
-
-    log {
-        output stdout
-        format json
-    }
+:80 {
+    reverse_proxy jarvis-manager:8080
 }

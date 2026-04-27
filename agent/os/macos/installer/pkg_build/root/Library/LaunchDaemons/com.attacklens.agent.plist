@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.attacklens.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>PYTHON3_PLACEHOLDER</string>
+        <string>/Library/AttackLens/bin/run_agent.py</string>
+        <string>--config</string>
+        <string>/Library/AttackLens/agent.toml</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Library/AttackLens</string>
+    <key>UserName</key>
+    <string>root</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Library/AttackLens/logs/agent-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/AttackLens/logs/agent-stderr.log</string>
+</dict>
+</plist>

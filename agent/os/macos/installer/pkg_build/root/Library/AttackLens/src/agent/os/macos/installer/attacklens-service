@@ -1,0 +1,637 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  attacklens-service — AttackLens Agent Service Manager  v2.0.0
+#  Also installed as: /usr/local/bin/attacklens  (alias)
+#
+#  Commands (no root required):
+#    status                  service status + recent log tail
+#    logs                    follow live log (Ctrl+C to stop)
+#    config                  print agent.toml
+#    version                 show installed version + python
+#    diagnose                connectivity + install health check
+#    help | --help | -h      this message
+#
+#  Commands (root required):
+#    start                   start agent + watchdog LaunchDaemons
+#    stop                    stop agent + watchdog
+#    restart                 stop then start
+#    reload                  hot config reload (SIGHUP, no process restart)
+#    set-manager <IP|URL>    update manager URL, clear API key, restart
+#    enroll                  clear stored API key, force re-enrollment
+#    update-config           regenerate agent.toml preserving identity
+#
+#  Aliases understood:
+#    attacklens <cmd>        identical — this binary is installed as both names
+# =============================================================================
+set -uo pipefail
+
+readonly VERSION="2.0.0"
+readonly LAUNCHDAEMON_DIR="/Library/LaunchDaemons"
+
+# ── Detect which installation variant is present ──────────────────────────────
+if   [[ -f "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" ]]; then
+  INSTALL_DIR="/Library/AttackLens"
+  AGENT_LABEL="com.attacklens.agent"
+  WATCHDOG_LABEL="com.attacklens.watchdog"
+  KEYCHAIN_SVC="com.attacklens.agent"
+elif [[ -f "${LAUNCHDAEMON_DIR}/com.macintel.agent.plist" ]]; then
+  # Legacy label (older installs)
+  INSTALL_DIR="/Library/Jarvis"
+  AGENT_LABEL="com.macintel.agent"
+  WATCHDOG_LABEL="com.macintel.watchdog"
+  KEYCHAIN_SVC="com.macintel.agent"
+else
+  echo "  AttackLens is not installed."
+  echo "  Install:  sudo installer -pkg attacklens-agent-${VERSION}-arm64.pkg -target /"
+  exit 1
+fi
+
+readonly LOG_DIR="${INSTALL_DIR}/logs"
+readonly CONFIG_PATH="${INSTALL_DIR}/agent.toml"
+readonly SECURITY_DIR="${INSTALL_DIR}/security"
+readonly BIN_DIR="${INSTALL_DIR}/bin"
+readonly AGENT_PLIST="${LAUNCHDAEMON_DIR}/${AGENT_LABEL}.plist"
+readonly WATCHDOG_PLIST="${LAUNCHDAEMON_DIR}/${WATCHDOG_LABEL}.plist"
+readonly AGENT_LOG="${LOG_DIR}/agent.log"
+readonly STDOUT_LOG="${LOG_DIR}/agent-stdout.log"
+readonly STDERR_LOG="${LOG_DIR}/agent-stderr.log"
+
+# Best python3 to use — prefer what the running plist actually resolved to
+PYTHON3=""
+_detect_python3() {
+  # 1. What did the plist resolve to at postinstall time?
+  local from_plist
+  from_plist=$(grep -A8 "ProgramArguments" "${AGENT_PLIST}" 2>/dev/null \
+    | grep -E "<string>/[^ ]*python" | head -1 \
+    | sed 's|.*<string>||;s|</string>.*||' | xargs 2>/dev/null) || true
+  if [[ -n "$from_plist" ]] && [[ -x "$from_plist" ]]; then
+    PYTHON3="$from_plist"; return
+  fi
+  # 2. Well-known locations (prefer system python, then Homebrew)
+  local p
+  for p in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+    if [[ -x "$p" ]]; then
+      PYTHON3="$p"; return
+    fi
+  done
+}
+_detect_python3
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+_need_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "  Requires root:  sudo $(basename "$0") ${CMD:-$*}"
+    exit 1
+  fi
+}
+
+_svc_pid() {
+  launchctl list "$1" 2>/dev/null \
+    | grep '"PID"' | grep -oE '[0-9]+' | head -1 || true
+}
+
+_svc_exit() {
+  launchctl list "$1" 2>/dev/null \
+    | grep '"LastExitStatus"' | grep -oE '[0-9-]+' | head -1 || echo "?"
+}
+
+_svc_status_line() {
+  local label="$1"
+  local info
+  info=$(launchctl list "$label" 2>/dev/null) || { echo "not loaded"; return; }
+  local pid
+  pid=$(echo "$info" | grep '"PID"' | grep -oE '[0-9]+' | head -1 || true)
+  if [[ -n "$pid" ]]; then
+    echo "running  (PID ${pid})"
+  else
+    local exit_code
+    exit_code=$(echo "$info" | grep '"LastExitStatus"' | grep -oE '[0-9-]+' | head -1 || echo "?")
+    echo "stopped  (last exit: ${exit_code})"
+  fi
+}
+
+_cfg_get() {
+  # Extract a simple TOML key = "value" (or = value) from agent.toml
+  local key="$1" default="${2:-}"
+  grep -E "^${key}\s*=" "${CONFIG_PATH}" 2>/dev/null \
+    | head -1 | sed 's/^[^=]*=\s*//;s/#.*//;s/"//g' | xargs 2>/dev/null \
+    || echo "$default"
+}
+
+_load_svc() {
+  local plist="$1" label="$2"
+  launchctl enable "system/${label}" 2>/dev/null || true
+  # macOS 13+ Ventura / 14 Sonoma / 15 Sequoia / 26 Tahoe — use bootstrap
+  if launchctl bootstrap system "$plist" 2>/dev/null; then return 0; fi
+  # Pre-Ventura fallback
+  if launchctl load -w "$plist"         2>/dev/null; then return 0; fi
+  return 1
+}
+
+_unload_svc() {
+  local label="$1" plist="$2"
+  launchctl bootout  "system/${label}" 2>/dev/null || \
+  launchctl unload -w "$plist"         2>/dev/null || true
+}
+
+# Fix plists that have a shell-script as ProgramArguments[0].
+# macOS 15+ (Sequoia / Tahoe) blocks shell-script-headed LaunchDaemons.
+# We rewrite them to call python3 directly.
+_patch_plist_python3() {
+  local plist="$1"
+  [[ ! -f "$plist" ]] && return 0
+  [[ -z "$PYTHON3" ]] && return 0
+
+  # Resolve PYTHON3_PLACEHOLDER if postinstall missed it
+  if grep -q "PYTHON3_PLACEHOLDER" "$plist" 2>/dev/null; then
+    sed -i '' "s|PYTHON3_PLACEHOLDER|${PYTHON3}|g" "$plist"
+    echo "  Resolved PYTHON3_PLACEHOLDER → ${PYTHON3} in $(basename "$plist")"
+    return 0
+  fi
+
+  # Check if ProgramArguments[0] is a shell script (not a Mach-O)
+  local prog0
+  prog0=$(grep -A3 "<key>ProgramArguments</key>" "$plist" 2>/dev/null \
+    | grep "<string>" | head -1 | sed 's|.*<string>||;s|</string>.*||' | xargs 2>/dev/null) || true
+
+  local needs_patch=0
+  if [[ -z "$prog0" ]] || [[ "$prog0" == *.sh ]] || [[ "$prog0" == *.py ]]; then
+    needs_patch=1
+  elif [[ -f "$prog0" ]]; then
+    file "$prog0" 2>/dev/null | grep -q "shell script" && needs_patch=1
+  fi
+
+  if [[ $needs_patch -eq 1 ]]; then
+    echo "  Patching $(basename "$plist") for macOS 15+ (python3 direct launch)..."
+    # Determine which bootstrap launcher to use
+    local run_py
+    if echo "$plist" | grep -q "watchdog"; then
+      run_py="${BIN_DIR}/run_watchdog.py"
+    else
+      run_py="${BIN_DIR}/run_agent.py"
+    fi
+
+    python3 - "$plist" "$PYTHON3" "$run_py" "$CONFIG_PATH" <<'PYEOF'
+import sys, re
+plist_path, python3, run_py, config = sys.argv[1:5]
+with open(plist_path) as f:
+    content = f.read()
+new_args = (
+    f"<key>ProgramArguments</key>\n"
+    f"    <array>\n"
+    f"        <string>{python3}</string>\n"
+    f"        <string>{run_py}</string>\n"
+    f"        <string>--config</string>\n"
+    f"        <string>{config}</string>\n"
+    f"    </array>"
+)
+content = re.sub(
+    r'<key>ProgramArguments</key>\s*<array>.*?</array>',
+    new_args, content, flags=re.DOTALL
+)
+with open(plist_path, 'w') as f:
+    f.write(content)
+print(f"  Patched: {plist_path}")
+PYEOF
+  fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+do_status() {
+  local manager_url agent_id agent_name
+  manager_url=$(_cfg_get "url" "—")
+  agent_id=$(_cfg_get "id"   "—")
+  agent_name=$(_cfg_get "name" "—")
+
+  echo ""
+  echo "  AttackLens Agent  v${VERSION}"
+  echo "  ════════════════════════════════════════════════════"
+  printf "  %-14s %s\n" "Agent:"      "$(_svc_status_line "$AGENT_LABEL")"
+  printf "  %-14s %s\n" "Watchdog:"   "$(_svc_status_line "$WATCHDOG_LABEL")"
+  echo "  ────────────────────────────────────────────────────"
+  printf "  %-14s %s\n" "Manager:"    "${manager_url}"
+  printf "  %-14s %s\n" "Agent ID:"   "${agent_id}"
+  printf "  %-14s %s\n" "Name:"       "${agent_name}"
+  printf "  %-14s %s\n" "Install:"    "${INSTALL_DIR}"
+  printf "  %-14s %s\n" "Config:"     "${CONFIG_PATH}"
+  printf "  %-14s %s\n" "Python:"     "${PYTHON3:-not detected}"
+  echo ""
+
+  # Recent log tail
+  local logfile
+  for logfile in "${AGENT_LOG}" "${STDERR_LOG}" "${STDOUT_LOG}"; do
+    if [[ -s "$logfile" ]]; then
+      echo "  Recent log ($(basename "$logfile")):"
+      tail -8 "$logfile" 2>/dev/null | sed 's/^/    /'
+      echo ""
+      break
+    fi
+  done
+
+  # Hint: agent enrolled?
+  if security find-generic-password -s "${KEYCHAIN_SVC}" \
+     /Library/Keychains/System.keychain &>/dev/null 2>&1; then
+    echo "  Enrollment: API key stored in Keychain"
+  else
+    echo "  Enrollment: pending (will auto-enroll on first manager contact)"
+  fi
+  echo ""
+}
+
+do_start() {
+  _need_root
+
+  # Pre-flight checks
+  if [[ ! -f "$AGENT_PLIST" ]]; then
+    echo "  ERROR: Agent plist missing: ${AGENT_PLIST}"
+    echo "  Reinstall: sudo installer -pkg attacklens-agent-${VERSION}-arm64.pkg -target /"
+    exit 1
+  fi
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    echo "  ERROR: Config missing: ${CONFIG_PATH}"
+    echo "  Run: sudo $(basename "$0") update-config"
+    exit 1
+  fi
+  if [[ -z "$PYTHON3" ]]; then
+    echo "  ERROR: python3 not found. Install from https://python.org"
+    exit 1
+  fi
+
+  # Fix plists if needed (macOS 15+, stale PYTHON3_PLACEHOLDER)
+  _patch_plist_python3 "$AGENT_PLIST"
+  _patch_plist_python3 "$WATCHDOG_PLIST"
+
+  echo "  Starting AttackLens..."
+
+  if _load_svc "$AGENT_PLIST" "$AGENT_LABEL"; then
+    echo "  Started: ${AGENT_LABEL}"
+  else
+    echo ""
+    echo "  WARNING: Could not bootstrap ${AGENT_LABEL}"
+    echo "  This is normal on first install — macOS may need approval."
+    echo "  → System Settings › Privacy & Security › Background Items"
+    echo "  → Allow items from AttackLens"
+    echo ""
+  fi
+
+  if _load_svc "$WATCHDOG_PLIST" "$WATCHDOG_LABEL"; then
+    echo "  Started: ${WATCHDOG_LABEL}"
+  else
+    echo "  NOTE: Watchdog did not start — agent will still run without it."
+  fi
+
+  sleep 2
+  echo ""
+  do_status
+}
+
+do_stop() {
+  _need_root
+  echo "  Stopping AttackLens..."
+  _unload_svc "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"
+  _unload_svc "$AGENT_LABEL"    "$AGENT_PLIST"
+  echo "  Stopped."
+}
+
+do_restart() {
+  _need_root
+  do_stop
+  sleep 1
+  do_start
+}
+
+do_reload() {
+  _need_root
+  if launchctl kill HUP "system/${AGENT_LABEL}" 2>/dev/null; then
+    echo "  Config reloaded — SIGHUP sent to ${AGENT_LABEL}."
+    echo "  No restart needed; running configuration updated in-place."
+  else
+    echo "  Agent is not running."
+    echo "  Start it first: sudo $(basename "$0") start"
+    exit 1
+  fi
+}
+
+do_logs() {
+  # Pick the richest log file that has content
+  local logfile
+  for logfile in "${AGENT_LOG}" "${STDOUT_LOG}" "${STDERR_LOG}"; do
+    [[ -s "$logfile" ]] && break
+    logfile=""
+  done
+
+  if [[ -z "$logfile" ]] || [[ ! -f "$logfile" ]]; then
+    echo "  No logs yet.  Start the agent: sudo $(basename "$0") start"
+    exit 1
+  fi
+  echo "  → ${logfile}  (Ctrl+C to stop)"
+  echo ""
+  tail -f "$logfile"
+}
+
+do_config() {
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    echo "  Config not found: ${CONFIG_PATH}"
+    echo "  Run: sudo $(basename "$0") update-config"
+    exit 1
+  fi
+  echo "  ── ${CONFIG_PATH} ──"
+  cat "$CONFIG_PATH"
+}
+
+do_version() {
+  echo "  attacklens-service  ${VERSION}"
+  echo "  Install dir:        ${INSTALL_DIR}"
+  if [[ -n "$PYTHON3" ]]; then
+    echo "  Python:             $("${PYTHON3}" --version 2>&1)"
+  else
+    echo "  Python:             not detected"
+  fi
+  local ver_file="${INSTALL_DIR}/src/agent/VERSION"
+  [[ -f "$ver_file" ]] && echo "  Agent code:         $(cat "$ver_file")"
+  local sw_vers
+  sw_vers=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+  echo "  macOS:              ${sw_vers}"
+}
+
+do_diagnose() {
+  local pass=0 fail=0
+
+  _ok()   { printf "  \033[32m✓\033[0m  %-38s %s\n" "$1" "${2:-}"; ((pass++)) || true; }
+  _fail() { printf "  \033[31m✗\033[0m  %-38s %s\n" "$1" "${2:-FAILED}"; ((fail++)) || true; }
+  _warn() { printf "  \033[33m⚠\033[0m  %-38s %s\n" "$1" "${2:-}"; }
+
+  echo ""
+  echo "  AttackLens Diagnostics  v${VERSION}"
+  echo "  ════════════════════════════════════════════════════"
+
+  echo ""
+  echo "  [macOS & Python]"
+  local sw_vers
+  sw_vers=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+  _ok "macOS version" "$sw_vers"
+
+  if [[ -n "$PYTHON3" ]]; then
+    local py_ver
+    py_ver=$("${PYTHON3}" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "?")
+    local py_major py_minor
+    py_major=$(echo "$py_ver" | cut -d. -f1)
+    py_minor=$(echo "$py_ver" | cut -d. -f2)
+    if [[ $py_major -ge 3 ]] && [[ $py_minor -ge 11 ]]; then
+      _ok "Python 3.11+" "${PYTHON3}  (${py_ver})"
+    else
+      _fail "Python 3.11+" "${PYTHON3}  (${py_ver}) — upgrade recommended"
+    fi
+    # TOML support
+    if "${PYTHON3}" -c "import tomllib" 2>/dev/null \
+       || "${PYTHON3}" -c "import tomli" 2>/dev/null; then
+      _ok "TOML library (tomllib/tomli)" "OK"
+    else
+      _fail "TOML library" "run: pip3 install tomli"
+    fi
+    # psutil
+    if "${PYTHON3}" -c "import psutil" 2>/dev/null; then
+      _ok "psutil" "OK"
+    else
+      _warn "psutil not installed" "lsof/sysctl fallbacks will be used"
+    fi
+  else
+    _fail "Python3 detected" "install from https://python.org"
+  fi
+
+  echo ""
+  echo "  [Installation]"
+  [[ -d "$INSTALL_DIR" ]] && _ok  "Install dir ${INSTALL_DIR}" "exists" \
+                           || _fail "Install dir ${INSTALL_DIR}" "MISSING"
+  [[ -f "$CONFIG_PATH"  ]] && _ok  "Config file agent.toml"   "exists" \
+                           || _fail "Config file agent.toml"   "MISSING — run update-config"
+  [[ -f "$AGENT_PLIST"  ]] && _ok  "Agent plist"              "exists" \
+                           || _fail "Agent plist"              "MISSING — reinstall pkg"
+  [[ -f "$WATCHDOG_PLIST" ]] && _ok  "Watchdog plist"         "exists" \
+                             || _warn "Watchdog plist"         "missing — watchdog disabled"
+  [[ -f "${BIN_DIR}/run_agent.py" ]] && _ok  "run_agent.py"   "exists" \
+                                     || _fail "run_agent.py"   "MISSING — reinstall pkg"
+
+  echo ""
+  echo "  [Services]"
+  local agent_svc
+  agent_svc=$(_svc_status_line "$AGENT_LABEL")
+  if [[ "$agent_svc" == running* ]]; then
+    _ok "Agent daemon"    "$agent_svc"
+  else
+    _fail "Agent daemon"  "$agent_svc"
+  fi
+  local wd_svc
+  wd_svc=$(_svc_status_line "$WATCHDOG_LABEL")
+  if [[ "$wd_svc" == running* ]]; then
+    _ok "Watchdog daemon" "$wd_svc"
+  else
+    _warn "Watchdog daemon" "$wd_svc (non-critical)"
+  fi
+
+  echo ""
+  echo "  [Configuration]"
+  if [[ -f "$CONFIG_PATH" ]]; then
+    local manager_url agent_id
+    manager_url=$(_cfg_get "url" "")
+    agent_id=$(_cfg_get "id" "")
+    if [[ -n "$manager_url" ]]; then
+      _ok "Manager URL" "$manager_url"
+    else
+      _fail "Manager URL" "not set — run: sudo $(basename "$0") set-manager <IP>"
+    fi
+    if [[ "$manager_url" == *"YOUR_MANAGER"* ]]; then
+      _fail "Manager URL (placeholder)" "Update: sudo $(basename "$0") set-manager <IP>"
+    fi
+    [[ -n "$agent_id" ]] && _ok "Agent ID" "$agent_id" || _fail "Agent ID" "missing"
+  else
+    _fail "agent.toml" "missing — run: sudo $(basename "$0") update-config"
+  fi
+
+  echo ""
+  echo "  [Network]"
+  local manager_url
+  manager_url=$(_cfg_get "url" "")
+  if [[ -n "$manager_url" ]] && [[ "$manager_url" != *"YOUR_MANAGER"* ]]; then
+    local host port
+    host=$(echo "$manager_url" | sed 's|https\?://||;s|[:/].*||')
+    port=$(echo "$manager_url" | grep -oE ':[0-9]+' | tr -d ':' | head -1 || echo "8080")
+    if nc -z -w4 "$host" "$port" 2>/dev/null; then
+      _ok "Manager reachable  ${host}:${port}" "OK"
+    else
+      _fail "Manager reachable  ${host}:${port}" "UNREACHABLE — check IP/firewall"
+    fi
+    # HTTP health check
+    local http_code
+    http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
+      --max-time 5 "${manager_url%/}/health" 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" ]]; then
+      _ok "Manager /health HTTP" "${http_code}"
+    else
+      _warn "Manager /health HTTP" "${http_code} (may be normal if endpoint differs)"
+    fi
+  else
+    _warn "Manager network check" "skipped (URL not set or placeholder)"
+  fi
+
+  echo ""
+  echo "  [Keychain / Enrollment]"
+  if security find-generic-password -s "${KEYCHAIN_SVC}" \
+     /Library/Keychains/System.keychain &>/dev/null 2>&1; then
+    _ok "API key in Keychain" "enrolled"
+  else
+    _warn "API key not in Keychain" "will auto-enroll on first manager contact"
+  fi
+
+  echo ""
+  echo "  ════════════════════════════════════════════════════"
+  printf "  Passed: \033[32m%d\033[0m   Failed: \033[31m%d\033[0m\n" "$pass" "$fail"
+  echo ""
+  [[ $fail -eq 0 ]]
+}
+
+do_set_manager() {
+  _need_root
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "  Usage: sudo $(basename "$0") set-manager <IP_OR_URL>"
+    echo "  Examples:"
+    echo "    sudo $(basename "$0") set-manager 34.224.174.38"
+    echo "    sudo $(basename "$0") set-manager https://manager.example.com"
+    exit 1
+  fi
+
+  local new_url
+  if [[ "$target" == http://* ]] || [[ "$target" == https://* ]]; then
+    new_url="$target"
+  else
+    new_url="http://${target}:8080"
+  fi
+
+  echo "  Updating manager → ${new_url}"
+
+  [[ ! -f "$CONFIG_PATH" ]] && { echo "  ERROR: Config not found: ${CONFIG_PATH}"; exit 1; }
+
+  # Rewrite url + tls_verify with python (safer than sed for TOML)
+  python3 - "${CONFIG_PATH}" "${new_url}" <<'PYEOF'
+import sys, re
+path, url = sys.argv[1], sys.argv[2]
+tls = "false" if url.startswith("http://") else "true"
+with open(path) as f:
+    content = f.read()
+content = re.sub(r'^url\s*=\s*"[^"]*"',      f'url        = "{url}"', content, flags=re.MULTILINE)
+content = re.sub(r'^tls_verify\s*=\s*\S+',   f'tls_verify = {tls}',  content, flags=re.MULTILINE)
+with open(path, 'w') as f:
+    f.write(content)
+print(f"  Config updated: {path}")
+PYEOF
+
+  # Clear stored key so agent re-enrolls with the new manager
+  echo "  Clearing stored API key (agent will re-enroll with new manager)..."
+  security delete-generic-password -s "${KEYCHAIN_SVC}" \
+    /Library/Keychains/System.keychain 2>/dev/null && \
+    echo "  Keychain entry cleared." || echo "  (no Keychain entry)"
+  rm -f "${SECURITY_DIR}"/*.key 2>/dev/null || true
+
+  echo "  Restarting..."
+  do_stop
+  sleep 1
+  do_start
+}
+
+do_enroll() {
+  _need_root
+  local agent_id
+  agent_id=$(_cfg_get "id" "unknown")
+  echo "  Clearing API key for agent: ${agent_id}"
+  if security delete-generic-password -s "${KEYCHAIN_SVC}" \
+     /Library/Keychains/System.keychain 2>/dev/null; then
+    echo "  Keychain entry deleted."
+  else
+    echo "  (no Keychain entry — already clear)"
+  fi
+  rm -f "${SECURITY_DIR}"/*.key 2>/dev/null && echo "  Key files cleared." || true
+  echo ""
+  echo "  The agent will auto-enroll on next manager contact."
+  echo "  Run:  sudo $(basename "$0") restart"
+}
+
+do_update_config() {
+  _need_root
+  # Preserve identity & manager from existing config
+  local manager_url agent_id agent_name
+  manager_url=$(_cfg_get "url"  "http://YOUR_MANAGER_IP:8080")
+  agent_id=$(_cfg_get    "id"   "")
+  agent_name=$(_cfg_get  "name" "")
+
+  local gen_script="${BIN_DIR}/generate_config.sh"
+  if [[ -x "$gen_script" ]]; then
+    MANAGER_URL="$manager_url" \
+    AGENT_ID="$agent_id"       \
+    AGENT_NAME="$agent_name"   \
+    INSTALL_DIR="$INSTALL_DIR" \
+    LOG_DIR="$LOG_DIR"         \
+    SECURITY_DIR="$SECURITY_DIR" \
+    bash "$gen_script"
+  else
+    echo "  ERROR: generate_config.sh not found at ${gen_script}"
+    echo "  Reinstall the package to restore it."
+    exit 1
+  fi
+}
+
+do_help() {
+  local self
+  self="$(basename "$0")"
+  echo ""
+  echo "  Usage: ${self} <command> [args]"
+  echo "  (Also available as: attacklens)"
+  echo ""
+  echo "  No root required:"
+  echo "    status                   service + config summary"
+  echo "    logs                     follow live log  (Ctrl+C to stop)"
+  echo "    config                   print agent.toml"
+  echo "    version                  installed version + python"
+  echo "    diagnose                 connectivity + install health check"
+  echo ""
+  echo "  Root required:"
+  echo "    start                    start agent + watchdog"
+  echo "    stop                     stop agent + watchdog"
+  echo "    restart                  stop then start"
+  echo "    reload                   hot config reload (SIGHUP, no restart)"
+  echo "    set-manager <IP|URL>     update manager, clear key, restart"
+  echo "    enroll                   clear API key, force re-enrollment"
+  echo "    update-config            regenerate agent.toml"
+  echo ""
+  echo "  Install:  ${INSTALL_DIR}"
+  echo "  Config:   ${CONFIG_PATH}"
+  echo "  Version:  ${VERSION}"
+  echo ""
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+CMD="${1:-status}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  status)         do_status              ;;
+  start)          do_start               ;;
+  stop)           do_stop                ;;
+  restart)        do_restart             ;;
+  reload)         do_reload              ;;
+  logs)           do_logs                ;;
+  config)         do_config              ;;
+  version)        do_version             ;;
+  diagnose)       do_diagnose            ;;
+  set-manager)    do_set_manager "$@"    ;;
+  enroll)         do_enroll              ;;
+  update-config)  do_update_config       ;;
+  help|--help|-h) do_help                ;;
+  *)
+    echo "  Unknown command: ${CMD}"
+    echo "  Run: $(basename "$0") help"
+    exit 1
+    ;;
+esac
