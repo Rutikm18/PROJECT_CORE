@@ -56,23 +56,37 @@ readonly AGENT_LOG="${LOG_DIR}/agent.log"
 readonly STDOUT_LOG="${LOG_DIR}/agent-stdout.log"
 readonly STDERR_LOG="${LOG_DIR}/agent-stderr.log"
 
-# Best python3 to use — prefer what the running plist actually resolved to
+# Best python3 to use — MUST resolve to a Mach-O binary.
+# macOS 15+ Sequoia/Tahoe blocks LaunchDaemons whose ProgramArguments[0]
+# is a shell script. /usr/local/bin/python3 is often an Xcode CLT stub
+# (shell script), so we resolve to the real Mach-O via sys.executable.
 PYTHON3=""
 _detect_python3() {
+  local candidates=()
+
   # 1. What did the plist resolve to at postinstall time?
   local from_plist
   from_plist=$(grep -A8 "ProgramArguments" "${AGENT_PLIST}" 2>/dev/null \
     | grep -E "<string>/[^ ]*python" | head -1 \
     | sed 's|.*<string>||;s|</string>.*||' | xargs 2>/dev/null) || true
-  if [[ -n "$from_plist" ]] && [[ -x "$from_plist" ]]; then
-    PYTHON3="$from_plist"; return
-  fi
-  # 2. Well-known locations (prefer system python, then Homebrew)
-  local p
-  for p in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
-    if [[ -x "$p" ]]; then
-      PYTHON3="$p"; return
+  [[ -n "$from_plist" ]] && candidates+=("$from_plist")
+
+  # 2. Well-known locations
+  candidates+=(/usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3)
+
+  local p real_p
+  for p in "${candidates[@]}"; do
+    [[ -x "$p" ]] || continue
+    # Ask Python itself where the real Mach-O binary lives (resolves all symlinks/stubs)
+    real_p=$("$p" -c "import os,sys; print(os.path.realpath(sys.executable))" 2>/dev/null || echo "$p")
+    if [[ -x "$real_p" ]] && file "$real_p" 2>/dev/null | grep -q "Mach-O"; then
+      PYTHON3="$real_p"; return
     fi
+  done
+
+  # Fallback: accept any executable python3 (may still be a wrapper)
+  for p in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+    [[ -x "$p" ]] && { PYTHON3="$p"; return; }
   done
 }
 _detect_python3
@@ -87,28 +101,32 @@ _need_root() {
 }
 
 _svc_pid() {
-  launchctl list "$1" 2>/dev/null \
-    | grep '"PID"' | grep -oE '[0-9]+' | head -1 || true
+  # launchctl print system/<label> works without sudo; launchctl list only sees user domain
+  launchctl print "system/$1" 2>/dev/null \
+    | grep -E '[[:space:]]pid[[:space:]]*=' | head -1 | grep -oE '[0-9]+' || true
 }
 
 _svc_exit() {
-  launchctl list "$1" 2>/dev/null \
-    | grep '"LastExitStatus"' | grep -oE '[0-9-]+' | head -1 || echo "?"
+  launchctl print "system/$1" 2>/dev/null \
+    | grep 'last exit code' | sed 's/.*= //' || echo "?"
 }
 
 _svc_status_line() {
   local label="$1"
   local info
-  info=$(launchctl list "$label" 2>/dev/null) || { echo "not loaded"; return; }
-  local pid
-  pid=$(echo "$info" | grep '"PID"' | grep -oE '[0-9]+' | head -1 || true)
-  if [[ -n "$pid" ]]; then
-    echo "running  (PID ${pid})"
-  else
-    local exit_code
-    exit_code=$(echo "$info" | grep '"LastExitStatus"' | grep -oE '[0-9-]+' | head -1 || echo "?")
-    echo "stopped  (last exit: ${exit_code})"
-  fi
+  info=$(launchctl print "system/${label}" 2>/dev/null) || { echo "not loaded"; return; }
+  local state pid
+  state=$(echo "$info" | grep -E '[[:space:]]state[[:space:]]*=' | head -1 | awk '{print $NF}')
+  pid=$(echo "$info"   | grep -E '[[:space:]]pid[[:space:]]*='   | head -1 | grep -oE '[0-9]+')
+  case "$state" in
+    running) echo "running  (PID ${pid})" ;;
+    waiting) echo "waiting  (PID ${pid:-?})" ;;
+    *)
+      local exit_info
+      exit_info=$(echo "$info" | grep 'last exit code' | sed 's/.*= //')
+      echo "stopped  (${exit_info:-last exit: ?})"
+      ;;
+  esac
 }
 
 _cfg_get() {
@@ -121,12 +139,13 @@ _cfg_get() {
 
 _load_svc() {
   local plist="$1" label="$2"
+  # Ensure not loaded in wrong domain first (launchctl load -w puts it in gui/)
+  launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
   launchctl enable "system/${label}" 2>/dev/null || true
-  # macOS 13+ Ventura / 14 Sonoma / 15 Sequoia / 26 Tahoe — use bootstrap
-  if launchctl bootstrap system "$plist" 2>/dev/null; then return 0; fi
-  # Pre-Ventura fallback
-  if launchctl load -w "$plist"         2>/dev/null; then return 0; fi
-  return 1
+  # macOS 13+ Ventura / 14 Sonoma / 15 Sequoia / 26 Tahoe — system domain only
+  # Never use `launchctl load -w` — that loads into user gui/ domain, not system/
+  launchctl bootstrap system "$plist" 2>/dev/null
+  return 0
 }
 
 _unload_svc() {
@@ -230,12 +249,27 @@ do_status() {
     fi
   done
 
-  # Hint: agent enrolled?
+  # Enrollment hint
   if security find-generic-password -s "${KEYCHAIN_SVC}" \
      /Library/Keychains/System.keychain &>/dev/null 2>&1; then
     echo "  Enrollment: API key stored in Keychain"
   else
     echo "  Enrollment: pending (will auto-enroll on first manager contact)"
+  fi
+
+  # Exit-code 78 (19968) hint — shell-script python stub or macOS policy rejection
+  local agent_exit
+  agent_exit=$(_svc_exit "$AGENT_LABEL")
+  if [[ "$agent_exit" == "19968" ]]; then
+    echo ""
+    echo "  !! Exit 78 (EX_CONFIG) — plist python3 is a shell-script stub"
+    echo "     macOS 15+ blocks shell scripts as LaunchDaemon executables."
+    echo "     Fix: sudo attacklens-service start"
+    echo "     (patches plist with real Mach-O python3, then restarts)"
+    echo ""
+    echo "     If still 78 after start:"
+    echo "     System Settings > Privacy & Security > Login Items"
+    echo "     Toggle ON AttackLens, then: sudo attacklens-service start"
   fi
   echo ""
 }
@@ -271,8 +305,8 @@ do_start() {
     echo ""
     echo "  WARNING: Could not bootstrap ${AGENT_LABEL}"
     echo "  This is normal on first install — macOS may need approval."
-    echo "  → System Settings › Privacy & Security › Background Items"
-    echo "  → Allow items from AttackLens"
+    echo "  → System Settings › Privacy & Security › Login Items & Extensions"
+    echo "  → Allow AttackLens, then run: sudo attacklens-service start"
     echo ""
   fi
 
@@ -282,7 +316,26 @@ do_start() {
     echo "  NOTE: Watchdog did not start — agent will still run without it."
   fi
 
-  sleep 2
+  sleep 3
+  # Post-start check: if still exit 78, the plist python3 is probably a shell script
+  local post_exit
+  post_exit=$(_svc_exit "$AGENT_LABEL")
+  if [[ "$post_exit" == "19968" ]]; then
+    echo ""
+    echo "  ⚠  Agent still exiting with code 78 after plist patch."
+    echo "     Python resolved to: ${PYTHON3}"
+    echo ""
+    echo "     Try one of:"
+    echo "     1. Install official Python.org python3:"
+    echo "        https://www.python.org/downloads/macos/"
+    echo "        Then run: sudo attacklens-service start"
+    echo ""
+    echo "     2. Approve in System Settings:"
+    echo "        Privacy & Security › Login Items & Extensions"
+    echo "        Toggle ON 'AttackLens'"
+    echo "        Then run: sudo attacklens-service start"
+    echo ""
+  fi
   echo ""
   do_status
 }

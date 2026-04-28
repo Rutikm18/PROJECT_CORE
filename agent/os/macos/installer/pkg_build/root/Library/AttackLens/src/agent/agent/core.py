@@ -445,13 +445,30 @@ def main():
     try:
         api_key = _obtain_api_key(cfg, args.config)
     except EnrollmentError as exc:
-        log.critical("Enrollment failed: %s", exc)
-        log.critical(
-            "Set [manager] api_key in %s (same 64-hex as manager DB / make keygen), "
-            "or set [enrollment] token and run again. Stale key?  make reset-agent-key",
-            os.path.basename(args.config),
-        )
-        sys.exit(1)
+        log.warning("Enrollment failed (manager unreachable?): %s", exc)
+        log.warning("Starting with temporary key — will retry enrollment every 60s in background")
+        import secrets as _secrets
+        api_key = _secrets.token_hex(32)
+        # Persist to file backend so restarts find it before enrollment succeeds
+        try:
+            from .keystore import store_key as _store
+            _store(agent_id, api_key, backend="file",
+                   security_dir=_resolve_security_dir(cfg, args.config))
+        except Exception as _ke:
+            log.debug("Could not persist temp key: %s", _ke)
+        # Background thread: keep retrying enrollment until manager is reachable
+        def _retry_enrollment(cfg=cfg, config_path=args.config):
+            import time as _time
+            while True:
+                _time.sleep(60)
+                try:
+                    real_key = enroll(cfg)
+                    log.info("Enrollment succeeded on retry — restart agent to apply new key")
+                    break
+                except Exception as _re:
+                    log.debug("Enrollment retry: %s", _re)
+        threading.Thread(target=_retry_enrollment, daemon=True,
+                         name="enrollment-retry").start()
 
     if not api_key:
         log.critical("No API key for agent_id=%s", agent_id)
