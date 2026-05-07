@@ -21,8 +21,32 @@ log = logging.getLogger(__name__)
 CollectorResult = Union[dict, list]
 
 
-def _run(cmd: list[str], timeout: int = 15) -> str:
-    """Run a command, return stdout as str. Returns '' on any error."""
+_EXTENDED_ENV: dict | None = None
+
+def _get_env() -> dict:
+    """Return os.environ with extra PATH entries for LaunchDaemon context.
+
+    LaunchDaemons start with PATH=/usr/bin:/bin:/usr/sbin:/sbin — missing
+    /usr/local/bin (brew, pip3, docker) and /opt/homebrew/bin (Apple Silicon).
+    """
+    global _EXTENDED_ENV
+    if _EXTENDED_ENV is None:
+        import os as _os
+        env = dict(_os.environ)
+        extra = "/usr/local/bin:/opt/homebrew/bin:/opt/homebrew/sbin"
+        current = env.get("PATH", "")
+        parts = [p for p in extra.split(":") if p not in current.split(":")]
+        env["PATH"] = ":".join(parts) + (":" + current if current else "")
+        # Suppress "MallocStackLogging: can't turn off..." spam in subprocess stderr.
+        # macOS injects this when the parent process has malloc debug flags set;
+        # setting it to 0 prevents child processes from inheriting the flag.
+        env["MallocStackLogging"] = "0"
+        _EXTENDED_ENV = env
+    return _EXTENDED_ENV
+
+
+def _run(cmd: list[str], timeout: int = 15, stderr: bool = False) -> str:
+    """Run a command, return stdout (or stderr when stderr=True) as str. Returns '' on any error."""
     try:
         r = subprocess.run(
             cmd,
@@ -30,8 +54,9 @@ def _run(cmd: list[str], timeout: int = 15) -> str:
             text=True,
             timeout=timeout,
             errors="replace",
+            env=_get_env(),
         )
-        return r.stdout
+        return r.stderr if stderr else r.stdout
     except FileNotFoundError:
         log.debug("Command not found: %s", cmd[0])
         return ""
@@ -80,8 +105,9 @@ def _codesign_info(path: str) -> dict:
     """
     Return codesign metadata for a binary:
       identifier, authority (list), team_id, flags, signed (bool)
+    codesign writes its verbose output to stderr, so we capture stderr.
     """
-    out = _run(["codesign", "-dvvv", "--", path], timeout=10)
+    out = _run(["codesign", "-dvvv", "--", path], timeout=10, stderr=True)
     info: dict = {"path": path, "signed": False, "identifier": None,
                   "authority": [], "team_id": None, "flags": None}
     if not out:

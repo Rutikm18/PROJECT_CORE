@@ -42,6 +42,22 @@ CREATE TABLE IF NOT EXISTS payloads (
 
 CREATE INDEX IF NOT EXISTS idx_payloads_agent_section_ts
     ON payloads(agent_id, section, collected_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id        TEXT NOT NULL,
+    connected_at    INTEGER NOT NULL,
+    disconnected_at INTEGER DEFAULT 0,
+    last_seen       INTEGER NOT NULL,
+    last_ip         TEXT DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'connected',
+    close_reason    TEXT DEFAULT '',
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent_ts
+    ON agent_sessions(agent_id, connected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_open
+    ON agent_sessions(agent_id, status, last_seen DESC);
 """
 
 # Idempotent migration: add new columns to agent_keys if upgrading from
@@ -210,6 +226,16 @@ class Database:
     async def upsert_agent(self, agent_id: str, name: str, ip: str):
         now = int(time.time())
         async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT last_seen FROM agents WHERE agent_id=?", (agent_id,)
+            ) as cur:
+                existing = await cur.fetchone()
+            previous_last_seen = int(existing["last_seen"] or 0) if existing else 0
+            starts_new_session = (
+                previous_last_seen <= 0
+                or now - previous_last_seen >= 300
+            )
             await db.execute("""
                 INSERT INTO agents(agent_id, name, last_seen, last_ip, created_at)
                 VALUES(?,?,?,?,?)
@@ -218,7 +244,80 @@ class Database:
                     last_seen=excluded.last_seen,
                     last_ip=excluded.last_ip
             """, (agent_id, name, now, ip, now))
+            if starts_new_session:
+                await db.execute("""
+                    UPDATE agent_sessions
+                    SET disconnected_at=?, status='disconnected',
+                        close_reason=CASE WHEN close_reason='' THEN 'timeout' ELSE close_reason END
+                    WHERE agent_id=? AND status='connected'
+                """, (min(previous_last_seen + 300, now) if previous_last_seen else now, agent_id))
+                await db.execute("""
+                    INSERT INTO agent_sessions(
+                        agent_id, connected_at, disconnected_at,
+                        last_seen, last_ip, status, close_reason
+                    ) VALUES(?,?,0,?,?,'connected','')
+                """, (agent_id, now, now, ip))
+            else:
+                cur = await db.execute("""
+                    UPDATE agent_sessions
+                    SET last_seen=?, last_ip=?
+                    WHERE id = (
+                        SELECT id FROM agent_sessions
+                        WHERE agent_id=? AND status='connected'
+                        ORDER BY connected_at DESC LIMIT 1
+                    )
+                """, (now, ip, agent_id))
+                if cur.rowcount == 0:
+                    await db.execute("""
+                        INSERT INTO agent_sessions(
+                            agent_id, connected_at, disconnected_at,
+                            last_seen, last_ip, status, close_reason
+                        ) VALUES(?,?,0,?,?,'connected','')
+                    """, (agent_id, previous_last_seen or now, now, ip))
             await db.commit()
+
+    async def close_stale_agent_sessions(self, stale_after: int = 300) -> int:
+        now = int(time.time())
+        cutoff = now - stale_after
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("""
+                UPDATE agent_sessions
+                SET disconnected_at=CASE
+                        WHEN last_seen + ? < ? THEN last_seen + ?
+                        ELSE ?
+                    END,
+                    status='disconnected',
+                    close_reason='timeout'
+                WHERE status='connected'
+                  AND last_seen <= ?
+            """, (stale_after, now, stale_after, now, cutoff))
+            await db.commit()
+            return cur.rowcount
+
+    async def get_agent_sessions(self, agent_id: str, limit: int = 5) -> list[dict]:
+        await self.close_stale_agent_sessions()
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT id, agent_id, connected_at, disconnected_at,
+                       last_seen, last_ip, status, close_reason
+                FROM agent_sessions
+                WHERE agent_id=?
+                ORDER BY connected_at DESC
+                LIMIT ?
+            """, (agent_id, limit)) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_agent_session_counts(self) -> dict[str, int]:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("""
+                SELECT agent_id, COUNT(*) AS cnt
+                FROM agent_sessions
+                GROUP BY agent_id
+            """) as cur:
+                rows = await cur.fetchall()
+        return {r[0]: int(r[1] or 0) for r in rows}
 
     async def insert_payload(self, agent_id: str, section: str,
                              collected_at: int, data: dict):
@@ -231,6 +330,7 @@ class Database:
             await db.commit()
 
     async def get_all_agents(self) -> list:
+        await self.close_stale_agent_sessions()
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -239,6 +339,7 @@ class Database:
                 return [dict(r) for r in await cur.fetchall()]
 
     async def get_agent(self, agent_id: str) -> dict | None:
+        await self.close_stale_agent_sessions()
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -274,3 +375,33 @@ class Database:
              "data": json.loads(r[2])}
             for r in rows
         ]
+
+    async def get_latest_packages_per_agent(self) -> list[tuple[str, list]]:
+        """
+        Return the most-recent packages payload for every agent.
+        Used by ThreatIntelWorker for proactive CVE re-scanning.
+        Returns list of (agent_id, packages_list) tuples.
+        """
+        import json as _json
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("""
+                SELECT p.agent_id, p.data
+                FROM payloads p
+                INNER JOIN (
+                    SELECT agent_id, MAX(collected_at) AS max_ts
+                    FROM payloads WHERE section = 'packages'
+                    GROUP BY agent_id
+                ) latest ON p.agent_id = latest.agent_id
+                        AND p.collected_at = latest.max_ts
+                        AND p.section = 'packages'
+            """) as cur:
+                rows = await cur.fetchall()
+        result: list[tuple[str, list]] = []
+        for agent_id, data_text in rows:
+            try:
+                data = _json.loads(data_text) if data_text else []
+                if isinstance(data, list):
+                    result.append((agent_id, data))
+            except Exception:
+                pass
+        return result

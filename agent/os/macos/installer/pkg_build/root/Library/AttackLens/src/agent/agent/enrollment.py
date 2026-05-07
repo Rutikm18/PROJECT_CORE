@@ -198,10 +198,18 @@ def _post_enroll(url: str, token: str, payload: dict, tls_verify: bool) -> dict:
             f"Server: {body_resp.decode(errors='replace')}"
         )
     if status == 409:
-        raise EnrollmentError(
-            "Agent already enrolled on manager (HTTP 409). "
-            "To re-enroll: use POST /api/v1/keys/{agent_id}/rotate on the manager."
-        )
+        # Already enrolled — manager may return the existing key in the body.
+        try:
+            body_json = json.loads(body_resp)
+            existing_key = body_json.get("api_key", "").strip()
+            if existing_key and len(existing_key) == 64:
+                log.info("Agent already enrolled — reusing existing key from manager")
+                return {"api_key": existing_key}
+        except Exception:
+            pass
+        # Manager didn't return a key; the key already in keystore is still valid.
+        log.info("Agent already enrolled (HTTP 409) — keystore key still valid")
+        return {}
     raise EnrollmentError(
         f"Manager returned HTTP {status}: {body_resp.decode(errors='replace')}"
     )

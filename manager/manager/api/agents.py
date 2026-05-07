@@ -30,6 +30,32 @@ if TYPE_CHECKING:
     from ..store import TelemetryStore
 
 log = logging.getLogger("manager.api.agents")
+ONLINE_WINDOW_SECONDS = 300
+
+
+def _agent_live_fields(agent: dict, now: float, session_count: int = 0) -> dict:
+    last_seen = int(agent.get("last_seen", 0) or 0)
+    online = bool(last_seen and (now - last_seen) < ONLINE_WINDOW_SECONDS)
+    delta = max(0, int(now - last_seen)) if last_seen else 0
+    return {
+        **agent,
+        "online": online,
+        "live_status": "connected" if online else "disconnected",
+        "last_seen_label": "live now" if online else ("never seen" if not last_seen else f"last seen {_human_delta(delta)} ago"),
+        "online_for": delta if online else 0,
+        "offline_for": 0 if online else delta,
+        "session_count": session_count,
+    }
+
+
+def _human_delta(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 
 def make_agents_router(db: "Database", store: "TelemetryStore") -> APIRouter:
@@ -40,10 +66,8 @@ def make_agents_router(db: "Database", store: "TelemetryStore") -> APIRouter:
     async def list_agents():
         agents = await db.get_all_agents()
         now = time.time()
-        return [
-            {**a, "online": (now - a.get("last_seen", 0)) < 300}
-            for a in agents
-        ]
+        counts = await db.get_agent_session_counts()
+        return [_agent_live_fields(a, now, counts.get(a["agent_id"], 0)) for a in agents]
 
     # ── Agent detail ──────────────────────────────────────────────────────────
     @router.get("/{agent_id}", response_model=AgentDetail)
@@ -52,8 +76,19 @@ def make_agents_router(db: "Database", store: "TelemetryStore") -> APIRouter:
         if not agent:
             raise HTTPException(404, "Agent not found")
         sections = await db.get_section_last_times(agent_id)
-        online   = (time.time() - agent.get("last_seen", 0)) < 300
-        return {**agent, "sections": sections, "online": online}
+        sessions = await db.get_agent_sessions(agent_id, limit=5)
+        shaped_sessions = []
+        for session in sessions:
+            duration_end = session.get("disconnected_at") or int(time.time())
+            shaped_sessions.append({
+                **session,
+                "duration": max(0, int(duration_end - session.get("connected_at", 0))),
+            })
+        return {
+            **_agent_live_fields(agent, time.time(), len(sessions)),
+            "sections": sections,
+            "sessions": shaped_sessions,
+        }
 
     # ── Section summary (freshness for timeline) ──────────────────────────────
     @router.get("/{agent_id}/sections")

@@ -34,12 +34,19 @@ from typing import Any, Optional
 
 from .rules import (
     MALICIOUS_PORTS, PROCESS_RULES, SUSPICIOUS_PATHS, CONFIG_RULES,
-    RISKY_PACKAGES, SUSPICIOUS_SERVICE_PATTERNS, get_tactic, severity_to_score,
+    RISKY_PACKAGES, SUSPICIOUS_SERVICE_PATTERNS, PARENT_CHILD_RULES,
+    OBFUSCATION_RULES, get_tactic, severity_to_score,
+)
+from .allowlist import (
+    is_trusted_ip, is_apple_system_process, get_dual_use_info,
+    is_suspicious_spawn, has_benign_parent, adjust_finding_for_allowlist,
+    cap_severity, APPLE_SYSTEM_PROCS,
 )
 from .behavioral  import BehavioralAnalyzer
 from .feeds       import FeedManager
 from .nvd         import CVELookup
 from .correlator  import CorrelationEngine
+from ..threat.scoring import score_matrix
 
 log = logging.getLogger("manager.jarvis.engine")
 
@@ -74,21 +81,41 @@ class JarvisEngine:
         # Per-agent payload counter — run correlation every 3 payloads
         self._payload_count: dict[str, int] = {}
 
+    @property
+    def feeds(self) -> "FeedManager":
+        """Shared FeedManager instance (used by ThreatIntelWorker)."""
+        return self._feeds
+
+    @property
+    def nvd(self) -> "CVELookup":
+        """Shared CVELookup instance (used by ThreatIntelWorker)."""
+        return self._nvd
+
     async def start(self) -> None:
-        """Call once at startup."""
-        await self._feeds.refresh()
-        asyncio.create_task(self._feed_refresh_loop())
+        """Call once at startup. Feed scheduling is owned by ThreatIntelWorker."""
+        await self._feeds.refresh()   # initial load from DB cache only (no network)
         asyncio.create_task(self._nvd_worker())
         self._ready = True
         log.info("Jarvis engine started")
 
-    async def process(self, agent_id: str, section: str, data: Any) -> None:
-        """Entry point called by ingest pipeline for every payload."""
+    async def process(
+        self,
+        agent_id: str,
+        section: str,
+        data: Any,
+        skip_correlation: bool = False,
+    ) -> None:
+        """
+        Entry point for every payload (or chunk).
+
+        skip_correlation=True when the caller is processing a chunk that is
+        part of a larger chunk set — the ChunkTracker will fire correlation
+        once when the final chunk completes, rather than once per chunk.
+        """
         if not self._ready:
             return
         try:
             findings = await self._dispatch(agent_id, section, data)
-            # Behavioral analysis runs in parallel
             beh = await self._behav.analyze(agent_id, section, data)
             findings.extend(beh)
 
@@ -97,14 +124,21 @@ class JarvisEngine:
                 f["agent_id"] = agent_id
                 await self._idb.upsert_finding(f, ts)
 
-            # Run cross-section correlation every 3 payloads per agent
-            count = self._payload_count.get(agent_id, 0) + 1
-            self._payload_count[agent_id] = count
-            if count % 3 == 0:
-                asyncio.create_task(self._run_correlations(agent_id))
+            if not skip_correlation:
+                count = self._payload_count.get(agent_id, 0) + 1
+                self._payload_count[agent_id] = count
+                if count % 3 == 0:
+                    asyncio.create_task(self._run_correlations(agent_id))
         except Exception as exc:
             log.warning("Jarvis.process error agent=%s section=%s: %s",
                         agent_id, section, exc)
+
+    async def run_correlations(self, agent_id: str) -> None:
+        """
+        Public trigger for cross-section correlation.
+        Called by ChunkTracker when the last chunk of a chunk set completes.
+        """
+        asyncio.create_task(self._run_correlations(agent_id))
 
     async def _run_correlations(self, agent_id: str) -> None:
         """Evaluate cross-section correlation rules and store results."""
@@ -210,41 +244,109 @@ class JarvisEngine:
         findings = []
         if not isinstance(data, list):
             return findings
+
+        # Build a pid → name/exe lookup for parent-child analysis
+        pid_map: dict[int, dict] = {}
+        for item in data:
+            if isinstance(item, dict):
+                try:
+                    pid_map[int(item.get("pid", 0) or 0)] = item
+                except (ValueError, TypeError):
+                    pass
+
         for item in data:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name", "") or "")
-            cmd  = str(item.get("cmdline", "") or item.get("cmd", "") or "")
-            exe  = str(item.get("exe", "") or item.get("path", "") or "")
-            pid  = item.get("pid", "?")
-            full = f"{exe} {cmd}".strip()
+            name    = str(item.get("name", "") or "")
+            cmd     = str(item.get("cmdline", "") or item.get("cmd", "") or "")
+            exe     = str(item.get("exe", "") or item.get("path", "") or "")
+            pid     = item.get("pid", "?")
+            ppid    = item.get("ppid") or item.get("parent_pid")
+            full    = f"{exe} {cmd}".strip()
 
-            # Regex rules against cmdline
+            # Skip Apple system processes entirely
+            if is_apple_system_process(name, exe):
+                continue
+
+            # Resolve parent name for lineage checks
+            parent_name = ""
+            if ppid:
+                try:
+                    parent_item = pid_map.get(int(ppid), {})
+                    parent_name = str(parent_item.get("name", "") or "")
+                except (ValueError, TypeError):
+                    pass
+
+            # Benign parent check — suppress if spawned from known-good IDE/shell
+            if parent_name and has_benign_parent(parent_name, name):
+                continue
+
+            # Parent-child lineage rules (Office/browser → shell is critical)
+            for lrule in PARENT_CHILD_RULES:
+                if parent_name and lrule["parent_re"].search(parent_name):
+                    if lrule["child_re"].search(name) or lrule["child_re"].search(cmd):
+                        f = self._finding(
+                            category="process",
+                            item_key=f"lineage:{parent_name}:{name}:{pid}",
+                            severity=lrule["severity"],
+                            score=severity_to_score(lrule["severity"]),
+                            title=f"Suspicious spawn: {parent_name} → {name}",
+                            desc=(f"{lrule['desc']} — "
+                                  f"'{parent_name}' (PID {ppid}) spawned '{name}' (PID {pid}): {cmd[:100]}"),
+                            evidence={**item, "parent_name": parent_name, "ppid": ppid},
+                            source="rule:process_lineage", mitre=lrule["mitre"],
+                            tags=["process", "lineage", "high_confidence"],
+                        )
+                        findings.append(f)
+                        break
+
+            # Standard process pattern rules
             for rule in PROCESS_RULES:
                 if rule["compiled"].search(full) or rule["compiled"].search(name):
-                    findings.append(self._finding(
+                    f = self._finding(
                         category="process",
-                        item_key=f"proc:{name}:{pid}",
+                        item_key=f"proc:{name}:{_fp(exe or cmd)}",
                         severity=rule["severity"],
-                        score=severity_to_score(rule["severity"]),
+                        score=severity_to_score(rule["severity"]) * rule.get("confidence", 0.8),
                         title=f"Suspicious process: {name}",
                         desc=f"{rule['desc']} — PID {pid}: {cmd[:120]}",
                         evidence=item, source="rule:process_pattern",
-                        mitre=rule["mitre"],
-                        tags=["process", "suspicious"],
-                    ))
+                        mitre=rule["mitre"], tags=["process", "suspicious"],
+                    )
+                    # Apply dual-use allowlist adjustment
+                    f = adjust_finding_for_allowlist(f, name=name, path=exe, cmd=cmd,
+                                                     parent_name=parent_name)
+                    if f:
+                        findings.append(f)
                     break
 
-            # SUID / SGID
+            # Obfuscation pattern check against cmdline
+            for orule in OBFUSCATION_RULES:
+                if orule["compiled"].search(cmd):
+                    f = self._finding(
+                        category="process",
+                        item_key=f"obfusc:{name}:{_fp(cmd)}",
+                        severity=orule["severity"],
+                        score=severity_to_score(orule["severity"]) * orule.get("confidence", 0.8),
+                        title=f"Obfuscated command in process: {name}",
+                        desc=f"{orule['desc']} — PID {pid}: {cmd[:150]}",
+                        evidence=item, source="rule:obfuscation",
+                        mitre=orule["mitre"], tags=["process", "obfuscation"],
+                    )
+                    findings.append(f)
+                    break
+
+            # SUID / SGID check
             if item.get("suid") or item.get("is_suid"):
                 findings.append(self._finding(
-                    category="process", item_key=f"proc_suid:{exe}",
+                    category="process", item_key=f"proc_suid:{_fp(exe or name)}",
                     severity="medium", score=4.5,
                     title=f"SUID process running: {name}",
                     desc=f"Process {name} (PID {pid}) is running with SUID bit set.",
                     evidence=item, source="rule:suid_process",
                     mitre="T1548.001", tags=["process", "privilege_escalation"],
                 ))
+
         return findings
 
     async def _connections(self, agent_id: str, data: list) -> list[dict]:
@@ -259,6 +361,9 @@ class JarvisEngine:
                 continue
             ip = raddr.rsplit(":", 1)[0].strip("[]")
             if not ip or _PRIVATE_RE.match(ip):
+                continue
+            # Skip trusted CDN/cloud IPs to reduce FP
+            if is_trusted_ip(ip):
                 continue
 
             # Threat feed check
@@ -365,7 +470,7 @@ class JarvisEngine:
             # Risky package rule check
             for pkg_name, rule in RISKY_PACKAGES.items():
                 if pkg_name in name:
-                    findings.append(self._finding(
+                    f = self._finding(
                         category="package",
                         item_key=f"pkg:{manager}:{name}",
                         severity=rule["severity"],
@@ -375,7 +480,11 @@ class JarvisEngine:
                         evidence=item, source="rule:risky_package",
                         mitre=rule["mitre"],
                         tags=["package", "tool", manager],
-                    ))
+                    )
+                    # Apply dual-use downgrade for legitimate pentest/admin tools
+                    f = adjust_finding_for_allowlist(f, name=name)
+                    if f:
+                        findings.append(f)
                     break
 
             # Queue for NVD CVE lookup (async, non-blocking)
@@ -551,14 +660,6 @@ class JarvisEngine:
 
     # ── Background workers ─────────────────────────────────────────────────────
 
-    async def _feed_refresh_loop(self) -> None:
-        while True:
-            await asyncio.sleep(3600)
-            try:
-                await self._feeds.refresh()
-            except Exception as exc:
-                log.warning("Feed refresh error: %s", exc)
-
     async def _nvd_worker(self) -> None:
         """Drain the NVD / AbuseIPDB queue at a controlled rate."""
         while True:
@@ -587,6 +688,12 @@ class JarvisEngine:
                         f["cve_ids"]  = [cve["cve_id"]]
                         f["cvss_score"] = score
                         f["cvss_vector"] = cve.get("cvss_vector", "")
+                        f.update(_intel_fields_from_cve(cve, raw))
+                        f["composite_score"] = score_matrix.compute(
+                            f, agent_id=agent_id, collected_ts=time.time(),
+                        )
+                        f["priority_reason"] = _priority_reason(f)
+                        f["action_plan"] = _action_plan_for(f)
                         await self._idb.upsert_finding(f, time.time())
 
                 elif item[0] == "abuseipdb":
@@ -605,6 +712,14 @@ class JarvisEngine:
                             tags=["connection", "abuseipdb"],
                         )
                         f["agent_id"] = agent_id
+                        f["asset_tier"] = _asset_tier_from_evidence(raw_item)
+                        f["asset_importance"] = _asset_importance(f["asset_tier"])
+                        f["composite_score"] = max(
+                            f["score"],
+                            score_matrix.compute(f, agent_id=agent_id, collected_ts=time.time()),
+                        )
+                        f["priority_reason"] = _priority_reason(f)
+                        f["action_plan"] = _action_plan_for(f)
                         await self._idb.upsert_finding(f, time.time())
 
             except Exception as exc:
@@ -643,3 +758,83 @@ class JarvisEngine:
 def _fp(s: str) -> str:
     """Short fingerprint for use in item_key."""
     return hashlib.sha256(s.encode()).hexdigest()[:12]
+
+
+def _intel_fields_from_cve(cve: dict, evidence: dict) -> dict:
+    refs = cve.get("references") or cve.get("reference_urls") or []
+    ref_text = " ".join(map(str, refs)).lower()
+    desc = str(cve.get("description", "")).lower()
+    kev = bool(cve.get("kev") or cve.get("cisa_kev") or cve.get("known_exploited"))
+    exploit_sources: list[str] = []
+    if cve.get("exploit_db_id"):
+        exploit_sources.append(f"ExploitDB:{cve.get('exploit_db_id')}")
+    if "exploit-db" in ref_text or "exploitdb" in ref_text:
+        exploit_sources.append("ExploitDB reference")
+    if "metasploit" in ref_text or "metasploit" in desc:
+        exploit_sources.append("Metasploit reference")
+    if "proof-of-concept" in desc or "poc" in ref_text:
+        exploit_sources.append("public PoC reference")
+    epss = float(cve.get("epss_score") or cve.get("epss") or 0)
+    tier = _asset_tier_from_evidence(evidence)
+    return {
+        "kev": kev,
+        "epss_score": epss,
+        "exploit_available": bool(exploit_sources or cve.get("exploit_available")),
+        "exploit_sources": sorted(set(exploit_sources)),
+        "asset_tier": tier,
+        "asset_importance": _asset_importance(tier),
+    }
+
+
+def _asset_tier_from_evidence(evidence: dict) -> str:
+    text = json.dumps(evidence or {}, default=str).lower()
+    if any(x in text for x in ("server", "runner", "build", "prod", "database", "k8s", "container")):
+        return "server"
+    if any(x in text for x in ("executive", "finance", "admin", "ciso", "ceo")):
+        return "crown_jewel"
+    if any(x in text for x in ("laptop", "macbook", "workstation", "desktop")):
+        return "workstation"
+    return "endpoint"
+
+
+def _asset_importance(tier: str) -> float:
+    return {
+        "crown_jewel": 1.0,
+        "server": 0.9,
+        "workstation": 0.55,
+        "endpoint": 0.4,
+    }.get(tier, 0.3)
+
+
+def _priority_reason(f: dict) -> str:
+    bits = []
+    if f.get("kev"):
+        bits.append("CISA KEV")
+    if f.get("exploit_available"):
+        bits.append("public exploit")
+    if f.get("epss_score"):
+        bits.append(f"EPSS {float(f['epss_score']) * 100:.0f}%")
+    if f.get("cvss_score"):
+        bits.append(f"CVSS {float(f['cvss_score']):.1f}")
+    if f.get("asset_tier"):
+        bits.append(f"{f['asset_tier']} asset")
+    return ", ".join(bits) or "telemetry/rule correlation"
+
+
+def _action_plan_for(f: dict) -> list[dict]:
+    cat = f.get("category", "")
+    if cat == "package":
+        return [
+            {"type": "contain", "title": "Restrict exposure for affected service", "detail": "Firewall or segment the service until the package is patched."},
+            {"type": "remediate", "title": "Patch or upgrade vulnerable package", "detail": "Use the package manager to move to a non-vulnerable version and rescan."},
+            {"type": "hunt", "title": "Review logs for exploitation attempts", "detail": "Search service and proxy logs for payloads matching the CVE window."},
+        ]
+    if cat == "connection":
+        return [
+            {"type": "contain", "title": "Block destination IOC", "detail": "Block the IP/domain at egress controls and DNS where applicable."},
+            {"type": "investigate", "title": "Identify owning process and parent chain", "detail": "Map PID, binary path, signer, launch mechanism, and user context."},
+        ]
+    return [
+        {"type": "investigate", "title": "Validate evidence and owner", "detail": "Confirm the finding, affected asset, business owner, and immediate blast radius."},
+        {"type": "remediate", "title": "Apply recommended mitigation", "detail": "Track status, assignee, and closure notes in the finding activity log."},
+    ]

@@ -19,9 +19,36 @@
 #
 #    Manager is NOT directly exposed to the internet.
 #    Only Caddy can reach it via Docker internal network.
+#
+#    threat-intel is the central reusable intelligence service:
+#      • owns NVD / IOC feed sync
+#      • stores shared intel in /app/data/intel.db
+#      • exposes APIs for multiple dashboards/managers
 # =============================================================================
 
 services:
+
+  # ── Message broker ───────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: jarvis-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-jarvis}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-changeme}"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - jarvis_internal
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_listener", "5672"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
 
   # ── TLS reverse proxy ────────────────────────────────────────────────────────
   caddy:
@@ -49,7 +76,7 @@ services:
         condition: service_healthy
 
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:2019/metrics"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -88,9 +115,48 @@ services:
       BIND_PORT:               "8080"
       TLS_MODE:                "none"
 
+      # RabbitMQ — async ingest pipeline
+      RABBITMQ_URL:            "amqp://${RABBITMQ_USER:-jarvis}:${RABBITMQ_PASS:-changeme}@rabbitmq:5672/"
+
+      # Central threat-intel API. Manager still degrades gracefully if unavailable.
+      THREAT_INTEL_URL:        "http://threat-intel:8090"
+      MANAGER_EMBEDDED_THREAT_INTEL: "${MANAGER_EMBEDDED_THREAT_INTEL:-false}"
+
+      # ── AI analyst (Claude API) ─────────────────────────────────────────────
+      ANTHROPIC_API_KEY:       "${ANTHROPIC_API_KEY:-}"
+      AI_ANALYST_MODEL:        "${AI_ANALYST_MODEL:-claude-sonnet-4-6}"
+      AI_ANALYST_ENABLED:      "${AI_ANALYST_ENABLED:-true}"
+
+      # ── Email notifications ─────────────────────────────────────────────────
+      SMTP_HOST:               "${SMTP_HOST:-}"
+      SMTP_PORT:               "${SMTP_PORT:-587}"
+      SMTP_USER:               "${SMTP_USER:-}"
+      SMTP_PASS:               "${SMTP_PASS:-}"
+      SMTP_FROM:               "${SMTP_FROM:-}"
+      SMTP_TLS:                "${SMTP_TLS:-starttls}"
+      ALERT_RECIPIENTS:        "${ALERT_RECIPIENTS:-}"
+      DIGEST_RECIPIENTS:       "${DIGEST_RECIPIENTS:-}"
+      OUTLOOK_CLIENT_ID:       "${OUTLOOK_CLIENT_ID:-}"
+      OUTLOOK_CLIENT_SECRET:   "${OUTLOOK_CLIENT_SECRET:-}"
+      OUTLOOK_TENANT_ID:       "${OUTLOOK_TENANT_ID:-}"
+      OUTLOOK_SENDER:          "${OUTLOOK_SENDER:-}"
+      EMAIL_ENABLED:           "${EMAIL_ENABLED:-true}"
+
+      # ── Threat intel keys ───────────────────────────────────────────────────
+      ABUSEIPDB_KEY:           "${ABUSEIPDB_KEY:-}"
+      OTX_KEY:                 "${OTX_KEY:-}"
+      GREYNOISE_KEY:           "${GREYNOISE_KEY:-}"
+
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      threat-intel:
+        condition: service_healthy
+
     volumes:
-      - ./data:/app/data      # SQLite DBs, .secrets, hot/warm/cold store
-      - ./logs:/app/logs      # Rotating log files
+      - ./data:/app/data                                  # SQLite DBs, .secrets, hot/warm/cold store
+      - ./logs:/app/logs                                  # Rotating log files
+      - ./manager/dashboard:/app/manager/dashboard:ro     # live-reload static UI without rebuild
 
     networks:
       - jarvis_internal
@@ -102,10 +168,51 @@ services:
       retries: 3
       start_period: 20s
 
+  # ── Central reusable threat intelligence service ───────────────────────────
+  threat-intel:
+    build:
+      context: .
+      dockerfile: manager/ThreatIntel.Dockerfile
+    image: attacklens-threat-intel:latest
+    container_name: attacklens-threat-intel
+    restart: unless-stopped
+
+    ports:
+      - "${THREAT_INTEL_PORT:-8090}:8090"
+
+    environment:
+      LOG_LEVEL:                    "${LOG_LEVEL:-info}"
+      DATA_DIR:                     "/app/data"
+      THREAT_INTEL_DATA_DIR:        "/app/data"
+      THREAT_INTEL_DB:              "/app/data/intel.db"
+      CORS_ORIGINS:                 "${CORS_ORIGINS:-*}"
+      THREAT_FEED_INTERVAL_SECONDS: "${THREAT_FEED_INTERVAL_SECONDS:-3600}"
+      NVD_SYNC_INTERVAL_SECONDS:    "${NVD_SYNC_INTERVAL_SECONDS:-7200}"
+      NVD_SYNC_HOURS:               "${NVD_SYNC_HOURS:-48}"
+      NVD_SYNC_MAX_PAGES:           "${NVD_SYNC_MAX_PAGES:-3}"
+      ABUSEIPDB_KEY:                "${ABUSEIPDB_KEY:-}"
+      OTX_KEY:                      "${OTX_KEY:-}"
+      GREYNOISE_KEY:                "${GREYNOISE_KEY:-}"
+
+    volumes:
+      - ./data/threat-intel:/app/data
+      - ./logs:/app/logs
+
+    networks:
+      - jarvis_internal
+
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+
 # ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
   caddy_data:    # Caddy ACME certificates + state (survives restarts)
   caddy_config:  # Caddy runtime config cache
+  rabbitmq_data: # RabbitMQ message persistence
 
 # ── Networks ──────────────────────────────────────────────────────────────────
 networks:

@@ -1,8 +1,13 @@
 """
-manager/manager/threat/rules.py — Static detection rules.
+manager/manager/jarvis/rules.py — Static detection rules with confidence scoring.
 
 Sources: SANS Internet Storm Center, Feodo Tracker, MITRE ATT&CK,
-Emerging Threats, NIST NVD, public security research.
+Emerging Threats, NIST NVD, public security research, LOLBAS project.
+
+Each rule carries:
+  - confidence : base confidence 0.0–1.0 (high = very few false positives)
+  - dual_use   : True if tool is legitimately used by sysadmins/pentesters
+  - severity   : critical / high / medium / low / info
 """
 from __future__ import annotations
 import re
@@ -48,43 +53,180 @@ MALICIOUS_PORTS: dict[int, dict] = {
 
 # ── Suspicious process name / cmdline patterns (compiled regex) ───────────────
 _PROC_RULES_RAW: list[dict] = [
+    # ── Confirmed offensive tools ─────────────────────────────────────────────
     {"pattern": r"(?i)(xmrig|xmr-?stak|minergate|cpuminer|minerd|cryptonight)",
-     "severity": "critical", "desc": "Cryptominer process", "mitre": "T1496"},
+     "severity": "critical", "confidence": 0.97, "dual_use": False,
+     "desc": "Cryptominer process", "mitre": "T1496"},
     {"pattern": r"(?i)(msfconsole|msfvenom|msfd)",
-     "severity": "critical", "desc": "Metasploit component", "mitre": "T1587.001"},
+     "severity": "critical", "confidence": 0.92, "dual_use": True,
+     "desc": "Metasploit component", "mitre": "T1587.001"},
     {"pattern": r"(?i)(cobalt.?strike|cobaltstrike|beacon\.x64|beacon\.x86)",
-     "severity": "critical", "desc": "Cobalt Strike beacon", "mitre": "T1587.001"},
+     "severity": "critical", "confidence": 0.98, "dual_use": False,
+     "desc": "Cobalt Strike beacon", "mitre": "T1587.001"},
     {"pattern": r"(?i)(empire|starkiller|powershell.empire)",
-     "severity": "critical", "desc": "Empire C2 framework", "mitre": "T1059.001"},
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "Empire C2 framework", "mitre": "T1059.001"},
     {"pattern": r"(?i)(mimikatz|pypykatz|lsassdump|procdump.*lsass)",
-     "severity": "critical", "desc": "Credential dumping tool", "mitre": "T1003"},
+     "severity": "critical", "confidence": 0.98, "dual_use": False,
+     "desc": "Credential dumping tool", "mitre": "T1003"},
     {"pattern": r"(?i)(lazagne|credstealer|credgrap)",
-     "severity": "critical", "desc": "Credential harvester", "mitre": "T1003"},
-    {"pattern": r"(?i)(ngrok|frpc?|bore\.sh|chisel|ligolo|rpivot)",
-     "severity": "high",     "desc": "Tunnelling / port-forward tool", "mitre": "T1090"},
+     "severity": "critical", "confidence": 0.97, "dual_use": False,
+     "desc": "Credential harvester", "mitre": "T1003"},
+    {"pattern": r"(?i)(sliver|havoc.?\s*c2|brute.?ratel|nighthawk)",
+     "severity": "critical", "confidence": 0.97, "dual_use": False,
+     "desc": "Modern C2 framework (Sliver/Havoc/BruteRatel)", "mitre": "T1587.001"},
+    {"pattern": r"(?i)(pwncat|platypus|villain\.py)",
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "Reverse shell framework", "mitre": "T1059"},
+    # ── Tunnelling / proxy (dual-use) ─────────────────────────────────────────
+    {"pattern": r"(?i)(ngrok|frpc?|bore\.sh|chisel|ligolo|rpivot|rathole|cloudflared.*tunnel)",
+     "severity": "high", "confidence": 0.70, "dual_use": True,
+     "desc": "Tunnelling / port-forward tool", "mitre": "T1090"},
+    # ── Auth attack tools ─────────────────────────────────────────────────────
     {"pattern": r"(?i)(ncrack|hydra|medusa|thc-?hydra)\s",
-     "severity": "high",     "desc": "Network brute-force tool", "mitre": "T1110.001"},
+     "severity": "high", "confidence": 0.85, "dual_use": True,
+     "desc": "Network brute-force tool", "mitre": "T1110.001"},
     {"pattern": r"(?i)(hashcat|john.?the.?ripper|ophcrack)\s",
-     "severity": "high",     "desc": "Password cracking tool", "mitre": "T1110.002"},
+     "severity": "high", "confidence": 0.80, "dual_use": True,
+     "desc": "Password cracking tool", "mitre": "T1110.002"},
     {"pattern": r"(?i)(sqlmap|sqli.dumper)\s",
-     "severity": "high",     "desc": "SQL injection tool", "mitre": "T1190"},
-    {"pattern": r"(?i)(masscan|nmap|zmap|rustscan)\s",
-     "severity": "medium",   "desc": "Network/port scanner", "mitre": "T1046"},
+     "severity": "high", "confidence": 0.82, "dual_use": True,
+     "desc": "SQL injection tool", "mitre": "T1190"},
+    # ── Scanners (dual-use, lower confidence) ─────────────────────────────────
+    {"pattern": r"(?i)(masscan|rustscan|zmap)\s",
+     "severity": "medium", "confidence": 0.65, "dual_use": True,
+     "desc": "High-speed network/port scanner", "mitre": "T1046"},
+    {"pattern": r"(?i)nmap\s+.*(--script\s*(vuln|exploit|brute)|--open)\s",
+     "severity": "medium", "confidence": 0.70, "dual_use": True,
+     "desc": "Nmap vulnerability/brute scan mode", "mitre": "T1046"},
+    # ── Obfuscation / RCE patterns ────────────────────────────────────────────
     {"pattern": r"(?i)python[23]?\s+-c\s+['\"].*base64",
-     "severity": "high",     "desc": "Python executing base64-encoded payload", "mitre": "T1027"},
-    {"pattern": r"(?i)(bash|sh|zsh)\s+-c\s+['\"].*base64",
-     "severity": "high",     "desc": "Shell executing base64-encoded command", "mitre": "T1027"},
+     "severity": "high", "confidence": 0.85, "dual_use": False,
+     "desc": "Python executing base64-encoded payload", "mitre": "T1027"},
+    {"pattern": r"(?i)(bash|sh|zsh)\s+-c\s+['\"].*base64.*decode",
+     "severity": "high", "confidence": 0.88, "dual_use": False,
+     "desc": "Shell executing base64-decoded command", "mitre": "T1027"},
+    {"pattern": r"(?i)(curl|wget)\s+.*\|\s*(bash|sh|zsh|python)",
+     "severity": "critical", "confidence": 0.93, "dual_use": False,
+     "desc": "Remote code execution via pipe-to-shell", "mitre": "T1059"},
+    {"pattern": r"(?i)bash\s+-i\s+>&\s*/dev/tcp/",
+     "severity": "critical", "confidence": 0.97, "dual_use": False,
+     "desc": "Bash TCP reverse shell", "mitre": "T1059.004"},
+    {"pattern": r"(?i)python[23]?\s+-c\s+['\"]import\s+socket",
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "Python reverse shell", "mitre": "T1059.006"},
+    # ── Living-off-the-land (LOLBin) patterns ─────────────────────────────────
     {"pattern": r"(?i)/dev/shm/",
-     "severity": "critical", "desc": "Process running from /dev/shm (memory-only evasion)", "mitre": "T1036.005"},
-    {"pattern": r"(?i)/tmp/[a-z0-9_-]{6,20}$",
-     "severity": "medium",   "desc": "Process from /tmp with random-looking name", "mitre": "T1036"},
-    {"pattern": r"(?i)(curl|wget)\s+.*\|\s*(bash|sh|python)",
-     "severity": "critical", "desc": "Remote code execution via pipe-to-shell", "mitre": "T1059"},
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "Process running from /dev/shm (memory-only evasion)", "mitre": "T1036.005"},
+    {"pattern": r"(?i)/tmp/[a-z0-9_.\-]{6,30}$",
+     "severity": "medium", "confidence": 0.60, "dual_use": False,
+     "desc": "Process from /tmp with random-looking name", "mitre": "T1036"},
+    {"pattern": r"(?i)osascript\s+(-e\s+['\"].*do\s+shell|.*javascript)",
+     "severity": "high", "confidence": 0.82, "dual_use": False,
+     "desc": "AppleScript executing shell command or JavaScript (T1059.002)", "mitre": "T1059.002"},
+    {"pattern": r"(?i)launchctl\s+(submit|load)\s+.*(/tmp/|/var/tmp/|/dev/shm/)",
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "launchctl loading service from temp/memory path", "mitre": "T1543.004"},
+    {"pattern": r"(?i)(perl|ruby)\s+-e\s+['\"].*exec\s*\(",
+     "severity": "high", "confidence": 0.80, "dual_use": False,
+     "desc": "Perl/Ruby one-liner process execution", "mitre": "T1059"},
+    # ── Keylogging / exfiltration ─────────────────────────────────────────────
+    {"pattern": r"(?i)(keylogger|keystroke|pynput|pynput\.keyboard|evdev.*grab)",
+     "severity": "critical", "confidence": 0.90, "dual_use": False,
+     "desc": "Keylogger library or process", "mitre": "T1056.001"},
+    {"pattern": r"(?i)(dnscat|iodine|dns2tcp|dnscrypt.*tunnel)",
+     "severity": "high", "confidence": 0.90, "dual_use": False,
+     "desc": "DNS tunnelling tool (C2/exfil via DNS)", "mitre": "T1071.004"},
 ]
 
 PROCESS_RULES: list[dict] = [
     {**r, "compiled": re.compile(r["pattern"])} for r in _PROC_RULES_RAW
 ]
+
+# ── Suspicious parent→child process spawn patterns ────────────────────────────
+# Office/browser apps spawning shells is almost always malicious (T1203, T1566)
+_PARENT_CHILD_RAW: list[dict] = [
+    {
+        "parent_pattern": r"(?i)(microsoft\s+word|word|pages\.app|libreoffice|soffice)",
+        "child_pattern":  r"(?i)(bash|sh|zsh|python|perl|ruby|osascript|curl|wget)",
+        "severity": "critical", "confidence": 0.96,
+        "desc": "Office document spawning shell/interpreter (macro exploit)", "mitre": "T1566.001",
+    },
+    {
+        "parent_pattern": r"(?i)(safari|chrome|firefox|brave|opera|chromium|edge)",
+        "child_pattern":  r"(?i)(bash|sh|zsh|python3?|perl|ruby|osascript)",
+        "severity": "critical", "confidence": 0.95,
+        "desc": "Browser spawning shell (drive-by exploit)", "mitre": "T1189",
+    },
+    {
+        "parent_pattern": r"(?i)(microsoft\s+excel|excel|numbers\.app)",
+        "child_pattern":  r"(?i)(bash|sh|zsh|python|perl|curl|wget|nc|ncat)",
+        "severity": "critical", "confidence": 0.96,
+        "desc": "Spreadsheet spawning shell/downloader (macro exploit)", "mitre": "T1566.001",
+    },
+    {
+        "parent_pattern": r"(?i)(mail\.app|thunderbird|outlook|evolution)",
+        "child_pattern":  r"(?i)(bash|sh|zsh|python3?|curl|wget|open\s+-a)",
+        "severity": "critical", "confidence": 0.94,
+        "desc": "Email client spawning shell (phishing exploit)", "mitre": "T1566.002",
+    },
+    {
+        "parent_pattern": r"(?i)(preview|adobe\s+acrobat|pdf\s*viewer|evince)",
+        "child_pattern":  r"(?i)(bash|sh|zsh|python3?|osascript|curl)",
+        "severity": "critical", "confidence": 0.95,
+        "desc": "PDF viewer spawning shell (malicious PDF exploit)", "mitre": "T1566.001",
+    },
+]
+
+PARENT_CHILD_RULES: list[dict] = [
+    {**r,
+     "parent_re": re.compile(r["parent_pattern"]),
+     "child_re":  re.compile(r["child_pattern"])}
+    for r in _PARENT_CHILD_RAW
+]
+
+# ── Obfuscation / encoding detection patterns ─────────────────────────────────
+_OBFUSCATION_RAW: list[dict] = [
+    {
+        "pattern": r"(?i)(eval\s*\(|exec\s*\()\s*(base64|atob|Buffer\.from|__import__)",
+        "severity": "critical", "confidence": 0.92,
+        "desc": "Eval of encoded/obfuscated payload", "mitre": "T1027",
+    },
+    {
+        "pattern": r"(?:[A-Za-z0-9+/]{60,}={0,2})",   # Long base64 blob
+        "severity": "medium", "confidence": 0.55,
+        "desc": "Long base64-encoded blob (possible obfuscated payload)", "mitre": "T1027",
+    },
+    {
+        "pattern": r"(?i)\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){15,}",  # Hex shellcode
+        "severity": "high", "confidence": 0.80,
+        "desc": "Hex-encoded string (possible shellcode)", "mitre": "T1027",
+    },
+    {
+        "pattern": r"(?i)(fromcharcode|charCodeAt|String\.fromCharCode)",
+        "severity": "medium", "confidence": 0.65,
+        "desc": "Character-code obfuscation (JS/JScript)", "mitre": "T1027",
+    },
+    {
+        "pattern": r"(?i)IEX\s*\(|Invoke-Expression",
+        "severity": "high", "confidence": 0.88,
+        "desc": "PowerShell IEX / Invoke-Expression (obfuscated exec)", "mitre": "T1059.001",
+    },
+]
+
+OBFUSCATION_RULES: list[dict] = [
+    {**r, "compiled": re.compile(r["pattern"])} for r in _OBFUSCATION_RAW
+]
+
+# ── DNS / beacon suspicious patterns ─────────────────────────────────────────
+BEACON_REGEX = re.compile(
+    r"(?i)([a-z0-9]{20,}\.[a-z]{2,6}$|"     # long random subdomain
+    r"[a-z0-9]{8,}\.(top|xyz|tk|ml|ga|cf|gq|pw|click|download|loan|online|site|tech|bid|win)$)"
+)
+
+# Entropy threshold for DNS label (high entropy = DGA / beaconing)
+BEACON_ENTROPY_THRESHOLD = 3.8  # bits per character
 
 # ── Suspicious process executable paths ──────────────────────────────────────
 SUSPICIOUS_PATHS: list[dict] = [

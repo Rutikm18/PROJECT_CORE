@@ -268,7 +268,7 @@ class ProcessesCollector(BaseCollector):
                         "started_at":   int(i.get("create_time") or 0),
                         "cmdline":      cmd[:512],
                         "exe":          exe,
-                        "signed":       self._is_signed(exe),
+                        "signed":       None,
                     })
                 except (_psutil.NoSuchProcess, _psutil.AccessDenied):
                     pass
@@ -277,15 +277,6 @@ class ProcessesCollector(BaseCollector):
         except Exception:
             return self._collect_ps()
         return sorted(procs, key=lambda x: x["cpu_percent"], reverse=True)[:80]
-
-    def _is_signed(self, exe: str) -> bool | None:
-        if not exe:
-            return None
-        out = _run(["codesign", "-v", "--", exe], timeout=5)
-        if not out and "valid on disk" not in out:
-            out2 = _run(["codesign", "--verify", "--", exe], timeout=5)
-            return "valid" in out2.lower() if out2 else None
-        return "invalid" not in out.lower() if out else None
 
     def _collect_ps(self) -> list:
         out  = _run(["ps", "-axo", "pid=,ppid=,user=,pcpu=,pmem=,rss=,stat=,comm="])

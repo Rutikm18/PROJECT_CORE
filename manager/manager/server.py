@@ -36,6 +36,17 @@ from .store     import TelemetryStore
 from .ws_hub    import WebSocketHub
 from .indexer   import IntelDB
 from .jarvis    import JarvisEngine
+from .queue.producer      import QueueProducer
+from .workers.telemetry   import TelemetryWorker
+from .workers.jarvis      import JarvisWorker
+from .chunk_tracker       import ChunkTracker
+from .workers.intel       import ThreatIntelWorker
+from .workers.enrichment  import EnrichmentWorker
+from .workers.consumer    import TelemetryConsumer
+from .threat.nvd_sync     import NVDSyncWorker
+from .ai_analyst          import AIAnalyst
+from .notifications.email import EmailNotifier
+from .api.remediation     import router as remediation_router
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
@@ -76,11 +87,25 @@ def create_app() -> FastAPI:
     intel_path = os.path.join(data_dir, "intel.db")
     os.makedirs(data_dir, exist_ok=True)
 
+    rabbitmq_url = os.environ.get("RABBITMQ_URL", "").strip()
+    threat_intel_url = os.environ.get("THREAT_INTEL_URL", "").strip().rstrip("/")
+    embedded_threat_intel = os.environ.get(
+        "MANAGER_EMBEDDED_THREAT_INTEL", "true"
+    ).lower() not in ("false", "0", "no", "off")
+
     db       = Database(db_path)
     store    = TelemetryStore(data_dir)
     hub      = WebSocketHub()
     intel_db = IntelDB(intel_path)
     jarvis   = JarvisEngine(db, intel_db)
+    producer: QueueProducer | None = QueueProducer(rabbitmq_url) if rabbitmq_url else None
+    chunk_tracker = ChunkTracker()
+    _tel_worker:    TelemetryWorker | None = None
+    _jar_worker:    JarvisWorker | None = None
+    _intel_worker:  ThreatIntelWorker | None = None
+    _enrich_worker: EnrichmentWorker | None = None
+    _tel_consumer:  TelemetryConsumer | None = None
+    _nvd_sync:      NVDSyncWorker | None = None
 
     # ── App ───────────────────────────────────────────────────────────────────
     app = FastAPI(title="mac_intel Manager", version="1.0.0", docs_url=None)
@@ -113,6 +138,14 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 log.warning("Store cleanup error: %s", exc)
 
+    async def _expire_chunks():
+        """Periodic chunk-tracker expiry — prevents unbounded memory growth."""
+        while True:
+            await asyncio.sleep(300)
+            n = await chunk_tracker.expire_old()
+            if n:
+                log.warning("Chunk tracker expired %d stale chunk set(s)", n)
+
     async def _dev_bootstrap_agent_key():
         """
         Local dev: agent.toml and manager share one key via API_KEY, but ingest
@@ -136,6 +169,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
+        nonlocal _tel_worker, _jar_worker, _intel_worker, _enrich_worker, _tel_consumer, _nvd_sync
         setup_logging(
             logfile=os.environ.get("LOG_FILE", "manager/logs/manager.log"),
             level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -147,6 +181,42 @@ def create_app() -> FastAPI:
         await jarvis.start()
         asyncio.create_task(_evict_nonces())
         asyncio.create_task(_cleanup_store())
+        asyncio.create_task(_expire_chunks())
+
+        if producer is not None:
+            await producer.start()
+            _tel_worker = TelemetryWorker(rabbitmq_url, db, store, hub, producer)
+            _jar_worker = JarvisWorker(rabbitmq_url, jarvis, chunk_tracker)
+            asyncio.create_task(_tel_worker.run())
+            asyncio.create_task(_jar_worker.run())
+            _tel_consumer = TelemetryConsumer(rabbitmq_url, db, store, hub, producer, jarvis)
+            asyncio.create_task(_tel_consumer.run())
+            log.info("RabbitMQ: producer + workers + consumer started (url=%s)", rabbitmq_url)
+        else:
+            log.info("RabbitMQ: not configured — sync pipeline active")
+
+        if embedded_threat_intel:
+            _intel_worker = ThreatIntelWorker(intel_db, db, jarvis.feeds, jarvis.nvd)
+            await _intel_worker.start()
+        else:
+            log.info("Threat intel: central mode enabled (url=%s)", threat_intel_url or "not set")
+
+        # AI analyst + email notifier — attach to app.state for route access
+        ai_analyst     = AIAnalyst(intel_db, jarvis.feeds)
+        email_notifier = EmailNotifier()
+        app.state.intel_db      = intel_db
+        app.state.ai_analyst    = ai_analyst
+        app.state.email_notifier = email_notifier
+        app.state.feeds         = jarvis.feeds
+        log.info("AI Analyst enabled=%s  Email enabled=%s",
+                 ai_analyst.enabled, email_notifier.enabled)
+
+        _enrich_worker = EnrichmentWorker(intel_db, rabbitmq_url or None)
+        await _enrich_worker.start()
+
+        _nvd_sync = NVDSyncWorker(intel_db)
+        await _nvd_sync.start()
+
         log.info("Manager started. DB=%s  Intel=%s  Data=%s",
                  db_path, intel_path, data_dir)
         log.info("Enrollment mode: %s",
@@ -155,6 +225,20 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown():
+        if _nvd_sync:
+            await _nvd_sync.stop()
+        if _enrich_worker:
+            await _enrich_worker.stop()
+        if _tel_consumer:
+            await _tel_consumer.stop()
+        if _intel_worker:
+            await _intel_worker.stop()
+        if _tel_worker:
+            await _tel_worker.stop()
+        if _jar_worker:
+            await _jar_worker.stop()
+        if producer is not None:
+            await producer.stop()
         await store.close()
         await intel_db.close()
 
@@ -165,6 +249,7 @@ def create_app() -> FastAPI:
     from .api.jarvis    import make_jarvis_router
     from .api.keys      import make_keys_router
     from .api.findings  import make_findings_router
+    from .api.threat    import make_threat_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
@@ -177,19 +262,22 @@ def create_app() -> FastAPI:
 
     admin_token = os.environ.get("ADMIN_TOKEN", "").strip()
 
-    ingest_router    = make_ingest_router(db, store, hub, nonce_cache, jarvis)
+    ingest_router    = make_ingest_router(db, store, hub, nonce_cache, jarvis, producer=producer)
     agents_router    = make_agents_router(db, store)
     enroll_router    = make_enroll_router(db, enrollment_tokens, open_enrollment)
     jarvis_router    = make_jarvis_router(intel_db, jarvis)
     keys_router      = make_keys_router(db, admin_token)
     findings_router  = make_findings_router(intel_db)
+    threat_router    = make_threat_router(intel_db, central_url=threat_intel_url)
 
-    app.include_router(ingest_router,   prefix="/api/v1")
-    app.include_router(agents_router,   prefix="/api/v1/agents")
-    app.include_router(enroll_router,   prefix="/api/v1")
-    app.include_router(jarvis_router,   prefix="/api/v1/jarvis")
-    app.include_router(keys_router,     prefix="/api/v1/keys")
-    app.include_router(findings_router, prefix="/api/v1/soc")
+    app.include_router(ingest_router,    prefix="/api/v1")
+    app.include_router(agents_router,    prefix="/api/v1/agents")
+    app.include_router(enroll_router,    prefix="/api/v1")
+    app.include_router(jarvis_router,    prefix="/api/v1/jarvis")
+    app.include_router(keys_router,      prefix="/api/v1/keys")
+    app.include_router(findings_router,  prefix="/api/v1/soc")
+    app.include_router(threat_router,    prefix="/api/v1/threat")
+    app.include_router(remediation_router)  # prefixes defined inline
 
     # ── Global exception handler ──────────────────────────────────────────────
     @app.exception_handler(Exception)
@@ -223,13 +311,34 @@ def create_app() -> FastAPI:
             "intel":  intel_stats,
         }
 
+    # ── Enrichment ────────────────────────────────────────────────────────────
+    @app.post("/api/v1/enrich/{finding_id}")
+    async def enrich_finding(finding_id: str):
+        if _enrich_worker is None:
+            raise HTTPException(status_code=503, detail="Enrichment worker not running")
+        try:
+            updated = await _enrich_worker.enrich_finding_now(finding_id)
+        except Exception as exc:
+            log.exception("enrichment failed for finding=%s", finding_id)
+            raise HTTPException(status_code=500, detail=str(exc))
+        if not updated:
+            raise HTTPException(status_code=404, detail="finding not found")
+        return updated
+
     # ── WebSocket ─────────────────────────────────────────────────────────────
+    @app.get("/api/v1/dashboard/ws-token")
+    async def dashboard_ws_token():
+        """Return the WS auth token for the browser dashboard. Internal use only."""
+        return {"token": (api_key or "").strip()}
+
     @app.websocket("/ws/{agent_id}")
     async def ws_endpoint(websocket: WebSocket, agent_id: str):
         token = websocket.query_params.get("token", "").strip()
         master = (api_key or "").strip()
         ok = False
-        if token and master and token.lower() == master.lower():
+        if not master:
+            ok = True  # no API_KEY set → open WS (dev / internal mode)
+        elif token and token.lower() == master.lower():
             ok = True
         elif token:
             agent_key = await db.get_agent_key(agent_id)

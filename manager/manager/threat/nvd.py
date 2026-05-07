@@ -58,16 +58,49 @@ class CVELookup:
         self._db = db
 
     async def lookup(self, package: str, version: str = "") -> list[dict]:
-        """Return cached or freshly-fetched CVEs for a package."""
+        """
+        Lookup priority:
+          1. cve_cache      — reactive 24h cache (fastest)
+          2. nvd_cve_local  — local NVD mirror populated by NVDSyncWorker (fast, no network)
+          3. Live NVD API   — rate-limited fallback when mirror is empty/warming up
+        """
         cache_key = f"{package.lower()}:{version}"
+
+        # 1. Reactive cache
         cached = await self._db.get_cve_cache(cache_key)
         if cached:
             return cached
 
+        # 2. Local NVD mirror (FTS5 search — sub-millisecond)
+        local = await self._db.search_nvd_local(package.lower())
+        if local:
+            converted = [self._from_local(r) for r in local]
+            await self._db.set_cve_cache(cache_key, converted, ttl=CVE_TTL)
+            return converted
+
+        # 3. Live API fallback (only fires while mirror is warming up)
         cves = await self._fetch_nvd(package, version)
         if cves:
             await self._db.set_cve_cache(cache_key, cves, ttl=CVE_TTL)
         return cves
+
+    def _from_local(self, row: dict) -> dict:
+        """Convert nvd_cve_local row format to the CVELookup result format."""
+        import json as _j
+        try:
+            cwes = _j.loads(row.get("cwe_ids") or "[]")
+        except Exception:
+            cwes = []
+        return {
+            "cve_id":       row["cve_id"],
+            "description":  row.get("description", ""),
+            "cvss_score":   row.get("cvss_score"),
+            "cvss_vector":  row.get("cvss_vector", ""),
+            "severity":     row.get("severity", "info"),
+            "cwe_ids":      cwes,
+            "published_at": row.get("published_at", ""),
+            "modified_at":  row.get("modified_at", ""),
+        }
 
     async def get_cve(self, cve_id: str) -> Optional[dict]:
         """Fetch a single CVE by ID."""

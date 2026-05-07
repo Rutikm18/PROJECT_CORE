@@ -1,561 +1,649 @@
-# mac_intel Platform — Installation Guide
+# AttackLens — Installation Guide
 
-Step-by-step instructions to deploy the Manager and install agents on macOS and Windows.
+Complete guide for deploying the Manager and installing the macOS agent.
 
 ---
 
 ## Table of Contents
-
-1. [Prerequisites](#1-prerequisites)
-2. [Deploy the Manager (Docker)](#2-deploy-the-manager-docker)
-   - [Option A — Dev / VM (self-signed TLS, port 8443)](#option-a--dev--vm-self-signed-tls-port-8443)
-   - [Option B — Production (Caddy + Let's Encrypt, port 443)](#option-b--production-caddy--lets-encrypt-port-443)
-3. [Get Credentials from Manager](#3-get-credentials-from-manager)
-4. [Install macOS Agent](#4-install-macos-agent)
-5. [Install Windows Agent](#5-install-windows-agent)
-6. [Verify Connectivity](#6-verify-connectivity)
-7. [Key Management](#7-key-management)
-8. [Uninstall](#8-uninstall)
-9. [Troubleshooting](#9-troubleshooting)
-
----
-
-## 1. Prerequisites
-
-### Manager host (any Linux/macOS server or VM)
-- Docker 24+ and Docker Compose v2
-- Outbound port 80/443 (prod) or 8443 (dev) open in firewall/security group
-- For production: a domain name with an A record pointing to the server
-
-### macOS endpoint
-- macOS 12 (Monterey) or later
-- Python 3.10+ (for dev/direct run) **or** pre-built `jarvis-agent` + `jarvis-watchdog` PyInstaller binaries
-- `sudo` access for service installation
-
-### Windows endpoint
-- Windows 10 / Server 2016 or later
-- PowerShell 5.1+ (run as Administrator)
-- Pre-built `jarvis-agent.exe` + `jarvis-watchdog.exe` PyInstaller binaries
-- Python 3.10+ only needed if running from source
+1. [Manager Installation](#1-manager-installation)
+   - [Docker Compose (recommended)](#option-a-docker-compose-recommended)
+   - [Manual / bare metal](#option-b-manual-bare-metal)
+   - [AWS EC2 quick deploy](#option-c-aws-ec2-quick-deploy)
+2. [macOS Agent Installation](#2-macos-agent-installation)
+   - [PKG installer (recommended)](#option-a-pkg-installer-recommended)
+   - [Manual script install](#option-b-manual-script-install)
+   - [Mass deployment (MDM / Jamf)](#option-c-mass-deployment-mdm--jamf)
+3. [TLS Configuration](#3-tls-configuration)
+4. [Agent Configuration Reference](#4-agent-configuration-reference)
+5. [Post-Installation Verification](#5-post-installation-verification)
+6. [Uninstallation](#6-uninstallation)
+7. [Upgrade Guide](#7-upgrade-guide)
 
 ---
 
-## 2. Deploy the Manager (Docker)
+## 1. Manager Installation
 
-Clone the repository on the manager host:
+### Option A: Docker Compose (recommended)
+
+**Requirements:**
+- Linux server (Ubuntu 22.04+ / Debian 12 / RHEL 9)
+- Docker 20.10+ and Compose v2
+- 2 vCPU / 4 GB RAM minimum
+- Ports 443 (or 8443) and 80 open in firewall
+
+**Step 1 — Install Docker**
 
 ```bash
-git clone <repo-url> macbook_data
-cd macbook_data
+# Ubuntu / Debian
+sudo apt update
+sudo apt install -y docker.io docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER && newgrp docker
 ```
 
-### Option A — Dev / VM (self-signed TLS, port 8443)
+```bash
+# RHEL / Rocky Linux / Amazon Linux 2023
+sudo dnf install -y docker docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER && newgrp docker
+```
 
-Use this when you have a public IP but no domain name (or for local dev).
+**Step 2 — Clone and configure**
 
 ```bash
-# 1. Set your server's public IP (agents will trust the cert at this IP)
-export PUBLIC_IP=$(curl -s https://api.ipify.org)
+git clone <repo-url> attacklens
+cd attacklens
 
-# 2. (Optional) override port
-export BIND_PORT=8443
+# Run the interactive setup wizard
+bash env.sh
+```
 
-# 3. Start
+The wizard generates:
+- `.env` — all environment variables with auto-generated secrets
+- `Caddyfile` — TLS configuration (self-signed for IP, or Let's Encrypt for domain)
+
+**Step 3 — Start services**
+
+```bash
 docker compose up -d
 
-# 4. Watch startup and copy the printed tokens
-docker compose logs -f manager
+# Monitor startup
+docker compose logs -f
+
+# Verify all services are healthy
+docker compose ps
 ```
 
-On first boot the manager auto-generates:
-- A **self-signed RSA-4096 TLS certificate** with the public IP in the SAN
-- An **enrollment token** (`sk-enroll-…`) — put this in agent.toml
-- An **admin token** (`sk-admin-…`) — used for key management API
+**Step 4 — Open firewall ports**
 
-Both are saved to `./data/.secrets` and survive container restarts.
+```bash
+# Ubuntu (ufw)
+sudo ufw allow 8443/tcp   # self-signed mode
+sudo ufw allow 443/tcp    # Let's Encrypt mode
+sudo ufw allow 80/tcp     # ACME challenge (Let's Encrypt only)
 
-**Agent config for Option A:**
-```toml
-[manager]
-url        = "https://<PUBLIC_IP>:8443"
-tls_verify = false     # self-signed cert
+# AWS (add to Security Group inbound rules)
+# Port 8443 TCP from 0.0.0.0/0 (or restrict to your network)
 ```
 
 ---
 
-### Option B — Production (Caddy + Let's Encrypt, port 443)
+### Option B: Manual / Bare Metal
 
-Use this when you have a domain name.  
-DNS A record must already point to the server before starting.
+**Requirements:**
+- Python 3.11+
+- RabbitMQ 3.12+ (must be running separately)
 
 ```bash
-# 1. Set domain and admin email
-export DOMAIN=jarvis.example.com
-export ADMIN_EMAIL=you@example.com
+git clone <repo-url> attacklens
+cd attacklens
 
-# 2. (Optional) pre-set tokens to avoid auto-generation
-# export ENROLLMENT_TOKENS=sk-enroll-yourtoken
-# export ADMIN_TOKEN=sk-admin-yourtoken
+# Install Python dependencies
+pip install -r manager/requirements.txt
 
-# 3. Start
-docker compose -f docker-compose.prod.yml up -d
+# Create data directories
+mkdir -p data/threat-intel data/hot data/warm data/cold logs
 
-# 4. Watch startup and copy tokens
-docker compose -f docker-compose.prod.yml logs -f manager
+# Set required environment variables (or create a .env file)
+export ENROLLMENT_TOKENS="sk-enroll-$(openssl rand -hex 32)"
+export ADMIN_TOKEN="sk-admin-$(openssl rand -hex 32)"
+export RABBITMQ_URL="amqp://user:pass@localhost:5672/"
+export DATA_DIR="./data"
+export LOG_FILE="./logs/manager.log"
+
+# Start the manager
+cd manager
+uvicorn manager.server:app --host 0.0.0.0 --port 8080
+
+# Start the threat intel service (separate process)
+uvicorn manager.manager.threat_intel_service:app --host 0.0.0.0 --port 8090
 ```
 
-Caddy automatically provisions and renews a Let's Encrypt certificate.
-
-**Agent config for Option B:**
-```toml
-[manager]
-url        = "https://jarvis.example.com"
-tls_verify = true      # real CA cert
-```
+For TLS, put Caddy or Nginx in front of port 8080.
 
 ---
 
-## 3. Get Credentials from Manager
+### Option C: AWS EC2 Quick Deploy
+
+**Launch a t3.medium (or larger) with Ubuntu 22.04:**
 
 ```bash
-docker compose logs manager 2>&1 | grep -A 20 "Jarvis Manager"
+# SSH into your EC2 instance
+ssh -i your-key.pem ubuntu@YOUR_EC2_IP
+
+# One-shot setup
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker ubuntu && newgrp docker
+
+git clone <repo-url> attacklens && cd attacklens
+
+# Run wizard with your EC2 public IP auto-detected
+bash env.sh
+
+docker compose up -d
+```
+
+**Security Group rules required:**
+
+| Port | Protocol | Source | Purpose |
+|---|---|---|---|
+| 8443 | TCP | 0.0.0.0/0 | HTTPS (agent + dashboard) — self-signed mode |
+| 443 | TCP | 0.0.0.0/0 | HTTPS (agent + dashboard) — Let's Encrypt mode |
+| 80 | TCP | 0.0.0.0/0 | Let's Encrypt ACME challenge |
+| 22 | TCP | Your IP | SSH management |
+
+---
+
+## 2. macOS Agent Installation
+
+### Option A: PKG Installer (recommended)
+
+**Step 1 — Build the PKG on the server**
+
+```bash
+# On the manager server
+cd attacklens/agent/os/macos/installer
+sudo bash build_pkg.sh
+
+# Output: dist/attacklens-agent-1.0.pkg
+```
+
+**Step 2 — Transfer to endpoint**
+
+```bash
+# SCP from server
+scp user@SERVER:~/attacklens/agent/os/macos/installer/dist/attacklens-agent-1.0.pkg ~/Downloads/
+
+# Or serve via HTTP from the manager
+python3 -m http.server 9000 --directory dist/
+# → Download from http://SERVER_IP:9000/attacklens-agent-1.0.pkg
+```
+
+**Step 3 — Install on macOS**
+
+```bash
+# Install the package (requires admin / sudo)
+sudo installer -pkg ~/Downloads/attacklens-agent-1.0.pkg -target /
+```
+
+Or double-click the PKG in Finder and follow the installer wizard.
+
+**What the PKG installs:**
+
+```
+/Library/AttackLens/
+├── bin/
+│   ├── attacklens-agent      # Main agent binary
+│   ├── attacklens-watchdog   # Crash recovery watchdog
+│   ├── attacklens-ctl        # Management CLI
+│   └── generate_config.sh    # Config generator
+├── agent.toml                # Configuration (auto-generated by generate_config.sh)
+├── security/                 # API key storage (mode 700, root only)
+├── data/                     # In-flight telemetry queue
+├── spool/                    # Offline send queue (NDJSON+gzip)
+├── logs/                     # Rotating log files
+└── QUICKSTART.md
+
+/Library/LaunchDaemons/
+├── com.attacklens.agent.plist    # Agent service definition
+└── com.attacklens.watchdog.plist # Watchdog service definition
+```
+
+**Step 4 — Configure the agent**
+
+```bash
+# Minimum configuration — just the manager URL
+sudo /Library/AttackLens/bin/generate_config.sh \
+  --manager-url https://YOUR_SERVER_IP:8443 \
+  --tls-verify false          # only if self-signed cert
+```
+
+```bash
+# With enrollment token (if OPEN_ENROLLMENT=false on manager)
+sudo /Library/AttackLens/bin/generate_config.sh \
+  --manager-url https://YOUR_SERVER_IP:8443 \
+  --enrollment-token sk-enroll-YOUR_TOKEN \
+  --tls-verify false
+```
+
+```bash
+# With all options
+sudo /Library/AttackLens/bin/generate_config.sh \
+  --manager-url https://your-domain.com \
+  --agent-name "Finance-MacBook-Pro" \
+  --tls-verify true \
+  --log-level INFO
+```
+
+**Step 5 — Start the agent**
+
+```bash
+# Load and start both services
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.agent.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.watchdog.plist
+
+# Verify
+sudo attacklens-ctl status
 ```
 
 Expected output:
 ```
-╔══════════════════════════════════════════════════════════════╗
-║              Jarvis Manager — Starting Up                   ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  ENROLLMENT TOKEN (put in agent.toml):                      ║
-║    sk-enroll-xxxxxxxxxxxxxxxxxxxxxxxx                        ║
-║                                                              ║
-║  ADMIN TOKEN (for key management API):                       ║
-║    sk-admin-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx                 ║
-║                                                              ║
-║  Manager URL:                                                ║
-║    https://<YOUR_IP>:8443                                    ║
-╚══════════════════════════════════════════════════════════════╝
+AttackLens Agent:   Running (PID 1234)
+AttackLens Watchdog: Running (PID 1235)
+Agent ID:  mac-XXXXXXXXXXXXXXXX
+Manager:   https://YOUR_SERVER_IP:8443
+Last send: 5 seconds ago
 ```
-
-Tokens are also stored at `./data/.secrets` on the manager host.
 
 ---
 
-## 4. Install macOS Agent
+### Option B: Manual Script Install
 
-### 4.1 Prepare directories
+For environments where you can't use the PKG installer:
 
 ```bash
-sudo mkdir -p /Library/Jarvis/{bin,config,data,security,spool,logs}
-sudo chown -R root:wheel /Library/Jarvis
-sudo chmod 750 /Library/Jarvis/config
-sudo chmod 700 /Library/Jarvis/security
-sudo chmod 755 /Library/Jarvis/{bin,data,spool,logs}
-```
+# Clone the repo on the Mac (or copy just the agent/ directory)
+git clone <repo-url> attacklens
 
-### 4.2 Install binaries
+cd attacklens
 
-**From pre-built PyInstaller binaries (recommended for production):**
-```bash
-sudo cp jarvis-agent    /Library/Jarvis/bin/
-sudo cp jarvis-watchdog /Library/Jarvis/bin/
-sudo chmod 755 /Library/Jarvis/bin/jarvis-agent
-sudo chmod 755 /Library/Jarvis/bin/jarvis-watchdog
-```
-
-**From source (dev only):**
-```bash
-# Install dependencies
+# Install Python dependencies
 pip3 install -r agent/requirements.txt
 
-# Binaries are replaced by the Python entry points:
-# python3 agent/os/macos/launchd.py   (or python3 -m agent.agent.core)
-# The plist will point to python3 instead of a binary
+# Create directories
+sudo mkdir -p /Library/AttackLens/{bin,security,data,spool,logs}
+sudo chmod 700 /Library/AttackLens/security
+
+# Copy agent files
+sudo cp agent/agent_entry.py /Library/AttackLens/bin/attacklens-agent
+sudo chmod +x /Library/AttackLens/bin/attacklens-agent
+
+# Create basic config
+sudo tee /Library/AttackLens/agent.toml > /dev/null <<EOF
+[agent]
+name = "$(scutil --get ComputerName)"
+
+[manager]
+url = "https://YOUR_SERVER_IP:8443"
+tls_verify = false
+
+[enrollment]
+token = ""
+keystore = "file"
+
+[collection]
+enabled = true
+tick_sec = 5
+EOF
+
+# Create LaunchDaemon
+sudo tee /Library/LaunchDaemons/com.attacklens.agent.plist > /dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.attacklens.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/Library/AttackLens/bin/attacklens-agent</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/Library/AttackLens/logs/agent.log</string>
+    <key>StandardErrorPath</key><string>/Library/AttackLens/logs/agent.log</string>
+</dict>
+</plist>
+EOF
+
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.agent.plist
 ```
 
-### 4.3 Write agent configuration
+---
+
+### Option C: Mass Deployment (MDM / Jamf)
+
+**For Jamf Pro deployment:**
+
+1. Upload `attacklens-agent-1.0.pkg` to Jamf as a package
+2. Create a policy with the package
+3. Create a script with the post-install configuration:
 
 ```bash
-sudo cp agent/config/agent.toml.example /Library/Jarvis/config/agent.toml
-sudo nano /Library/Jarvis/config/agent.toml
+#!/bin/bash
+# Jamf post-install configuration script
+
+MANAGER_URL="https://your-attacklens.company.com"
+ENROLLMENT_TOKEN="sk-enroll-YOUR_TOKEN"
+AGENT_NAME="$(scutil --get ComputerName)"
+
+/Library/AttackLens/bin/generate_config.sh \
+  --manager-url "$MANAGER_URL" \
+  --enrollment-token "$ENROLLMENT_TOKEN" \
+  --agent-name "$AGENT_NAME" \
+  --tls-verify true
+
+# Start services
+launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.agent.plist
+launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.watchdog.plist
 ```
 
-Minimum required changes:
+**For Apple Business Manager / MDM via configuration profile:**
+
+The PKG can be signed and notarized for silent MDM deployment:
+
+```bash
+# Sign the PKG (requires Apple Developer ID)
+productsign \
+  --sign "Developer ID Installer: Your Company (TEAMID)" \
+  attacklens-agent-1.0.pkg \
+  attacklens-agent-1.0-signed.pkg
+
+# Notarize
+xcrun notarytool submit attacklens-agent-1.0-signed.pkg \
+  --apple-id your@email.com \
+  --team-id YOURTEAMID \
+  --password your-app-specific-password \
+  --wait
+```
+
+---
+
+## 3. TLS Configuration
+
+### Self-Signed (IP-only, development / internal)
+
+Set in `.env`:
+```
+BIND_PORT=8443
+TLS_MODE=self-signed
+```
+
+Agents must set `tls_verify = false` in `agent.toml`.
+
+Generated Caddyfile:
+```
+https://YOUR_IP:8443 {
+    tls internal
+    reverse_proxy manager:8080
+}
+```
+
+### Let's Encrypt (domain, production)
+
+Set in `.env`:
+```
+DOMAIN=attacklens.yourcompany.com
+BIND_PORT=443
+TLS_MODE=letsencrypt
+ADMIN_EMAIL=admin@yourcompany.com
+```
+
+Port 80 must be publicly reachable for the ACME HTTP-01 challenge.
+
+Agents use `tls_verify = true` (default).
+
+### Custom Certificate (corporate CA)
+
+```
+# Caddyfile (edit manually after env.sh)
+https://attacklens.yourcompany.com:8443 {
+    tls /etc/caddy/certs/attacklens.crt /etc/caddy/certs/attacklens.key
+    reverse_proxy manager:8080
+}
+```
+
+Mount your certificate in `docker-compose.yml`:
+```yaml
+caddy:
+  volumes:
+    - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    - ./certs:/etc/caddy/certs:ro    # add this line
+    - caddy_data:/data
+```
+
+On agents, install your corporate CA certificate in the macOS System Keychain and set `tls_verify = true`.
+
+---
+
+## 4. Agent Configuration Reference
+
+Full configuration file: `/Library/AttackLens/agent.toml`
+
+### Critical Settings
 
 ```toml
 [agent]
-id   = "macbook-001"          # unique ID — alphanumeric, max 128 chars
-name = "Alice's MacBook Pro"  # display name on dashboard
+name = "hostname-or-label"         # shown on dashboard
+id   = ""                          # auto-set from hardware UUID on enrollment
 
 [manager]
-url        = "https://<MANAGER_IP_OR_DOMAIN>:8443"
-tls_verify = false            # false for self-signed, true for Let's Encrypt
+url          = "https://IP:8443"   # REQUIRED
+tls_verify   = true                # false only for self-signed certs
+timeout_sec  = 30
 
 [enrollment]
-token    = "sk-enroll-xxxxxxxxxxxxxxxxxxxxxxxx"  # from step 3
-keystore = "keychain"         # "keychain" (recommended) or "file"
+token    = ""                      # empty if OPEN_ENROLLMENT=true on manager
+keystore = "keychain"              # "keychain" (recommended) or "file"
 ```
 
-Lock down the config:
-```bash
-sudo chmod 640 /Library/Jarvis/config/agent.toml
-sudo chown root:wheel /Library/Jarvis/config/agent.toml
+### Collection Tuning
+
+```toml
+[collection]
+enabled  = true
+tick_sec = 5                       # orchestrator pulse (seconds)
+
+# Reduce volatile interval on battery / constrained devices
+[collection.sections.metrics]
+interval_sec = 30                  # default: 10
+
+# Disable expensive sections if not needed
+[collection.sections.binaries]
+enabled = false                    # binary scan is slow on large systems
+
+[collection.sections.sbom]
+enabled = false                    # SBOM collection adds 5-10 seconds/day
 ```
 
-### 4.4 Register LaunchDaemons
+### All Configurable Sections
 
-The plists are generated by `agent/os/macos/launchd.py`.  
-Run as root to write and load them:
+| Section | Default Interval | Data |
+|---|---|---|
+| `metrics` | 10 s | CPU, RAM, swap, disk I/O, network I/O |
+| `connections` | 10 s | Active TCP/UDP connections with process + IP |
+| `processes` | 10 s | Top 80 processes (CPU/mem, cmdline, signing) |
+| `ports` | 30 s | All LISTEN sockets |
+| `network` | 120 s | Interfaces, DNS, gateway, WiFi info |
+| `arp` | 120 s | Local LAN ARP table |
+| `mounts` | 120 s | Mounted filesystems |
+| `battery` | 120 s | Battery state, cycle count |
+| `openfiles` | 120 s | Top 60 FD-heavy processes |
+| `services` | 120 s | LaunchDaemons + LaunchAgents |
+| `users` | 120 s | Local accounts, admin group, last login |
+| `hardware` | 120 s | USB, Thunderbolt, Bluetooth, GPU |
+| `containers` | 120 s | Running Docker/Podman containers |
+| `storage` | 600 s | Disk volumes (size, used, free) |
+| `tasks` | 600 s | Cron + launchd periodic tasks |
+| `security` | 3600 s | SIP, Gatekeeper, FileVault, Firewall, XProtect |
+| `sysctl` | 3600 s | Security-relevant kernel parameters |
+| `configs` | 3600 s | Critical config file content + hash |
+| `apps` | 86400 s | Installed .app bundles |
+| `packages` | 86400 s | brew, pip3, npm, gem, cargo packages |
+| `binaries` | 3600 s | SUID/SGID/world-writable binaries in PATH |
+| `sbom` | 86400 s | Software Bill of Materials (PURL format) |
 
-```bash
-sudo python3 -c "
-from agent.os.macos.launchd import install_plist
-install_plist('both')
-print('LaunchDaemons loaded.')
-"
-```
+---
 
-Or manually write the plists (see `agent/os/macos/launchd.py` for full XML templates):
+## 5. Post-Installation Verification
 
-**`/Library/LaunchDaemons/com.jarvis.watchdog.plist`** — launchd keeps watchdog alive; watchdog manages the agent.  
-**`/Library/LaunchDaemons/com.jarvis.agent.plist`** — loaded but managed by watchdog.
-
-Plist permissions:
-```bash
-sudo chown root:wheel /Library/LaunchDaemons/com.jarvis.{agent,watchdog}.plist
-sudo chmod 644 /Library/LaunchDaemons/com.jarvis.{agent,watchdog}.plist
-```
-
-Load services:
-```bash
-sudo launchctl load -w /Library/LaunchDaemons/com.jarvis.watchdog.plist
-sudo launchctl load -w /Library/LaunchDaemons/com.jarvis.agent.plist
-```
-
-### 4.5 Verify macOS agent is running
-
-```bash
-# Check launchd status (look for "PID" in output)
-sudo launchctl list com.jarvis.agent
-sudo launchctl list com.jarvis.watchdog
-
-# Tail logs
-tail -f /Library/Jarvis/logs/agent-stdout.log
-tail -f /Library/Jarvis/logs/agent-stderr.log
-```
-
-On first run the agent enrolls automatically — look for:
-```
-Enrollment successful. API key stored in keychain.
-```
-
-### 4.6 Day-to-day macOS service management
+### Manager Verification
 
 ```bash
-# Status
-sudo launchctl list com.jarvis.agent
+# Basic health
+curl http://localhost:8080/health
 
-# Stop
-sudo launchctl kill TERM system/com.jarvis.agent
+# Check all containers
+docker compose ps
 
-# Start / restart
-sudo launchctl kickstart -k system/com.jarvis.agent
+# Verify threat feeds started (wait 5 minutes)
+curl http://localhost:8090/api/v1/intel/feeds | python3 -m json.tool
 
-# Reload config (SIGHUP, no full restart)
-sudo launchctl kill HUP system/com.jarvis.agent
+# Test the admin API
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/agents
+```
 
-# View logs
-tail -f /Library/Jarvis/logs/agent-stdout.log
+### Agent Verification
+
+```bash
+# Status overview
+sudo attacklens-ctl status
+
+# Live log (watch for enrollment and first sends)
+sudo attacklens-ctl logs
+# Look for:
+# INFO  Enrollment complete. Agent ID: mac-XXXXXXXX
+# INFO  Section 'metrics' sent successfully
+
+# Verify Keychain entry (after enrollment)
+security find-generic-password -s "com.attacklens.agent" -a mac-XXXXXXXX
+```
+
+### End-to-End Test
+
+```bash
+# On the manager server — watch for the agent appearing
+watch -n 2 'curl -s -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/agents | python3 -m json.tool'
+
+# Check findings are being generated
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  "http://localhost:8080/api/v1/findings?limit=5" | python3 -m json.tool
 ```
 
 ---
 
-## 5. Install Windows Agent
+## 6. Uninstallation
 
-Run **PowerShell as Administrator** for all steps.
-
-### 5.1 Prepare the installer package
-
-Copy these files to a working directory (e.g. `C:\Temp\jarvis-install\`):
-- `jarvis-agent.exe`
-- `jarvis-watchdog.exe`
-- `agent/os/windows/installer/install.ps1`
-
-```powershell
-cd C:\Temp\jarvis-install
-```
-
-### 5.2 Run the installer
-
-```powershell
-.\install.ps1 `
-    -ManagerUrl  "https://<MANAGER_IP>:8443" `
-    -EnrollToken "sk-enroll-xxxxxxxxxxxxxxxxxxxxxxxx" `
-    -AgentId     "desktop-001" `
-    -AgentName   "Bob's Workstation" `
-    -TlsVerify   $false        # $false for self-signed, $true for Let's Encrypt
-```
-
-The installer will:
-1. Create `C:\Program Files (x86)\Jarvis\{bin,config,data,security,spool,logs}`
-2. Apply restrictive ACLs (SYSTEM + Admins only; no user read on security/)
-3. Copy and lock binaries (SYSTEM + Admins read/execute only)
-4. Write `agent.toml` with the provided parameters
-5. Register `MacIntelAgent` and `MacIntelWatchdog` Windows services
-6. Start both services
-
-### 5.3 Verify Windows agent is running
-
-```powershell
-# Check service status
-Get-Service MacIntelAgent, MacIntelWatchdog
-
-# View agent logs
-Get-Content "C:\Program Files (x86)\Jarvis\logs\agent.log" -Tail 50 -Wait
-
-# Or use Event Viewer: Windows Logs → Application, source MacIntelAgent
-```
-
-On first run look for:
-```
-Enrollment successful. API key stored in Windows Credential Manager.
-```
-
-### 5.4 Day-to-day Windows service management
-
-```powershell
-# Stop
-Stop-Service MacIntelAgent -Force
-
-# Start
-Start-Service MacIntelAgent
-
-# Restart
-Restart-Service MacIntelAgent
-
-# View status
-Get-Service MacIntelAgent | Select-Object Status, DisplayName
-```
-
-### 5.5 Build Windows binaries from source (optional)
-
-If you don't have pre-built binaries, build them on a Windows machine:
-
-```powershell
-# Install build dependencies
-pip install pyinstaller -r agent\requirements.txt
-
-# Build agent binary
-pyinstaller --onefile --name jarvis-agent `
-    --add-data "agent\config;config" `
-    agent\agent\core.py
-
-# Build watchdog binary
-pyinstaller --onefile --name jarvis-watchdog `
-    agent\agent\watchdog.py
-
-# Outputs: dist\jarvis-agent.exe, dist\jarvis-watchdog.exe
-```
-
----
-
-## 6. Verify Connectivity
-
-### Manager health check
+### Remove the macOS Agent
 
 ```bash
-# Dev (self-signed)
-curl -sk https://<MANAGER_IP>:8443/health | python3 -m json.tool
+# Stop services
+sudo launchctl bootout system /Library/LaunchDaemons/com.attacklens.agent.plist 2>/dev/null
+sudo launchctl bootout system /Library/LaunchDaemons/com.attacklens.watchdog.plist 2>/dev/null
 
-# Prod (real cert)
-curl -s https://jarvis.example.com/health | python3 -m json.tool
+# Remove files
+sudo rm -rf /Library/AttackLens
+sudo rm -f /Library/LaunchDaemons/com.attacklens.agent.plist
+sudo rm -f /Library/LaunchDaemons/com.attacklens.watchdog.plist
+
+# Remove Keychain entry
+security delete-generic-password -s "com.attacklens.agent" 2>/dev/null
+
+echo "AttackLens agent removed."
 ```
 
-Expected:
-```json
-{"status": "ok", "agents": 1, "payloads": 240}
+Or use the bundled uninstaller:
+```bash
+sudo /Library/AttackLens/uninstall.sh
 ```
 
-### Confirm agent appears
+### Remove the Manager
 
 ```bash
-curl -sk https://<MANAGER_IP>:8443/api/v1/agents | python3 -m json.tool
-```
-
-Expected:
-```json
-[{"agent_id": "macbook-001", "name": "Alice's MacBook Pro", "last_seen": 1712700120, ...}]
-```
-
-### Check section data is arriving
-
-```bash
-# Replace macbook-001 with your agent_id
-curl -sk https://<MANAGER_IP>:8443/api/v1/agents/macbook-001/metrics | python3 -m json.tool
-```
-
-### Open the dashboard
-
-Navigate to `https://<MANAGER_IP>:8443` in a browser.  
-Accept the self-signed certificate warning in dev, or trust Let's Encrypt in prod.
-
----
-
-## 7. Key Management
-
-All key management calls require the admin token from step 3.
-
-```bash
-MANAGER="https://<MANAGER_IP>:8443"
-ADMIN_TOKEN="sk-admin-xxxxxxxx"
-AGENT_ID="macbook-001"
-```
-
-### List all agent keys (no secrets returned)
-```bash
-curl -sk -H "X-Admin-Token: $ADMIN_TOKEN" $MANAGER/api/v1/keys | python3 -m json.tool
-```
-
-### Rotate a key (new key shown once)
-```bash
-curl -sk -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
-     $MANAGER/api/v1/keys/$AGENT_ID/rotate | python3 -m json.tool
-```
-
-After rotation the agent will fail to ingest until it re-enrolls  
-(or until you push the new key into the keystore manually).  
-Simplest: delete the keystore entry on the agent and restart — it will re-enroll.
-
-### Set key expiry (30 days from now)
-```bash
-curl -sk -X PATCH \
-     -H "X-Admin-Token: $ADMIN_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"expires_in_days": 30}' \
-     $MANAGER/api/v1/keys/$AGENT_ID/expiry
-```
-
-### Revoke a key immediately
-```bash
-curl -sk -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
-     $MANAGER/api/v1/keys/$AGENT_ID/revoke
-```
-
-### Hard-delete a key (agent must re-enroll)
-```bash
-curl -sk -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" \
-     $MANAGER/api/v1/keys/$AGENT_ID
-```
-
----
-
-## 8. Uninstall
-
-### Uninstall macOS agent
-
-```bash
-# Unload and remove LaunchDaemons
-sudo launchctl unload -w /Library/LaunchDaemons/com.jarvis.agent.plist    2>/dev/null
-sudo launchctl unload -w /Library/LaunchDaemons/com.jarvis.watchdog.plist 2>/dev/null
-sudo rm -f /Library/LaunchDaemons/com.jarvis.{agent,watchdog}.plist
-
-# Remove all agent files
-sudo rm -rf /Library/Jarvis
-
-# Remove Keychain entry (replace agent-001 with your agent_id)
-security delete-generic-password -s com.jarvis.agent -a agent-001 2>/dev/null || true
-```
-
-### Uninstall Windows agent
-
-Run PowerShell as Administrator:
-
-```powershell
-# Run the uninstaller
-.\agent\os\windows\installer\uninstall.ps1
-
-# Or manually:
-Stop-Service MacIntelAgent, MacIntelWatchdog -Force -ErrorAction SilentlyContinue
-& sc.exe delete MacIntelAgent
-& sc.exe delete MacIntelWatchdog
-Remove-Item -Recurse -Force "C:\Program Files (x86)\Jarvis"
-
-# Remove Credential Manager entry
-& cmdkey /delete:jarvis:agent-001
-```
-
-### Remove manager
-
-```bash
-# Stop containers
+# Stop and remove all containers
 docker compose down
 
-# Remove data (tokens, certs, database, telemetry store)
-# WARNING: this is irreversible
-sudo rm -rf ./data ./certs ./logs
+# Remove all data (DESTRUCTIVE — deletes all findings and telemetry)
+docker compose down -v
+rm -rf data/ logs/
+
+# Remove Docker images
+docker rmi jarvis-manager:latest attacklens-threat-intel:latest
 ```
 
 ---
 
-## 9. Troubleshooting
+## 7. Upgrade Guide
 
-### Agent won't enroll
-
-| Symptom | Fix |
-|---------|-----|
-| `401 Unauthorized` on enroll | Enrollment token wrong or expired — check `./data/.secrets` on manager |
-| `Connection refused` | Manager not running, or wrong IP/port in `agent.toml` |
-| TLS certificate error | Use `tls_verify = false` for self-signed (dev only); or copy the cert to the agent |
-| `Clock skew too large` | NTP sync the agent and manager clocks; skew window is ±300 s |
-
-### Agent enrolled but no data visible
-
-| Symptom | Fix |
-|---------|-----|
-| `401` on ingest | Key mismatch — rotate key via admin API and re-enroll |
-| `409 Replay` | System clock drifted; check NTP |
-| Sections missing | Collector returned empty data; check agent logs for errors |
-| Circuit breaker OPEN | Section is failing; check stderr log for root cause |
-
-### Disk spool growing
+### Manager Upgrade
 
 ```bash
-# macOS
-ls -lh /Library/Jarvis/spool/
+cd attacklens
 
-# Windows PowerShell
-Get-ChildItem "C:\Program Files (x86)\Jarvis\spool"
+# Pull latest code
+git pull
+
+# Rebuild and restart
+docker compose build
+docker compose up -d
+
+# Check logs for migration messages
+docker compose logs manager | grep -i "migrat\|schema\|init"
 ```
 
-The spool grows when the manager is unreachable. It drains automatically on reconnect.  
-Max size is 50 MB; oldest entries are trimmed when full.
+The manager runs schema migrations automatically on startup (`ALTER TABLE ... ADD COLUMN` pattern — safe on existing data).
 
-### Check manager logs
+### Agent Upgrade
 
 ```bash
-# Live logs
-docker compose logs -f manager
+# Build new PKG on server
+cd agent/os/macos/installer
+sudo bash build_pkg.sh
 
-# Persistent log file
-tail -f ./logs/manager.log
+# Transfer to endpoint and reinstall (over existing installation)
+sudo installer -pkg ~/Downloads/attacklens-agent-1.0.pkg -target /
+
+# The PKG upgrade preserves:
+# - /Library/AttackLens/agent.toml (your config)
+# - /Library/AttackLens/security/ (your API key)
+# - /Library/AttackLens/spool/ (any unsent payloads)
+
+# Restart to pick up new binary
+sudo attacklens-ctl restart
 ```
 
-### Useful curl one-liners
+### Zero-Downtime Agent Upgrade (MDM)
 
-```bash
-# Manager health
-curl -sk https://<IP>:8443/health
+For MDM deployments:
+1. Upload the new PKG to Jamf
+2. Target a test scope first
+3. Deploy the policy (installs over existing — no downtime)
+4. Verify on test scope
+5. Expand to full scope
 
-# List agents
-curl -sk https://<IP>:8443/api/v1/agents
+---
 
-# Last 10 metrics payloads for an agent
-curl -sk "https://<IP>:8443/api/v1/agents/macbook-001/metrics?limit=10"
+## Troubleshooting Quick Reference
 
-# Jarvis findings
-curl -sk https://<IP>:8443/api/v1/jarvis/macbook-001/findings
-
-# Jarvis summary
-curl -sk https://<IP>:8443/api/v1/jarvis/macbook-001/summary
-```
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| Agent doesn't appear on dashboard | Manager URL wrong or unreachable | Check `agent.toml` URL; test `curl -k https://MANAGER_URL/health` |
+| `TLS certificate verify failed` | Self-signed cert with `tls_verify=true` | Set `tls_verify = false` in agent.toml |
+| `Enrollment failed: 401` | Wrong or missing enrollment token | Set correct `token` in `[enrollment]` |
+| Agent keeps restarting | Config error or crash | Check `sudo attacklens-ctl logs` for error |
+| No findings after 5 minutes | Threat intel feeds still loading | Wait 10 min; check `docker compose logs threat-intel` |
+| `503 AI analyst not available` | No Anthropic API key | Add `ANTHROPIC_API_KEY` to `.env`, restart manager |
+| Manager container exits | Port conflict or SQLite error | Check `docker compose logs manager`; ensure `./data/` is writable |
+| RabbitMQ unhealthy | Not enough memory | Increase server RAM; RabbitMQ needs at least 256 MB |

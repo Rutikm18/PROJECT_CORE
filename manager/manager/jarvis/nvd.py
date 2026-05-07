@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
@@ -23,6 +24,7 @@ NVD_API_URL    = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 CVE_TTL        = 86400        # 24 hours
 REQUEST_DELAY  = 7.0          # seconds between NVD requests (rate limit)
 MAX_RESULTS    = 10           # max CVEs per package lookup
+SYNC_PAGE_SIZE = 200          # bounded page size for continuous modified sync
 TIMEOUT        = aiohttp.ClientTimeout(total=20)
 
 # CVSS → severity mapping
@@ -39,6 +41,10 @@ def cvss_to_severity(score: Optional[float]) -> str:
 def _pkg_keyword(name: str, version: str = "") -> str:
     kw = re.sub(r"[^a-zA-Z0-9\.\-_]", " ", name).strip()
     return kw
+
+
+def _nvd_dt(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 _last_nvd_call: float = 0.0
 _nvd_lock = asyncio.Lock()
@@ -75,6 +81,28 @@ class CVELookup:
         if cached:
             return cached
         return await self._fetch_single_cve(cve_id)
+
+    async def sync_recent(self, hours: int = 48, max_pages: int = 3) -> int:
+        """
+        Pull recently modified CVEs from NVD and store them in the local intel DB.
+        This keeps threat intelligence fresh even when agents are not sending
+        new package telemetry.
+        """
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(hours=max(1, hours))
+        count = 0
+        start_index = 0
+        for _ in range(max(1, max_pages)):
+            page = await self._fetch_modified_window(start, now, start_index)
+            if not page:
+                break
+            for cve in page:
+                await self._db.upsert_cve(cve)
+                count += 1
+            if len(page) < SYNC_PAGE_SIZE:
+                break
+            start_index += SYNC_PAGE_SIZE
+        return count
 
     # ── NVD API calls ─────────────────────────────────────────────────────────
 
@@ -142,6 +170,44 @@ class CVELookup:
             except Exception as exc:
                 log.debug("NVD single CVE fetch failed %s: %s", cve_id, exc)
                 return None
+
+    async def _fetch_modified_window(
+        self,
+        start: datetime,
+        end: datetime,
+        start_index: int,
+    ) -> list[dict]:
+        global _last_nvd_call
+        async with _nvd_lock:
+            elapsed = time.time() - _last_nvd_call
+            if elapsed < REQUEST_DELAY:
+                await asyncio.sleep(REQUEST_DELAY - elapsed)
+            params = {
+                "lastModStartDate": _nvd_dt(start),
+                "lastModEndDate": _nvd_dt(end),
+                "resultsPerPage": SYNC_PAGE_SIZE,
+                "startIndex": start_index,
+            }
+            try:
+                async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
+                    async with s.get(NVD_API_URL, params=params) as r:
+                        _last_nvd_call = time.time()
+                        if r.status == 403:
+                            log.warning("NVD modified sync rate limited")
+                            return []
+                        if r.status != 200:
+                            log.debug("NVD modified sync returned %d", r.status)
+                            return []
+                        data = await r.json()
+                results = []
+                for vuln in data.get("vulnerabilities", []):
+                    parsed = self._parse_cve(vuln.get("cve", {}))
+                    if parsed:
+                        results.append(parsed)
+                return results
+            except Exception as exc:
+                log.debug("NVD modified sync failed: %s", exc)
+                return []
 
     def _parse_cve(self, cve: dict) -> Optional[dict]:
         cve_id = cve.get("id", "")

@@ -194,10 +194,15 @@ class AppsCollector(BaseCollector):
         except Exception:
             pass
 
-        # codesign
-        cs = _run(["codesign", "-dvv", "--", path], timeout=8)
-        signed = bool(cs and "Identifier=" in cs)
-        notarized = "notarized" in cs.lower() or "trusted" in cs.lower()
+        # codesign writes to stderr; capture it explicitly
+        cs = _run(["codesign", "-dvvv", "--", path], timeout=8, stderr=True)
+        signed = "Identifier=" in cs
+        # Notarized = app has a Timestamp from Apple's TSA (added during notarization)
+        # plus at least one Developer ID or Apple authority in the chain.
+        has_timestamp = "Timestamp=" in cs
+        authorities   = [l.split("=",1)[1].strip() for l in cs.splitlines() if l.startswith("Authority=")]
+        has_dev_id    = any("Developer ID" in a or "Apple" in a for a in authorities)
+        notarized     = has_timestamp and has_dev_id
 
         # Install time from filesystem
         try:

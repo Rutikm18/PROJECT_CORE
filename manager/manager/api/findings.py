@@ -131,10 +131,12 @@ def make_findings_router(intel_db) -> APIRouter:
             raise HTTPException(404, f"Finding {finding_id} not found")
         comments = await intel_db.get_comments(finding_id)
         activity = await intel_db.get_activity(finding_id)
+        actions = await intel_db.get_actions(finding_id)
         return {
             **finding,
             "comments": comments,
             "activity": activity,
+            "actions": actions,
         }
 
     # ── Update finding ────────────────────────────────────────────────────────
@@ -188,6 +190,16 @@ def make_findings_router(intel_db) -> APIRouter:
             raise HTTPException(404, "Finding not found")
         activity = await intel_db.get_activity(finding_id)
         return {"activity": activity, "count": len(activity)}
+
+    # ── 6-month historical trend ──────────────────────────────────────────────
+    @router.get("/historical")
+    async def historical_trend(months: int = Query(6, ge=1, le=24)):
+        """Monthly finding counts for the last N months (dashboard 6-month chart)."""
+        try:
+            return {"monthly_trend": await intel_db.get_historical_trend(months), "months": months}
+        except Exception as exc:
+            log.exception("historical_trend failed")
+            raise HTTPException(500, f"Failed to load historical trend: {exc}")
 
     # ── Bulk actions ──────────────────────────────────────────────────────────
     @router.post("/bulk")

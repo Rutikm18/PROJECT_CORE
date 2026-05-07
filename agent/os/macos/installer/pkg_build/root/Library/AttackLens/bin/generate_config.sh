@@ -261,9 +261,9 @@ interval_sec = 3600
 send         = true
 
 [collection.sections.binaries]
-enabled      = false
+enabled      = true
 interval_sec = 3600
-send         = false
+send         = true
 
 [collection.sections.sbom]
 enabled      = true

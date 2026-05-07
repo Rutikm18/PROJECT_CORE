@@ -18,37 +18,83 @@
 
 ## 1. Installation
 
-### Install from package
+### Recommended install flow (env file)
+
+**Step 1 — Write the env file** (before running the installer):
+
+```bash
+echo "ATTACKLENS_MANAGER='72.61.228.62'" > /tmp/attacklens_envs
+echo "ATTACKLENS_AGENT_NAME='MyMac'" >> /tmp/attacklens_envs
+```
+
+Supported env vars:
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `ATTACKLENS_MANAGER` | yes | Manager IP, IP:port, or full `http/https://` URL |
+| `ATTACKLENS_AGENT_NAME` | no | Human-readable label (default: ComputerName) |
+| `ATTACKLENS_TAGS` | no | Comma-separated tags, e.g. `"prod,finance"` |
+| `ATTACKLENS_TOKEN` | no | Enrollment token if manager requires one |
+
+**Step 2 — Install the package:**
 
 ```bash
 sudo installer -pkg attacklens-agent-2.0.0-arm64.pkg -target /
 ```
 
 The installer automatically:
-- Detects the correct `python3` path and patches LaunchDaemon plists
+- Reads `/tmp/attacklens_envs` and applies manager URL + agent name
+- Detects the correct `python3` (real Mach-O binary) and patches LaunchDaemon plists
 - Installs Python dependencies: `psutil`, `cryptography`, `requests`, `tomli`
 - Writes a complete `agent.toml` with all 22 collection sections
 - Bootstraps `com.attacklens.agent` and `com.attacklens.watchdog` as LaunchDaemons in the **system domain**
+- Deletes `/tmp/attacklens_envs` on completion (security cleanup)
 
-### Verify installation
+**Step 3 — Start the agent:**
+
+```bash
+sudo attacklens-service start
+```
+
+**Step 4 — Verify:**
 
 ```bash
 attacklens-service status
 attacklens-service diagnose
 ```
 
+Expected healthy output:
+```
+  AttackLens Agent  v2.0.0
+  Agent:    running  (PID 12345)
+  Watchdog: running  (PID 12346)
+  Manager:  http://72.61.228.62
+  Name:     MyMac
+  Enrollment: API key stored in Keychain
+```
+
+### Install without env file (set manager after install)
+
+```bash
+sudo installer -pkg attacklens-agent-2.0.0-arm64.pkg -target /
+sudo attacklens-service set-manager 72.61.228.62
+sudo attacklens-service start
+```
+
 ---
 
 ## 2. First-Time Setup
 
-### If manager IP was baked into the package
+### Auto-enrollment
 
-No action needed — the agent auto-enrolls on first contact.
+When the manager is reachable, the agent enrolls automatically on first contact — no manual steps needed. The API key is stored in the macOS System Keychain under `com.attacklens.agent`.
 
-### If manager IP needs to be set after install
+If the manager is temporarily unreachable at install time, the agent starts with a temporary key and retries enrollment every 60 seconds in the background. Once the manager is available, enrollment completes automatically on the next retry — no restart needed.
+
+### Update manager IP
 
 ```bash
-sudo attacklens-service set-manager 34.224.174.38
+sudo attacklens-service set-manager 72.61.228.62
 ```
 
 This updates `agent.toml`, clears any stale API key, and restarts both services.

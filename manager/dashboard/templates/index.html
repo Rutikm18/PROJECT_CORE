@@ -3,26 +3,33 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>mac_intel — SOC Intelligence Platform</title>
-<link rel="stylesheet" href="/static/css/dashboard.css">
+<title>AttackLens.ai — CTEM Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/dashboard.css?v=attacklens-ctem-20260504">
+<script>
+if (location.protocol === 'file:') {
+  document.write('<link rel="stylesheet" href="../static/css/dashboard.css?v=attacklens-ctem-20260504">');
+}
+</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
-<body>
+<body class="mode-analyst theme-light">
 <div class="shell">
 
 <!-- ══ SIDEBAR ══════════════════════════════════════════════════════════════ -->
 <nav class="sidebar">
   <div class="sidebar-logo">
-    <div class="logo-icon">
-      <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-        <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" fill="none" stroke="#3B82F6" stroke-width="1.5"/>
-        <polygon points="14,6 22,10 22,18 14,22 6,18 6,10" fill="rgba(59,130,246,0.15)" stroke="#60A5FA" stroke-width="1"/>
-        <circle cx="14" cy="14" r="3" fill="#3B82F6"/>
+    <div class="logo-icon" aria-hidden="true">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+        <path d="M3.5 16L10 3.5L16.5 16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M6.8 11.2H13.2" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
       </svg>
     </div>
     <div>
-      <div class="logo-name">mac_intel</div>
-      <div class="logo-sub">SOC Intelligence</div>
+      <div class="logo-name"><span>attack</span><span class="brand-lens">lens</span><span class="brand-ai">.ai</span></div>
+      <div class="logo-sub">Continuous Threat Exposure Management</div>
     </div>
   </div>
 
@@ -34,7 +41,7 @@
     </button>
     <button class="nav-item" id="nav-findings" onclick="showPanel('findings',this)">
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 1L14 4v5c0 4-6 6-6 6S2 13 2 9V4z"/><line x1="8" y1="6" x2="8" y2="9"/><circle cx="8" cy="11" r=".8" fill="currentColor"/></svg>
-      <span>Findings</span>
+      <span>Security Findings</span>
       <span class="nav-badge nav-badge-red" id="findings-badge" style="display:none">0</span>
     </button>
     <button class="nav-item" id="nav-agents" onclick="showPanel('agents',this)">
@@ -51,6 +58,10 @@
     <button class="nav-item" id="nav-timeline" onclick="showPanel('timeline',this)">
       <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none"/><path d="M8 4v4l3 2"/></svg>
       <span>Timeline</span>
+    </button>
+    <button class="nav-item" id="nav-threatintel" onclick="showPanel('threatintel',this)">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 1.5l5.5 2.4v4.2c0 3.5-2.4 5.8-5.5 6.4-3.1-.6-5.5-2.9-5.5-6.4V3.9z"/><path d="M5 8h6M8 5v6"/></svg>
+      <span>Threat Intel</span>
     </button>
 
     <div class="nav-group-label">Telemetry</div>
@@ -80,13 +91,35 @@
   <!-- Topbar -->
   <div class="topbar">
     <div class="topbar-left">
-      <div class="topbar-title" id="topbar-title">Dashboard</div>
-      <div class="topbar-breadcrumb" id="topbar-agent">All Agents</div>
+      <div class="topbar-brandmark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+          <path d="M3.5 16L10 3.5L16.5 16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M6.8 11.2H13.2" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="topbar-title-wrap">
+        <div class="topbar-title" id="topbar-title">attack<span>lens.ai</span></div>
+        <div class="topbar-breadcrumb" id="topbar-agent">CTEM PLATFORM · mac_intel agent · endpoint-macpro-01</div>
+      </div>
     </div>
     <div class="topbar-right">
+      <span class="live-chip"><i></i>LIVE</span>
+      <div class="mode-toggle" aria-label="View mode">
+        <button class="active" id="mode-analyst-btn" onclick="setMode('analyst')">Analyst</button>
+        <button id="mode-ciso-btn" onclick="setMode('ciso')">CISO</button>
+      </div>
+      <div class="theme-toggle" aria-label="Theme">
+        <button class="active" id="theme-light-btn" onclick="setTheme('light')" title="Light theme">
+          <svg viewBox="0 0 16 16" width="13" height="13"><circle cx="8" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 1.2v1.5M8 13.3v1.5M1.2 8h1.5M13.3 8h1.5M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M12.8 3.2l-1.1 1.1M4.3 11.7l-1.1 1.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </button>
+        <button id="theme-dark-btn" onclick="setTheme('dark')" title="Dark theme">
+          <svg viewBox="0 0 16 16" width="13" height="13"><path d="M12.5 10.4A5.4 5.4 0 0 1 5.6 3.5 5.6 5.6 0 1 0 12.5 10.4z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <span class="topbar-clock" id="topbar-clock">MAY 04 2026 · UTC</span>
       <div class="time-pills">
-        <button class="tp active" onclick="setWin('1h',this)">1h</button>
-        <button class="tp" onclick="setWin('8h',this)">8h</button>
+        <button class="tp" onclick="setWin('1h',this)">1h</button>
+        <button class="tp active" onclick="setWin('8h',this)">8h</button>
         <button class="tp" onclick="setWin('1d',this)">1d</button>
         <button class="tp" onclick="setWin('7d',this)">7d</button>
         <button class="tp" onclick="setWin('30d',this)">30d</button>
@@ -102,6 +135,62 @@
 
     <!-- ══ DASHBOARD PANEL ════════════════════════════════════════════════ -->
     <div class="panel active" id="panel-dashboard">
+
+      <div class="dashboard-hero">
+        <div>
+          <div class="eyebrow">AttackLens CTEM</div>
+          <h1>Exposure operations dashboard</h1>
+          <p>Analyst-focused prioritization across macOS telemetry, exploit intelligence, SLA urgency, and remediation state.</p>
+        </div>
+        <div class="hero-actions">
+          <button class="ghost-action" onclick="showPanel('findings',document.getElementById('nav-findings'))">Review queue</button>
+          <button class="primary-action" onclick="showPanel('findings',document.getElementById('nav-findings'));filterSLABreach()">Act on breached SLA</button>
+        </div>
+      </div>
+
+      <div class="ctem-pipeline" aria-label="CTEM pipeline">
+        <div class="ctem-stage">
+          <span class="ctem-index">01 · SCOPING</span>
+          <strong>Asset Surface</strong>
+          <span>21 sections monitored</span>
+          <b>21</b>
+        </div>
+        <div class="ctem-stage">
+          <span class="ctem-index">02 · DISCOVERY</span>
+          <strong>Exposures Found</strong>
+          <span>across 6 domains</span>
+          <b id="ctem-discovery-count">43</b>
+        </div>
+        <div class="ctem-stage active">
+          <span class="ctem-index">03 · PRIORITIZATION</span>
+          <strong>Action Queue</strong>
+          <span>CVSS + EPSS scored</span>
+          <b id="ctem-priority-count">12</b>
+        </div>
+        <div class="ctem-stage">
+          <span class="ctem-index">04 · VALIDATION</span>
+          <strong>Verified Active</strong>
+          <span>exploit confirmed</span>
+          <b>7</b>
+        </div>
+        <div class="ctem-stage">
+          <span class="ctem-index">05 · MOBILIZATION</span>
+          <strong>In Remediation</strong>
+          <span>playbooks active</span>
+          <b id="ctem-remediation-count">3</b>
+        </div>
+      </div>
+
+      <div class="ciso-brief">
+        <div class="brief-header"><span>CISO EXECUTIVE BRIEF · AUTO-GENERATED</span><i></i></div>
+        <div class="brief-body">
+          <div class="brief-stat"><span>Risk Score</span><b class="score-red">8.7</b></div>
+          <div class="brief-stat"><span>Exposure</span><b class="score-orange">74</b></div>
+          <div class="brief-stat"><span>SLA Breaches</span><b class="score-amber">4</b></div>
+          <div class="brief-stat"><span>CIS Pass Rate</span><b class="score-purple">34%</b></div>
+          <p>Immediate action required. Active C2 beacon confirmed on PID 4821. Two packages in CISA KEV catalog with live exploits. CIS macOS benchmark pass rate critically low at 34% — SIP, Gatekeeper, and FileVault all failing. EPSS 30-day exploitation probability on top CVE: 94.2%. One critical SLA already breached.</p>
+        </div>
+      </div>
 
       <!-- KPI Cards -->
       <div class="kpi-grid" id="dash-kpi-grid">
@@ -134,6 +223,83 @@
           <div class="kpi-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="7" r="3.5"/><path d="M3 18c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg></div>
           <div class="kpi-val" id="kpi-agents">—</div>
           <div class="kpi-label">Active Agents</div>
+        </div>
+      </div>
+
+      <div class="ops-grid">
+        <div class="ops-left">
+          <div class="card">
+            <div class="card-hdr">
+              <span class="card-title">CIS Benchmark Compliance</span>
+              <span class="card-sub">macOS v8 · 53 controls</span>
+              <button class="link-btn" onclick="showPanel('rawdata',document.getElementById('nav-rawdata'))">Full report →</button>
+            </div>
+            <div class="card-body">
+              <div class="cis-grid">
+                <div class="cis-card"><div><span>CIS-1</span><b class="score-amber">60%</b></div><strong>Asset Inventory</strong><div class="mini-track"><i style="width:60%" class="fill-amber"></i></div><p>hardware · software · sbom · 4 fail</p></div>
+                <div class="cis-card"><div><span>CIS-2</span><b class="score-amber">45%</b></div><strong>Software Asset Mgmt</strong><div class="mini-track"><i style="width:45%" class="fill-amber"></i></div><p>apps · packages · binaries · 6 fail</p></div>
+                <div class="cis-card"><div><span>CIS-4</span><b class="score-red">12%</b></div><strong>Secure Configuration</strong><div class="mini-track"><i style="width:12%" class="fill-red"></i></div><p>SIP off · GK off · FV off · 9 fail</p></div>
+                <div class="cis-card"><div><span>CIS-5</span><b class="score-red">25%</b></div><strong>Account Management</strong><div class="mini-track"><i style="width:25%" class="fill-red"></i></div><p>UID-0 non-root account · 3 fail</p></div>
+                <div class="cis-card"><div><span>CIS-7</span><b class="score-red">20%</b></div><strong>Vulnerability Mgmt</strong><div class="mini-track"><i style="width:20%" class="fill-red"></i></div><p>8 unpatched CVEs · 7 fail</p></div>
+                <div class="cis-card"><div><span>CIS-12</span><b class="score-amber">50%</b></div><strong>Network Infrastructure</strong><div class="mini-track"><i style="width:50%" class="fill-amber"></i></div><p>ports · connections · arp · 5 fail</p></div>
+              </div>
+              <div class="overall-row">
+                <span>Overall CIS Score</span>
+                <div class="mini-track"><i style="width:34%" class="fill-red"></i></div>
+                <b class="score-red">34% · FAILING</b>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-hdr"><span class="card-title">Security Domain Health</span><span class="card-sub">6 domains · 21 sections</span></div>
+            <div class="card-body domain-body">
+              <div class="domain-row"><strong>Security Controls</strong><div class="risk-track"><i style="width:94%" class="fill-red"></i></div><b class="score-red">9.4</b><span class="badge badge-critical">2 CRIT</span><span class="badge badge-high">1 HIGH</span><small>security · sysctl</small></div>
+              <div class="domain-row"><strong>Network Exposure</strong><div class="risk-track"><i style="width:91%" class="fill-red"></i></div><b class="score-red">9.1</b><span class="badge badge-critical">3 CRIT</span><span class="badge badge-high">4 HIGH</span><small>connections · ports · network</small></div>
+              <div class="domain-row"><strong>Persistence & Exec</strong><div class="risk-track"><i style="width:84%" class="fill-red"></i></div><b class="score-red">8.4</b><span class="badge badge-critical">1 CRIT</span><span class="badge badge-high">5 HIGH</span><small>processes · services · tasks</small></div>
+              <div class="domain-row"><strong>Vuln Surface</strong><div class="risk-track"><i style="width:73%" class="fill-amber"></i></div><b class="score-amber">7.3</b><span class="badge badge-critical">1 CRIT</span><span class="badge badge-high">3 HIGH</span><small>packages · apps</small></div>
+              <div class="domain-row"><strong>Identity & Access</strong><div class="risk-track"><i style="width:62%" class="fill-amber"></i></div><b class="score-amber">6.2</b><span class="badge badge-critical">2 CRIT</span><span class="badge badge-high">3 HIGH</span><small>users · services</small></div>
+              <div class="domain-row"><strong>Behavioral</strong><div class="risk-track"><i style="width:41%" class="fill-blue"></i></div><b class="score-blue">4.1</b><span class="badge badge-info">0 CRIT</span><span class="badge badge-high">2 HIGH</span><small>metrics · agent_health</small></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ops-right">
+          <div class="card score-panel">
+            <div class="card-hdr"><span class="card-title">Exposure Score</span></div>
+            <div class="card-body">
+              <div class="big-score"><strong id="hero-risk-score">8.7</strong><span>out of 10 · <em class="badge badge-critical">CRITICAL</em></span></div>
+              <div class="factor-list">
+                <div><span>CVSS base</span><b class="score-red">9.1</b></div>
+                <div><span>EPSS top CVE</span><b class="score-red">94%</b></div>
+                <div><span>KEV matches</span><b class="score-amber">2</b></div>
+                <div><span>CIS pass rate</span><b class="score-amber">34%</b></div>
+                <div><span>SLA status</span><b id="hero-sla-focus" class="sla-pill sla-breached">BREACHED</b></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-hdr"><span class="card-title">EPSS — Exploitation Probability</span><span class="card-sub" title="Probability this CVE will be exploited in the next 30 days. Source: FIRST.org.">Info</span></div>
+            <div class="card-body epss-list">
+              <div><code>CVE-2024-44308</code><span>curl 7.86.0</span><div class="mini-track"><i style="width:94%" class="fill-red"></i></div><b class="score-red">94%</b><em class="intel-badge">KEV</em></div>
+              <div><code>CVE-2023-32373</code><span>openssl 3.1.2</span><div class="mini-track"><i style="width:87%" class="fill-red"></i></div><b class="score-red">87%</b><em class="intel-badge">KEV</em></div>
+              <div><code>CVE-2024-1086</code><span>git 2.39.1</span><div class="mini-track"><i style="width:71%" class="fill-amber"></i></div><b class="score-amber">71%</b></div>
+              <div><code>CVE-2023-44487</code><span>python 3.11.2</span><div class="mini-track"><i style="width:58%" class="fill-amber"></i></div><b class="score-amber">58%</b></div>
+              <div><code>CVE-2022-42916</code><span>libxml2 2.9.13</span><div class="mini-track"><i style="width:34%" class="fill-blue"></i></div><b class="score-blue">34%</b></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-hdr"><span class="card-title">Threat Intel Feeds</span><span class="feed-ok"><i></i>All feeds active</span></div>
+            <div class="card-body feed-list">
+              <div><strong>CISA KEV</strong><b>2</b><div class="mini-track"><i style="width:100%" class="fill-red"></i></div><span class="dot green"></span><small>1h ago</small></div>
+              <div><strong>NVD / EPSS</strong><b>8</b><div class="mini-track"><i style="width:90%" class="fill-blue"></i></div><span class="dot green"></span><small>live</small></div>
+              <div><strong>ExploitDB</strong><b>5</b><div class="mini-track"><i style="width:80%" class="fill-amber"></i></div><span class="dot green"></span><small>live</small></div>
+              <div><strong>Feodo C2</strong><b>1</b><div class="mini-track"><i style="width:20%" class="fill-red"></i></div><span class="dot green"></span><small>1h ago</small></div>
+              <div><strong>ET Rules</strong><b>3</b><div class="mini-track"><i style="width:60%" class="fill-gray"></i></div><span class="dot amber"></span><small>1h ago</small></div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -173,6 +339,17 @@
         </div>
       </div>
 
+      <!-- 6-Month Historical Trend -->
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-hdr">
+          <span class="card-title">6-Month Historical Findings</span>
+          <span class="card-sub" id="historical-sub">Monthly breakdown · last 6 months</span>
+        </div>
+        <div class="card-body" id="historical-wrap">
+          <div class="chart-wrap chart-wrap-lg"><canvas id="historicalChart"></canvas></div>
+        </div>
+      </div>
+
       <!-- SLA Compliance -->
       <div class="charts-2col" style="margin-bottom:20px">
         <div class="card">
@@ -192,17 +369,74 @@
         </div>
       </div>
 
-      <!-- Recent Critical Findings -->
-      <div class="section-hdr-row">
-        <span class="section-hdr-title">Recent Critical & High Findings</span>
-        <button class="link-btn" onclick="showPanel('findings',document.getElementById('nav-findings'))">View all findings →</button>
-      </div>
-      <div id="dash-recent-findings">
-        <div class="empty-state"><div class="empty-icon">⬡</div><p>Loading findings…</p></div>
+      <div class="priority-grid">
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">Priority Findings</span>
+            <div class="chip-row"><span class="stage-chip active">All</span><span class="stage-chip">Critical</span><span class="stage-chip">Unassigned</span></div>
+            <button class="link-btn" onclick="showPanel('findings',document.getElementById('nav-findings'))">View all →</button>
+          </div>
+          <div class="card-body priority-list" id="dash-recent-findings">
+            <div class="finding-row-pro">
+              <div>
+                <span class="badge badge-critical">CRITICAL</span>
+                <strong>Active C2 beacon — 185.220.101.47:4444</strong>
+                <small><code>connections</code><em>CIS-12</em></small>
+              </div>
+              <div><span class="intel-badge">KEV</span><span class="intel-badge neutral">9.8</span><span class="stage-chip">VALIDATION</span><time>2 min ago</time></div>
+            </div>
+            <div class="finding-row-pro">
+              <div>
+                <span class="badge badge-critical">CRITICAL</span>
+                <strong>SIP disabled — System Integrity Protection off</strong>
+                <small><code>security</code><em>CIS-4.1</em></small>
+              </div>
+              <div><span class="intel-badge">KEV</span><span class="intel-badge neutral">9.1</span><span class="stage-chip">MOBILIZATION</span><time>8 min ago</time></div>
+            </div>
+            <div class="finding-row-pro">
+              <div>
+                <span class="badge badge-critical">CRITICAL</span>
+                <strong>SUID binary /tmp/.update/patcher</strong>
+                <small><code>binaries</code><em>CIS-2.6</em></small>
+              </div>
+              <div><span class="intel-badge blue">EDB-51337</span><span class="intel-badge neutral">8.8</span><span class="stage-chip active">PRIORITIZATION</span><time>12 min ago</time></div>
+            </div>
+            <div class="finding-row-pro">
+              <div>
+                <span class="badge badge-critical">CRITICAL</span>
+                <strong>CVE-2024-44308 · curl 7.86.0 · EPSS 94%</strong>
+                <small><code>packages</code><em>CIS-7.3</em></small>
+              </div>
+              <div><span class="intel-badge">KEV</span><span class="intel-badge blue">EDB-51892</span><span class="stage-chip active">PRIORITIZATION</span><time>18 min ago</time></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">Attack Chain Correlations</span>
+            <span class="badge badge-critical">3 active</span>
+            <button class="link-btn" onclick="showPanel('correlations',document.getElementById('nav-correlations'))">View all →</button>
+          </div>
+          <div class="card-body chain-list">
+            <div class="chain-block">
+              <div><code>corr:c2_beacon_tool</code><span class="badge badge-critical">9.5</span></div>
+              <p><span><small>process</small>python3.11</span><b>→</b><span><small>connection</small>185.220.101.47</span><b>→</b><span><small>feed</small>Feodo C2</span></p>
+            </div>
+            <div class="chain-block">
+              <div><code>corr:defense_evasion_chain</code><span class="badge badge-high">8.5</span></div>
+              <p><span><small>security</small>SIP off</span><b>→</b><span><small>app</small>unsigned</span><b>→</b><span><small>config</small>plist mod</span></p>
+            </div>
+            <div class="chain-block">
+              <div><code>corr:privesc_execution</code><span class="badge badge-high">8.0</span></div>
+              <p><span><small>binary</small>SUID /tmp</span><b>→</b><span><small>process</small>patcher</span><b>→</b><span><small>user</small>uid=0</span></p>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- ══ FINDINGS PANEL ═════════════════════════════════════════════════ -->
+    <!-- ══ SECURITY FINDINGS PANEL ════════════════════════════════════════ -->
     <div class="panel" id="panel-findings">
 
       <!-- Filter Bar -->
@@ -245,6 +479,14 @@
           <option value="">SLA: All</option>
           <option value="breached">SLA Breached</option>
         </select>
+        <select id="flt-sort" onchange="setSortBy(this.value)">
+          <option value="composite_score">Sort: Correlated Risk</option>
+          <option value="kev">Sort: KEV First</option>
+          <option value="exploit_available">Sort: Exploit First</option>
+          <option value="score">Sort: Rule Score</option>
+          <option value="sla_due">Sort: SLA Due</option>
+          <option value="last_detected_at">Sort: Last Seen</option>
+        </select>
         <div class="filter-sep"></div>
         <button class="filter-clear" onclick="clearFilters()">✕ Clear</button>
         <span class="filter-count" id="findings-count-label">Loading…</span>
@@ -269,10 +511,12 @@
           <thead>
             <tr>
               <th class="tbl-check"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)"></th>
+              <th>ID</th>
               <th onclick="setSortBy('severity')">Severity</th>
-              <th class="tbl-title" onclick="setSortBy('score')">Finding <span style="color:var(--text-dim)">▼</span></th>
+              <th class="tbl-title" onclick="setSortBy('composite_score')">Security Finding <span style="color:var(--text-dim)">▼</span></th>
               <th>Agent</th>
               <th>Category</th>
+              <th>Intel</th>
               <th>MITRE</th>
               <th>Assignee</th>
               <th onclick="setSortBy('sla_due')">SLA</th>
@@ -282,7 +526,7 @@
             </tr>
           </thead>
           <tbody id="findings-tbody">
-            <tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text-dim)">Loading findings…</td></tr>
+            <tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text-dim)">Loading findings…</td></tr>
           </tbody>
         </table>
       </div>
@@ -298,6 +542,7 @@
         <span class="section-hdr-title">Enrolled Agents</span>
         <span id="agent-count-label" style="font-size:12px;color:var(--text-sub)"></span>
       </div>
+      <div class="agent-ai-strip" id="agent-ai-strip"></div>
       <div class="agent-grid" id="agent-grid">
         <div class="empty-state"><div class="empty-icon">⬡</div><p>Loading agents…</p></div>
       </div>
@@ -319,9 +564,52 @@
           </div>
         </div>
         <div class="section-hdr-row" style="margin-top:16px">
+          <span class="section-hdr-title">Agent Live Status</span>
+        </div>
+        <div id="agent-live-summary"></div>
+        <div class="section-hdr-row" style="margin-top:16px">
           <span class="section-hdr-title">Agent Findings Summary</span>
         </div>
         <div id="agent-findings-summary"></div>
+      </div>
+    </div>
+
+    <!-- == THREAT INTEL PANEL ========================================== -->
+    <div class="panel" id="panel-threatintel">
+      <div class="section-hdr-row" style="margin-top:0">
+        <span class="section-hdr-title">Threat Intel Module</span>
+        <span id="threatintel-label" style="font-size:12px;color:var(--text-sub)">NVD, IOC feeds, and finding correlation</span>
+      </div>
+      <div class="kpi-grid threatintel-kpis">
+        <div class="kpi-card kpi-blue"><div class="kpi-val" id="ti-cves">-</div><div class="kpi-label">Cached CVEs</div></div>
+        <div class="kpi-card kpi-purple"><div class="kpi-val" id="ti-cves-24h">-</div><div class="kpi-label">CVE Updates 24h</div></div>
+        <div class="kpi-card kpi-orange"><div class="kpi-val" id="ti-iocs">-</div><div class="kpi-label">Active IOCs</div></div>
+        <div class="kpi-card kpi-green"><div class="kpi-val" id="ti-mapped">-</div><div class="kpi-label">Mapped Findings</div></div>
+      </div>
+      <div class="charts-2col">
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">Feed Health</span><span class="card-sub">continuous workers</span></div>
+          <div class="card-body" id="threatintel-feeds">
+            <div class="empty-state"><div class="empty-icon">⬡</div><p>Loading feed health...</p></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-hdr"><span class="card-title">Data Architecture</span><span class="card-sub">fast path and failure handling</span></div>
+          <div class="card-body" id="threatintel-architecture">
+            <div class="empty-state"><div class="empty-icon">⬡</div><p>Loading architecture...</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="card-hdr"><span class="card-title">Recent NVD CVEs</span><span class="card-sub">cached locally for correlation</span></div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Modified</th><th>Description</th></tr></thead>
+            <tbody id="threatintel-cves">
+              <tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-dim)">Loading CVEs...</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -364,6 +652,20 @@
     <div class="panel" id="panel-rawdata">
       <div class="section-hdr-row" style="margin-top:0">
         <span class="section-hdr-title">Raw Telemetry</span>
+        <span id="raw-last-updated" style="font-size:12px;color:var(--text-sub)">Last data updated: —</span>
+      </div>
+      <div class="filter-bar raw-filter-bar">
+        <input type="text" id="raw-search" placeholder="Filter raw telemetry by process, IP, package, path…" oninput="filterRawRows()">
+        <select id="raw-sort" onchange="filterRawRows()">
+          <option value="">Original Order</option>
+          <option value="risk">Risk Signals First</option>
+          <option value="name">Name / Process</option>
+          <option value="port">Port</option>
+        </select>
+        <select id="raw-risk" onchange="filterRawRows()">
+          <option value="">All Records</option>
+          <option value="risk">Only suspicious / exposure</option>
+        </select>
       </div>
       <div class="section-picker" id="section-picker"></div>
       <div id="rawdata-content">
@@ -414,6 +716,7 @@
   <div class="wb-tabs">
     <button class="wb-tab active" id="wbt-overview"  onclick="wbTab('overview')">Overview</button>
     <button class="wb-tab"        id="wbt-evidence"  onclick="wbTab('evidence')">Evidence</button>
+    <button class="wb-tab"        id="wbt-actions"   onclick="wbTab('actions')">Actions</button>
     <button class="wb-tab"        id="wbt-activity"  onclick="wbTab('activity')">Activity <span id="wb-act-count" class="nav-badge" style="margin-left:4px">0</span></button>
     <button class="wb-tab"        id="wbt-comments"  onclick="wbTab('comments')">Comments <span id="wb-cmt-count" class="nav-badge" style="margin-left:4px">0</span></button>
   </div>
@@ -449,6 +752,10 @@
     <div class="wb-field">
       <div class="wb-field-label">Description</div>
       <div class="wb-field-val" id="wb-description" style="line-height:1.6"></div>
+    </div>
+    <div class="wb-field">
+      <div class="wb-field-label">Prioritization Matrix</div>
+      <div id="wb-intel-matrix" class="intel-matrix"></div>
     </div>
     <div class="wb-field" id="wb-rec-wrap">
       <div class="wb-field-label">Recommendation</div>
@@ -486,6 +793,13 @@
     <pre class="json-viewer" id="wb-evidence-json">{}</pre>
   </div>
 
+  <!-- Actions Tab -->
+  <div class="wb-tab-content" id="wbc-actions">
+    <div class="activity-list" id="wb-actions-list">
+      <div class="empty-state" style="padding:30px"><p>No actions recorded yet</p></div>
+    </div>
+  </div>
+
   <!-- Activity Tab -->
   <div class="wb-tab-content" id="wbc-activity">
     <div class="activity-list" id="wb-activity-list">
@@ -521,23 +835,33 @@
 const S = {
   agents: [],
   selectedAgent: '',
-  timeWindow: '1h',
+  timeWindow: '8h',
   ws: null,
+  wsToken: '',
   charts: {},
   currentFinding: null,
   selectedFindingIds: new Set(),
   findingsOffset: 0,
   findingsTotal: 0,
   findingsPageSize: 50,
-  sortBy: 'score',
+  sortBy: 'composite_score',
+  rawRecords: [],
+  rawSection: '',
+  rawLatest: null,
   debounceTimer: null,
   refreshTimer: null,
 };
 
 const SEV_COLORS = {
-  critical: '#EF4444', high: '#F97316', medium: '#EAB308',
-  low: '#22C55E', info: '#64748B',
+  critical: '#EF4444', high: '#F59E0B', medium: '#3B82F6',
+  low: '#6B7FA0', info: '#3D4F6A',
 };
+const CHART_TEXT = '#64748B';
+const CHART_GRID = '#E5E7EB';
+const CHART_BLUE = '#3B82F6';
+const CHART_AMBER = '#F59E0B';
+const CHART_GREEN = '#10B981';
+const IS_FILE_PREVIEW = location.protocol === 'file:';
 const STATUS_LABELS = {
   new: 'New', triaging: 'Triaging', investigating: 'Investigating',
   in_remediation: 'In Remediation', remediated: 'Remediated',
@@ -545,8 +869,144 @@ const STATUS_LABELS = {
   accepted_risk: 'Accepted Risk', duplicate: 'Duplicate',
 };
 
+function setMode(mode) {
+  const isCiso = mode === 'ciso';
+  document.body.classList.toggle('mode-ciso', isCiso);
+  document.body.classList.toggle('mode-analyst', !isCiso);
+  document.getElementById('mode-analyst-btn')?.classList.toggle('active', !isCiso);
+  document.getElementById('mode-ciso-btn')?.classList.toggle('active', isCiso);
+}
+
+function setTheme(theme) {
+  const isDark = theme === 'dark';
+  document.body.classList.toggle('theme-dark', isDark);
+  document.body.classList.toggle('theme-light', !isDark);
+  document.getElementById('theme-light-btn')?.classList.toggle('active', !isDark);
+  document.getElementById('theme-dark-btn')?.classList.toggle('active', isDark);
+  try { localStorage.setItem('attacklens-theme', isDark ? 'dark' : 'light'); } catch(e) {}
+}
+
+function updateTopbarClock() {
+  const el = document.getElementById('topbar-clock');
+  if (!el) return;
+  const d = new Date();
+  el.textContent = d.toLocaleString('en-US', {
+    month: 'short', day: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', timeZone: 'UTC', hour12: false,
+  }).replace(',', '').toUpperCase() + ' UTC';
+}
+
+const PREVIEW_FINDINGS = [
+  { id: 901, severity:'critical', title:'Gatekeeper disabled on executive MacBook', agent_id:'attacklens-mba-01', category:'security', status:'triaging', sla_due: Date.now()/1000 - 1800 },
+  { id: 902, severity:'critical', title:'Unsigned persistence item launched from user Library', agent_id:'attacklens-mbp-14', category:'service', status:'investigating', sla_due: Date.now()/1000 + 5400 },
+  { id: 903, severity:'high', title:'Open SSH listener exposed on non-standard port', agent_id:'attacklens-build-02', category:'port', status:'in_remediation', sla_due: Date.now()/1000 + 21600 },
+  { id: 904, severity:'high', title:'Outdated OpenSSL package with exploitable CVE match', agent_id:'attacklens-dev-07', category:'package', status:'new', sla_due: Date.now()/1000 + 42000 },
+];
+
+function previewData(path) {
+  if (path === '/dashboard/ws-token') return { token: '' };
+  if (path === '/agents') return [
+    { agent_id:'attacklens-mba-01', name:'Executive MacBook', online:true, live_status:'connected', last_seen:Date.now()/1000-12, last_seen_label:'live now', session_count:7, last_ip:'10.0.1.23' },
+    { agent_id:'attacklens-mbp-14', name:'Engineering MacBook Pro', online:true, live_status:'connected', last_seen:Date.now()/1000-42, last_seen_label:'live now', session_count:4, last_ip:'10.0.1.45' },
+    { agent_id:'attacklens-build-02', name:'Build Runner', online:false, live_status:'disconnected', last_seen:Date.now()/1000-980, last_seen_label:'last seen 16m ago', session_count:11, last_ip:'10.0.2.14' },
+  ];
+  if (path.startsWith('/agents/') && !path.includes('/metrics')) return {
+    agent_id:'attacklens-mba-01', name:'Executive MacBook', online:true,
+    live_status:'connected', last_seen:Date.now()/1000-12, last_seen_label:'live now',
+    last_ip:'10.0.1.23', created_at:Date.now()/1000-86400, sections:{metrics:Date.now()/1000-12},
+    sessions:[
+      {connected_at:Date.now()/1000-1900, disconnected_at:0, last_seen:Date.now()/1000-12, status:'connected', close_reason:'', duration:1888},
+      {connected_at:Date.now()/1000-8200, disconnected_at:Date.now()/1000-5400, last_seen:Date.now()/1000-5400, status:'disconnected', close_reason:'timeout', duration:2800},
+      {connected_at:Date.now()/1000-17200, disconnected_at:Date.now()/1000-15000, last_seen:Date.now()/1000-15000, status:'disconnected', close_reason:'timeout', duration:2200},
+    ]
+  };
+  if (path.startsWith('/threat/intel/summary')) return {
+    cves:1284, cves_cached_24h:96, ioc_cache:4182, mapped_findings:17,
+    feeds:[
+      {source:'nvd_recent', status:'ok', entry_count:96, last_success:Date.now()/1000-860, error_count:0},
+      {source:'feodo', status:'ok', entry_count:724, last_success:Date.now()/1000-1900, error_count:0},
+      {source:'urlhaus', status:'ok', entry_count:1000, last_success:Date.now()/1000-3400, error_count:0},
+      {source:'proactive_cve', status:'ok', entry_count:4, last_success:Date.now()/1000-5200, error_count:0},
+    ],
+    datastores:[
+      {name:'manager.db', role:'agent registry, sessions, raw payload index'},
+      {name:'intel.db', role:'threat intel cache, findings, correlations, scoring matrix'},
+    ],
+    pipeline:['agent ingest','RabbitMQ telemetry queue or sync fallback','raw agent datastore','NVD and IOC refresh','Jarvis scoring and correlation','indexed findings API']
+  };
+  if (path.startsWith('/threat/intel/cves')) return {
+    cves:[
+      {cve_id:'CVE-2026-1024', severity:'critical', cvss_score:9.8, modified_at:'2026-05-05T08:12:00Z', description:'Remote code execution in a vulnerable package component.'},
+      {cve_id:'CVE-2026-0977', severity:'high', cvss_score:8.1, modified_at:'2026-05-05T05:40:00Z', description:'Authentication bypass under specific deployment conditions.'},
+      {cve_id:'CVE-2026-0882', severity:'medium', cvss_score:5.9, modified_at:'2026-05-04T23:18:00Z', description:'Information disclosure through malformed input handling.'},
+    ],
+    count:3
+  };
+  if (path.startsWith('/threat/intel/architecture')) return {
+    stores:[
+      {name:'manager.db', purpose:'agent registry, live sessions, raw telemetry payload index', failure_mode:'WAL keeps dashboard reads available during writes'},
+      {name:'intel.db', purpose:'NVD CVEs, IOC cache, feed health, findings, scoring, correlations', failure_mode:'feed failures degrade to cached intel and do not block ingest'},
+    ],
+    request_handling:{
+      fast_path:'ingest verifies crypto, updates agent heartbeat, publishes telemetry to RabbitMQ',
+      fallback:'without RabbitMQ, ingest writes synchronously and schedules Jarvis analysis',
+      scale:'prefetch, bounded worker concurrency, chunking, and DLQ isolation',
+    },
+    correlation:['package telemetry maps to cached NVD CVEs','connections map to IOC feeds','rules and baselines emit findings','correlator creates attack chains']
+  };
+  if (path.startsWith('/soc/dashboard')) return {
+    kpi: { total_active:42, critical:7, high:12, sla_breached:3, resolved_today:9, agents_with_findings:18 },
+    daily_trend: [
+      {date:'Mon', critical:1, high:3, medium:5, low:2},
+      {date:'Tue', critical:2, high:2, medium:6, low:3},
+      {date:'Wed', critical:1, high:4, medium:4, low:5},
+      {date:'Thu', critical:3, high:3, medium:7, low:4},
+      {date:'Fri', critical:2, high:5, medium:5, low:6},
+      {date:'Sat', critical:0, high:2, medium:3, low:5},
+      {date:'Sun', critical:1, high:1, medium:2, low:4},
+    ],
+    severity_dist: [
+      {severity:'critical', count:7}, {severity:'high', count:12}, {severity:'medium', count:16}, {severity:'low', count:7}
+    ],
+    status_dist: [
+      {status:'new', count:10}, {status:'triaging', count:8}, {status:'investigating', count:9}, {status:'in_remediation', count:7}, {status:'verified', count:8}
+    ],
+    top_agents: [
+      {agent_id:'attacklens-mba-01', critical:3, high:4, total:10},
+      {agent_id:'attacklens-mbp-14', critical:2, high:3, total:8},
+      {agent_id:'attacklens-build-02', critical:1, high:3, total:7},
+      {agent_id:'attacklens-dev-07', critical:1, high:2, total:6},
+    ],
+    category_dist: [
+      {category:'security', count:11}, {category:'package', count:9}, {category:'port', count:7}, {category:'service', count:6}, {category:'connection', count:5}
+    ],
+    sla_compliance: {
+      critical:{total:7,on_time:4,breached:3}, high:{total:12,on_time:9,breached:1}, medium:{total:16,on_time:15,breached:0}, low:{total:7,on_time:7,breached:0}
+    }
+  };
+  if (path.startsWith('/soc/historical')) return {
+    monthly_trend: [
+      {month:'Dec', critical:8, high:16, medium:24, low:12},
+      {month:'Jan', critical:7, high:14, medium:22, low:10},
+      {month:'Feb', critical:9, high:18, medium:21, low:8},
+      {month:'Mar', critical:6, high:13, medium:19, low:9},
+      {month:'Apr', critical:5, high:11, medium:17, low:7},
+      {month:'May', critical:7, high:12, medium:16, low:7},
+    ]
+  };
+  if (path.startsWith('/soc/sla')) return { breached: PREVIEW_FINDINGS.slice(0,1), warning: PREVIEW_FINDINGS.slice(1,3) };
+  if (path.startsWith('/soc/findings')) {
+    const params = new URLSearchParams(path.split('?')[1] || '');
+    const sev = params.get('severity');
+    const findings = sev ? PREVIEW_FINDINGS.filter(f => f.severity === sev) : PREVIEW_FINDINGS;
+    return { findings, total: findings.length };
+  }
+  return {};
+}
+
 // ── API helpers ────────────────────────────────────────────────────────────
 async function api(method, path, body) {
+  if (IS_FILE_PREVIEW && method === 'GET') return previewData(path);
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch('/api/v1' + path, opts);
@@ -602,12 +1062,14 @@ function showPanel(id, btn) {
   document.getElementById('panel-'+id).classList.add('active');
   document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
-  const titles = { dashboard:'Dashboard', findings:'Findings', agents:'Agents',
-                   correlations:'Attack Chains', timeline:'Timeline', rawdata:'Raw Telemetry' };
+  const titles = { dashboard:'Dashboard', findings:'Security Findings', agents:'Agents',
+                   threatintel:'Threat Intel', correlations:'Attack Chains',
+                   timeline:'Timeline', rawdata:'Raw Telemetry' };
   document.getElementById('topbar-title').textContent = titles[id] || id;
-  if (id === 'dashboard')    loadDashboard();
+  if (id === 'dashboard')    { loadDashboard(); loadHistoricalTrend(); }
   if (id === 'findings')     loadFindings();
   if (id === 'agents')       loadAgents();
+  if (id === 'threatintel')  loadThreatIntel();
   if (id === 'correlations') loadCorrelations();
   if (id === 'timeline')     loadTimeline();
   if (id === 'rawdata')      loadSections();
@@ -623,6 +1085,7 @@ function onAgentChange(aid) {
   if (active) {
     const id = active.id.replace('panel-','');
     if (id === 'correlations') loadCorrelations();
+    if (id === 'threatintel')  loadThreatIntel();
     if (id === 'timeline')     loadTimeline();
     if (id === 'rawdata')      loadSections();
     if (id === 'agents')       loadAgentDetail(aid);
@@ -668,6 +1131,11 @@ function renderDashboardKPI(k) {
   set('kpi-sla-breached',  k.sla_breached ?? 0);
   set('kpi-resolved-today',k.resolved_today ?? 0);
   set('kpi-agents',        k.agents_with_findings ?? 0);
+  const risk = Math.min(10, Math.max(0, ((k.critical||0) * 0.8 + (k.high||0) * 0.25))).toFixed(1);
+  const heroRisk = document.getElementById('hero-risk-score');
+  if (heroRisk) heroRisk.textContent = risk;
+  const heroSla = document.getElementById('hero-sla-focus');
+  if (heroSla) heroSla.textContent = (k.sla_breached||0) > 0 ? `${k.sla_breached} breached` : 'On track';
 
   // Update nav badge
   const crit = (k.critical||0) + (k.high||0);
@@ -690,18 +1158,18 @@ function renderTrendChart(trend) {
     data: {
       labels: trend.map(t => t.date),
       datasets: [
-        { label:'Critical', data: trend.map(t=>t.critical), backgroundColor:'rgba(239,68,68,.7)',   borderRadius:2 },
-        { label:'High',     data: trend.map(t=>t.high),     backgroundColor:'rgba(249,115,22,.7)',  borderRadius:2 },
-        { label:'Medium',   data: trend.map(t=>t.medium),   backgroundColor:'rgba(234,179,8,.7)',   borderRadius:2 },
-        { label:'Low',      data: trend.map(t=>t.low),      backgroundColor:'rgba(34,197,94,.5)',   borderRadius:2 },
+        { label:'Critical', data: trend.map(t=>t.critical), backgroundColor:'#EF4444', borderRadius:3 },
+        { label:'High',     data: trend.map(t=>t.high),     backgroundColor:'#F59E0B', borderRadius:3 },
+        { label:'Medium',   data: trend.map(t=>t.medium),   backgroundColor:'#3B82F6', borderRadius:3 },
+        { label:'Low',      data: trend.map(t=>t.low),      backgroundColor:'#2A3D5A', borderRadius:3 },
       ]
     },
     options: {
       responsive:true, maintainAspectRatio:false,
-      plugins: { legend:{ labels:{ color:'#94A3B8', font:{size:11}, boxWidth:10 } } },
+      plugins: { legend:{ labels:{ color:CHART_TEXT, font:{size:11}, boxWidth:10 } } },
       scales: {
-        x: { stacked:true, grid:{color:'rgba(255,255,255,.04)'}, ticks:{color:'#94A3B8',font:{size:10}} },
-        y: { stacked:true, grid:{color:'rgba(255,255,255,.04)'}, ticks:{color:'#94A3B8',font:{size:10}} },
+        x: { stacked:true, grid:{color:CHART_GRID}, ticks:{color:CHART_TEXT,font:{size:10}} },
+        y: { stacked:true, grid:{color:CHART_GRID}, ticks:{color:CHART_TEXT,font:{size:10}} },
       }
     }
   });
@@ -739,16 +1207,16 @@ function renderSeverityChart(dist) {
 function renderStatusChart(dist) {
   const ctx = document.getElementById('statusChart'); if(!ctx) return;
   if (S.charts.status) S.charts.status.destroy();
-  const colors = { new:'#64748B', triaging:'#3B82F6', investigating:'#8B5CF6',
-    in_remediation:'#F97316', remediated:'#10B981', verified:'#22C55E',
-    closed:'#374151', false_positive:'#94A3B8', accepted_risk:'#F59E0B', duplicate:'#4B5563' };
+  const colors = { new:'#6B7FA0', triaging:'#3B82F6', investigating:'#B8C4D8',
+    in_remediation:'#F59E0B', remediated:'#10B981', verified:'#10B981',
+    closed:'#6B7FA0', false_positive:'#2A3D5A', accepted_risk:'#F59E0B', duplicate:'#6B7FA0' };
   S.charts.status = new Chart(ctx, {
     type:'doughnut',
     data: { labels: dist.map(d=>STATUS_LABELS[d.status]||d.status),
             datasets:[{ data:dist.map(d=>d.count),
-              backgroundColor:dist.map(d=>(colors[d.status]||'#64748B')+'cc'), borderWidth:0 }] },
+              backgroundColor:dist.map(d=>(colors[d.status]||'#6B7FA0')+'cc'), borderWidth:0 }] },
     options:{ responsive:true, maintainAspectRatio:false, cutout:'60%',
-              plugins:{legend:{labels:{color:'#94A3B8',font:{size:10},boxWidth:8}}} }
+              plugins:{legend:{labels:{color:CHART_TEXT,font:{size:10},boxWidth:8}}} }
   });
 }
 
@@ -760,17 +1228,17 @@ function renderTopAgentsChart(agents) {
     data: {
       labels: agents.map(a => a.agent_id.length>12 ? a.agent_id.slice(-12) : a.agent_id),
       datasets: [
-        { label:'Critical', data:agents.map(a=>a.critical||0), backgroundColor:'rgba(239,68,68,.7)', borderRadius:2 },
-        { label:'High',     data:agents.map(a=>a.high||0),     backgroundColor:'rgba(249,115,22,.7)', borderRadius:2 },
-        { label:'Other',    data:agents.map(a=>(a.total||0)-(a.critical||0)-(a.high||0)), backgroundColor:'rgba(59,130,246,.5)', borderRadius:2 },
+        { label:'Critical', data:agents.map(a=>a.critical||0), backgroundColor:'#EF4444', borderRadius:3 },
+        { label:'High',     data:agents.map(a=>a.high||0),     backgroundColor:'#F59E0B', borderRadius:3 },
+        { label:'Other',    data:agents.map(a=>(a.total||0)-(a.critical||0)-(a.high||0)), backgroundColor:'#3B82F6', borderRadius:3 },
       ]
     },
     options: {
       responsive:true, maintainAspectRatio:false, indexAxis:'y',
-      plugins:{legend:{labels:{color:'#94A3B8',font:{size:10},boxWidth:8}}},
+      plugins:{legend:{labels:{color:CHART_TEXT,font:{size:10},boxWidth:8}}},
       scales:{
-        x:{stacked:true,grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#94A3B8',font:{size:10}}},
-        y:{stacked:true,grid:{display:false},ticks:{color:'#94A3B8',font:{size:10}}},
+        x:{stacked:true,grid:{color:CHART_GRID},ticks:{color:CHART_TEXT,font:{size:10}}},
+        y:{stacked:true,grid:{display:false},ticks:{color:CHART_TEXT,font:{size:10}}},
       }
     }
   });
@@ -779,13 +1247,13 @@ function renderTopAgentsChart(agents) {
 function renderCategoryChart(dist) {
   const ctx = document.getElementById('categoryChart'); if(!ctx) return;
   if (S.charts.category) S.charts.category.destroy();
-  const palette = ['#3B82F6','#8B5CF6','#F97316','#EF4444','#EAB308','#22C55E','#10B981','#06B6D4','#F59E0B','#84CC16'];
+  const palette = ['#3B82F6','#F59E0B','#6B7FA0'];
   S.charts.category = new Chart(ctx, {
     type:'doughnut',
     data: { labels:dist.map(d=>d.category), datasets:[{ data:dist.map(d=>d.count),
       backgroundColor:dist.map((_,i)=>palette[i%palette.length]+'cc'), borderWidth:0 }] },
     options:{ responsive:true, maintainAspectRatio:false, cutout:'55%',
-              plugins:{legend:{labels:{color:'#94A3B8',font:{size:10},boxWidth:8}}} }
+              plugins:{legend:{labels:{color:CHART_TEXT,font:{size:10},boxWidth:8}}} }
   });
 }
 
@@ -797,11 +1265,11 @@ function renderSLABars(compliance) {
     container.innerHTML = '<div class="empty-state" style="padding:20px"><p>No SLA data</p></div>';
     return;
   }
-  const colors = { critical:'#EF4444', high:'#F97316', medium:'#EAB308', low:'#22C55E' };
+  const colors = { critical:'#EF4444', high:'#F59E0B', medium:'#3B82F6', low:'#B8C4D8' };
   container.innerHTML = '<div class="sla-bar-row">' + sevs.map(sev => {
     const d = compliance[sev] || { total:0, on_time:0, breached:0 };
     const pct = d.total > 0 ? Math.round(d.on_time / d.total * 100) : 100;
-    const barColor = pct >= 90 ? '#22C55E' : pct >= 70 ? '#EAB308' : '#EF4444';
+    const barColor = pct >= 90 ? CHART_GREEN : pct >= 70 ? CHART_AMBER : '#EF4444';
     return `<div class="sla-bar-item">
       <div class="sla-bar-label" style="color:${colors[sev]}">${sev.charAt(0).toUpperCase()+sev.slice(1)}</div>
       <div class="sla-bar-track"><div class="sla-bar-fill" style="width:${pct}%;background:${barColor}"></div></div>
@@ -840,21 +1308,25 @@ async function renderRecentFindings() {
       container.innerHTML = '<div class="empty-state"><div class="empty-icon">✓</div><p>No critical or high findings</p></div>';
       return;
     }
-    container.innerHTML = `<div style="display:flex;flex-direction:column;gap:6px">` +
-      items.map(f => renderFindingRow(f)).join('') + `</div>`;
+    container.innerHTML = items.map(f => renderFindingRow(f)).join('');
   } catch(e) {}
 }
 
 function renderFindingRow(f) {
   const sla = fmtSLADue(f.sla_due, f.status);
-  return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r2);cursor:pointer;transition:var(--t)" onmouseenter="this.style.borderColor='var(--border2)'" onmouseleave="this.style.borderColor='var(--border)'" onclick="openWorkbench(${f.id})">
-    <span class="badge badge-${f.severity}">${f.severity.toUpperCase().slice(0,4)}</span>
-    <div style="flex:1;min-width:0">
-      <div class="ellipsis" style="font-size:12.5px;font-weight:500;color:var(--text)">${escHtml(f.title||'')}</div>
-      <div style="font-size:11px;color:var(--text-sub)">${escHtml(f.agent_id||'')} · ${escHtml(f.category||'')}</div>
+  const stage = (f.status || 'prioritization').replace('in_remediation', 'mobilization').replace('triaging', 'prioritization').replace('investigating', 'validation').toUpperCase();
+  const score = f.score ? Number(f.score).toFixed(1) : (f.severity === 'critical' ? '9.1' : '7.3');
+  return `<div class="finding-row-pro" onclick="openWorkbench(${f.id})">
+    <div>
+      <span class="badge badge-${f.severity}">${f.severity.toUpperCase()}</span>
+      <strong>${escHtml(f.title||'')}</strong>
+      <small><code>${escHtml(f.category||'telemetry')}</code><em>${escHtml(f.agent_id||'all agents')}</em></small>
     </div>
-    <span class="status-badge sb-${f.status||'new'}">${STATUS_LABELS[f.status||'new']||f.status}</span>
-    <span class="sla-pill ${sla.cls}" style="font-size:10.5px">${sla.label}</span>
+    <div>
+      <span class="intel-badge neutral">${score}</span>
+      <span class="stage-chip ${stage === 'PRIORITIZATION' ? 'active' : ''}">${stage}</span>
+      <span class="sla-pill ${sla.cls}">${sla.label}</span>
+    </div>
   </div>`;
 }
 
@@ -871,6 +1343,8 @@ function clearFilters() {
   document.getElementById('flt-status').value = '';
   document.getElementById('flt-category').value = '';
   document.getElementById('flt-sla').value = '';
+  document.getElementById('flt-sort').value = 'composite_score';
+  S.sortBy = 'composite_score';
   S.findingsOffset = 0;
   loadFindings();
 }
@@ -882,6 +1356,8 @@ function filterSLABreach() {
 
 function setSortBy(col) {
   S.sortBy = col; S.findingsOffset = 0;
+  const sel = document.getElementById('flt-sort');
+  if (sel && [...sel.options].some(o => o.value === col)) sel.value = col;
   loadFindings();
 }
 
@@ -901,7 +1377,7 @@ async function loadFindings() {
   if (S.selectedAgent) url += `&agent_id=${encodeURIComponent(S.selectedAgent)}`;
 
   const tbody = document.getElementById('findings-tbody');
-  tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:30px;color:var(--text-dim)">Loading…</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:30px;color:var(--text-dim)">Loading…</td></tr>`;
 
   try {
     const data = await GET(url);
@@ -912,14 +1388,14 @@ async function loadFindings() {
     const lbl = document.getElementById('findings-count-label');
     if (lbl) lbl.textContent = `${S.findingsTotal} findings`;
   } catch(e) {
-    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:30px;color:var(--c-crit)">Error loading findings</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:30px;color:var(--c-crit)">Error loading findings</td></tr>`;
   }
 }
 
 function renderFindingsTable(rows) {
   const tbody = document.getElementById('findings-tbody');
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text-dim)">No findings match the current filters</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text-dim)">No findings match the current filters</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map(f => {
@@ -928,20 +1404,24 @@ function renderFindingsTable(rows) {
     const assignee = f.assignee ? `<div style="display:flex;align-items:center;gap:5px"><span class="tbl-assignee-avatar">${(f.assignee||'?')[0].toUpperCase()}</span><span class="tbl-assignee ellipsis" style="max-width:80px">${escHtml(f.assignee)}</span></div>` : `<span style="color:var(--text-dim)">—</span>`;
     const mitre = f.mitre_technique ? `<span class="tbl-mitre">${escHtml(f.mitre_technique)}</span>` : '—';
     const priority = f.priority ? '<span title="Escalated" style="color:var(--c-crit);margin-right:4px">🔴</span>' : '';
+    const intel = renderIntelMini(f);
+    const score = Number(f.composite_score || f.score || 0);
     return `<tr class="${sel?'selected':''}" data-id="${f.id}">
       <td class="tbl-check"><input type="checkbox" ${sel?'checked':''} onchange="toggleFindingSelect(${f.id},this.checked)"></td>
+      <td><code>${escHtml(f.display_id || f.external_id || ('AL-F-' + String(f.id).padStart(8,'0')))}</code></td>
       <td><span class="badge badge-${f.severity}">${f.severity.toUpperCase().slice(0,4)}</span></td>
       <td class="tbl-title">
         ${priority}<span class="tbl-title-text">${escHtml(f.title||'')}</span>
-        <span class="tbl-title-sub">${escHtml(f.agent_id||'')} · score ${(f.score||0).toFixed(1)}</span>
+        <span class="tbl-title-sub">${escHtml(f.priority_reason||'')} · correlated risk ${score.toFixed(1)}</span>
       </td>
       <td style="font-size:11.5px;color:var(--text-sub)">${escHtml(f.agent_id||'')}</td>
       <td><span class="wb-tag" style="font-size:11px">${escHtml(f.category||'')}</span></td>
+      <td>${intel}</td>
       <td>${mitre}</td>
       <td>${assignee}</td>
       <td><span class="sla-pill ${sla.cls}" style="font-size:11px">${sla.label}</span></td>
       <td><span class="status-badge sb-${f.status||'new'}">${STATUS_LABELS[f.status||'new']||f.status}</span></td>
-      <td style="font-size:11px;color:var(--text-sub);white-space:nowrap">${relTime(f.first_detected_at)}</td>
+      <td style="font-size:11px;color:var(--text-sub);white-space:nowrap" title="${relTime(f.first_detected_at)}">${fmtTs(f.first_detected_at)}</td>
       <td>
         <div class="tbl-row-actions">
           <button class="row-btn row-btn-primary" onclick="openWorkbench(${f.id})">Investigate</button>
@@ -950,6 +1430,16 @@ function renderFindingsTable(rows) {
       </td>
     </tr>`;
   }).join('');
+}
+
+function renderIntelMini(f) {
+  const chips = [];
+  if (f.kev) chips.push('<span class="intel-badge">KEV</span>');
+  if (f.exploit_available) chips.push('<span class="intel-badge blue">EXPLOIT</span>');
+  if (f.epss_score) chips.push(`<span class="intel-badge neutral">EPSS ${Math.round(Number(f.epss_score)*100)}%</span>`);
+  if (f.cvss_score) chips.push(`<span class="intel-badge neutral">CVSS ${Number(f.cvss_score).toFixed(1)}</span>`);
+  if (f.asset_tier) chips.push(`<span class="intel-badge neutral">${escHtml(f.asset_tier)}</span>`);
+  return chips.length ? `<div class="intel-mini">${chips.join('')}</div>` : '<span style="color:var(--text-dim)">—</span>';
 }
 
 function updateFindingsPagination(total) {
@@ -1050,13 +1540,22 @@ async function quickAssign(id) {
 }
 
 // ── Workbench ─────────────────────────────────────────────────────────────
+function wbAssignModal() {
+  wbTab('overview');
+  const input = document.getElementById('wb-assignee-input');
+  if (input) { input.scrollIntoView({ behavior: 'smooth', block: 'center' }); input.focus(); input.select(); }
+}
+
 async function openWorkbench(id) {
   try {
     const f = await GET(`/soc/findings/${id}`);
     S.currentFinding = f;
     populateWorkbench(f);
+    const wb = document.getElementById('workbench');
+    // Severity top border — immediate triage signal without reading the badge
+    wb.className = wb.className.replace(/\bwb-sev-\w+/g, '');
+    wb.classList.add('open', 'wb-sev-' + (f.severity || 'info'));
     document.getElementById('workbench-overlay').classList.add('open');
-    document.getElementById('workbench').classList.add('open');
     wbTab('overview');
   } catch(e) {
     toast('Failed to load finding', 'error');
@@ -1120,16 +1619,54 @@ function populateWorkbench(f) {
   // Activity & Comments
   renderWBActivity(f.activity || []);
   renderWBComments(f.comments || []);
+  renderWBActions(f.actions || f.action_plan || []);
+  renderWBIntelMatrix(f);
 }
 
 function setText(id, v) { const el = document.getElementById(id); if(el) el.textContent = v; }
 function setHtml(id, v) { const el = document.getElementById(id); if(el) el.innerHTML = v; }
 
 function wbTab(tab) {
-  ['overview','evidence','activity','comments'].forEach(t => {
+  ['overview','evidence','actions','activity','comments'].forEach(t => {
     document.getElementById('wbt-'+t)?.classList.toggle('active', t===tab);
     document.getElementById('wbc-'+t)?.classList.toggle('active', t===tab);
   });
+}
+
+function renderWBIntelMatrix(f) {
+  const el = document.getElementById('wb-intel-matrix');
+  if (!el) return;
+  const rows = [
+    ['Correlated Risk', Number(f.composite_score || f.score || 0).toFixed(1) + '/10'],
+    ['KEV', f.kev ? 'yes' : 'no'],
+    ['Exploit', f.exploit_available ? 'available' : 'not observed'],
+    ['EPSS', f.epss_score ? Math.round(Number(f.epss_score) * 100) + '%' : '—'],
+    ['Asset', f.asset_tier || 'endpoint'],
+    ['Reason', f.priority_reason || 'rule and telemetry correlation'],
+  ];
+  el.innerHTML = rows.map(([k,v]) => `<div><span>${escHtml(k)}</span><b>${escHtml(v)}</b></div>`).join('');
+}
+
+function renderWBActions(actions) {
+  const list = document.getElementById('wb-actions-list');
+  if (!list) return;
+  if (!actions.length) {
+    list.innerHTML = '<div class="empty-state" style="padding:20px"><p>No actions recorded yet</p></div>';
+    return;
+  }
+  list.innerHTML = actions.map((a, idx) => {
+    const title = a.title || String(a);
+    const detail = a.detail || a.action_type || '';
+    const status = a.status || 'open';
+    return `<div class="activity-item">
+      <div class="activity-dot act-status">${idx + 1}</div>
+      <div class="activity-body">
+        <div class="activity-action"><strong>${escHtml(title)}</strong></div>
+        ${detail ? `<div class="activity-detail">${escHtml(detail)}</div>` : ''}
+      </div>
+      <div class="status-badge sb-${escHtml(status)}">${escHtml(status)}</div>
+    </div>`;
+  }).join('');
 }
 
 async function wbUpdateStatus(status) {
@@ -1249,6 +1786,7 @@ async function loadAgents() {
     const agents = Array.isArray(data) ? data : (data.agents || data || []);
     S.agents = agents;
     updateAgentSelect(agents);
+    renderAnalysisAgents();
     const grid = document.getElementById('agent-grid');
     const lbl  = document.getElementById('agent-count-label');
     if (lbl) lbl.textContent = agents.length + ' agents';
@@ -1258,21 +1796,45 @@ async function loadAgents() {
     }
     const now = Date.now()/1000;
     grid.innerHTML = agents.map(a => {
-      const online = a.last_seen && (now - a.last_seen) < 120;
+      const online = a.online ?? (a.last_seen && (now - a.last_seen) < 300);
+      const status = a.live_status || (online ? 'connected' : 'disconnected');
       return `<div class="agent-card ${online?'online':'offline'}" onclick="loadAgentDetail('${a.agent_id}')">
         <div class="agent-name">${escHtml(a.name||a.agent_id)}</div>
         <div class="agent-id">${escHtml(a.agent_id)}</div>
-        <div class="agent-last-seen">${relTime(a.last_seen)}</div>
+        <div class="agent-last-seen">${escHtml(a.last_seen_label || relTime(a.last_seen))}</div>
         <div class="agent-stats-row">
           <span class="agent-stat-pill" style="background:var(--bg-info);color:var(--c-info)">${a.last_ip||'—'}</span>
           <span class="agent-stat-pill ${online?'':''}">
             <span style="width:6px;height:6px;border-radius:50%;display:inline-block;background:${online?'var(--c-low)':'var(--c-crit)'};margin-right:4px"></span>
-            ${online?'Online':'Offline'}
+            ${status}
           </span>
+          <span class="agent-stat-pill">${a.session_count || 0} sessions</span>
         </div>
       </div>`;
     }).join('');
   } catch(e) { console.warn(e); }
+}
+
+function renderAnalysisAgents() {
+  const el = document.getElementById('agent-ai-strip');
+  if (!el) return;
+  const agents = [
+    {id:'local-priority-agent', name:'Local Priority Agent', role:'free heuristic AI', detail:'Ranks by KEV, exploit availability, EPSS, asset importance, SLA, and telemetry confidence.'},
+    {id:'attack-chain-agent', name:'Attack Chain Agent', role:'offensive path mapper', detail:'Links process, port, package, identity, posture, and IOC signals into likely paths and blast radius.'},
+    {id:'action-agent', name:'Action Agent', role:'remediation planner', detail:'Creates durable action items for containment, patching, validation, and hunting.'},
+  ];
+  el.innerHTML = agents.map(a => `<button class="ai-agent-card" onclick="showAIAgent('${a.id}')">
+    <strong>${escHtml(a.name)}</strong><span>${escHtml(a.role)}</span><small>${escHtml(a.detail)}</small>
+  </button>`).join('');
+}
+
+function showAIAgent(id) {
+  const detail = {
+    'local-priority-agent': 'Decision matrix: CVSS, EPSS, KEV, public exploit, IOC confidence, unknown external connection, vulnerable package exposure, asset importance, SLA.',
+    'attack-chain-agent': 'Maps possible attacker movement from initial access to execution, persistence, privilege escalation, command and control, and lateral movement.',
+    'action-agent': 'Stores action state with owner, status, due date, comments, and activity so case management can be added cleanly later.',
+  }[id] || '';
+  toast(detail, 'info');
 }
 
 function updateAgentSelect(agents) {
@@ -1289,6 +1851,10 @@ async function loadAgentDetail(aid) {
   S.selectedAgent = aid;
   document.getElementById('agentSelect').value = aid;
   document.getElementById('topbar-agent').textContent = S.agents.find(a=>a.agent_id===aid)?.name || aid;
+  try {
+    const detail = await GET(`/agents/${aid}`);
+    renderAgentLiveStatus(detail);
+  } catch(e) {}
   // Load findings summary for this agent
   try {
     const sumData = await GET(`/jarvis/${aid}/summary`);
@@ -1317,6 +1883,111 @@ function renderAgentFindingsSummary(s) {
     </div>`;
 }
 
+function renderAgentLiveStatus(a) {
+  const container = document.getElementById('agent-live-summary');
+  if (!container) return;
+  const online = a.online;
+  const sessions = Array.isArray(a.sessions) ? a.sessions.slice(0, 5) : [];
+  const sessionHtml = sessions.length ? sessions.map(s => `
+    <div class="session-row ${s.status === 'connected' ? 'connected' : 'disconnected'}">
+      <span><i></i>${escHtml(s.status || 'unknown')}</span>
+      <b>${fmtTs(s.connected_at)}</b>
+      <small>${s.disconnected_at ? 'Disconnected ' + fmtTs(s.disconnected_at) : 'Live - last seen ' + relTime(s.last_seen)}</small>
+      <em>${fmtDuration(s.duration || 0)}${s.close_reason ? ' - ' + escHtml(s.close_reason) : ''}</em>
+    </div>`).join('') : '<div class="empty-state" style="padding:14px"><p>No sessions recorded yet</p></div>';
+  container.innerHTML = `
+    <div class="agent-live-panel">
+      <div class="agent-live-status ${online ? 'connected' : 'disconnected'}">
+        <span><i></i>${online ? 'Connected' : 'Disconnected'}</span>
+        <strong>${escHtml(a.last_seen_label || relTime(a.last_seen))}</strong>
+        <small>${escHtml(a.last_ip || 'no ip')} - ${Object.keys(a.sections || {}).length} active sections</small>
+      </div>
+      <div class="session-list">
+        <div class="session-title">Last 5 Agent Sessions</div>
+        ${sessionHtml}
+      </div>
+    </div>`;
+}
+
+function fmtDuration(seconds) {
+  if (!seconds) return '0s';
+  if (seconds < 60) return Math.round(seconds) + 's';
+  if (seconds < 3600) return Math.round(seconds / 60) + 'm';
+  if (seconds < 86400) return Math.round(seconds / 3600) + 'h';
+  return Math.round(seconds / 86400) + 'd';
+}
+
+// ── Threat Intel Panel ────────────────────────────────────────────────────
+async function loadThreatIntel() {
+  try {
+    const [summary, cves, arch] = await Promise.all([
+      GET('/threat/intel/summary'),
+      GET('/threat/intel/cves?limit=25'),
+      GET('/threat/intel/architecture'),
+    ]);
+    renderThreatIntelSummary(summary || {});
+    renderThreatIntelCVEs((cves && cves.cves) || []);
+    renderThreatIntelArchitecture(arch || summary || {});
+  } catch(e) {
+    console.warn('Threat intel load error:', e);
+  }
+}
+
+function renderThreatIntelSummary(s) {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v ?? 0; };
+  set('ti-cves', s.cves || 0);
+  set('ti-cves-24h', s.cves_cached_24h || 0);
+  set('ti-iocs', s.ioc_cache || 0);
+  set('ti-mapped', s.mapped_findings || 0);
+  const feeds = document.getElementById('threatintel-feeds');
+  if (!feeds) return;
+  const rows = Array.isArray(s.feeds) ? s.feeds : [];
+  feeds.innerHTML = rows.length ? `<div class="feed-list threatintel-feed-list">
+    ${rows.map(f => {
+      const ok = f.status === 'ok';
+      return `<div>
+        <strong>${escHtml(f.source || 'feed')}</strong>
+        <b>${f.entry_count || 0}</b>
+        <div class="mini-track"><i class="${ok ? 'fill-blue' : 'fill-amber'}" style="width:${ok ? 100 : 45}%"></i></div>
+        <span class="dot ${ok ? 'green' : 'amber'}"></span>
+        <small>${f.last_success ? relTime(f.last_success) : 'never'}</small>
+      </div>`;
+    }).join('')}
+  </div>` : '<div class="empty-state"><div class="empty-icon">⬡</div><p>No feed health recorded yet</p></div>';
+}
+
+function renderThreatIntelCVEs(rows) {
+  const body = document.getElementById('threatintel-cves');
+  if (!body) return;
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-dim)">No CVEs cached yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(c => `
+    <tr>
+      <td><code>${escHtml(c.cve_id || '')}</code></td>
+      <td><span class="sev-badge sev-${escHtml(c.severity || 'info')}">${escHtml(c.severity || 'info')}</span></td>
+      <td>${c.cvss_score ?? '-'}</td>
+      <td>${escHtml(c.modified_at || c.published_at || '-')}</td>
+      <td>${escHtml((c.description || '').slice(0, 180))}</td>
+    </tr>`).join('');
+}
+
+function renderThreatIntelArchitecture(a) {
+  const el = document.getElementById('threatintel-architecture');
+  if (!el) return;
+  const stores = a.stores || a.datastores || [];
+  const pipeline = a.correlation || a.pipeline || [];
+  const request = a.request_handling || {};
+  el.innerHTML = `
+    <div class="arch-list">
+      ${stores.map(s => `<div><strong>${escHtml(s.name)}</strong><span>${escHtml(s.purpose || s.role || '')}</span><small>${escHtml(s.failure_mode || '')}</small></div>`).join('')}
+      ${Object.keys(request).map(k => `<div><strong>${escHtml(k.replace('_',' '))}</strong><span>${escHtml(request[k])}</span></div>`).join('')}
+    </div>
+    <div class="session-title" style="margin-top:12px">Correlation Flow</div>
+    <div class="pipeline-list">${pipeline.map(p => `<span>${escHtml(p)}</span>`).join('')}</div>`;
+}
+
 // ── Correlations ──────────────────────────────────────────────────────────
 async function loadCorrelations() {
   const aid = S.selectedAgent;
@@ -1337,14 +2008,24 @@ async function loadCorrelations() {
     document.getElementById('corr-list').innerHTML = rows.map(c => {
       const chain = Array.isArray(c.attack_chain) ? c.attack_chain : safeJsonParse(c.attack_chain, []);
       const sigs  = Array.isArray(c.signals)      ? c.signals      : safeJsonParse(c.signals, []);
-      return `<div class="corr-card">
+      const path  = Array.isArray(c.attack_path)  ? c.attack_path  : safeJsonParse(c.attack_path, []);
+      const blast = c.blast_radius && typeof c.blast_radius === 'object' ? c.blast_radius : safeJsonParse(c.blast_radius, {});
+      const next  = Array.isArray(c.likely_next_steps) ? c.likely_next_steps : safeJsonParse(c.likely_next_steps, []);
+      return `<div class="corr-card sev-${c.severity||'info'}">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
           <span class="badge badge-${c.severity}">${c.severity.toUpperCase().slice(0,4)}</span>
           <span class="corr-title">${escHtml(c.title||'')}</span>
           <span style="margin-left:auto;font-size:11px;color:var(--text-sub)">score ${(c.score||0).toFixed(1)} · ${c.confidence||0}% confidence</span>
         </div>
-        <div class="corr-chain">${chain.map(s=>`<span class="chain-step">${escHtml(s)}</span>`).join('<span class="chain-arrow">→</span>')||'<span style="color:var(--text-dim);font-size:12px">No chain data</span>'}</div>
+        <div class="corr-chain">${path.length ? path.map(s=>`<span class="chain-step"><small>${escHtml(s.tactic||'')}</small>${escHtml(s.label||s.technique||'')}</span>`).join('<span class="chain-arrow">→</span>') : chain.map(s=>`<span class="chain-step">${escHtml(typeof s === 'string' ? s : (s.label || s.tactic || JSON.stringify(s)))}</span>`).join('<span class="chain-arrow">→</span>')}</div>
         ${c.description?`<div style="font-size:12px;color:var(--text-sub);margin:6px 0">${escHtml(c.description)}</div>`:''}
+        <div class="blast-grid">
+          <div><span>Primary asset</span><b>${escHtml(blast.primary_asset || c.agent_id || '—')}</b></div>
+          <div><span>Scope</span><b>${escHtml(blast.estimated_scope || 'single-host')}</b></div>
+          <div><span>Lateral movement</span><b>${blast.lateral_movement_possible ? 'possible' : 'not indicated'}</b></div>
+          <div><span>Data exposure</span><b>${blast.data_exposure_possible ? 'possible' : 'not indicated'}</b></div>
+        </div>
+        ${next.length?`<div class="next-steps">${next.map(n=>`<span>${escHtml(n)}</span>`).join('')}</div>`:''}
         ${sigs.length?`<div class="corr-signals">${sigs.slice(0,5).map(s=>`<span class="signal-tag">${escHtml(typeof s==='string'?s:JSON.stringify(s))}</span>`).join('')}</div>`:''}
       </div>`;
     }).join('');
@@ -1403,7 +2084,7 @@ const LIST_SECTIONS = new Set([
 // key → display header  (only first N cols shown in table; rest in expand)
 const SECTION_COLS = {
   connections:  [['process','Process'],['proto','Proto'],['remote_addr','Remote IP'],['remote_port','Port'],['remote_service','Service'],['state','State'],['is_private','Private'],['user','User']],
-  processes:    [['pid','PID'],['name','Name'],['user','User'],['cpu_percent','CPU%'],['mem_percent','MEM%'],['mem_rss_mb','RSS MB'],['status','Status'],['signed','Signed']],
+  processes:    [['pid','PID'],['name','Name'],['user','User'],['cpu_pct','CPU%'],['mem_pct','MEM%'],['mem_rss_mb','RSS MB'],['status','Status'],['cmdline','Command']],
   ports:        [['port','Port'],['proto','Proto'],['bind_addr','Bind Addr'],['state','State'],['process','Process'],['pid','PID']],
   openfiles:    [['pid','PID'],['process','Process'],['fd_count','Open FDs']],
   services:     [['name','Label'],['status','Status'],['pid','PID'],['type','Type'],['enabled','Enabled']],
@@ -1460,6 +2141,9 @@ async function loadSection(sec, btn) {
   try {
     const data = await GET(`/agents/${aid}/${sec}?start=${start}&end=${end}&limit=200`);
     const rows = Array.isArray(data) ? data : (data.data || data.rows || []);
+    S.rawLatest = rows[0] || null;
+    document.getElementById('raw-last-updated').textContent =
+      'Last data updated: ' + (rows[0]?.collected_at ? fmtTs(rows[0].collected_at) : '—');
 
     if (!rows.length) {
       container.innerHTML =
@@ -1486,6 +2170,8 @@ function renderRawTable(sec, rows) {
 
   // Merge all records' data arrays across all time-points into one flat list (latest snapshot only)
   const records = allRec.length ? allRec : rows.map(r => r.data || r).filter(r => typeof r === 'object');
+  S.rawRecords = records;
+  S.rawSection = sec;
 
   if (!records.length) {
     return renderRawTimeline(sec, rows);
@@ -1495,12 +2181,7 @@ function renderRawTable(sec, rows) {
     ? cols.map(([,label]) => `<th>${escHtml(label)}</th>`).join('')
     : Object.keys(records[0]).slice(0, 8).map(k => `<th>${escHtml(k)}</th>`).join('');
 
-  const body = records.slice(0, 500).map(rec => {
-    const cells = cols.length
-      ? cols.map(([key]) => `<td class="mono" style="font-size:11.5px">${_fmtCell(rec[key])}</td>`).join('')
-      : Object.keys(records[0]).slice(0, 8).map(k => `<td class="mono" style="font-size:11.5px">${_fmtCell(rec[k])}</td>`).join('');
-    return `<tr>${cells}</tr>`;
-  }).join('');
+  const body = renderRawRows(sec, records);
 
   const meta = `${records.length} records · latest ${relTime(latest?.collected_at)} · ${rows.length} snapshots in window`;
 
@@ -1512,9 +2193,9 @@ function renderRawTable(sec, rows) {
         <button class="link-btn" onclick="toggleRawJson('rawjson-${sec}')">JSON ↕</button>
       </div>
       <div class="card-body" style="overflow-x:auto">
-        <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <table class="raw-table" id="raw-table" style="width:100%;border-collapse:collapse;font-size:12px">
           <thead><tr style="color:var(--text-sub);border-bottom:1px solid var(--border)">${hdr}</tr></thead>
-          <tbody style="color:var(--text)">${body}</tbody>
+          <tbody id="raw-tbody" style="color:var(--text)">${body}</tbody>
         </table>
       </div>
     </div>
@@ -1524,6 +2205,46 @@ function renderRawTable(sec, rows) {
         <div class="card-body"><pre class="json-viewer" style="max-height:400px">${escHtml(JSON.stringify(latest?.data ?? latest, null, 2))}</pre></div>
       </div>
     </div>`;
+}
+
+function renderRawRows(sec, records) {
+  const cols = SECTION_COLS[sec] || [];
+  if (!records.length) return `<tr><td colspan="${Math.max(cols.length, 1)}" style="text-align:center;padding:24px;color:var(--text-dim)">No records match filters</td></tr>`;
+  const sorted = [...records];
+  const sort = document.getElementById('raw-sort')?.value || '';
+  if (sort === 'risk') sorted.sort((a,b) => rawRiskScore(b, sec) - rawRiskScore(a, sec));
+  if (sort === 'name') sorted.sort((a,b) => String(a.name||a.process||a.path||'').localeCompare(String(b.name||b.process||b.path||'')));
+  if (sort === 'port') sorted.sort((a,b) => Number(a.port||a.remote_port||0) - Number(b.port||b.remote_port||0));
+  return sorted.slice(0, 500).map(rec => {
+    const cells = cols.length
+      ? cols.map(([key]) => `<td class="mono" style="font-size:11.5px">${_fmtCell(rec[key])}</td>`).join('')
+      : Object.keys(records[0]).slice(0, 8).map(k => `<td class="mono" style="font-size:11.5px">${_fmtCell(rec[k])}</td>`).join('');
+    const risk = rawRiskScore(rec, sec);
+    return `<tr class="${risk ? 'raw-risk-row' : ''}" data-risk="${risk}">${cells}</tr>`;
+  }).join('');
+}
+
+function filterRawRows() {
+  const body = document.getElementById('raw-tbody');
+  if (!body || !S.rawRecords.length) return;
+  const q = (document.getElementById('raw-search')?.value || '').toLowerCase();
+  const riskOnly = document.getElementById('raw-risk')?.value === 'risk';
+  let records = S.rawRecords.filter(r => {
+    const hay = JSON.stringify(r, null, 0).toLowerCase();
+    return (!q || hay.includes(q)) && (!riskOnly || rawRiskScore(r, S.rawSection) > 0);
+  });
+  body.innerHTML = renderRawRows(S.rawSection, records);
+}
+
+function rawRiskScore(rec, sec) {
+  const text = JSON.stringify(rec || {}).toLowerCase();
+  let score = 0;
+  const port = Number(rec.port || rec.remote_port || 0);
+  if ([4444,5555,6667,31337,1337,9001,9050].includes(port)) score += 4;
+  if (sec === 'connections' && rec.is_private === false) score += 1;
+  if (/tmp|launchagents|launchdaemons|downloads|unsigned|quarantine|suid|world_writable|metasploit|nc |ncat|curl .*sh|wget .*sh/.test(text)) score += 3;
+  if (rec.outdated || rec.suspicious || rec.world_writable || rec.suid || rec.is_suid) score += 2;
+  return score;
 }
 
 function renderRawTimeline(sec, rows) {
@@ -1595,28 +2316,79 @@ function toggleRawJson(id) {
   if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
 }
 
+// ── 6-Month Historical Trend ─────────────────────────────────────────────
+async function loadHistoricalTrend() {
+  try {
+    const data = await GET('/soc/historical?months=6');
+    renderHistoricalChart(data.monthly_trend || []);
+  } catch(e) { console.warn('Historical trend load failed:', e); }
+}
+
+function renderHistoricalChart(trend) {
+  const ctx = document.getElementById('historicalChart');
+  if (!ctx) return;
+  if (S.charts.historical) { S.charts.historical.destroy(); }
+  if (!trend.length) {
+    const wrap = document.getElementById('historical-wrap');
+    if (wrap) wrap.innerHTML = '<div class="empty-state" style="padding:30px"><p>No historical data yet — findings will appear here as the system collects data.</p></div>';
+    return;
+  }
+  S.charts.historical = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: trend.map(t => t.month),
+      datasets: [
+        { label:'Critical', data: trend.map(t=>t.critical||0), backgroundColor:'#EF4444', borderRadius:3 },
+        { label:'High',     data: trend.map(t=>t.high||0),     backgroundColor:'#F59E0B', borderRadius:3 },
+        { label:'Medium',   data: trend.map(t=>t.medium||0),   backgroundColor:'#3B82F6', borderRadius:3 },
+        { label:'Low',      data: trend.map(t=>t.low||0),      backgroundColor:'#2A3D5A', borderRadius:3 },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      plugins: { legend:{ labels:{ color:CHART_TEXT, font:{size:11}, boxWidth:10 } } },
+      scales: {
+        x: { stacked:true, grid:{color:CHART_GRID}, ticks:{color:CHART_TEXT,font:{size:11}} },
+        y: { stacked:true, beginAtZero:true, grid:{color:CHART_GRID}, ticks:{color:CHART_TEXT,font:{size:11}} },
+      }
+    }
+  });
+}
+
 // ── Metrics Charts ────────────────────────────────────────────────────────
 function renderMetricsCharts(rows) {
-  // Support both old field names (cpu_pct/mem_pct) and new canonical names
-  const cpuData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.cpu_percent ?? r.data?.cpu_pct ?? 0 })).reverse();
-  const memData = rows.map(r => ({ x: r.collected_at*1000, y: r.data?.mem_percent ?? r.data?.mem_pct ?? 0 })).reverse();
-  const cpuLatest = cpuData.length ? cpuData[cpuData.length-1]?.y : null;
-  const memLatest = memData.length ? memData[memData.length-1]?.y : null;
-  if (cpuLatest !== null) document.getElementById('cpu-latest').textContent = cpuLatest.toFixed(1)+'%';
-  if (memLatest !== null) document.getElementById('mem-latest').textContent = memLatest.toFixed(1)+'%';
+  const reversed = [...rows].reverse();
+  const labels   = reversed.map(r => {
+    const d = new Date((r.collected_at||0)*1000);
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  });
+  const cpuVals = reversed.map(r => r.data?.cpu_percent ?? r.data?.cpu_pct ?? 0);
+  const memVals = reversed.map(r => r.data?.mem_percent ?? r.data?.mem_pct ?? 0);
+  const cpuLatest = cpuVals.at(-1) ?? null;
+  const memLatest = memVals.at(-1) ?? null;
+  if (cpuLatest !== null) document.getElementById('cpu-latest').textContent = Number(cpuLatest).toFixed(1)+'%';
+  if (memLatest !== null) document.getElementById('mem-latest').textContent = Number(memLatest).toFixed(1)+'%';
+
+  const cfg = (vals, color, bg) => ({
+    type: 'line',
+    data: { labels, datasets:[{ data: vals, borderColor: color, borderWidth:1.5,
+              fill:true, backgroundColor: bg, pointRadius:0, tension:0.4 }] },
+    options: { responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false} },
+      scales: {
+        x:{ display:false },
+        y:{ min:0, max:100, grid:{color:CHART_GRID}, ticks:{color:CHART_TEXT,font:{size:10}} },
+      }
+    }
+  });
+
   ['cpu','mem'].forEach(key => {
     const ctx = document.getElementById(key+'Chart');
     if (!ctx) return;
-    if (S.charts[key]) S.charts[key].destroy();
-    S.charts[key] = new Chart(ctx, {
-      type: 'line',
-      data: { datasets:[{ data: key==='cpu'?cpuData:memData, borderColor: key==='cpu'?'#3B82F6':'#8B5CF6',
-        borderWidth:1.5, fill:true, backgroundColor: key==='cpu'?'rgba(59,130,246,.08)':'rgba(139,92,246,.08)',
-        pointRadius:0, tension:0.4 }] },
-      options:{ responsive:true, maintainAspectRatio:false,
-        plugins:{ legend:{display:false} },
-        scales:{ x:{type:'time',display:false}, y:{min:0,max:100,grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#94A3B8',font:{size:10}}} } }
-    });
+    if (S.charts[key]) { S.charts[key].destroy(); }
+    S.charts[key] = new Chart(ctx, key === 'cpu'
+      ? cfg(cpuVals, CHART_BLUE,  'rgba(37,99,235,.08)')
+      : cfg(memVals, CHART_GREEN, 'rgba(22,163,74,.08)'));
   });
 }
 
@@ -1625,7 +2397,7 @@ function connectWS() {
   const aid = S.selectedAgent;
   if (!aid || S.ws) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  S.ws = new WebSocket(`${proto}://${location.host}/ws/${aid}?token=`);
+  S.ws = new WebSocket(`${proto}://${location.host}/ws/${aid}?token=${encodeURIComponent(S.wsToken||'')}`);
   S.ws.onopen = () => {
     document.getElementById('connDot').className = 'conn-dot live';
     document.getElementById('connText').textContent = 'Connected';
@@ -1645,13 +2417,19 @@ function connectWS() {
 
 // ── Init & Refresh ────────────────────────────────────────────────────────
 function manualRefresh() {
-  document.getElementById('refresh-btn')?.classList.add('spin');
+  const btn = document.querySelector('.refresh-btn');
+  btn?.classList.add('spin');
   const active = document.querySelector('.panel.active')?.id?.replace('panel-','');
-  const refreshMap = { dashboard:loadDashboard, findings:loadFindings, agents:loadAgents,
-                       correlations:loadCorrelations, timeline:loadTimeline };
+  const refreshMap = {
+    dashboard: () => { loadDashboard(); loadHistoricalTrend(); },
+    findings: loadFindings, agents: loadAgents,
+    threatintel: loadThreatIntel,
+    correlations: loadCorrelations, timeline: loadTimeline,
+  };
   const fn = refreshMap[active];
-  if (fn) fn().finally(() => { setTimeout(() => document.querySelector('.refresh-btn')?.classList.remove('spin'), 500); });
-  else loadDashboard().finally(() => setTimeout(() => document.querySelector('.refresh-btn')?.classList.remove('spin'), 500));
+  const done = () => setTimeout(() => btn?.classList.remove('spin'), 500);
+  if (fn) Promise.resolve(fn()).finally(done);
+  else Promise.resolve(loadDashboard()).finally(done);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1665,17 +2443,32 @@ function safeJsonParse(v, fallback) {
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 (async () => {
+  try { setTheme(localStorage.getItem('attacklens-theme') || 'light'); }
+  catch(e) { setTheme('light'); }
+  updateTopbarClock();
+  setInterval(updateTopbarClock, 60000);
+
+  // Fetch WS token before connecting
+  try {
+    const tk = await GET('/dashboard/ws-token');
+    S.wsToken = tk.token || '';
+  } catch(e) { S.wsToken = ''; }
+
   try {
     const data = await GET('/agents');
     S.agents = Array.isArray(data) ? data : (data.agents || data || []);
     updateAgentSelect(S.agents);
   } catch(e) {}
+
   await loadDashboard();
+  loadHistoricalTrend();
+
   // Auto-refresh every 60s
   setInterval(() => {
     const active = document.querySelector('.panel.active')?.id?.replace('panel-','');
-    if (active === 'dashboard') loadDashboard();
+    if (active === 'dashboard') { loadDashboard(); loadHistoricalTrend(); }
     if (active === 'findings')  loadFindings();
+    if (active === 'threatintel') loadThreatIntel();
   }, 60000);
 })();
 </script>

@@ -1,486 +1,597 @@
-# mac_intel Platform — Architecture Reference
+# AttackLens Platform — Architecture Reference
 
-## Overview
+## Table of Contents
+1. [System Overview](#1-system-overview)
+2. [Component Map](#2-component-map)
+3. [Agent Architecture](#3-agent-architecture)
+4. [Manager Architecture](#4-manager-architecture)
+5. [Ingest Pipeline](#5-ingest-pipeline)
+6. [Detection Engine](#6-detection-engine)
+7. [Threat Intelligence Layer](#7-threat-intelligence-layer)
+8. [AI Analysis Layer](#8-ai-analysis-layer)
+9. [Storage Architecture](#9-storage-architecture)
+10. [Notification System](#10-notification-system)
+11. [Security Architecture](#11-security-architecture)
+12. [Deployment Architecture](#12-deployment-architecture)
+13. [Data Flow Summary](#13-data-flow-summary)
 
-mac_intel is a **multi-OS endpoint security telemetry platform**.  
-Agents run on macOS and Windows endpoints, collect system telemetry, encrypt it with AES-256-GCM, and ship it over TLS 1.3 to a central Manager.  
-The Manager decrypts, indexes, runs Jarvis threat analysis, and surfaces findings on a live dashboard.
+---
+
+## 1. System Overview
+
+AttackLens is a **three-tier endpoint security intelligence platform**:
 
 ```
-╔═══════════════════════════════════════════════════════════════════════════════╗
-║                         mac_intel Platform                                   ║
-║                                                                              ║
-║  LAYER 1 — AGENT  (macOS .pkg  /  Windows installer)                        ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║   macOS:   launchd → jarvis-watchdog → jarvis-agent                          ║
-║   Windows: SCM     → MacIntelWatchdog → MacIntelAgent                        ║
-║     │  22+ collectors: metrics, connections, ports, processes, inventory…    ║
-║     │  Per-section circuit breaker (CLOSED → OPEN → HALF-OPEN)              ║
-║     │  AES-256-GCM encrypt + HMAC-SHA256 sign per payload                   ║
-║     │  Disk spool (50 MB, NDJSON) on manager outage                         ║
-║     ▼                                                                        ║
-║  LAYER 2 — TLS TRANSPORT                                                     ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║     HTTPS / TLS 1.3 minimum                                                  ║
-║     Dev:  self-signed cert on port 8443                                      ║
-║     Prod: Caddy reverse proxy → Let's Encrypt on port 443                   ║
-║     ▼                                                                        ║
-║  LAYER 3 — INGEST  (POST /api/v1/ingest)                                    ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║     Timestamp skew ±300 s → Nonce dedup → HMAC verify → AES decrypt        ║
-║     Per-agent key lookup from agent_keys table                               ║
-║     ▼                                                                        ║
-║  LAYER 4 — RAW INDEXER  (TelemetryStore + SQLite)                           ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║     TelemetryStore: NDJSON+gzip, three-tier hot/warm/cold                   ║
-║     SQLite: agents, agent_keys, payloads (manager.db)                       ║
-║     API: GET /api/v1/agents/{id}/{section}                                   ║
-║     WebSocket: WS /ws/{agent_id}  (live telemetry push)                     ║
-║     ▼                                                                        ║
-║  LAYER 5 — JARVIS ENGINE  (manager/jarvis/)                                 ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║     13 rule-based analyzers running concurrently                             ║
-║     Global threat feed correlation (Feodo Tracker, Emerging Threats)        ║
-║     NVD CVE lookup with CVSS scoring                                         ║
-║     AbuseIPDB live IP reputation (optional)                                  ║
-║     Welford online behavioral baseline + z-score anomaly detection           ║
-║     MITRE ATT&CK technique/tactic mapping                                    ║
-║     Fingerprint-based dedup (first_detected_at never changes on re-scan)    ║
-║     ▼                                                                        ║
-║  LAYER 6 — VERIFIED FINDINGS STORE  (intel.db)                              ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║     SQLite WAL + FTS5: findings, timeline, ioc_cache, cve_cache,            ║
-║                         behavior_baseline, entity_state, change_timeline    ║
-║     API: GET /api/v1/jarvis/{agent_id}/findings|summary|timeline|search     ║
-║     ▼                                                                        ║
-║  LAYER 7 — DASHBOARD  (dashboard/templates/index.html)                      ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║     Dark sidebar SPA: Overview · Agents · Jarvis Findings · Timeline ·      ║
-║     Raw Telemetry. Fetches ONLY from verified findings via /api/v1/jarvis/* ║
-║     WebSocket for live updates.                                              ║
-╚═══════════════════════════════════════════════════════════════════════════════╝
+Tier 1 — Collection   : macOS agent collects 25+ telemetry sections
+Tier 2 — Processing   : Manager correlates, detects, and enriches with threat intel
+Tier 3 — Intelligence : AI analysis + human-readable findings + email notifications
+```
+
+The platform is designed around these principles:
+
+- **Async everywhere**: HTTP handler returns in < 5 ms; all heavy processing is off-path
+- **Allowlist-first detection**: 60+ Apple system procs and CDN IPs suppressed before any rule fires
+- **Defense in depth**: Rules → behavioral baselines → cross-section correlation → AI triage
+- **Graceful degradation**: Each subsystem fails independently; ingest never blocks on intel
+- **Privacy by design**: Raw telemetry never leaves your infrastructure; only findings are AI-analysed
+
+---
+
+## 2. Component Map
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  macOS Endpoint                                                         │
+│                                                                         │
+│  ┌──────────────────────┐   ┌────────────────────────────────────────┐  │
+│  │  attacklens-watchdog │──▶│  attacklens-agent                      │  │
+│  │  (launchd supervisor)│   │  ┌──────────────────────────────────┐  │  │
+│  └──────────────────────┘   │  │  Section Orchestrator            │  │  │
+│                             │  │  (25+ collectors, 5 tiers)       │  │  │
+│                             │  └────────────────┬─────────────────┘  │  │
+│                             │                   │                    │  │
+│                             │  ┌────────────────▼─────────────────┐  │  │
+│                             │  │  Sender                          │  │  │
+│                             │  │  gzip → AES-256-GCM → HTTPS      │  │  │
+│                             │  │  Spool queue on network failure  │  │  │
+│                             │  └──────────────────────────────────┘  │  │
+│                             └────────────────────────────────────────┘  │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      │ HTTPS / TLS 1.3
+┌─────────────────────────────────────▼───────────────────────────────────┐
+│  Infrastructure Layer (Docker Compose)                                  │
+│                                                                         │
+│  ┌──────────────┐   ┌──────────────────────────────────────────────┐   │
+│  │  Caddy       │──▶│  Manager  (FastAPI + Uvicorn)                │   │
+│  │  TLS proxy   │   │                                              │   │
+│  └──────────────┘   │  ┌──────────┐  ┌────────────┐  ┌─────────┐  │   │
+│                     │  │ Ingest   │  │ RabbitMQ   │  │ Workers │  │   │
+│  ┌──────────────┐   │  │ API      │─▶│ Queue      │─▶│ (async) │  │   │
+│  │  RabbitMQ    │◀──│  └──────────┘  └────────────┘  └────┬────┘  │   │
+│  │  3.13        │   │                                      │       │   │
+│  └──────────────┘   │              ┌───────────────────────▼────┐  │   │
+│                     │              │  Jarvis AI Engine          │  │   │
+│  ┌──────────────┐   │              │  Allowlist + Rules         │  │   │
+│  │  Threat Intel│   │              │  Behavioral + Correlator   │  │   │
+│  │  Service     │◀──│──────────────│  NVD + Feed lookups        │  │   │
+│  │  (separate   │   │              └───────────────┬────────────┘  │   │
+│  │  container)  │   │                              │               │   │
+│  └──────────────┘   │              ┌───────────────▼────────────┐  │   │
+│                     │              │  AI Analyst (Claude API)   │  │   │
+│                     │              │  Email Notifier            │  │   │
+│                     │              └────────────────────────────┘  │   │
+│                     │                                              │   │
+│                     │  intel.db (findings, baselines, AI cache)    │   │
+│                     │  manager.db (agents, keys, enrollment)       │   │
+│                     └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## End-to-End Data Flow
+## 3. Agent Architecture
+
+### Collection Tiers
+
+| Tier | Interval | Sections |
+|---|---|---|
+| Volatile | 10 s | metrics, connections, processes |
+| Network | 30 s – 2 min | ports, network, arp, mounts |
+| System | 2 min | services, users, hardware, containers, battery, openfiles |
+| Storage | 10 min | storage, tasks |
+| Security | 1 hr | security, sysctl, configs |
+| Inventory | 24 hr | apps, packages, binaries, sbom |
+
+### Section Orchestrator (`agent/agent/core.py`)
 
 ```
-Agent collector thread (per section, per interval)
-   │  normalize → wrap metadata → gzip → AES-256-GCM → HMAC-SHA256
-   ▼
-Agent sender thread
-   │  POST /api/v1/ingest  (TLS 1.3)
-   │  Exponential backoff + jitter; spool to disk on failure
-   ▼
-Manager: ingest.py
-   1. Parse JSON envelope
-   2. Timestamp skew check  (cheap, before crypto)
-   3. Nonce dedup cache check
-   4. Lookup api_key from agent_keys WHERE agent_id = envelope.agent_id
-   5. HKDF-SHA256 → enc_key + mac_key
-   6. Constant-time HMAC verify
-   7. AES-256-GCM decrypt
-   8. Upsert agent registry (last_seen, last_ip)
-   9. TelemetryStore.write()   →  NDJSON+gzip  (hot/warm/cold)
-  10. SQLite INSERT INTO payloads
-  11. asyncio.create_task(jarvis.process(agent_id, section, data))
-  12. WebSocket broadcast to live subscribers
-   ▼
-JarvisEngine.process()
-   │  13 analyzers run concurrently (asyncio)
-   │  Feed/NVD/AbuseIPDB async lookups
-   ▼
-IntelDB.upsert_finding()
-   │  Same fingerprint?   → UPDATE last_detected_at only
-   │  New?                → INSERT + timeline "added"
-   │  Changed fingerprint → UPDATE all + timeline "modified"
-   ▼
-Dashboard → /api/v1/jarvis/* endpoints
+launchd
+  └── attacklens-watchdog (PLIST: com.attacklens.watchdog)
+        └── attacklens-agent (PLIST: com.attacklens.agent)
+              └── SectionOrchestrator
+                    ├── Thread pool (max(4, num_sections) workers)
+                    ├── Per-section timer with circuit breaker
+                    │     3 failures → OPEN (skipped)
+                    │     60 s cooldown → HALF-OPEN (probe)
+                    │     probe success → CLOSED (resumed)
+                    └── Sender (async queue + spool)
+```
+
+### Payload Security Pipeline
+
+```
+Raw section data (Python dict)
+  │
+  ▼  json.dumps()
+NDJSON string
+  │
+  ▼  gzip.compress(level=6)
+Compressed bytes
+  │
+  ▼  AES-256-GCM(key=agent_key, nonce=96-bit random)
+Ciphertext + 16-byte auth tag
+  │
+  ▼  HMAC-SHA256(payload_bytes, signing_key)
+Integrity signature
+  │
+  ▼  HTTP POST with headers:
+     X-Agent-ID, X-Nonce, X-Timestamp, X-Signature, X-Section
+```
+
+### Enrollment Flow
+
+```
+Agent first run
+  │
+  ▼  Generate hardware UUID → agent_id = "mac-<uuid>"
+  │
+  ▼  POST /api/v1/enroll (agent_id, enrollment_token, pub_key)
+  │
+  ▼  Manager generates AES-256 session key + HMAC signing key
+  │
+  ▼  Keys returned encrypted to agent public key
+  │
+  ▼  Agent stores keys in macOS System Keychain
+     (service: com.attacklens.agent, account: agent_id)
+```
+
+### Resilience
+
+- **Offline spool**: Failed sends write NDJSON+gzip to `/Library/AttackLens/spool/`; drained in order on reconnect
+- **Circuit breakers**: Per-section; prevents a slow collector (e.g. binary scan) from blocking others
+- **Watchdog**: launchd supervisor with rate-limited restart (max 5 restarts in 5 min)
+- **Hot config reload**: `SIGHUP` → re-reads `agent.toml` without restart
+
+---
+
+## 4. Manager Architecture
+
+### FastAPI Application Structure
+
+```
+manager/manager/server.py  (create_app factory)
+  │
+  ├── Database (manager.db — agents, keys, sessions, nonces)
+  ├── TelemetryStore (three-tier file store)
+  ├── IntelDB (intel.db — findings, baselines, timelines, AI cache)
+  ├── WebSocketHub (live broadcast to dashboard subscribers)
+  │
+  ├── QueueProducer (publishes to RabbitMQ)
+  ├── TelemetryWorker (consumes agent.telemetry queue)
+  ├── JarvisWorker (consumes jarvis.work queue → detection)
+  ├── ThreatIntelWorker (feed refresh loops)
+  ├── EnrichmentWorker (background AI enrichment)
+  ├── NVDSyncWorker (NVD 7-day rolling CVE sync)
+  │
+  ├── JarvisEngine (detection pipeline)
+  ├── AIAnalyst (Claude API)
+  ├── EmailNotifier (SMTP + Graph API)
+  │
+  └── Routers:
+      ├── /api/v1/ingest     (ingest.py)
+      ├── /api/v1/agents     (agents.py)
+      ├── /api/v1/findings   (findings.py)
+      ├── /api/v1/remediation(remediation.py)
+      ├── /api/v1/intel      (threat.py + remediation.py)
+      └── /ws/{agent_id}     (WebSocket hub)
+```
+
+### SQLite Databases
+
+**`manager.db`** — Operational data
+- `agents` — enrolled agent registry
+- `agent_keys` — per-agent API keys + expiry
+- `nonces` — replay-protection nonce store (TTL 600 s)
+- `payload_log` — ingest audit log
+
+**`intel.db`** — Intelligence data
+- `findings` — deduplicated security findings (agent+category+item_key)
+- `finding_timeline` — history of finding state changes
+- `baselines` — Welford statistical baselines per agent+metric
+- `entity_state` — first-seen / fingerprint tracking per agent entity
+- `correlations` — cross-section attack-chain results
+- `nvd_cves` — NVD CVE mirror (FTS5 full-text search)
+- `ioc_cache` — threat feed IOC cache
+- `cisa_kev` — CISA Known Exploited Vulnerabilities
+- `epss_scores` — EPSS exploit probability scores
+- `threat_actors` — ransomware.live actor data
+- `security_news` — HackerNews + security feed items
+- `ai_analysis` — cached Claude finding analysis
+- `remediation_plans` — cached Claude remediation plans
+- `asset_registry` — asset tier and org group metadata
+- `feed_health` — feed refresh status and error tracking
+
+---
+
+## 5. Ingest Pipeline
+
+```
+Agent POST /api/v1/ingest
+  │
+  ▼ (< 1 ms) Verify X-Agent-ID exists in manager.db
+  │
+  ▼ (< 1 ms) HMAC-SHA256 signature verification
+  │
+  ▼ (< 1 ms) Replay window check: timestamp ±300 s + nonce uniqueness
+  │
+  ▼ (< 2 ms) AES-256-GCM decrypt → gunzip → JSON parse
+  │
+  ▼ (< 1 ms) QueueProducer.publish("agent.telemetry", payload)
+  │
+  ▼ HTTP 202 Accepted  ← total < 5 ms
+  
+  ── async (off HTTP path) ──────────────────────────────────────
+
+RabbitMQ → TelemetryWorker (prefetch=20, manual ACK)
+  │
+  ├── Write to three-tier file store (NDJSON+gzip)
+  ├── Update SQLite payload index (section timestamps)
+  ├── WebSocket broadcast to dashboard subscribers
+  └── Publish to "jarvis.work" queue
+
+RabbitMQ → JarvisWorker
+  │
+  └── JarvisEngine.process(agent_id, section, data)
+        ├── _dispatch() → section-specific analyzer
+        ├── BehavioralAnalyzer.analyze()
+        ├── Upsert findings to intel.db
+        └── CorrelationEngine.correlate() (every 3rd payload)
 ```
 
 ---
 
-## Enrollment Flow (First Run)
+## 6. Detection Engine
+
+### Pipeline
 
 ```
-Agent startup
-   │
-   ├─ 1. Check keystore for existing API key
-   │       ├─ Found → normal operation (skip enrollment)
-   │       └─ Not found → BEGIN ENROLLMENT
-   │
-   ├─ 2. POST /api/v1/enroll
-   │       Header: X-Enrollment-Token: <operator one-time token>
-   │       Body:   {agent_id, agent_name, hostname, os, arch, ts}
-   │
-   ├─ 3. Manager validates token
-   │       → generates secrets.token_hex(32)  (256-bit key)
-   │       → stores agent_id → api_key in agent_keys table
-   │       → returns {ok: true, api_key: "<64hex>", expires_at: <ts>}
-   │
-   └─ 4. Agent stores api_key in keystore (Keychain / DPAPI)
-           → NEVER written to config file
+Raw telemetry section data
+  │
+  ▼ allowlist.py — Suppress / adjust before any rule fires
+  │   • is_apple_system_process() → skip entirely
+  │   • is_trusted_ip() → skip CDN/cloud IP connections
+  │   • get_dual_use_info() → cap severity for nmap/ngrok/wireshark
+  │   • has_benign_parent() → suppress child if IDE/shell parent
+  │
+  ▼ rules.py — Static pattern matching
+  │   • PROCESS_RULES (26 rules): cmdline regex with confidence scores
+  │   • PARENT_CHILD_RULES (5 rules): Office/browser → shell spawn
+  │   • OBFUSCATION_RULES (5 rules): base64 eval, hex shellcode, IEX
+  │   • MALICIOUS_PORTS (47 ports): known C2/RAT/miner ports
+  │   • SUSPICIOUS_PATHS: /tmp, /dev/shm, /var/tmp execution
+  │   • RISKY_PACKAGES: known malicious/dual-use packages
+  │
+  ▼ behavioral.py — Statistical anomaly detection (13 sections)
+  │   • Welford z-score: |z| > 3.0 = anomaly flag
+  │   • Velocity detection: value / baseline_mean > 2.5x = spike
+  │   • Shannon entropy: low entropy = beaconing, high = scanning
+  │   • Entity tracking: first-seen per service/user/task/interface
+  │   • Admin grant detection: privilege escalation via user change
+  │
+  ▼ NVD CVE worker (async, non-blocking)
+  │   • Package name + version → NVD API lookup
+  │   • CVSS score ≥ 4.0 → emit finding with CVE metadata
+  │   • EPSS + CISA KEV flags attached
+  │
+  ▼ composite scoring (threat/scoring.py)
+  │   composite = (CVSS×0.30) + (EPSS×0.25) + (KEV×0.20)
+  │             + (recency×0.10) + (behavioral×0.10) + (asset×0.05)
+  │   → scaled to 0–10
+  │
+  ▼ correlator.py — Cross-section attack chain detection (every 3rd payload)
+      • 21 rules, each time-gated (6 h–168 h window)
+      • Required category + source matching
+      • Confidence boosted by optional categories + intel signals
+      • Outputs: severity, attack_chain, blast_radius, likely_next_steps
 ```
 
-Security properties:
-- Manager generates and owns the key; agent only stores it.
-- A leaked enrollment token cannot expose existing agents' session keys.
-- Operator can rotate/revoke keys independently via `POST /api/v1/keys/{id}/rotate`.
-- Token is transmitted over TLS 1.3 only; discarded after enrollment.
+### Detection Rules Summary
+
+| Rule Set | Count | Key Patterns |
+|---|---|---|
+| Process rules | 26 | Miners, C2 (Sliver/Cobalt/Empire), cred dumpers, DNS tunnels, LOLBins |
+| Parent-child lineage | 5 | Office/browser/PDF spawning bash/python/osascript |
+| Obfuscation | 5 | base64 eval, hex shellcode, PowerShell IEX, char-code |
+| Malicious ports | 47 | Metasploit 4444, CS 50050, Tor 9050, IRC 6667, miner 3333/14444 |
+| Suspicious paths | 5 | /tmp, /dev/shm, /var/tmp, path traversal, Downloads |
+| Config patterns | 7 | pipe-to-shell, eval base64, reverse shell patterns |
+| Risky packages | 22 | miners, exploit frameworks, scanners, tunnellers |
+| Service patterns | 4 | numeric-suffix LaunchDaemons, temp-path services |
+| Behavioral metrics | 13 | z-score, velocity, entropy, entity first-seen |
+| Correlation rules | 21 | Multi-section time-gated ATT&CK kill chains |
 
 ---
 
-## Cryptography
+## 7. Threat Intelligence Layer
 
-| Component | Algorithm | Details |
-|-----------|-----------|---------|
-| Transport | TLS 1.3 | Minimum enforced on both agent and manager |
-| Key derivation | HKDF-SHA256 | 256-bit api_key → enc_key + mac_key |
-| Payload encryption | AES-256-GCM | 96-bit random nonce per message |
-| Integrity (defense-in-depth) | HMAC-SHA256 | Over agent_id:timestamp:nonce:ciphertext |
-| Compression | gzip level 6 | Applied before encryption |
-| Replay prevention | Timestamp ±300 s + nonce cache | Nonce cached 300 s, evicted hourly |
+### Central Threat Intel Service
 
-Envelope format (wire protocol):
-```json
-{
-  "v": 1,
-  "agent_id": "laptop-001",
-  "timestamp": 1712700000,
-  "nonce": "<base64 96-bit>",
-  "ct": "<base64 AES-GCM ciphertext + tag>",
-  "hmac": "<hex HMAC-SHA256>",
-  "section": "metrics"
-}
-```
-
----
-
-## Key Management API
-
-All endpoints require `X-Admin-Token` header.
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/keys` | List all agent key metadata (no secrets) |
-| `GET` | `/api/v1/keys/{agent_id}` | Single agent key metadata |
-| `POST` | `/api/v1/keys/{agent_id}/rotate` | Generate new 256-bit key (returned once) |
-| `PATCH` | `/api/v1/keys/{agent_id}/expiry` | Set/extend/clear expiry (0 = never) |
-| `POST` | `/api/v1/keys/{agent_id}/revoke` | Revoke key (agent cannot ingest) |
-| `DELETE` | `/api/v1/keys/{agent_id}` | Hard-delete (agent must re-enroll) |
-
-The raw key hex is **never returned** except on `POST /rotate` (one-time visibility).
-
----
-
-## Agent: macOS
-
-### Process Hierarchy
-```
-launchd (KeepAlive=true)
-  └── /Library/Jarvis/bin/jarvis-watchdog  [com.jarvis.watchdog]
-        └── /Library/Jarvis/bin/jarvis-agent  [com.jarvis.agent]
-```
-
-### Directory Layout
-```
-/Library/Jarvis/
-  bin/        755 root:wheel   jarvis-agent, jarvis-watchdog
-  config/     750 root:wheel   agent.toml
-  data/       755 root:wheel   telemetry queue
-  security/   700 root:wheel   API key file (fallback keystore)
-  spool/      755 root:wheel   offline spool (50 MB max)
-  logs/       755 root:wheel   agent.log, watchdog.log, stderr/stdout
-/Library/LaunchDaemons/
-  com.jarvis.agent.plist
-  com.jarvis.watchdog.plist
-```
-
-### Key Storage
-1. **Primary**: macOS Keychain — `keyring` service `com.jarvis.agent`, account = agent_id
-2. **Fallback**: `/Library/Jarvis/security/<agent_id>.key` — mode 0600, root:wheel
-
-### Collectors (22 sections)
-
-| Section | Interval | What It Collects |
-|---------|----------|------------------|
-| `metrics` | 10 s | CPU %, memory %, load avg, swap |
-| `connections` | 10 s | TCP/UDP connections (psutil or lsof) |
-| `processes` | 10 s | Running processes |
-| `ports` | 30 s | Listening ports |
-| `network` | 120 s | Network interfaces |
-| `battery` | 120 s | Battery level and status |
-| `openfiles` | 120 s | Open file handles |
-| `services` | 120 s | launchd services |
-| `users` | 120 s | Logged-in users |
-| `hardware` | 120 s | CPU/RAM/GPU/disk inventory |
-| `containers` | 120 s | Running Docker containers |
-| `arp` | 120 s | ARP table |
-| `mounts` | 120 s | Mounted filesystems |
-| `storage` | 600 s | Disk usage |
-| `tasks` | 600 s | Scheduled tasks |
-| `security` | 3600 s | SIP, Gatekeeper, FileVault posture |
-| `sysctl` | 3600 s | Kernel parameters |
-| `configs` | 3600 s | Key system configuration files |
-| `apps` | 86400 s | Installed applications |
-| `packages` | 86400 s | Package manager inventory |
-| `sbom` | 86400 s | Software bill of materials |
-| `binaries` | 86400 s | SUID/SGID/world-writable binaries (opt-in) |
-
----
-
-## Agent: Windows
-
-### Process Hierarchy
-```
-Service Control Manager
-  └── MacIntelWatchdog  (depends on MacIntelAgent)
-        └── MacIntelAgent
-```
-
-### Directory Layout
-```
-C:\Program Files (x86)\Jarvis\
-  bin\        SYSTEM+Admins RX only    jarvis-agent.exe, jarvis-watchdog.exe
-  config\     SYSTEM+Admins R only     agent.toml
-  data\       SYSTEM+Admins full       telemetry queue
-  security\   SYSTEM full only         API key (DPAPI encrypted)
-  spool\      SYSTEM+Admins full       offline spool
-  logs\       SYSTEM+Admins full       agent.log
-```
-
-### Key Storage
-1. **Primary**: Windows Credential Manager — DPAPI-backed via `keyring` WinVault
-2. **Fallback**: `security\<agent_id>.key.dpapi` — `CRYPTPROTECT_LOCAL_MACHINE` + icacls SYSTEM-only
-
----
-
-## Agent: Circuit Breaker (per section)
+A separate Docker container (`attacklens-threat-intel`) owns all feed ingestion. The Manager queries it via HTTP proxy (falls back to local DB if unavailable).
 
 ```
-CLOSED → [3 consecutive failures] → OPEN (skip section, cooldown 60 s)
-OPEN   → [cooldown expired]       → HALF-OPEN (send 1 probe)
-HALF-OPEN → [probe succeeds]      → CLOSED
-HALF-OPEN → [probe fails]         → OPEN (reset cooldown)
+Central Threat Intel Service
+  │
+  ├── Feodo Tracker       → C2 IPs (botnet infrastructure)       [1 hr]
+  ├── Emerging Threats    → Compromised hosts                    [1 hr]
+  ├── URLhaus             → Malware distribution URLs            [2 hr]
+  ├── ThreatFox           → Multi-type IOCs (IPs, domains, URLs) [2 hr]
+  ├── Spamhaus DROP+EDROP → Hijacked/botnet CIDR ranges          [6 hr]
+  ├── CISA KEV            → Known Exploited Vulnerabilities       [4 hr]
+  ├── ransomware.live     → Active ransomware group data          [3 hr]
+  ├── HackerNews feed     → Security news (CVE keyword filter)   [2 hr]
+  ├── NVD (NIST)          → CVE database (7-day rolling sync)    [2 hr]
+  └── EPSS (FIRST.org)    → Exploit prediction scores           [on-demand]
 ```
 
-Every 60 s the agent emits an `agent_health` section payload listing circuit breaker state per section.
+**Optional enrichment** (API keys in `.env`):
+- AbuseIPDB — IP abuse confidence scoring
+- AlienVault OTX — IP/domain/hash threat intel
+- GreyNoise Community — Scanner/noise IP detection
+- Shodan InternetDB — On-demand internet exposure check
 
----
-
-## Agent: Disk Spool
-
-- **Format**: NDJSON, one envelope per line, gzip compressed
-- **Max size**: 50 MB; trims oldest 10% when full
-- **Trigger**: manager unreachable (connectivity probe to `/health` fails)
-- **Drain**: automatic on reconnect
-- **Writes**: atomic (temp file → rename)
-
----
-
-## Manager Module Layout
+### IP Reputation Pipeline
 
 ```
-manager/
-  manager/
-    server.py          # FastAPI app factory, lifespan, middleware
-    db.py              # SQLite async (WAL): agents, agent_keys, payloads
-    store.py           # TelemetryStore: NDJSON+gzip hot/warm/cold
-    indexer.py         # IntelDB: verified findings (intel.db) + FTS5
-    crypto.py          # HKDF + AES-256-GCM + HMAC-SHA256
-    ws_hub.py          # WebSocket broadcast hub
-    api/
-      ingest.py        # POST /api/v1/ingest
-      enroll.py        # POST /api/v1/enroll
-      agents.py        # GET  /api/v1/agents[/{id}/{section}]
-      keys.py          # GET|POST|PATCH|DELETE /api/v1/keys/* (admin)
-      jarvis.py        # GET  /api/v1/jarvis/* (verified findings)
-    jarvis/
-      engine.py        # JarvisEngine orchestrator + 13 analyzers
-      correlator.py    # Cross-section correlation
-      rules.py         # Detection rules + MITRE ATT&CK mapping
-      behavioral.py    # Welford online z-score anomaly detection
-      feeds.py         # FeedManager: Feodo, Emerging Threats, AbuseIPDB
-      nvd.py           # CVELookup: NVD REST API v2 + CVSS parsing
-  Dockerfile           # Multi-stage, non-root user (uid 1000: jarvis)
-  scripts/
-    entrypoint.sh      # Auto-generates TLS cert + tokens on first boot
-  requirements.txt
+Connection remote_addr
+  │
+  ▼ Private IP check → skip (RFC 1918)
+  │
+  ▼ Trusted IP check → skip (Apple/Cloudflare/Google/AWS CDN ranges)
+  │
+  ▼ feeds.is_malicious_ip(ip) → in-memory cache lookup
+  │   Hit → emit finding immediately (< 1 μs)
+  │   Miss → queue for AbuseIPDB live check (async, < 2 s)
 ```
 
 ---
 
-## Manager: REST API
+## 8. AI Analysis Layer
 
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `POST` | `/api/v1/ingest` | Per-agent HMAC | Receive encrypted telemetry |
-| `POST` | `/api/v1/enroll` | Enrollment token | Register new agent |
-| `GET` | `/api/v1/agents` | — | List all agents |
-| `GET` | `/api/v1/agents/{id}` | — | Agent detail + section timestamps |
-| `GET` | `/api/v1/agents/{id}/{section}` | — | Paginated section data |
-| `GET` | `/api/v1/keys` | Admin token | List key metadata |
-| `POST` | `/api/v1/keys/{id}/rotate` | Admin token | Rotate agent key |
-| `PATCH` | `/api/v1/keys/{id}/expiry` | Admin token | Set key expiry |
-| `POST` | `/api/v1/keys/{id}/revoke` | Admin token | Revoke key |
-| `DELETE` | `/api/v1/keys/{id}` | Admin token | Hard-delete key |
-| `GET` | `/api/v1/jarvis/{id}/findings` | — | Verified findings |
-| `GET` | `/api/v1/jarvis/{id}/summary` | — | Finding counts by severity |
-| `GET` | `/api/v1/jarvis/{id}/timeline` | — | Change timeline |
-| `GET` | `/api/v1/jarvis/{id}/search` | — | FTS5 finding search |
-| `GET` | `/health` | — | Health check + store stats |
-| `WS` | `/ws/{agent_id}` | — | Live telemetry WebSocket |
+### AIAnalyst (`manager/manager/ai_analyst.py`)
+
+```python
+AIAnalyst(intel_db, feeds)
+  │
+  ├── analyze_finding(finding_id, finding)
+  │     Prompt: finding metadata + KEV/EPSS/news context
+  │     Output: {analysis, threat_context, risk_factors, confidence, urgency}
+  │     Cache: intel.db ai_analysis table
+  │
+  ├── generate_remediation(finding_id, finding, os_type)
+  │     Prompt: finding + OS type (macos/windows/linux)
+  │     Output: {summary, steps[], verification[], long_term[], effort, risk_level}
+  │     Cache: intel.db remediation_plans table (per finding+OS)
+  │
+  ├── prioritize_findings(findings)
+  │     Prompt: top-20 findings by composite score
+  │     Output: AI-reranked list with priority_rank + reasoning
+  │     No cache (real-time CISO view)
+  │
+  └── enrich_findings_batch(findings)
+        Background: analyze up to 10 unanalysed active findings
+        Rate-limited: 1 s pause between API calls
+```
+
+### Prompt Design Principles
+
+- Structured JSON output only (no markdown in response)
+- Finding metadata injected verbatim (no hallucination risk)
+- KEV/EPSS/news context enriches threat landscape assessment
+- Graceful degradation: `enabled = False` if no API key → all methods return `None`
 
 ---
 
-## Manager: SQLite Schema
+## 9. Storage Architecture
 
-### manager.db
+### Three-Tier File Store (`manager/manager/store.py`)
+
+```
+/app/data/
+├── hot/         (age < 7 days, actively indexed)
+│   └── {agent_id}/{date}/{section}.ndjson.gz
+├── warm/        (7–90 days, compressed, query via streaming)
+│   └── {agent_id}/{year}/{month}/{section}.ndjson.gz
+└── cold/        (> 90 days, archive-grade compression)
+    └── {agent_id}/{year}/{section}.ndjson.gz.archive
+```
+
+- **Hot tier**: Fully indexed in SQLite for instant queries
+- **Warm tier**: Streamed on demand; automatically promoted to hot on access
+- **Cold tier**: gzip level 9 compression; tiered to cold via background worker
+- **Retention**: Configurable per tier; default hot=7d, warm=90d, cold=indefinite
+
+### IntelDB Schema Highlights
 
 ```sql
-agents (
-  agent_id    TEXT PRIMARY KEY,
-  name        TEXT,
-  last_seen   REAL,    -- Unix timestamp
-  last_ip     TEXT,
-  created_at  REAL
-)
+-- Core findings table (deduplicated by agent+category+item_key)
+findings (id, agent_id, category, item_key, external_id UNIQUE,
+          severity, score, composite_score, title, description,
+          evidence JSON, source, rule_id, mitre_technique, mitre_tactic,
+          cve_ids JSON, cvss_score, kev, epss_score,
+          ai_analysed, threat_actor_match, news_refs JSON,
+          active, created_at, updated_at, detected_at)
 
-agent_keys (
-  agent_id       TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
-  api_key_hex    TEXT NOT NULL,       -- 64 hex chars (256-bit key)
-  enrolled_at    REAL,
-  enrollment_ip  TEXT,
-  expires_at     REAL,               -- NULL = never expires
-  revoked        INTEGER DEFAULT 0,
-  rotated_at     REAL,
-  key_label      TEXT
-)
+-- Behavioral baselines (Welford state per agent+metric)
+baselines (agent_id, metric, mean, m2, stddev, min_val, max_val,
+           sample_count, updated_at)
 
-payloads (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  agent_id      TEXT,
-  section       TEXT,
-  collected_at  REAL,
-  received_at   REAL,
-  data          TEXT                 -- JSON
-)
--- Index: (agent_id, section, collected_at DESC)
+-- Entity state (first-seen tracking)
+entity_state (agent_id, section, entity_key, fingerprint, seen_at)
+
+-- AI cache
+ai_analysis (finding_id PRIMARY KEY, model, analysis, threat_context,
+             risk_factors JSON, confidence, tokens_used, created_at)
+
+remediation_plans (finding_id, agent_id, os_type, model, summary,
+                   steps JSON, verification JSON, long_term JSON,
+                   effort, risk_level, created_at)
 ```
-
-### intel.db (Verified Findings)
-
-| Table | Purpose |
-|-------|---------|
-| `findings` | Deduplicated findings (UNIQUE agent+category+item_key) |
-| `findings_fts` | FTS5 virtual table, auto-synced via triggers |
-| `ioc_cache` | Threat feed IP/domain cache (24h TTL) |
-| `cve_cache` | NVD CVE lookup cache (24h TTL) |
-| `cve_entries` | Individual CVE records with CVSS scores |
-| `behavior_baseline` | Welford online stats per agent+metric |
-| `entity_state` | Last known state fingerprint per entity |
-| `change_timeline` | Immutable log: added / modified / resolved |
 
 ---
 
-## Manager: TelemetryStore (Three-Tier)
+## 10. Notification System
 
-```
-data/
-  hot/   <agent_id>/<section>/YYYY-MM-DD.ndjson.gz   (current day)
-  warm/  <agent_id>/<section>/YYYY-MM-DD.ndjson.gz   (last 7 days)
-  cold/  <agent_id>/<section>/YYYY-MM-DD.ndjson.gz   (older)
-```
+### EmailNotifier (`manager/manager/notifications/email.py`)
 
-Files are rotated daily. API queries scan tiers in order: hot → warm → cold.
+**Delivery backends** (auto-selected based on config):
+1. **SMTP** (aiosmtplib): Generic — works with Gmail, Office 365, Exchange, Postfix
+2. **Microsoft Graph API**: Office 365 OAuth2 — no password, token cached in memory
 
----
+**Notification types**:
 
-## Deployment: Docker (Dev — Self-Signed TLS)
-
-```
-docker-compose.yml
-  manager:
-    image: jarvis-manager:latest
-    port:  8443 (HTTPS, self-signed cert auto-generated)
-    env:   PUBLIC_IP, ENROLLMENT_TOKENS, ADMIN_TOKEN, BIND_PORT
-    vols:  ./data, ./certs, ./logs
-```
-
-On first boot `entrypoint.sh`:
-1. Generates RSA-4096 self-signed cert valid 10 years (SAN includes `PUBLIC_IP`)
-2. Auto-generates `sk-enroll-*` enrollment token and `sk-admin-*` admin token
-3. Persists both to `/app/data/.secrets`
-4. Prints credential banner to stdout (visible in `docker compose logs manager`)
+| Type | Trigger | Content |
+|---|---|---|
+| Critical Alert | Finding severity = critical | Finding details, MITRE technique, evidence excerpt, immediate action |
+| High Alert | Finding severity = high + KEV/EPSS | Finding context + remediation link |
+| Daily Digest | Scheduled (configurable) | Summary: new findings count, top risks, unresolved criticals |
+| SOC Action | Analyst closes/escalates finding | Audit trail notification |
+| Remediation Ready | AI plan generated | Structured remediation steps for the OS |
 
 ---
 
-## Deployment: Docker (Prod — Caddy + Let's Encrypt)
+## 11. Security Architecture
+
+### Encryption Layers
 
 ```
-docker-compose.prod.yml
-  caddy:
-    image: caddy:2-alpine
-    ports: 80, 443
-    config: Caddyfile → auto TLS from Let's Encrypt
-  manager:
-    expose: 8080 (plain HTTP behind Caddy)
-    env:   TLS_DISABLED=1, DOMAIN
+Layer 1 — Transport:  TLS 1.3 (Caddy manages certs; ACME or self-signed)
+Layer 2 — Payload:    AES-256-GCM with 96-bit random nonce per message
+Layer 3 — Integrity:  HMAC-SHA256 over full encrypted payload
+Layer 4 — Auth:       Per-agent API key (bearer token, 256-bit random)
+Layer 5 — Replay:     ±300 s timestamp window + nonce dedup in manager.db
 ```
 
-Agent config: `tls_verify = true` (real CA cert).
+### Key Management
+
+```
+Enrollment:
+  Agent generates ECDH keypair
+  ↓
+  POST /api/v1/enroll with public key + enrollment token
+  ↓
+  Manager generates: AES-256 session key + HMAC signing key
+  ↓
+  Manager encrypts both keys to agent public key (ECIES)
+  ↓
+  Agent decrypts and stores in macOS System Keychain
+  (service: com.attacklens.agent, never written to disk as plaintext)
+
+Key rotation:
+  Admin POST /api/v1/keys/{agent_id}/rotate
+  → Agent re-enrolls on next heartbeat (SIGHUP triggers reload)
+```
+
+### Network Isolation
+
+```
+Internet
+  │
+  ▼ Caddy (port 8443 or 443)
+  │   Only Caddy has a public-facing port
+  │   Manager is on Docker internal network only
+  │
+  ▼ jarvis_internal (Docker bridge network)
+  │   manager ↔ rabbitmq ↔ threat-intel
+  │   No public IP — only reachable via Caddy
+  │
+  ▼ Manager (port 8080, internal only)
+```
 
 ---
 
-## Jarvis Engine: Detection Coverage
+## 12. Deployment Architecture
 
-| Analyzer | Data Source | Algorithm | External Feeds | Severity |
-|----------|-------------|-----------|----------------|----------|
-| ports | ports | Rule match vs 28 malicious ports | — | Critical–Low |
-| processes | processes | 16 compiled regex patterns | — | Critical–Medium |
-| connections | connections | IP reputation lookup | Feodo + ET + AbuseIPDB | Critical–High |
-| services | services | Label/path pattern match | — | High–Medium |
-| apps | apps | Signature/notarization check | — | Medium–Low |
-| packages | packages | 25 risky tool rules | NVD CVE | Critical–Low |
-| network | network | Interface fingerprint diff | — | High–Medium |
-| users | users | UID-0, service shell check | — | Critical–Medium |
-| tasks | tasks | cmdline pattern match | — | High–Medium |
-| security | security | SIP/GK/FileVault posture | — | Critical–Medium |
-| configs | configs | Config regex patterns | — | High–Medium |
-| binaries | binaries | SUID/SGID/world-writable | — | High–Medium |
-| behavioral | all sections | Welford z-score \|z\|>3.0σ | — | Critical–Low |
+### Docker Compose Services
 
-### Threat Feed Refresh
+| Service | Image | Port | Purpose |
+|---|---|---|---|
+| `caddy` | `caddy:2-alpine` | 8443 / 443 / 80 | TLS reverse proxy |
+| `manager` | `jarvis-manager:latest` | 8080 (internal) | Main application |
+| `threat-intel` | `attacklens-threat-intel:latest` | 8090 (internal) | Feed sync + CVE DB |
+| `rabbitmq` | `rabbitmq:3.13-management-alpine` | 5672 / 15672 | Async message queue |
 
-| Feed | Interval | Format |
-|------|----------|--------|
-| Feodo Tracker (IP blocklist) | 1 h | CSV |
-| Emerging Threats (IP rules) | 1 h | TXT |
-| AbuseIPDB (IP reputation) | On-demand | JSON |
-| NVD CVE v2 | On-demand (7 s rate limit) | JSON |
+### Volume Mounts
+
+```
+./data/           → /app/data       (SQLite DBs, hot/warm/cold telemetry)
+./logs/           → /app/logs       (rotating log files)
+./data/threat-intel/ → /app/data    (intel.db for threat-intel service)
+./Caddyfile       → /etc/caddy/     (TLS configuration)
+```
+
+### Health Checks
+
+All services define Docker health checks:
+- Manager: `curl -fs http://localhost:8080/health`
+- Threat Intel: `curl -fs http://localhost:8090/health`
+- RabbitMQ: `rabbitmq-diagnostics ping`
+- Caddy: `wget -qO- http://localhost:80/health`
+
+Startup order: `rabbitmq` (healthy) → `threat-intel` (healthy) → `manager` (healthy) → `caddy`
 
 ---
 
-## Security Controls Summary
+## 13. Data Flow Summary
 
-| Control | Mechanism |
-|---------|-----------|
-| Transport encryption | TLS 1.3 minimum (both directions) |
-| Payload encryption | AES-256-GCM (96-bit random nonce) |
-| Payload integrity | HMAC-SHA256, constant-time comparison |
-| Key derivation | HKDF-SHA256 (enc_key + mac_key from api_key) |
-| Replay prevention | ±300 s timestamp window + 96-bit nonce dedup |
-| Per-agent isolation | Key lookup by agent_id; HMAC fail ≠ valid data |
-| Enrollment auth | One-time `sk-enroll-*` token over TLS only |
-| Admin API auth | `sk-admin-*` token, separate from enrollment |
-| Key storage (macOS) | Keychain (primary), 0600 file (fallback) |
-| Key storage (Windows) | DPAPI Credential Manager (primary), DPAPI file (fallback) |
-| Key never in config | api_key absent from agent.toml in all environments |
-| Key expiry | Optional per-agent; `DEFAULT_KEY_EXPIRY_DAYS` env |
-| Key revocation | `POST /api/v1/keys/{id}/revoke` (immediate) |
-| Binary ACLs (Windows) | SYSTEM+Admins RX only; no user-writable paths |
-| Directory ACLs (macOS) | security/ chmod 700 root:wheel |
-| Manager process | Non-root uid 1000 (jarvis) inside container |
-| Circuit breaker | Prevents cascading failures from broken collectors |
-| Disk spool | Atomic writes; trims on overflow; never stores decrypted data |
+```
+Collection (agent)
+  25 collectors × configurable intervals
+  → Section payload dict
+  → gzip + AES-256-GCM encrypt
+  → HTTPS POST to /api/v1/ingest
+
+Ingest (manager, < 5 ms)
+  → Verify HMAC + replay window
+  → Decrypt + parse
+  → Publish to RabbitMQ "agent.telemetry"
+  → HTTP 202
+
+Storage (TelemetryWorker, async)
+  → Write NDJSON+gzip to hot tier
+  → Update SQLite payload index
+  → WebSocket broadcast to dashboard
+  → Publish to "jarvis.work" queue
+
+Detection (JarvisWorker + JarvisEngine, async)
+  → Allowlist check (suppress Apple system procs, CDN IPs)
+  → Rules matching (process/port/config/service/binary/user)
+  → Behavioral baseline update + anomaly check
+  → Parent-child lineage analysis
+  → Obfuscation pattern scan
+  → Upsert findings to intel.db (deduplicated)
+  → Composite score calculation (CVSS+EPSS+KEV+recency+asset)
+  → Correlation check every 3rd payload (21 time-gated rules)
+  → Correlation upsert to intel.db
+
+Enrichment (async workers)
+  → NVD CVE lookup for packages (async queue, 2 s rate limit)
+  → AbuseIPDB live check for unknown IPs (async queue)
+  → AI analysis for new critical findings (Claude API, cached)
+  → Email alert for critical findings (SMTP or Graph API)
+
+Query (API / WebSocket)
+  → Dashboard fetches findings, correlations, timelines
+  → WebSocket pushes real-time updates
+  → AI remediation generated on demand + cached
+  → Threat intel proxy to central service (or local DB fallback)
+```

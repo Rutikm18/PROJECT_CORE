@@ -297,7 +297,7 @@ class ContainersCollector(BaseCollector):
             "docker", "ps", "-a",
             "--format", '{"id":"{{.ID}}","name":"{{.Names}}","image":"{{.Image}}",'
                         '"status":"{{.Status}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}"}',
-        ])
+        ], timeout=30)
         rows = []
         for line in out.splitlines():
             try:

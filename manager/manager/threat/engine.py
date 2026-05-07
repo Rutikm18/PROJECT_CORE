@@ -39,6 +39,7 @@ from .rules import (
 from .behavioral import BehavioralAnalyzer
 from .feeds      import FeedManager
 from .nvd        import CVELookup
+from .scoring    import score_matrix
 
 log = logging.getLogger("manager.threat.engine")
 
@@ -588,15 +589,17 @@ class ThreatEngine:
 
     @staticmethod
     def _finding(*, category: str, item_key: str, severity: str,
-                 score: float, title: str, desc: str, evidence: dict,
+                 score: float = 0.0, title: str, desc: str, evidence: dict,
                  source: str, mitre: str = "", tags: list | None = None,
                  cve_ids: list | None = None, cvss_score: float | None = None,
                  cvss_vector: str = "") -> dict:
-        return {
+        # Backward compat: if caller passed score=0 (or omitted), derive from severity.
+        eff_score = score if score and score > 0 else severity_to_score(severity)
+        finding = {
             "category":        category,
             "item_key":        item_key,
             "severity":        severity,
-            "score":           round(score, 2),
+            "score":           round(eff_score, 2),
             "title":           title,
             "description":     desc,
             "evidence":        evidence,
@@ -609,6 +612,14 @@ class ThreatEngine:
             "cvss_vector":     cvss_vector,
             "tags":            tags or [category, source],
         }
+        # Multi-factor composite score — does not replace 'score', augments it.
+        try:
+            finding["composite_score"] = score_matrix.compute(
+                finding, agent_id="", collected_ts=time.time(),
+            )
+        except Exception:
+            finding["composite_score"] = round(eff_score, 2)
+        return finding
 
 
 def _fp(s: str) -> str:

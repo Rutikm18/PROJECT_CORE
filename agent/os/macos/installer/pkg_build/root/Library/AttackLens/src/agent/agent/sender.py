@@ -28,6 +28,8 @@ _SPOOL_MAX_BYTES = 50 * 1024 * 1024
 _SPOOL_RETRY_INTERVAL = 30
 # Connectivity probe timeout (seconds)
 _PROBE_TIMEOUT = 5
+# Consecutive 401s from an "online" manager before triggering re-enrollment
+_AUTH_FAIL_THRESHOLD = 3
 
 
 class DiskSpool:
@@ -120,6 +122,12 @@ class Sender:
         spool_dir = config.get("paths", {}).get("spool_dir", _default_spool)
         self._spool = DiskSpool(os.path.join(spool_dir, "unsent.ndjson"))
 
+        # Auth-failure tracking: counts consecutive 401s to detect key invalidation
+        self._auth_fail_count = 0
+        # Optional callback — called when persistent auth failure detected.
+        # Signature: on_auth_error() -> None.  Set by caller after construction.
+        self.on_auth_error: "threading.Callable | None" = None
+
     # ── SSL ───────────────────────────────────────────────────────────────────
 
     def _build_ssl_ctx(self):
@@ -179,11 +187,26 @@ class Sender:
             if not self._online and (now - spool_check) >= _SPOOL_RETRY_INTERVAL:
                 spool_check = now
                 if self._probe():
-                    log.info("Manager back online — draining spool")
                     self._online = True
-                    spooled = self._spool.drain()
-                    for env in spooled:
-                        self.queue.put_nowait(env)
+                    if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
+                        log.warning(
+                            "Manager back online after %d auth failures — "
+                            "clearing spool and triggering re-enrollment",
+                            self._auth_fail_count,
+                        )
+                        self._auth_fail_count = 0
+                        self._spool.drain()   # stale encrypted data, discard
+                        if self.on_auth_error:
+                            threading.Thread(
+                                target=self.on_auth_error,
+                                daemon=True,
+                                name="re-enroll",
+                            ).start()
+                    else:
+                        log.info("Manager back online — draining spool")
+                        spooled = self._spool.drain()
+                        for env in spooled:
+                            self.queue.put_nowait(env)
                 else:
                     log.debug("Manager still unreachable — spool has %d bytes",
                               self._spool.size())
@@ -193,11 +216,34 @@ class Sender:
             except queue.Empty:
                 continue
 
+            # When manager is known unreachable, spool directly — skip the
+            # full retry cycle (3 × backoff) that wastes time and queue capacity.
+            if not self._online:
+                self._spool.write(envelope)
+                continue
+
             success = self._send_with_retry(envelope)
             if not success:
                 log.warning("Spooling %s to disk", envelope.get("section"))
                 self._spool.write(envelope)
                 self._online = False
+                # If auth failures crossed the threshold and manager is reachable,
+                # the key is invalid — trigger re-enrollment and clear bad spool.
+                if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
+                    if self._probe():
+                        log.warning(
+                            "Persistent 401 after %d attempts — manager online but key rejected; "
+                            "clearing spool and triggering re-enrollment",
+                            self._auth_fail_count,
+                        )
+                        self._auth_fail_count = 0
+                        self._spool.drain()   # old encrypted data can't be re-keyed
+                        if self.on_auth_error:
+                            threading.Thread(
+                                target=self.on_auth_error,
+                                daemon=True,
+                                name="re-enroll",
+                            ).start()
 
     # ── Send with retry ───────────────────────────────────────────────────────
 
@@ -231,10 +277,18 @@ class Sender:
                         if not self._online:
                             log.info("Manager connection restored")
                         self._online = True
+                        self._auth_fail_count = 0
                         log.debug("Sent %s → 200", envelope.get("section"))
                         return True
+                    elif resp.status == 401:
+                        self._auth_fail_count += 1
+                        log.warning(
+                            "HTTP 401 (count=%d) section=%s — spooling for re-auth",
+                            self._auth_fail_count, envelope.get("section"),
+                        )
+                        return False
                     elif 400 <= resp.status < 500:
-                        # Client error — bad payload, not a connectivity issue
+                        self._auth_fail_count = 0
                         log.error("Manager rejected (HTTP %d) section=%s — dropping",
                                   resp.status, envelope.get("section"))
                         return True   # "handled" — don't spool
@@ -243,7 +297,17 @@ class Sender:
                                     resp.status, attempt, self.max_retry)
 
             except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    # Auth expired (manager restart, key rotation) — spool, do NOT drop.
+                    self._auth_fail_count += 1
+                    log.warning(
+                        "HTTP 401 (count=%d) section=%s — spooling for re-auth",
+                        self._auth_fail_count, envelope.get("section"),
+                    )
+                    return False   # spool it
                 if 400 <= exc.code < 500:
+                    # True client errors (bad payload, forbidden) — drop permanently.
+                    self._auth_fail_count = 0
                     log.error("Manager rejected (HTTP %d) section=%s — dropping",
                               exc.code, envelope.get("section"))
                     return True

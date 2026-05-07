@@ -35,6 +35,7 @@ PRAGMA foreign_keys = ON;
 -- ── Findings ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS findings (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id       TEXT,
     agent_id          TEXT    NOT NULL,
     category          TEXT    NOT NULL,
     item_key          TEXT    NOT NULL,
@@ -50,6 +51,15 @@ CREATE TABLE IF NOT EXISTS findings (
     cve_ids           TEXT,
     cvss_score        REAL,
     cvss_vector       TEXT,
+    composite_score   REAL    NOT NULL DEFAULT 0,
+    epss_score        REAL    NOT NULL DEFAULT 0,
+    kev               INTEGER NOT NULL DEFAULT 0,
+    exploit_available INTEGER NOT NULL DEFAULT 0,
+    exploit_sources   TEXT,
+    asset_tier        TEXT    NOT NULL DEFAULT '',
+    asset_importance  REAL    NOT NULL DEFAULT 0,
+    priority_reason   TEXT,
+    action_plan       TEXT,
     mitre_technique   TEXT,
     mitre_tactic      TEXT,
     first_detected_at REAL    NOT NULL,
@@ -60,9 +70,11 @@ CREATE TABLE IF NOT EXISTS findings (
     tags              TEXT,
     UNIQUE(agent_id, category, item_key)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_find_external_id ON findings(external_id);
 CREATE INDEX IF NOT EXISTS idx_find_agent   ON findings(agent_id, severity, is_active);
 CREATE INDEX IF NOT EXISTS idx_find_ts      ON findings(last_detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_find_score   ON findings(score DESC);
+CREATE INDEX IF NOT EXISTS idx_find_composite ON findings(composite_score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_cat     ON findings(agent_id, category);
 
 -- ── FTS5 for full-text search ─────────────────────────────────────────────
@@ -157,6 +169,11 @@ CREATE TABLE IF NOT EXISTS correlations (
     description     TEXT,
     recommendation  TEXT,
     attack_chain    TEXT,
+    attack_path      TEXT,
+    blast_radius     TEXT,
+    entry_points     TEXT,
+    affected_assets  TEXT,
+    likely_next_steps TEXT,
     signals         TEXT,
     signal_count    INTEGER DEFAULT 0,
     first_detected  REAL    NOT NULL,
@@ -207,6 +224,201 @@ CREATE TABLE IF NOT EXISTS soc_comments (
     created_at  REAL    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cmt_finding ON soc_comments(finding_id, created_at DESC);
+
+-- ── SOC workflow: durable action / remediation plan items ─────────────────
+CREATE TABLE IF NOT EXISTS soc_actions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id  INTEGER NOT NULL,
+    agent_id    TEXT    NOT NULL,
+    action_type TEXT    NOT NULL DEFAULT 'remediate',
+    title       TEXT    NOT NULL DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'open',
+    owner       TEXT    NOT NULL DEFAULT '',
+    due_at      REAL    DEFAULT 0,
+    detail      TEXT    DEFAULT '',
+    created_by  TEXT    NOT NULL DEFAULT 'system',
+    created_at  REAL    NOT NULL,
+    updated_at  REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_action_finding ON soc_actions(finding_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_action_agent   ON soc_actions(agent_id, status, created_at DESC);
+
+-- ── Threat intel feed health ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS feed_health (
+    source        TEXT PRIMARY KEY,
+    last_attempt  REAL NOT NULL DEFAULT 0,
+    last_success  REAL NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT '',
+    error_count   INTEGER NOT NULL DEFAULT 0,
+    entry_count   INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'unknown'
+);
+
+-- ── NVD CVE local mirror (bulk-synced; separate from reactive cve_entries) ───
+-- pkg_keywords is a space-separated token string extracted from CPE URIs and
+-- the CVE description — indexed via FTS5 for sub-millisecond package lookups.
+CREATE TABLE IF NOT EXISTS nvd_cve_local (
+    cve_id        TEXT PRIMARY KEY,
+    description   TEXT NOT NULL DEFAULT '',
+    cvss_score    REAL,
+    cvss_vector   TEXT NOT NULL DEFAULT '',
+    severity      TEXT NOT NULL DEFAULT 'info',
+    cwe_ids       TEXT NOT NULL DEFAULT '[]',
+    cpe_uris      TEXT NOT NULL DEFAULT '[]',
+    pkg_keywords  TEXT NOT NULL DEFAULT '',
+    published_at  TEXT NOT NULL DEFAULT '',
+    modified_at   TEXT NOT NULL DEFAULT '',
+    synced_at     REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_nvd_score ON nvd_cve_local(cvss_score DESC);
+CREATE INDEX IF NOT EXISTS idx_nvd_mod   ON nvd_cve_local(modified_at DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS nvd_cve_fts USING fts5(
+    cve_id UNINDEXED,
+    pkg_keywords,
+    content='nvd_cve_local', content_rowid=rowid
+);
+CREATE TRIGGER IF NOT EXISTS nvd_ai AFTER INSERT ON nvd_cve_local BEGIN
+    INSERT INTO nvd_cve_fts(rowid, cve_id, pkg_keywords)
+    VALUES(new.rowid, new.cve_id, new.pkg_keywords);
+END;
+CREATE TRIGGER IF NOT EXISTS nvd_ad AFTER DELETE ON nvd_cve_local BEGIN
+    INSERT INTO nvd_cve_fts(nvd_cve_fts, rowid, cve_id, pkg_keywords)
+    VALUES('delete', old.rowid, old.cve_id, old.pkg_keywords);
+END;
+CREATE TRIGGER IF NOT EXISTS nvd_au AFTER UPDATE ON nvd_cve_local BEGIN
+    INSERT INTO nvd_cve_fts(nvd_cve_fts, rowid, cve_id, pkg_keywords)
+    VALUES('delete', old.rowid, old.cve_id, old.pkg_keywords);
+    INSERT INTO nvd_cve_fts(rowid, cve_id, pkg_keywords)
+    VALUES(new.rowid, new.cve_id, new.pkg_keywords);
+END;
+
+-- ── NVD sync state (key/value for sync timestamps) ───────────────────────
+CREATE TABLE IF NOT EXISTS nvd_sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+
+-- ── CISA Known Exploited Vulnerabilities ─────────────────────────────────
+CREATE TABLE IF NOT EXISTS cisa_kev (
+    cve_id          TEXT PRIMARY KEY,
+    vendor          TEXT NOT NULL DEFAULT '',
+    product         TEXT NOT NULL DEFAULT '',
+    vuln_name       TEXT NOT NULL DEFAULT '',
+    date_added      TEXT NOT NULL DEFAULT '',
+    short_desc      TEXT NOT NULL DEFAULT '',
+    required_action TEXT NOT NULL DEFAULT '',
+    due_date        TEXT NOT NULL DEFAULT '',
+    cached_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kev_date ON cisa_kev(date_added DESC);
+
+-- ── EPSS scores ───────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS epss_scores (
+    cve_id      TEXT PRIMARY KEY,
+    epss        REAL NOT NULL DEFAULT 0,
+    percentile  REAL NOT NULL DEFAULT 0,
+    model_date  TEXT NOT NULL DEFAULT '',
+    cached_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_epss_score ON epss_scores(epss DESC);
+
+-- ── Threat actors (ransomware.live, ThreatFox, etc.) ──────────────────────
+CREATE TABLE IF NOT EXISTS threat_actors (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    aliases     TEXT NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL DEFAULT '',
+    active      INTEGER NOT NULL DEFAULT 1,
+    countries   TEXT NOT NULL DEFAULT '[]',
+    ttps        TEXT NOT NULL DEFAULT '[]',
+    source      TEXT NOT NULL DEFAULT 'ransomware.live',
+    first_seen  TEXT NOT NULL DEFAULT '',
+    last_active TEXT NOT NULL DEFAULT '',
+    cached_at   REAL NOT NULL,
+    UNIQUE(name, source)
+);
+CREATE INDEX IF NOT EXISTS idx_actors_active ON threat_actors(active, cached_at DESC);
+
+-- ── Security news feed (HackerNews, security blogs) ──────────────────────
+CREATE TABLE IF NOT EXISTS security_news (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source       TEXT NOT NULL,
+    external_id  TEXT NOT NULL DEFAULT '',
+    title        TEXT NOT NULL,
+    url          TEXT NOT NULL DEFAULT '',
+    summary      TEXT NOT NULL DEFAULT '',
+    keywords     TEXT NOT NULL DEFAULT '[]',
+    cve_refs     TEXT NOT NULL DEFAULT '[]',
+    severity     TEXT NOT NULL DEFAULT 'info',
+    published_at REAL NOT NULL DEFAULT 0,
+    cached_at    REAL NOT NULL,
+    UNIQUE(source, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_news_pub ON security_news(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_news_src ON security_news(source, cached_at DESC);
+
+-- ── AI analysis cache per finding ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_analysis (
+    finding_id      INTEGER PRIMARY KEY,
+    model           TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
+    analysis        TEXT NOT NULL DEFAULT '',
+    threat_context  TEXT NOT NULL DEFAULT '',
+    risk_factors    TEXT NOT NULL DEFAULT '[]',
+    ioc_matches     TEXT NOT NULL DEFAULT '[]',
+    news_context    TEXT NOT NULL DEFAULT '[]',
+    actor_context   TEXT NOT NULL DEFAULT '[]',
+    confidence      REAL NOT NULL DEFAULT 0,
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    generated_at    REAL NOT NULL
+);
+
+-- ── AI-generated remediation plans ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS remediation_plans (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id   INTEGER NOT NULL,
+    agent_id     TEXT NOT NULL,
+    os_type      TEXT NOT NULL DEFAULT 'macos',
+    model        TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
+    steps        TEXT NOT NULL DEFAULT '[]',
+    summary      TEXT NOT NULL DEFAULT '',
+    effort       TEXT NOT NULL DEFAULT 'medium',
+    risk_level   TEXT NOT NULL DEFAULT 'low',
+    verification TEXT NOT NULL DEFAULT '[]',
+    long_term    TEXT NOT NULL DEFAULT '[]',
+    generated_at REAL NOT NULL,
+    UNIQUE(finding_id, os_type)
+);
+CREATE INDEX IF NOT EXISTS idx_remed_finding ON remediation_plans(finding_id);
+CREATE INDEX IF NOT EXISTS idx_remed_agent   ON remediation_plans(agent_id, generated_at DESC);
+
+-- ── Asset registry (enriched from agent telemetry) ────────────────────────
+CREATE TABLE IF NOT EXISTS asset_registry (
+    agent_id    TEXT PRIMARY KEY,
+    hostname    TEXT NOT NULL DEFAULT '',
+    os          TEXT NOT NULL DEFAULT '',
+    os_version  TEXT NOT NULL DEFAULT '',
+    arch        TEXT NOT NULL DEFAULT '',
+    asset_tier  TEXT NOT NULL DEFAULT 'standard',
+    asset_group TEXT NOT NULL DEFAULT '',
+    importance  REAL NOT NULL DEFAULT 0.3,
+    owner       TEXT NOT NULL DEFAULT '',
+    department  TEXT NOT NULL DEFAULT '',
+    tags        TEXT NOT NULL DEFAULT '[]',
+    first_seen  REAL NOT NULL DEFAULT 0,
+    last_seen   REAL NOT NULL DEFAULT 0
+);
+
+-- ── Org groups for priority weighting ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS org_groups (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE,
+    description   TEXT NOT NULL DEFAULT '',
+    importance    REAL NOT NULL DEFAULT 0.5,
+    member_agents TEXT NOT NULL DEFAULT '[]',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
 """
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -223,12 +435,31 @@ _SOC_STATUSES = {
 
 # Migrations: add SOC workflow columns to existing findings table
 _SOC_MIGRATIONS = [
+    ("findings",     "external_id",       "TEXT    DEFAULT ''"),
     ("findings",     "status",        "TEXT    DEFAULT 'new'"),
     ("findings",     "assignee",      "TEXT    DEFAULT ''"),
     ("findings",     "sla_due",       "REAL    DEFAULT 0"),
     ("findings",     "closed_at",     "REAL    DEFAULT NULL"),
     ("findings",     "priority",      "INTEGER DEFAULT 0"),
     ("findings",     "analyst_notes", "TEXT    DEFAULT ''"),
+    ("findings",     "composite_score",   "REAL    DEFAULT 0"),
+    ("findings",     "epss_score",        "REAL    DEFAULT 0"),
+    ("findings",     "kev",               "INTEGER DEFAULT 0"),
+    ("findings",     "exploit_available", "INTEGER DEFAULT 0"),
+    ("findings",     "exploit_sources",   "TEXT    DEFAULT '[]'"),
+    ("findings",     "asset_tier",        "TEXT    DEFAULT ''"),
+    ("findings",     "asset_importance",  "REAL    DEFAULT 0"),
+    ("findings",     "priority_reason",   "TEXT    DEFAULT ''"),
+    ("findings",     "action_plan",       "TEXT    DEFAULT '[]'"),
+    ("correlations",  "attack_path",       "TEXT    DEFAULT '[]'"),
+    ("correlations",  "blast_radius",      "TEXT    DEFAULT '{}'"),
+    ("correlations",  "entry_points",      "TEXT    DEFAULT '[]'"),
+    ("correlations",  "affected_assets",   "TEXT    DEFAULT '[]'"),
+    ("correlations",  "likely_next_steps", "TEXT    DEFAULT '[]'"),
+    # AI enrichment columns
+    ("findings", "ai_analysed",        "INTEGER DEFAULT 0"),
+    ("findings", "threat_actor_match", "TEXT    DEFAULT ''"),
+    ("findings", "news_refs",          "TEXT    DEFAULT '[]'"),
 ]
 
 
@@ -243,10 +474,8 @@ class IntelDB:
     async def init(self) -> None:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
-        async with self._conn.executescript(_SCHEMA):
-            pass
-        await self._conn.commit()
-        # Apply SOC column migrations on existing databases
+        # Migrations must run before executescript so new columns exist
+        # before _SCHEMA tries to build indexes that reference them.
         for table, col, defn in _SOC_MIGRATIONS:
             try:
                 await self._conn.execute(
@@ -254,7 +483,26 @@ class IntelDB:
                 )
                 await self._conn.commit()
             except Exception:
-                pass  # column already exists
+                pass  # column already exists, or table not yet created (fresh db)
+        # Backfill external_id for existing rows so the UNIQUE index creation
+        # doesn't fail on rows that all share the '' default.
+        try:
+            async with self._conn.execute(
+                "SELECT id FROM findings WHERE external_id IS NULL OR external_id = ''"
+            ) as cur:
+                rows = await cur.fetchall()
+            for row in rows:
+                await self._conn.execute(
+                    "UPDATE findings SET external_id=? WHERE id=?",
+                    (_external_id(row[0]), row[0]),
+                )
+            if rows:
+                await self._conn.commit()
+        except Exception:
+            pass  # findings table doesn't exist yet on a fresh db
+        async with self._conn.executescript(_SCHEMA):
+            pass
+        await self._conn.commit()
         log.info("IntelDB initialised at %s", self._path)
 
     async def close(self) -> None:
@@ -276,6 +524,15 @@ class IntelDB:
         evidence_j = json.dumps(f.get("evidence") or {}, default=str)
         tags_j     = json.dumps(f.get("tags") or [])
         cve_j      = json.dumps(f.get("cve_ids") or [])
+        exploit_j  = json.dumps(f.get("exploit_sources") or [], default=str)
+        action_j   = json.dumps(f.get("action_plan") or [], default=str)
+        composite  = float(f.get("composite_score") or f.get("score") or 0)
+        epss       = float(f.get("epss_score") or 0)
+        kev        = 1 if f.get("kev") else 0
+        exploit    = 1 if f.get("exploit_available") else 0
+        asset_tier = str(f.get("asset_tier") or "")
+        asset_imp  = float(f.get("asset_importance") or 0)
+        priority_reason = str(f.get("priority_reason") or _priority_reason(f))
 
         async with self._lock:
             row = await self._fetchone(
@@ -291,16 +548,20 @@ class IntelDB:
                     INSERT INTO findings
                     (agent_id,category,item_key,fingerprint,severity,score,
                      title,description,evidence,source,rule_id,cve_ids,
-                     cvss_score,cvss_vector,mitre_technique,mitre_tactic,
+                     cvss_score,cvss_vector,composite_score,epss_score,kev,
+                     exploit_available,exploit_sources,asset_tier,asset_importance,
+                     priority_reason,action_plan,mitre_technique,mitre_tactic,
                      first_detected_at,last_detected_at,scan_count,is_active,tags,
                      status,assignee,sla_due,priority,analyst_notes)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
                            'new','',?,0,'')
                 """, (agent_id, category, item_key, fp,
                       sev, f.get("score",0),
                       f.get("title",""), f.get("description",""),
                       evidence_j, f.get("source",""), f.get("rule_id",""),
                       cve_j, f.get("cvss_score"), f.get("cvss_vector",""),
+                      composite, epss, kev, exploit, exploit_j, asset_tier,
+                      asset_imp, priority_reason, action_j,
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
                       ts, ts, tags_j, sla_due))
                 await self._conn.commit()
@@ -311,6 +572,15 @@ class IntelDB:
                 )
                 new_row = await cur2.fetchone()
                 if new_row:
+                    external_id = _external_id(new_row["id"])
+                    await self._conn.execute(
+                        "UPDATE findings SET external_id=? WHERE id=?",
+                        (external_id, new_row["id"]),
+                    )
+                    await self._ensure_default_actions(
+                        new_row["id"], agent_id, f.get("action_plan") or [], ts,
+                    )
+                    await self._conn.commit()
                     await self._log_activity(
                         new_row["id"], agent_id, "created", "system",
                         "", sev, f.get("title",""), ts,
@@ -326,6 +596,9 @@ class IntelDB:
                         fingerprint=?, severity=?, score=?, title=?,
                         description=?, evidence=?, source=?, rule_id=?,
                         cve_ids=?, cvss_score=?, cvss_vector=?,
+                        composite_score=?, epss_score=?, kev=?,
+                        exploit_available=?, exploit_sources=?, asset_tier=?,
+                        asset_importance=?, priority_reason=?, action_plan=?,
                         mitre_technique=?, mitre_tactic=?,
                         last_detected_at=?, scan_count=scan_count+1,
                         is_active=1, tags=?
@@ -334,6 +607,8 @@ class IntelDB:
                       f.get("title",""), f.get("description",""),
                       evidence_j, f.get("source",""), f.get("rule_id",""),
                       cve_j, f.get("cvss_score"), f.get("cvss_vector",""),
+                      composite, epss, kev, exploit, exploit_j, asset_tier,
+                      asset_imp, priority_reason, action_j,
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
                       ts, tags_j, agent_id, category, item_key))
                 await self._conn.commit()
@@ -459,6 +734,11 @@ class IntelDB:
         agent_id = c["agent_id"]
         rule_id  = c["rule_id"]
         chain_j  = json.dumps(c.get("attack_chain") or [], default=str)
+        path_j   = json.dumps(c.get("attack_path") or [], default=str)
+        blast_j  = json.dumps(c.get("blast_radius") or {}, default=str)
+        entry_j  = json.dumps(c.get("entry_points") or [], default=str)
+        assets_j = json.dumps(c.get("affected_assets") or [], default=str)
+        next_j   = json.dumps(c.get("likely_next_steps") or [], default=str)
         sigs_j   = json.dumps(c.get("signals") or [], default=str)
 
         async with self._lock:
@@ -470,25 +750,29 @@ class IntelDB:
                 await self._conn.execute("""
                     INSERT INTO correlations
                     (agent_id, rule_id, severity, score, confidence, title, description,
-                     recommendation, attack_chain, signals, signal_count,
+                     recommendation, attack_chain, attack_path, blast_radius, entry_points,
+                     affected_assets, likely_next_steps, signals, signal_count,
                      first_detected, last_detected, is_active)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
                 """, (agent_id, rule_id,
                       c.get("severity", "high"), c.get("score", 0),
                       c.get("confidence", 0), c.get("title", ""),
                       c.get("description", ""), c.get("recommendation", ""),
-                      chain_j, sigs_j, c.get("signal_count", 0), ts, ts))
+                      chain_j, path_j, blast_j, entry_j, assets_j, next_j,
+                      sigs_j, c.get("signal_count", 0), ts, ts))
             else:
                 await self._conn.execute("""
                     UPDATE correlations SET
                         severity=?, score=?, confidence=?, title=?, description=?,
-                        recommendation=?, attack_chain=?, signals=?,
+                        recommendation=?, attack_chain=?, attack_path=?, blast_radius=?,
+                        entry_points=?, affected_assets=?, likely_next_steps=?, signals=?,
                         signal_count=?, last_detected=?, is_active=1
                     WHERE agent_id=? AND rule_id=?
                 """, (c.get("severity", "high"), c.get("score", 0),
                       c.get("confidence", 0), c.get("title", ""),
                       c.get("description", ""), c.get("recommendation", ""),
-                      chain_j, sigs_j, c.get("signal_count", 0), ts,
+                      chain_j, path_j, blast_j, entry_j, assets_j, next_j,
+                      sigs_j, c.get("signal_count", 0), ts,
                       agent_id, rule_id))
             await self._conn.commit()
 
@@ -510,6 +794,14 @@ class IntelDB:
                 d["signals"] = json.loads(d.get("signals") or "[]")
             except Exception:
                 d["signals"] = []
+            for key, default in (
+                ("attack_path", []),
+                ("blast_radius", {}),
+                ("entry_points", []),
+                ("affected_assets", []),
+                ("likely_next_steps", []),
+            ):
+                d[key] = _json_value(d.get(key), default)
             result.append(d)
         return result
 
@@ -584,6 +876,69 @@ class IntelDB:
         row = await self._fetchone(
             "SELECT * FROM cve_entries WHERE cve_id=?", (cve_id,))
         return dict(row) if row else None
+
+    async def list_cves(
+        self,
+        *,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        parts: list[str] = []
+        args: list = []
+        if severity:
+            parts.append("severity=?")
+            args.append(severity)
+        where = ("WHERE " + " AND ".join(parts)) if parts else ""
+        rows = await self._fetchall(
+            f"SELECT * FROM cve_entries {where} "
+            f"ORDER BY COALESCE(cvss_score, 0) DESC, modified_at DESC "
+            f"LIMIT ? OFFSET ?",
+            (*args, limit, offset),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_threat_intel_overview(self) -> dict:
+        cve = await self._fetchone("SELECT COUNT(*) AS n FROM cve_entries", ())
+        cve_sev = await self._fetchall(
+            "SELECT severity, COUNT(*) AS n FROM cve_entries GROUP BY severity", ()
+        )
+        cve_recent = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM cve_entries WHERE cached_at>?",
+            (time.time() - 86400,),
+        )
+        ioc = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM ioc_cache WHERE expires_at>?", (time.time(),)
+        )
+        findings = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM findings WHERE is_active=1", ()
+        )
+        mapped = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM findings WHERE is_active=1 AND cve_ids IS NOT NULL AND cve_ids!='[]'",
+            (),
+        )
+        feeds = await self.get_all_feed_health()
+        return {
+            "cves": cve["n"] if cve else 0,
+            "cves_cached_24h": cve_recent["n"] if cve_recent else 0,
+            "ioc_cache": ioc["n"] if ioc else 0,
+            "active_findings": findings["n"] if findings else 0,
+            "mapped_findings": mapped["n"] if mapped else 0,
+            "cve_by_severity": {r["severity"] or "info": r["n"] for r in cve_sev},
+            "feeds": feeds,
+            "datastores": [
+                {"name": "manager.db", "role": "agent registry, sessions, raw payload index"},
+                {"name": "intel.db", "role": "threat intel cache, findings, correlations, scoring matrix"},
+            ],
+            "pipeline": [
+                "agent ingest",
+                "RabbitMQ telemetry queue or sync fallback",
+                "raw agent datastore",
+                "threat intel refresh and NVD modified sync",
+                "Jarvis rules, CVE matching, behavior baselines",
+                "indexed findings and correlations API",
+            ],
+        }
 
     # ── Baseline ──────────────────────────────────────────────────────────────
 
@@ -665,6 +1020,10 @@ class IntelDB:
 
         where = ("WHERE " + " AND ".join(parts)) if parts else ""
         valid_sorts = {"score": "f.score DESC", "last_detected_at": "f.last_detected_at DESC",
+                       "composite_score": "f.composite_score DESC",
+                       "priority": "f.priority DESC, f.composite_score DESC",
+                       "kev": "f.kev DESC, f.composite_score DESC",
+                       "exploit_available": "f.exploit_available DESC, f.composite_score DESC",
                        "severity": "CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",
                        "sla_due": "f.sla_due ASC"}
         order = valid_sorts.get(sort_by, "f.score DESC")
@@ -690,7 +1049,7 @@ class IntelDB:
 
         result = []
         for r in rows:
-            d = dict(r)
+            d = _shape_finding(dict(r))
             d["sla_status"] = _sla_status(d.get("sla_due", 0), d.get("status", "new"))
             result.append(d)
         return result
@@ -699,7 +1058,7 @@ class IntelDB:
         row = await self._fetchone(
             "SELECT * FROM findings WHERE id=?", (finding_id,)
         )
-        return dict(row) if row else None
+        return _shape_finding(dict(row)) if row else None
 
     async def update_finding(
         self, finding_id: int, *,
@@ -815,6 +1174,13 @@ class IntelDB:
         )
         return [dict(r) for r in rows]
 
+    async def get_actions(self, finding_id: int) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM soc_actions WHERE finding_id=? ORDER BY status ASC, created_at ASC",
+            (finding_id,),
+        )
+        return [dict(r) for r in rows]
+
     async def _log_activity(
         self, finding_id: int, agent_id: str, action: str,
         actor: str, old_val: str, new_val: str, detail: str, ts: float,
@@ -824,6 +1190,32 @@ class IntelDB:
             "VALUES(?,?,?,?,?,?,?,?)",
             (finding_id, agent_id, action, actor, old_val, new_val, detail, ts),
         )
+
+    async def _ensure_default_actions(
+        self, finding_id: int, agent_id: str, action_plan: list, ts: float,
+    ) -> None:
+        if not action_plan:
+            return
+        existing = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM soc_actions WHERE finding_id=?",
+            (finding_id,),
+        )
+        if existing and existing["n"]:
+            return
+        rows = []
+        for item in action_plan[:8]:
+            title = item.get("title") if isinstance(item, dict) else str(item)
+            detail = item.get("detail", "") if isinstance(item, dict) else ""
+            action_type = item.get("type", "remediate") if isinstance(item, dict) else "remediate"
+            if title:
+                rows.append((finding_id, agent_id, action_type, title, "open", "", 0,
+                             detail, "system", ts, ts))
+        if rows:
+            await self._conn.executemany(
+                "INSERT INTO soc_actions(finding_id,agent_id,action_type,title,status,owner,due_at,detail,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
 
     # ── Dashboard & SLA analytics ─────────────────────────────────────────────
 
@@ -941,6 +1333,24 @@ class IntelDB:
             result.append(d)
         return result
 
+    async def get_historical_trend(self, months: int = 6) -> list[dict]:
+        """Monthly finding counts for the last N months (for 6-month dashboard chart)."""
+        cutoff = time.time() - months * 30 * 86400
+        rows = await self._fetchall("""
+            SELECT
+                strftime('%Y-%m', datetime(first_detected_at, 'unixepoch')) AS month,
+                SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical,
+                SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) AS high,
+                SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) AS medium,
+                SUM(CASE WHEN severity='low'      THEN 1 ELSE 0 END) AS low,
+                COUNT(*) AS total
+            FROM findings
+            WHERE first_detected_at >= ?
+            GROUP BY month
+            ORDER BY month ASC
+        """, (cutoff,))
+        return [dict(r) for r in rows]
+
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def stats(self) -> dict:
@@ -948,11 +1358,404 @@ class IntelDB:
         tl  = await self._fetchone("SELECT COUNT(*) AS n FROM change_timeline", ())
         ioc = await self._fetchone(
             "SELECT COUNT(*) AS n FROM ioc_cache WHERE expires_at>?", (time.time(),))
+        cve = await self._fetchone("SELECT COUNT(*) AS n FROM cve_entries", ())
+        nvd = await self._fetchone("SELECT COUNT(*) AS n FROM nvd_cve_local", ())
         return {
             "findings":     (row["n"] if row else 0),
             "timeline":     (tl["n"]  if tl  else 0),
             "ioc_cache":    (ioc["n"] if ioc else 0),
+            "cve_entries":  (cve["n"] if cve else 0),
+            "nvd_local":    (nvd["n"] if nvd else 0),
         }
+
+    # ── NVD local mirror ──────────────────────────────────────────────────────
+
+    async def upsert_nvd_bulk(self, cves: list[dict]) -> int:
+        """Batch upsert CVEs into local NVD mirror. Returns count written."""
+        async with self._lock:
+            await self._conn.executemany("""
+                INSERT INTO nvd_cve_local
+                (cve_id, description, cvss_score, cvss_vector, severity,
+                 cwe_ids, cpe_uris, pkg_keywords, published_at, modified_at, synced_at)
+                VALUES (:cve_id, :description, :cvss_score, :cvss_vector, :severity,
+                        :cwe_ids, :cpe_uris, :pkg_keywords, :published_at, :modified_at, :synced_at)
+                ON CONFLICT(cve_id) DO UPDATE SET
+                    description  = excluded.description,
+                    cvss_score   = excluded.cvss_score,
+                    cvss_vector  = excluded.cvss_vector,
+                    severity     = excluded.severity,
+                    cwe_ids      = excluded.cwe_ids,
+                    cpe_uris     = excluded.cpe_uris,
+                    pkg_keywords = excluded.pkg_keywords,
+                    modified_at  = excluded.modified_at,
+                    synced_at    = excluded.synced_at
+            """, cves)
+            await self._conn.commit()
+        return len(cves)
+
+    async def search_nvd_local(self, keyword: str, limit: int = 20) -> list[dict]:
+        """FTS5 prefix search on local NVD mirror, ordered by CVSS score."""
+        fts_term = keyword.strip() + "*"
+        try:
+            rows = await self._fetchall("""
+                SELECT n.cve_id, n.description, n.cvss_score, n.cvss_vector,
+                       n.severity, n.cwe_ids, n.cpe_uris, n.published_at, n.modified_at
+                FROM nvd_cve_fts f
+                JOIN nvd_cve_local n ON n.rowid = f.rowid
+                WHERE nvd_cve_fts MATCH ?
+                ORDER BY COALESCE(n.cvss_score, 0) DESC
+                LIMIT ?
+            """, (fts_term, limit))
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            log.debug("NVD FTS search failed, using LIKE fallback: %s", exc)
+            rows = await self._fetchall("""
+                SELECT cve_id, description, cvss_score, cvss_vector, severity,
+                       cwe_ids, cpe_uris, published_at, modified_at
+                FROM nvd_cve_local
+                WHERE pkg_keywords LIKE ?
+                ORDER BY COALESCE(cvss_score, 0) DESC
+                LIMIT ?
+            """, (f"%{keyword}%", limit))
+            return [dict(r) for r in rows]
+
+    async def get_nvd_state(self, key: str) -> Optional[str]:
+        row = await self._fetchone(
+            "SELECT value FROM nvd_sync_state WHERE key=?", (key,))
+        return row["value"] if row else None
+
+    async def set_nvd_state(self, key: str, value: str) -> None:
+        await self._conn.execute("""
+            INSERT INTO nvd_sync_state(key, value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
+        await self._conn.commit()
+
+    async def get_nvd_stats(self) -> dict:
+        total  = await self._fetchone("SELECT COUNT(*) AS n FROM nvd_cve_local", ())
+        by_sev = await self._fetchall(
+            "SELECT severity, COUNT(*) AS n FROM nvd_cve_local GROUP BY severity", ())
+        last_full  = await self.get_nvd_state("nvd_full_sync_at")
+        last_delta = await self.get_nvd_state("nvd_delta_sync_at")
+        return {
+            "total":          total["n"] if total else 0,
+            "by_severity":    {r["severity"]: r["n"] for r in by_sev},
+            "last_full_sync": float(last_full  or 0),
+            "last_delta_sync": float(last_delta or 0),
+        }
+
+    # ── Feed health ───────────────────────────────────────────────────────────
+
+    async def record_feed_attempt(
+        self,
+        source:      str,
+        *,
+        success:     bool,
+        entry_count: int  = 0,
+        error:       str  = "",
+    ) -> None:
+        """
+        Record the result of a feed fetch attempt.
+        On success: resets error_count, updates last_success and entry_count.
+        On failure: increments error_count, updates last_error.
+        """
+        now = time.time()
+        if success:
+            await self._conn.execute("""
+                INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
+                VALUES(?,?,?,  '',      0,          ?,          'ok')
+                ON CONFLICT(source) DO UPDATE SET
+                    last_attempt=excluded.last_attempt,
+                    last_success=excluded.last_success,
+                    last_error='',
+                    error_count=0,
+                    entry_count=excluded.entry_count,
+                    status='ok'
+            """, (source, now, now, entry_count))
+        else:
+            await self._conn.execute("""
+                INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
+                VALUES(?,?,           0,           ?,        1,           0,         'error')
+                ON CONFLICT(source) DO UPDATE SET
+                    last_attempt=excluded.last_attempt,
+                    last_error=excluded.last_error,
+                    error_count=error_count+1,
+                    status=CASE WHEN error_count+1 >= 3 THEN 'error' ELSE 'degraded' END
+            """, (source, now, error[:200]))
+        await self._conn.commit()
+
+    async def get_all_feed_health(self) -> list[dict]:
+        """Return health record for every known feed source."""
+        rows = await self._fetchall(
+            "SELECT * FROM feed_health ORDER BY source ASC", ()
+        )
+        return [dict(r) for r in rows]
+
+    # ── CISA KEV ──────────────────────────────────────────────────────────────
+
+    async def upsert_cisa_kev(self, cve_id: str, data: dict) -> None:
+        now = time.time()
+        await self._conn.execute("""
+            INSERT INTO cisa_kev
+            (cve_id,vendor,product,vuln_name,date_added,short_desc,required_action,due_date,cached_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(cve_id) DO UPDATE SET
+                vendor=excluded.vendor, product=excluded.product,
+                vuln_name=excluded.vuln_name, date_added=excluded.date_added,
+                short_desc=excluded.short_desc, required_action=excluded.required_action,
+                due_date=excluded.due_date, cached_at=excluded.cached_at
+        """, (cve_id, data.get("vendorProject",""), data.get("product",""),
+              data.get("vulnerabilityName",""), data.get("dateAdded",""),
+              data.get("shortDescription",""), data.get("requiredAction",""),
+              data.get("dueDate",""), now))
+        await self._conn.commit()
+
+    async def is_kev(self, cve_id: str) -> bool:
+        row = await self._fetchone("SELECT 1 FROM cisa_kev WHERE cve_id=?", (cve_id,))
+        return row is not None
+
+    async def list_kev(self, limit: int = 200) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM cisa_kev ORDER BY date_added DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows]
+
+    async def kev_count(self) -> int:
+        row = await self._fetchone("SELECT COUNT(*) AS n FROM cisa_kev", ())
+        return row["n"] if row else 0
+
+    # ── EPSS scores ───────────────────────────────────────────────────────────
+
+    async def upsert_epss(self, cve_id: str, epss: float, percentile: float, model_date: str = "") -> None:
+        await self._conn.execute("""
+            INSERT INTO epss_scores(cve_id,epss,percentile,model_date,cached_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(cve_id) DO UPDATE SET
+                epss=excluded.epss, percentile=excluded.percentile,
+                model_date=excluded.model_date, cached_at=excluded.cached_at
+        """, (cve_id, epss, percentile, model_date, time.time()))
+        await self._conn.commit()
+
+    async def get_epss(self, cve_id: str) -> Optional[dict]:
+        row = await self._fetchone("SELECT * FROM epss_scores WHERE cve_id=?", (cve_id,))
+        return dict(row) if row else None
+
+    async def get_epss_bulk(self, cve_ids: list[str]) -> dict[str, float]:
+        if not cve_ids:
+            return {}
+        placeholders = ",".join("?" * len(cve_ids))
+        rows = await self._fetchall(
+            f"SELECT cve_id, epss FROM epss_scores WHERE cve_id IN ({placeholders})",
+            tuple(cve_ids))
+        return {r["cve_id"]: r["epss"] for r in rows}
+
+    # ── Threat actors ─────────────────────────────────────────────────────────
+
+    async def upsert_threat_actor(self, name: str, source: str, data: dict) -> None:
+        now = time.time()
+        await self._conn.execute("""
+            INSERT INTO threat_actors
+            (name,aliases,description,active,countries,ttps,source,first_seen,last_active,cached_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(name,source) DO UPDATE SET
+                aliases=excluded.aliases, description=excluded.description,
+                active=excluded.active, countries=excluded.countries,
+                ttps=excluded.ttps, first_seen=excluded.first_seen,
+                last_active=excluded.last_active, cached_at=excluded.cached_at
+        """, (name, json.dumps(data.get("aliases",[])), data.get("description",""),
+              1 if data.get("active", True) else 0,
+              json.dumps(data.get("countries",[])), json.dumps(data.get("ttps",[])),
+              source, data.get("first_seen",""), data.get("last_active",""), now))
+        await self._conn.commit()
+
+    async def get_threat_actors(self, active_only: bool = True, limit: int = 100) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM threat_actors WHERE (?=0 OR active=1) ORDER BY cached_at DESC LIMIT ?",
+            (1 if active_only else 0, limit))
+        return [dict(r) for r in rows]
+
+    async def actor_count(self) -> int:
+        row = await self._fetchone("SELECT COUNT(*) AS n FROM threat_actors WHERE active=1", ())
+        return row["n"] if row else 0
+
+    # ── Security news ─────────────────────────────────────────────────────────
+
+    async def upsert_news(self, source: str, external_id: str, data: dict) -> None:
+        await self._conn.execute("""
+            INSERT INTO security_news
+            (source,external_id,title,url,summary,keywords,cve_refs,severity,published_at,cached_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(source,external_id) DO UPDATE SET
+                title=excluded.title, summary=excluded.summary,
+                keywords=excluded.keywords, cve_refs=excluded.cve_refs,
+                cached_at=excluded.cached_at
+        """, (source, external_id, data.get("title",""), data.get("url",""),
+              data.get("summary",""), json.dumps(data.get("keywords",[])),
+              json.dumps(data.get("cve_refs",[])), data.get("severity","info"),
+              data.get("published_at", time.time()), time.time()))
+        await self._conn.commit()
+
+    async def get_recent_news(self, hours: int = 48, limit: int = 50) -> list[dict]:
+        cutoff = time.time() - hours * 3600
+        rows = await self._fetchall(
+            "SELECT * FROM security_news WHERE published_at>? ORDER BY published_at DESC LIMIT ?",
+            (cutoff, limit))
+        return [dict(r) for r in rows]
+
+    async def search_news_by_cve(self, cve_id: str) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM security_news WHERE cve_refs LIKE ? ORDER BY published_at DESC LIMIT 10",
+            (f"%{cve_id}%",))
+        return [dict(r) for r in rows]
+
+    async def news_count(self) -> int:
+        cutoff = time.time() - 7 * 86400
+        row = await self._fetchone("SELECT COUNT(*) AS n FROM security_news WHERE cached_at>?", (cutoff,))
+        return row["n"] if row else 0
+
+    # ── AI analysis ───────────────────────────────────────────────────────────
+
+    async def upsert_ai_analysis(self, finding_id: int, data: dict) -> None:
+        await self._conn.execute("""
+            INSERT INTO ai_analysis
+            (finding_id,model,analysis,threat_context,risk_factors,ioc_matches,
+             news_context,actor_context,confidence,tokens_used,generated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(finding_id) DO UPDATE SET
+                model=excluded.model, analysis=excluded.analysis,
+                threat_context=excluded.threat_context, risk_factors=excluded.risk_factors,
+                ioc_matches=excluded.ioc_matches, news_context=excluded.news_context,
+                actor_context=excluded.actor_context, confidence=excluded.confidence,
+                tokens_used=excluded.tokens_used, generated_at=excluded.generated_at
+        """, (finding_id, data.get("model","claude-sonnet-4-6"),
+              data.get("analysis",""), data.get("threat_context",""),
+              json.dumps(data.get("risk_factors",[])), json.dumps(data.get("ioc_matches",[])),
+              json.dumps(data.get("news_context",[])), json.dumps(data.get("actor_context",[])),
+              float(data.get("confidence",0)), int(data.get("tokens_used",0)),
+              time.time()))
+        await self._conn.execute(
+            "UPDATE findings SET ai_analysed=1 WHERE id=?", (finding_id,))
+        await self._conn.commit()
+
+    async def get_ai_analysis(self, finding_id: int) -> Optional[dict]:
+        row = await self._fetchone("SELECT * FROM ai_analysis WHERE finding_id=?", (finding_id,))
+        return dict(row) if row else None
+
+    # ── Remediation plans ─────────────────────────────────────────────────────
+
+    async def upsert_remediation_plan(self, finding_id: int, agent_id: str,
+                                      os_type: str, data: dict) -> None:
+        await self._conn.execute("""
+            INSERT INTO remediation_plans
+            (finding_id,agent_id,os_type,model,steps,summary,effort,risk_level,
+             verification,long_term,generated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(finding_id,os_type) DO UPDATE SET
+                model=excluded.model, steps=excluded.steps, summary=excluded.summary,
+                effort=excluded.effort, risk_level=excluded.risk_level,
+                verification=excluded.verification, long_term=excluded.long_term,
+                generated_at=excluded.generated_at
+        """, (finding_id, agent_id, os_type, data.get("model","claude-sonnet-4-6"),
+              json.dumps(data.get("steps",[])), data.get("summary",""),
+              data.get("effort","medium"), data.get("risk_level","low"),
+              json.dumps(data.get("verification",[])), json.dumps(data.get("long_term",[])),
+              time.time()))
+        await self._conn.commit()
+
+    async def get_remediation_plan(self, finding_id: int,
+                                   os_type: str = "macos") -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT * FROM remediation_plans WHERE finding_id=? AND os_type=?",
+            (finding_id, os_type))
+        if not row:
+            return None
+        d = dict(row)
+        for field in ("steps", "verification", "long_term"):
+            try:
+                d[field] = json.loads(d[field])
+            except Exception:
+                d[field] = []
+        return d
+
+    async def list_remediation_plans(self, agent_id: str, limit: int = 50) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM remediation_plans WHERE agent_id=? ORDER BY generated_at DESC LIMIT ?",
+            (agent_id, limit))
+        return [dict(r) for r in rows]
+
+    # ── Asset registry ────────────────────────────────────────────────────────
+
+    async def upsert_asset(self, agent_id: str, data: dict) -> None:
+        now = time.time()
+        await self._conn.execute("""
+            INSERT INTO asset_registry
+            (agent_id,hostname,os,os_version,arch,asset_tier,asset_group,
+             importance,owner,department,tags,first_seen,last_seen)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                hostname=excluded.hostname, os=excluded.os,
+                os_version=excluded.os_version, arch=excluded.arch,
+                asset_tier=COALESCE(NULLIF(excluded.asset_tier,''), asset_tier),
+                asset_group=COALESCE(NULLIF(excluded.asset_group,''), asset_group),
+                importance=COALESCE(CASE WHEN excluded.importance>0 THEN excluded.importance END, importance),
+                owner=COALESCE(NULLIF(excluded.owner,''), owner),
+                department=COALESCE(NULLIF(excluded.department,''), department),
+                tags=excluded.tags, last_seen=excluded.last_seen
+        """, (agent_id, data.get("hostname",""), data.get("os",""),
+              data.get("os_version",""), data.get("arch",""),
+              data.get("asset_tier","standard"), data.get("asset_group",""),
+              float(data.get("importance", 0.3)), data.get("owner",""),
+              data.get("department",""), json.dumps(data.get("tags",[])),
+              now, now))
+        await self._conn.commit()
+
+    async def get_asset(self, agent_id: str) -> Optional[dict]:
+        row = await self._fetchone("SELECT * FROM asset_registry WHERE agent_id=?", (agent_id,))
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["tags"] = json.loads(d["tags"])
+        except Exception:
+            d["tags"] = []
+        return d
+
+    async def list_assets(self, limit: int = 500) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM asset_registry ORDER BY importance DESC, last_seen DESC LIMIT ?",
+            (limit,))
+        return [dict(r) for r in rows]
+
+    async def update_asset_tier(self, agent_id: str, tier: str, importance: float,
+                                group: str = "", owner: str = "") -> None:
+        await self._conn.execute("""
+            UPDATE asset_registry SET asset_tier=?, importance=?,
+            asset_group=COALESCE(NULLIF(?,''),(SELECT asset_group FROM asset_registry WHERE agent_id=?)),
+            owner=COALESCE(NULLIF(?,''),(SELECT owner FROM asset_registry WHERE agent_id=?))
+            WHERE agent_id=?
+        """, (tier, importance, group, agent_id, owner, agent_id, agent_id))
+        await self._conn.commit()
+
+    # ── Org groups ────────────────────────────────────────────────────────────
+
+    async def upsert_org_group(self, name: str, data: dict) -> None:
+        now = time.time()
+        await self._conn.execute("""
+            INSERT INTO org_groups(name,description,importance,member_agents,created_at,updated_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET
+                description=excluded.description, importance=excluded.importance,
+                member_agents=excluded.member_agents, updated_at=excluded.updated_at
+        """, (name, data.get("description",""), float(data.get("importance",0.5)),
+              json.dumps(data.get("member_agents",[])), now, now))
+        await self._conn.commit()
+
+    async def list_org_groups(self) -> list[dict]:
+        rows = await self._fetchall("SELECT * FROM org_groups ORDER BY importance DESC", ())
+        return [dict(r) for r in rows]
+
+    async def get_org_group(self, name: str) -> Optional[dict]:
+        row = await self._fetchone("SELECT * FROM org_groups WHERE name=?", (name,))
+        return dict(row) if row else None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -995,3 +1798,48 @@ def _fingerprint(f: dict) -> str:
     }
     blob = json.dumps(key_fields, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _external_id(finding_id: int) -> str:
+    return f"AL-F-{int(finding_id):08d}"
+
+
+def _json_value(v: Any, default: Any) -> Any:
+    if v is None or v == "":
+        return default
+    if isinstance(v, (list, dict)):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return default
+
+
+def _shape_finding(d: dict) -> dict:
+    d["external_id"] = d.get("external_id") or _external_id(d["id"])
+    d["display_id"] = d["external_id"]
+    d["kev"] = bool(d.get("kev"))
+    d["exploit_available"] = bool(d.get("exploit_available"))
+    d["exploit_sources"] = _json_value(d.get("exploit_sources"), [])
+    d["action_plan"] = _json_value(d.get("action_plan"), [])
+    d["priority_reason"] = d.get("priority_reason") or _priority_reason(d)
+    return d
+
+
+def _priority_reason(f: dict) -> str:
+    reasons: list[str] = []
+    if f.get("kev"):
+        reasons.append("CISA KEV match")
+    if f.get("exploit_available"):
+        reasons.append("public exploit available")
+    if f.get("epss_score"):
+        reasons.append(f"EPSS {float(f.get('epss_score') or 0) * 100:.0f}%")
+    if f.get("asset_tier"):
+        reasons.append(f"{f.get('asset_tier')} asset")
+    if f.get("source", "").startswith("feed:") or f.get("source") in ("abuseipdb",):
+        reasons.append("threat-intel IOC hit")
+    if not reasons and f.get("cvss_score"):
+        reasons.append(f"CVSS {f.get('cvss_score')}")
+    if not reasons:
+        reasons.append("rule and telemetry correlation")
+    return ", ".join(reasons)

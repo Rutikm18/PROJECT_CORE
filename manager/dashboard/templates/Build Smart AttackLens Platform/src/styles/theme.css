@@ -1,0 +1,357 @@
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --font-size: 16px;
+
+  /* AttackLens Neutrals - Enhanced */
+  --white: #FFFFFF;
+  --gray-25: #FAFBFC;
+  --gray-50: #F7F8FA;
+  --gray-100: #F1F3F5;
+  --gray-200: #E4E7EB;
+  --gray-300: #D2D6DC;
+  --gray-400: #9BA3AF;
+  --gray-500: #6C7383;
+  --gray-600: #4D5562;
+  --gray-700: #374151;
+  --gray-800: #1F2937;
+  --gray-900: #0F1419;
+
+  /* Brand Orange - Enhanced with gradients */
+  --brand-orange: #E8581A;
+  --brand-orange-50: #FFF7F2;
+  --brand-orange-100: #FFEADC;
+  --brand-orange-200: #FFD4B8;
+  --brand-orange-600: #D74F16;
+  --brand-orange-700: #C2410C;
+  --brand-orange-800: #9A3409;
+
+  /* Semantic Colors - Enhanced */
+  --red-50: #FEF5F5;
+  --red-100: #FEE2E2;
+  --red-500: #EF4444;
+  --red-600: #DC2626;
+  --red-700: #B91C1C;
+  --amber-50: #FFFBF0;
+  --amber-100: #FEF3C7;
+  --amber-500: #F59E0B;
+  --amber-600: #D97706;
+  --amber-700: #B45309;
+  --green-50: #F0FDF9;
+  --green-100: #D1FAE5;
+  --green-500: #10B981;
+  --green-600: #059669;
+  --green-700: #047857;
+  --blue-50: #F0F9FF;
+  --blue-100: #E0F2FE;
+  --blue-500: #3B82F6;
+  --blue-600: #2563EB;
+  --blue-700: #1D4ED8;
+
+  /* Accent Colors for depth */
+  --purple-50: #FAF5FF;
+  --purple-600: #9333EA;
+  --indigo-50: #EEF2FF;
+  --indigo-600: #4F46E5;
+
+  /* Shadow variables */
+  --shadow-subtle: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.02);
+  --shadow-card: 0 2px 8px 0 rgba(0, 0, 0, 0.06), 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+  --shadow-elevated: 0 4px 16px 0 rgba(0, 0, 0, 0.08), 0 2px 6px 0 rgba(0, 0, 0, 0.04);
+
+  /* Base Tokens */
+  --background: var(--white);
+  --foreground: var(--gray-900);
+  --card: var(--white);
+  --card-foreground: var(--gray-900);
+  --popover: var(--white);
+  --popover-foreground: var(--gray-900);
+  --primary: var(--brand-orange);
+  --primary-foreground: var(--white);
+  --secondary: var(--gray-100);
+  --secondary-foreground: var(--gray-900);
+  --muted: var(--gray-100);
+  --muted-foreground: var(--gray-500);
+  --accent: var(--brand-orange-50);
+  --accent-foreground: var(--brand-orange-700);
+  --destructive: var(--red-600);
+  --destructive-foreground: var(--white);
+  --border: var(--gray-200);
+  --input: transparent;
+  --input-background: var(--white);
+  --switch-background: var(--gray-300);
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: var(--brand-orange);
+  --chart-1: var(--blue-600);
+  --chart-2: var(--amber-600);
+  --chart-3: var(--gray-400);
+  --chart-4: var(--green-600);
+  --chart-5: var(--red-600);
+  --radius: 0.5rem;
+  --sidebar: var(--gray-25);
+  --sidebar-foreground: var(--gray-600);
+  --sidebar-primary: var(--brand-orange);
+  --sidebar-primary-foreground: var(--white);
+  --sidebar-accent: var(--brand-orange-50);
+  --sidebar-accent-foreground: var(--brand-orange-700);
+  --sidebar-border: var(--gray-200);
+  --sidebar-ring: var(--brand-orange);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.145 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.145 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.985 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.396 0.141 25.723);
+  --destructive-foreground: oklch(0.637 0.237 25.331);
+  --border: oklch(0.269 0 0);
+  --input: oklch(0.269 0 0);
+  --ring: oklch(0.439 0 0);
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(0.269 0 0);
+  --sidebar-ring: oklch(0.439 0 0);
+}
+
+@theme inline {
+  /* Base Tokens */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* AttackLens Neutrals */
+  --color-white: var(--white);
+  --color-gray-25: var(--gray-25);
+  --color-gray-50: var(--gray-50);
+  --color-gray-100: var(--gray-100);
+  --color-gray-200: var(--gray-200);
+  --color-gray-300: var(--gray-300);
+  --color-gray-400: var(--gray-400);
+  --color-gray-500: var(--gray-500);
+  --color-gray-600: var(--gray-600);
+  --color-gray-700: var(--gray-700);
+  --color-gray-800: var(--gray-800);
+  --color-gray-900: var(--gray-900);
+
+  /* Brand */
+  --color-brand-orange: var(--brand-orange);
+  --color-brand-orange-50: var(--brand-orange-50);
+  --color-brand-orange-100: var(--brand-orange-100);
+  --color-brand-orange-700: var(--brand-orange-700);
+
+  /* Semantic */
+  --color-red-50: var(--red-50);
+  --color-red-100: var(--red-100);
+  --color-red-500: var(--red-500);
+  --color-red-600: var(--red-600);
+  --color-red-700: var(--red-700);
+  --color-amber-50: var(--amber-50);
+  --color-amber-100: var(--amber-100);
+  --color-amber-500: var(--amber-500);
+  --color-amber-600: var(--amber-600);
+  --color-amber-700: var(--amber-700);
+  --color-green-50: var(--green-50);
+  --color-green-100: var(--green-100);
+  --color-green-500: var(--green-500);
+  --color-green-600: var(--green-600);
+  --color-green-700: var(--green-700);
+  --color-blue-50: var(--blue-50);
+  --color-blue-100: var(--blue-100);
+  --color-blue-500: var(--blue-500);
+  --color-blue-600: var(--blue-600);
+  --color-blue-700: var(--blue-700);
+  --color-purple-50: var(--purple-50);
+  --color-purple-600: var(--purple-600);
+  --color-indigo-50: var(--indigo-50);
+  --color-indigo-600: var(--indigo-600);
+  --color-brand-orange-200: var(--brand-orange-200);
+  --color-brand-orange-600: var(--brand-orange-600);
+  --color-brand-orange-800: var(--brand-orange-800);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: linear-gradient(135deg, #FAFBFC 0%, #F7F8FA 100%);
+  }
+
+  .font-mono {
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+  }
+
+  /* Enhanced shadows for depth */
+  .shadow-subtle {
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.02);
+  }
+
+  .shadow-card {
+    box-shadow: 0 2px 8px 0 rgba(0, 0, 0, 0.06), 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+  }
+
+  .shadow-elevated {
+    box-shadow: 0 4px 16px 0 rgba(0, 0, 0, 0.08), 0 2px 6px 0 rgba(0, 0, 0, 0.04);
+  }
+
+  /* Gradient backgrounds */
+  .bg-gradient-orange {
+    background: linear-gradient(135deg, var(--brand-orange) 0%, var(--brand-orange-700) 100%);
+  }
+
+  .bg-gradient-critical {
+    background: linear-gradient(135deg, #FEF5F5 0%, #FEE2E2 100%);
+  }
+
+  .bg-gradient-panel {
+    background: linear-gradient(180deg, #FFFFFF 0%, #FAFBFC 100%);
+  }
+
+  /* Smooth animations */
+  @keyframes pulse-soft {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.7;
+    }
+  }
+
+  @keyframes shimmer {
+    0% {
+      background-position: -200% center;
+    }
+    100% {
+      background-position: 200% center;
+    }
+  }
+
+  .animate-shimmer {
+    background-size: 200% 100%;
+    animation: shimmer 3s linear infinite;
+  }
+
+  /* Smooth hover transitions */
+  * {
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* Better text rendering */
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  /**
+  * Default typography styles for HTML elements (h1-h4, p, label, button, input).
+  * These are in @layer base, so Tailwind utility classes (like text-sm, text-lg) automatically override them.
+  */
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  h1 {
+    font-size: var(--text-2xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  h2 {
+    font-size: var(--text-xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  h3 {
+    font-size: var(--text-lg);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  h4 {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  label {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  input {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+  }
+}

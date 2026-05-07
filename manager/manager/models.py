@@ -21,10 +21,16 @@ class AgentSummary(BaseModel):
     last_ip:    str
     created_at: int
     online:     bool
+    live_status: str = "offline"
+    last_seen_label: str = ""
+    online_for: int = 0
+    offline_for: int = 0
+    session_count: int = 0
 
 
 class AgentDetail(AgentSummary):
     sections: dict[str, int]   # section_name → last collected_at (Unix epoch)
+    sessions: list[dict] = []
 
 
 class SectionRow(BaseModel):
@@ -34,7 +40,8 @@ class SectionRow(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    status: str = "ok"
+    status: str  = "ok"
+    queued: bool = False   # True when payload was published to RabbitMQ queue
 
 
 class HealthResponse(BaseModel):

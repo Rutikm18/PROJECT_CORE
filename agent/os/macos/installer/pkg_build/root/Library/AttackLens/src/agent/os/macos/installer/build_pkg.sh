@@ -178,6 +178,8 @@ cat > "${PKG_ROOT}${LDIR}/com.attacklens.agent.plist" <<PLIST
     <dict>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>MallocStackLogging</key>
+        <string>0</string>
     </dict>
 
     <key>WorkingDirectory</key>
@@ -224,6 +226,8 @@ cat > "${PKG_ROOT}${LDIR}/com.attacklens.watchdog.plist" <<PLIST
     <dict>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>MallocStackLogging</key>
+        <string>0</string>
     </dict>
 
     <key>WorkingDirectory</key>

@@ -489,6 +489,46 @@ def main():
     orch = Orchestrator(cfg, enc_key, mac_key, send_queue)
     orch_thread  = orch.start()
 
+    # Re-enrollment callback: called by sender when persistent 401 detected.
+    # Obtains a new key, derives new crypto keys, updates the orchestrator in-place.
+    _security_dir = _resolve_security_dir(cfg, args.config)
+    _ks_backend   = cfg.get("enrollment", {}).get("keystore", "keychain")
+
+    def _on_auth_error():
+        log.info("Re-enrollment triggered — obtaining new key from manager...")
+        try:
+            new_key = enroll(cfg)
+            if not new_key:
+                # 409 case: existing key still valid, nothing to do
+                log.info("Re-enrollment: existing key still valid")
+                return
+            store_key(agent_id, new_key, backend=_ks_backend,
+                      security_dir=_security_dir)
+            new_enc, new_mac = derive_keys(new_key)
+            orch.enc_key = new_enc
+            orch.mac_key = new_mac
+            # Drain in-memory queue: items encrypted with old key cannot be
+            # decrypted by the manager after key rotation — drop them so the
+            # sender doesn't loop on 401s from stale-key ciphertext.
+            drained = 0
+            while not send_queue.empty():
+                try:
+                    send_queue.get_nowait()
+                    drained += 1
+                except Exception:
+                    break
+            if drained:
+                log.info("Dropped %d stale-key items from send queue after re-enrollment",
+                         drained)
+            log.info("Re-enrollment complete — new crypto keys active (tail=...%s)",
+                     new_key[-4:])
+        except EnrollmentError as exc:
+            log.error("Re-enrollment failed (will retry on next auth failure): %s", exc)
+        except Exception as exc:
+            log.error("Re-enrollment unexpected error: %s", exc)
+
+    sender.on_auth_error = _on_auth_error
+
     def _shutdown(signum, frame):
         log.info("Shutting down (signal %d)", signum)
         orch.stop()
@@ -506,7 +546,9 @@ def main():
                 cfg = load_config(args.config)
                 log.info("Config reloaded on SIGHUP")
                 orch.stop()
-                orch.__init__(cfg, enc_key, mac_key, send_queue)
+                # Use orch.enc_key/mac_key — not startup enc_key/mac_key — so
+                # any keys updated via re-enrollment are preserved across reloads.
+                orch.__init__(cfg, orch.enc_key, orch.mac_key, send_queue)
                 orch.start()
             except Exception as exc:
                 log.error("Config reload failed: %s", exc)

@@ -17,8 +17,14 @@
 #    make run-agent       start agent (requires agent.conf)
 #    make build-binaries  build arm64 agent + watchdog binaries
 #    make build-pkg       build arm64 .pkg installer
-#    make docker-up       start manager in Docker
-#    make docker-down     stop Docker services
+#    make build           build all Docker images
+#    make up              start full stack (docker compose up -d)
+#    make down            stop all containers
+#    make logs            tail all service logs
+#    make ps              show container status
+#    make restart         restart manager container
+#    make docker-up       rebuild images then start (build + up)
+#    make docker-down     alias for down
 #    make clean           remove compiled files and test artifacts
 # =============================================================================
 
@@ -279,18 +285,49 @@ install-pkg: ## Install the latest .pkg (requires sudo)
 	sudo installer -pkg $$(ls -t agent/pkg/build/*.pkg | head -1) -target /
 
 # ── Docker ────────────────────────────────────────────────────────────────────
-.PHONY: docker-up
-docker-up: ## Build and start the manager in Docker
-	@test -n "$$API_KEY" || (echo "ERROR: export API_KEY=... first" && exit 1)
-	docker compose up -d --build manager
+.PHONY: build
+build: ## Build all Docker images (manager + threat-intel)
+	@test -f .env || (echo ""; echo "  ERROR: .env not found — run: bash env.sh"; echo ""; exit 1)
+	docker compose build
 
-.PHONY: docker-down
-docker-down: ## Stop all Docker services
+.PHONY: up
+up: ## Start the full stack detached (docker compose up -d)
+	@test -f .env || (echo ""; echo "  ERROR: .env not found — run: bash env.sh"; echo ""; exit 1)
+	docker compose up -d
+	@echo ""
+	@echo "  Stack is up. Run 'make logs' to follow output."
+	@echo ""
+
+.PHONY: down
+down: ## Stop and remove all containers (data volumes preserved)
 	docker compose down
 
+.PHONY: docker-build
+docker-build: build ## Alias for build
+
+.PHONY: docker-up
+docker-up: ## Rebuild images then start the full stack
+	@test -f .env || (echo ""; echo "  ERROR: .env not found — run: bash env.sh"; echo ""; exit 1)
+	docker compose up -d --build
+
+.PHONY: docker-down
+docker-down: down ## Alias for down
+
+.PHONY: logs
+logs: ## Tail logs for all services
+	docker compose logs -f
+
 .PHONY: docker-logs
-docker-logs: ## Tail manager container logs
+docker-logs: ## Tail manager container logs only
 	docker compose logs -f manager
+
+.PHONY: ps
+ps: ## Show container status
+	docker compose ps
+
+.PHONY: restart
+restart: ## Restart the manager container only
+	docker compose restart manager
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 .PHONY: clean

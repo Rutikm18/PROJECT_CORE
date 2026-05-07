@@ -19,3 +19,12 @@ python-multipart>=0.0.9
 
 # Async HTTP client (threat feed fetching)
 aiohttp>=3.9.0
+
+# RabbitMQ async client (Phase 2 queue pipeline)
+aio-pika>=9.0.0
+
+# AI analysis engine (Claude API)
+anthropic>=0.40.0
+
+# Async SMTP for email notifications
+aiosmtplib>=3.0.0
