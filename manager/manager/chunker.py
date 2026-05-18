@@ -6,7 +6,7 @@ carries a list with hundreds of items, processing it as one Jarvis task
 saturates the event loop and wastes all work on any single-item failure.
 
 PayloadChunker fans out large lists into fixed-size slices.  Each slice is
-published as an independent jarvis.work message and processed in parallel.
+published as an independent attacklens.work message and processed in parallel.
 Non-list data (dicts, scalars) passes through as a single chunk so callers
 need no special-casing.
 

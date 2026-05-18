@@ -1,0 +1,154 @@
+# ── AttackLens — Production HA docker-compose ─────────────────────────────────
+#
+# Topology:
+#   nginx (TLS LB) → manager-1 + manager-2 (active-active)
+#                  → rabbitmq (HA queue — AMQP)
+#   Shared data:   manager.db and intel.db are on a named volume mounted
+#                  read-write by both replicas.  SQLite WAL mode makes this
+#                  safe: one writer at a time (serialised by pool lock),
+#                  multiple concurrent readers.
+#
+# Scaling notes:
+#   - For >10k agents: replace SQLite with PostgreSQL + pgBouncer.
+#   - For >100k findings: add ClickHouse as an analytics replica.
+#   - For geographically distributed agents: add regional collectors that
+#     fan-out to RabbitMQ federation.
+#
+# Environment:
+#   Copy .env.example to .env and fill in all values before running.
+#
+# Run:
+#   docker-compose -f docker-compose.ha.yml up -d
+
+version: "3.9"
+
+x-manager-base: &manager-base
+  build:
+    context: .
+    dockerfile: manager/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    rabbitmq:
+      condition: service_healthy
+  environment:
+    DATA_DIR:              /data
+    LOG_FILE:              /logs/manager.log
+    LOG_LEVEL:             ${LOG_LEVEL:-INFO}
+    RABBITMQ_URL:          amqp://guest:guest@rabbitmq:5672/
+    CORS_ORIGINS:          ${CORS_ORIGINS:-}
+    OPEN_ENROLLMENT:       ${OPEN_ENROLLMENT:-true}
+    ENROLLMENT_TOKENS:     ${ENROLLMENT_TOKENS:-}
+    ADMIN_TOKEN:           ${ADMIN_TOKEN:-}
+    API_KEY:               ${API_KEY:-}
+    MANAGER_EMBEDDED_THREAT_INTEL: "true"
+    # Rate limiting: allow 20 req/s per agent, burst 60, max 6 concurrent
+    AGENT_RATE:            ${AGENT_RATE:-20}
+    AGENT_BURST:           ${AGENT_BURST:-60}
+    AGENT_SLOTS:           ${AGENT_SLOTS:-6}
+    ANTHROPIC_API_KEY:     ${ANTHROPIC_API_KEY:-}
+    SMTP_HOST:             ${SMTP_HOST:-}
+    SMTP_PORT:             ${SMTP_PORT:-587}
+    SMTP_USER:             ${SMTP_USER:-}
+    SMTP_PASS:             ${SMTP_PASS:-}
+    ALERT_EMAIL_TO:        ${ALERT_EMAIL_TO:-}
+  volumes:
+    - manager_data:/data
+    - manager_logs:/logs
+    - ./certs:/certs:ro
+  networks:
+    - internal
+
+services:
+  # ── RabbitMQ (message queue) ───────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+      RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.6
+      RABBITMQ_DISK_FREE_LIMIT: "1GB"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"    # management UI (internal only — don't expose externally)
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # ── Manager replica 1 (primary writer) ────────────────────────────────────
+  manager-1:
+    <<: *manager-base
+    container_name: attacklens-manager-1
+    environment:
+      <<: *manager-base
+      BIND_HOST:   "0.0.0.0"
+      BIND_PORT:   "8443"
+      TLS_CERT:    /certs/server.crt
+      TLS_KEY:     /certs/server.key
+    expose:
+      - "8443"
+
+  # ── Manager replica 2 (hot standby / secondary) ───────────────────────────
+  manager-2:
+    <<: *manager-base
+    container_name: attacklens-manager-2
+    environment:
+      <<: *manager-base
+      BIND_HOST:   "0.0.0.0"
+      BIND_PORT:   "8443"
+      TLS_CERT:    /certs/server.crt
+      TLS_KEY:     /certs/server.key
+    expose:
+      - "8443"
+
+  # ── Nginx load balancer (TLS termination + routing) ───────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - manager-1
+      - manager-2
+    networks:
+      - internal
+      - external
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Watchtower (optional: auto-pull new images in staging) ────────────────
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   command: --interval 300 --cleanup
+
+volumes:
+  manager_data:
+    driver: local
+  manager_logs:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  nginx_logs:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge
+    internal: true      # manager + rabbit cannot reach internet directly
+  external:
+    driver: bridge      # nginx faces the internet

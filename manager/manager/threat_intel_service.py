@@ -18,8 +18,8 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .indexer import IntelDB
-from .jarvis.feeds import FeedManager
-from .jarvis.nvd import CVELookup
+from .attacklens.feeds import FeedManager
+from .attacklens.nvd import CVELookup
 
 log = logging.getLogger("threat_intel")
 

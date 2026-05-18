@@ -38,6 +38,12 @@ class FindingUpdate(BaseModel):
     analyst_notes: Optional[str] = None
     priority:      Optional[int] = None
     actor:         Optional[str] = "analyst"
+    resolution_note: Optional[str] = None  # close/accept justification
+
+
+class QuickAction(BaseModel):
+    actor:  str = "analyst"
+    reason: Optional[str] = None   # optional justification for close/accept/FP
 
 
 class CommentCreate(BaseModel):
@@ -89,20 +95,42 @@ def make_findings_router(intel_db) -> APIRouter:
         }
 
     # ── Findings list (global, all agents) ───────────────────────────────────
+    _TERMINAL_STATUSES = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
+
     @router.get("/findings")
     async def list_findings(
-        agent_id:     Optional[str]  = Query(None, description="Filter by agent"),
-        severity:     Optional[str]  = Query(None, description="critical|high|medium|low|info"),
-        status:       Optional[str]  = Query(None, description="SOC workflow status"),
-        category:     Optional[str]  = Query(None, description="Finding category"),
-        assignee:     Optional[str]  = Query(None, description="Assigned analyst"),
-        sla_breached: bool           = Query(False, description="Only SLA-breached findings"),
-        active_only:  bool           = Query(True,  description="Only active findings"),
-        search:       Optional[str]  = Query(None,  description="Full-text search"),
+        agent_id:     Optional[str]  = Query(None,  description="Filter by agent"),
+        severity:     Optional[str]  = Query(None,  description="critical|high|medium|low|info"),
+        status:       Optional[str]  = Query(None,  description="SOC workflow status"),
+        category:     Optional[str]  = Query(None,  description="Finding category"),
+        assignee:     Optional[str]  = Query(None,  description="Assigned analyst"),
+        sla_breached: bool           = Query(False,  description="Only SLA-breached findings"),
+        active_only:  bool           = Query(True,   description="Only active (open) findings"),
+        view:         Optional[str]  = Query(None,   description="active|closed|all — shorthand for active_only"),
+        search:       Optional[str]  = Query(None,   description="Full-text search"),
         sort_by:      str            = Query("score", description="score|last_detected_at|severity|sla_due"),
-        limit:        int            = Query(200, ge=1, le=1000),
+        limit:        int            = Query(500, ge=1, le=1000),
         offset:       int            = Query(0, ge=0),
     ):
+        """
+        List findings with full SOC filters.
+
+        `view` overrides `active_only`:
+          active  → only open/active findings (default)
+          closed  → only closed/resolved/accepted/fp findings
+          all     → every finding regardless of state
+        """
+        # view param takes precedence
+        if view == "active":
+            active_only = True
+        elif view == "closed":
+            active_only = False
+            # If no status filter, restrict to terminal states
+            if not status:
+                status = "__closed__"   # sentinel handled in DB layer
+        elif view == "all":
+            active_only = False
+
         try:
             rows = await intel_db.get_soc_findings(
                 agent_id=agent_id,
@@ -190,6 +218,153 @@ def make_findings_router(intel_db) -> APIRouter:
             raise HTTPException(404, "Finding not found")
         activity = await intel_db.get_activity(finding_id)
         return {"activity": activity, "count": len(activity)}
+
+    # ── Improvement metrics ───────────────────────────────────────────────────
+    @router.get("/metrics")
+    async def improvement_metrics():
+        """
+        Computed improvement metrics for the dashboard:
+          - MTTR (mean time to resolve) in hours
+          - Closure rate (% closed vs total this week)
+          - False positive rate
+          - Week-over-week improvement
+          - Actions taken counts (status changes by type)
+        """
+        import time as _time
+        now = _time.time()
+        week_ago   = now - 7  * 86400
+        week_2_ago = now - 14 * 86400
+
+        try:
+            # MTTR: avg resolution time for findings closed in last 30 days
+            mttr_rows = await intel_db._fetchall(
+                "SELECT first_detected_at, resolved_at FROM findings "
+                "WHERE resolved_at IS NOT NULL AND resolved_at > ? AND is_active=0 "
+                "AND status IN ('closed','verified','remediated') LIMIT 500",
+                (now - 30 * 86400,),
+            )
+            if mttr_rows:
+                times = [r["resolved_at"] - r["first_detected_at"] for r in mttr_rows
+                         if r["resolved_at"] and r["first_detected_at"]]
+                mttr_hours = round(sum(times) / len(times) / 3600, 1) if times else 0
+            else:
+                mttr_hours = 0
+
+            # This week vs last week closed count
+            this_week_closed = (await intel_db._fetchone(
+                "SELECT COUNT(*) AS n FROM findings WHERE resolved_at > ? AND is_active=0",
+                (week_ago,),
+            ) or {}).get("n", 0)
+            last_week_closed = (await intel_db._fetchone(
+                "SELECT COUNT(*) AS n FROM findings WHERE resolved_at > ? AND resolved_at <= ? AND is_active=0",
+                (week_2_ago, week_ago),
+            ) or {}).get("n", 0)
+
+            wow_improvement = 0
+            if last_week_closed and last_week_closed > 0:
+                wow_improvement = round(((this_week_closed - last_week_closed) / last_week_closed) * 100)
+
+            # False positive rate (last 30 days)
+            total_30d = (await intel_db._fetchone(
+                "SELECT COUNT(*) AS n FROM findings WHERE first_detected_at > ?",
+                (now - 30 * 86400,),
+            ) or {}).get("n", 0)
+            fp_30d = (await intel_db._fetchone(
+                "SELECT COUNT(*) AS n FROM findings WHERE first_detected_at > ? AND status='false_positive'",
+                (now - 30 * 86400,),
+            ) or {}).get("n", 0)
+            fp_rate = round((fp_30d / total_30d) * 100, 1) if total_30d else 0
+
+            # Actions breakdown (soc_activity this week)
+            action_rows = await intel_db._fetchall(
+                "SELECT action, COUNT(*) AS cnt FROM soc_activity WHERE created_at > ? GROUP BY action",
+                (week_ago,),
+            )
+            actions = {r["action"]: r["cnt"] for r in action_rows}
+
+            # Accepted risk count
+            accepted = (await intel_db._fetchone(
+                "SELECT COUNT(*) AS n FROM findings WHERE status='accepted_risk' AND is_active=0",
+                (),
+            ) or {}).get("n", 0)
+
+            return {
+                "mttr_hours":         mttr_hours,
+                "closed_this_week":   this_week_closed,
+                "closed_last_week":   last_week_closed,
+                "wow_improvement_pct": wow_improvement,
+                "fp_rate_pct":        fp_rate,
+                "fp_count_30d":       fp_30d,
+                "accepted_risk":      accepted,
+                "actions_this_week":  actions,
+                "note": "MTTR calculated over findings closed in last 30 days. WoW = week-over-week closure count change.",
+            }
+        except Exception as exc:
+            log.exception("improvement_metrics failed")
+            raise HTTPException(500, f"Failed to compute metrics: {exc}")
+
+    # ── Quick-action convenience endpoints ───────────────────────────────────
+    # These wrap PATCH so the frontend can call a single intent endpoint
+    # instead of encoding state-machine knowledge on the client.
+
+    @router.post("/findings/{finding_id}/close")
+    async def close_finding(finding_id: int, body: QuickAction):
+        """Close a finding. Marks is_active=0, records closed_at."""
+        updated = await intel_db.update_finding(
+            finding_id, status="closed", actor=body.actor,
+            analyst_notes=body.reason,
+        )
+        if not updated:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+        return {"status": "closed", **updated}
+
+    @router.post("/findings/{finding_id}/accept-risk")
+    async def accept_risk(finding_id: int, body: QuickAction):
+        """Accept the risk. Marks is_active=0, status=accepted_risk."""
+        updated = await intel_db.update_finding(
+            finding_id, status="accepted_risk", actor=body.actor,
+            analyst_notes=body.reason,
+        )
+        if not updated:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+        return {"status": "accepted_risk", **updated}
+
+    @router.post("/findings/{finding_id}/false-positive")
+    async def mark_false_positive(finding_id: int, body: QuickAction):
+        """Mark as false positive. Marks is_active=0, status=false_positive."""
+        updated = await intel_db.update_finding(
+            finding_id, status="false_positive", actor=body.actor,
+            analyst_notes=body.reason,
+        )
+        if not updated:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+        return {"status": "false_positive", **updated}
+
+    @router.post("/findings/{finding_id}/reopen")
+    async def reopen_finding(finding_id: int, body: QuickAction):
+        """
+        Reopen a closed/accepted/FP finding.
+        Sets status=triaging, is_active=1, clears closed_at.
+        """
+        finding = await intel_db.get_finding_by_id(finding_id)
+        if not finding:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+        updated = await intel_db.update_finding(
+            finding_id, status="triaging", actor=body.actor,
+            analyst_notes=body.reason,
+        )
+        return {"status": "triaging", "reopened": True, **updated}
+
+    @router.post("/findings/{finding_id}/open")
+    async def open_finding(finding_id: int, body: QuickAction):
+        """Move finding to triaging (open). Alias for reopen."""
+        finding = await intel_db.get_finding_by_id(finding_id)
+        if not finding:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+        updated = await intel_db.update_finding(
+            finding_id, status="triaging", actor=body.actor,
+        )
+        return {"status": "triaging", **updated}
 
     # ── 6-month historical trend ──────────────────────────────────────────────
     @router.get("/historical")

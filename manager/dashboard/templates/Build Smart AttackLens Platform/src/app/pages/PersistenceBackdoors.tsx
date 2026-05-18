@@ -1,72 +1,51 @@
-import { useState } from "react";
 import { Anchor } from "lucide-react";
-import { PageHeader, FilterBar, FindingsTable, SectionHeading, type Finding } from "./shared";
+import { GenericDetectionPage, type DetectionFinding } from "./DetectionShared";
+import { cn } from "../../lib/utils";
 
-const MOCK: Finding[] = [
-  { id: 401, title: "Unknown LaunchDaemon registered at 02:14", category: "service", severity: "critical", score: 9.1, mitre_technique: "T1543.004", mitre_tactic: "Persistence", agent_id: "mac-a1b2", first_detected_at: 1746599400, last_detected_at: 1746621600, status: "new", description: "com.update-helper.plist appeared at /Library/LaunchDaemons/ at 02:14 local time. No matching installer receipt in pkg db. Binary at /usr/local/bin/.helper (hidden dot-prefix)." },
-  { id: 402, title: "Login item added for non-App-Store binary", category: "service", severity: "high", score: 8.3, mitre_technique: "T1547.001", mitre_tactic: "Persistence", agent_id: "mac-c3d4", first_detected_at: 1746605000, last_detected_at: 1746621600, status: "triaging", description: "Login item 'SyncHelper' added pointing to /Users/user/Library/.sync/agent — not code-signed, not in Gatekeeper DB" },
-  { id: 403, title: "Cron job added by non-root user", category: "service", severity: "high", score: 7.8, mitre_technique: "T1053.003", mitre_tactic: "Persistence", agent_id: "mac-e5f6", first_detected_at: 1746610000, last_detected_at: 1746621600, status: "new", description: "crontab entry: '*/15 * * * * /tmp/.x >/dev/null 2>&1' added by uid=501. /tmp/.x is a 47KB ELF binary." },
-  { id: 404, title: "LaunchAgent in hidden dot-directory", category: "service", severity: "high", score: 7.5, mitre_technique: "T1543.001", mitre_tactic: "Persistence", agent_id: "mac-g7h8", first_detected_at: 1746608000, last_detected_at: 1746621600, status: "investigating", description: "~/Library/.agents/com.apple.syncservice.plist — spoofing Apple naming convention. RunAtLoad=true, KeepAlive=true." },
-  { id: 405, title: "Periodic maintenance script modified", category: "service", severity: "medium", score: 6.2, mitre_technique: "T1053.003", mitre_tactic: "Persistence", agent_id: "mac-a1b2", first_detected_at: 1746601000, last_detected_at: 1746621600, status: "triaging", description: "/etc/periodic/daily/900.backup modified mtime changed. New content appends curl download-and-exec." },
-  { id: 406, title: "KextManager-loaded unsigned kernel extension", category: "service", severity: "medium", score: 5.9, mitre_technique: "T1547.006", mitre_tactic: "Persistence", agent_id: "mac-c3d4", first_detected_at: 1746595000, last_detected_at: 1746621600, status: "new", description: "Kext 'com.anon.driver' loaded — not Apple-signed, not from known vendor. Kexts have kernel-level access." },
-];
+const CAT_COLORS: Record<string, string> = {
+  service: "bg-purple-50 text-purple-700 border-purple-200",
+  task:    "bg-amber-50 text-amber-700 border-amber-200",
+  config:  "bg-red-50 text-red-700 border-red-200",
+  binary:  "bg-blue-50 text-blue-700 border-blue-200",
+  cron:    "bg-orange-50 text-orange-700 border-orange-200",
+  launch:  "bg-indigo-50 text-indigo-700 border-indigo-200",
+};
 
-const KNOWN_GOOD = [
-  "com.apple.mdmclient.plist",
-  "com.apple.AirPlayXPCHelper.plist",
-  "com.apple.softwareupdated.plist",
-];
+function CatChip({ f }: { f: DetectionFinding }) {
+  const key   = Object.keys(CAT_COLORS).find(k => f.category.toLowerCase().includes(k)) ?? "binary";
+  const icons: Record<string, string> = { service: "⚙", task: "⏱", config: "📄", binary: "⬡", cron: "🕐", launch: "🚀" };
+  return (
+    <span className={cn("text-[9px] font-semibold px-2 py-0.5 rounded-full border flex items-center gap-1 w-fit", CAT_COLORS[key])}>
+      <span className="text-[10px]">{icons[key]}</span>{f.category}
+    </span>
+  );
+}
+
+function RiskScore({ f }: { f: DetectionFinding }) {
+  const s     = f.composite_score ?? f.score;
+  const color = s >= 8 ? "text-red-600" : s >= 6 ? "text-amber-700" : "text-blue-600";
+  const bg    = s >= 8 ? "bg-red-50 border-red-200" : s >= 6 ? "bg-amber-50 border-amber-200" : "bg-blue-50 border-blue-200";
+  return (
+    <div className={cn("inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-black tabular-nums", color, bg)}>
+      {s.toFixed(1)}<span className="text-[8px] font-normal opacity-60">/10</span>
+    </div>
+  );
+}
 
 export default function PersistenceBackdoors() {
-  const [search, setSearch] = useState("");
-  const [severity, setSeverity] = useState("");
-  const [status, setStatus] = useState("");
-
-  const filtered = MOCK.filter(f =>
-    (!severity || f.severity === severity) &&
-    (!status   || f.status   === status)   &&
-    (!search   || f.title.toLowerCase().includes(search.toLowerCase()))
-  );
-
   return (
-    <div>
-      <PageHeader
-        icon={<Anchor className="w-6 h-6 text-[--purple-600]" />}
-        title="Persistence & Backdoors"
-        subtitle="LaunchDaemons · LaunchAgents · cron jobs · login items · kexts"
-        backstory="Every advanced threat actor establishes persistence after initial access. APT41 abuses LaunchDaemons (T1543.004); Lazarus Group uses Login Items (T1547.001); multiple ransomware operators use cron jobs for re-infection resilience. A new LaunchDaemon outside a known software installer context is a near-definitive indicator of compromise — macOS installers always leave a pkg receipt. No receipt + hidden binary path = backdoor. The time-of-creation signal matters too: 02:14 local time, no interactive session = automated install."
-        accentClass="border-l-[--purple-600]"
-        bgClass="from-[--purple-50]"
-        tactics={["TA0003 · Persistence", "TA0005 · Defense Evasion"]}
-        techniqueIds={[
-          { id: "T1543.004", label: "LaunchDaemon" },
-          { id: "T1547.001", label: "Login Item" },
-          { id: "T1053.003", label: "Cron Job" },
-          { id: "T1547.006", label: "Kernel Module" },
-        ]}
-        kpis={[
-          { label: "New LaunchDaemons", value: 1, color: "red"    },
-          { label: "Unsigned Login Items", value: 1, color: "red"   },
-          { label: "Cron Additions",    value: 2, color: "amber"  },
-          { label: "Total Persistence", value: MOCK.length, color: "amber" },
-        ]}
-      />
-
-      <FilterBar search={search} onSearch={setSearch} severity={severity} onSeverity={setSeverity} status={status} onStatus={setStatus} />
-      <FindingsTable findings={filtered} />
-
-      <div className="mt-4">
-        <SectionHeading title="Known-good LaunchDaemons (baseline)" color="green" />
-        <div className="bg-white border border-[--gray-200] rounded-lg shadow-card p-3">
-          <div className="flex flex-wrap gap-2">
-            {KNOWN_GOOD.map(p => (
-              <span key={p} className="px-2 py-1 bg-[--green-50] text-[--green-700] border border-[--green-600]/20 rounded text-[10px] font-mono">{p}</span>
-            ))}
-            <span className="px-2 py-1 text-[--gray-400] text-[10px]">+ 47 more Apple system daemons</span>
-          </div>
-          <p className="text-[10px] text-[--gray-500] mt-2">These are suppressed from findings — any LaunchDaemon NOT in this allowlist is flagged for review.</p>
-        </div>
-      </div>
-    </div>
+    <GenericDetectionPage
+      title="Persistence & Backdoors"
+      subtitle="LaunchDaemons · cron/launchd tasks · shell config injection · SUID binaries · world-writable PATH"
+      apiUrl="/api/v1/detection/persistence"
+      accent="amber"
+      icon={<Anchor className="w-5 h-5 text-orange-500" />}
+      emptyMsg="No persistence findings yet. Agent needs to report services, tasks, configs, and binaries sections."
+      columns={[
+        { key: "category",        label: "Type",  render: f => <CatChip f={f} /> },
+        { key: "composite_score", label: "Risk",  render: f => <RiskScore f={f} /> },
+        { key: "source",          label: "Rule",  render: f => <span className="text-[9px] font-mono text-gray-500">{f.source}</span> },
+      ]}
+    />
   );
 }

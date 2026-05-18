@@ -6,7 +6,7 @@ Usage
     producer = QueueProducer("amqp://guest:guest@localhost/")
     await producer.start()
     await producer.publish_telemetry(build_telemetry_msg(...))
-    await producer.publish_jarvis_work(build_jarvis_msg(...))
+    await producer.publish_attacklens_work(build_attacklens_msg(...))
     await producer.stop()
 
 Design
@@ -27,7 +27,7 @@ import aio_pika
 from aio_pika import DeliveryMode, Message
 
 from .connection import declare_topology
-from .schemas import ROUTING_TELEMETRY, ROUTING_JARVIS
+from .schemas import ROUTING_TELEMETRY, ROUTING_ATTACKLENS
 
 log = logging.getLogger("manager.queue.producer")
 
@@ -92,9 +92,9 @@ class QueueProducer:
         """Publish a raw-telemetry message to the agent.telemetry queue."""
         await self._publish(msg, ROUTING_TELEMETRY)
 
-    async def publish_jarvis_work(self, msg: dict) -> None:
-        """Publish a pre-validated payload to the jarvis.work queue."""
-        await self._publish(msg, ROUTING_JARVIS)
+    async def publish_attacklens_work(self, msg: dict) -> None:
+        """Publish a pre-validated payload to the attacklens.work queue."""
+        await self._publish(msg, ROUTING_ATTACKLENS)
 
     async def _publish(self, body: dict, routing_key: str) -> None:
         if self._exchange is None:

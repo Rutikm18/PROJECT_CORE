@@ -509,8 +509,9 @@ do_diagnose() {
   manager_url=$(_cfg_get "url" "")
   if [[ -n "$manager_url" ]] && [[ "$manager_url" != *"YOUR_MANAGER"* ]]; then
     local host port
-    host=$(echo "$manager_url" | sed 's|https\?://||;s|[:/].*||')
-    port=$(echo "$manager_url" | grep -oE ':[0-9]+' | tr -d ':' | head -1 || echo "8080")
+    host=$(echo "$manager_url" | sed -E 's|https?://||;s|[:/].*||')
+    port=$(echo "$manager_url" | grep -oE ':[0-9]+' | tr -d ':' | head -1)
+    port="${port:-8080}"
     if nc -z -w4 "$host" "$port" 2>/dev/null; then
       _ok "Manager reachable  ${host}:${port}" "OK"
     else

@@ -35,10 +35,11 @@ from .db        import Database
 from .store     import TelemetryStore
 from .ws_hub    import WebSocketHub
 from .indexer   import IntelDB
-from .jarvis    import JarvisEngine
+from .attacklens  import AttackLensEngine
+from .pool        import AgentRateLimiter
 from .queue.producer      import QueueProducer
 from .workers.telemetry   import TelemetryWorker
-from .workers.jarvis      import JarvisWorker
+from .workers.attacklens  import AttackLensWorker
 from .chunk_tracker       import ChunkTracker
 from .workers.intel       import ThreatIntelWorker
 from .workers.enrichment  import EnrichmentWorker
@@ -97,11 +98,19 @@ def create_app() -> FastAPI:
     store    = TelemetryStore(data_dir)
     hub      = WebSocketHub()
     intel_db = IntelDB(intel_path)
-    jarvis   = JarvisEngine(db, intel_db)
+    engine   = AttackLensEngine(db, intel_db)
     producer: QueueProducer | None = QueueProducer(rabbitmq_url) if rabbitmq_url else None
     chunk_tracker = ChunkTracker()
+
+    # Per-agent rate limiter: 10 req/s sustained, burst 30, max 4 concurrent per agent.
+    # Override via env: AGENT_RATE=20 AGENT_BURST=60 AGENT_SLOTS=8
+    rate_limiter = AgentRateLimiter(
+        rate=float(os.environ.get("AGENT_RATE",  "10")),
+        burst=float(os.environ.get("AGENT_BURST", "30")),
+        max_slots=int(os.environ.get("AGENT_SLOTS", "4")),
+    )
     _tel_worker:    TelemetryWorker | None = None
-    _jar_worker:    JarvisWorker | None = None
+    _al_worker:     AttackLensWorker | None = None
     _intel_worker:  ThreatIntelWorker | None = None
     _enrich_worker: EnrichmentWorker | None = None
     _tel_consumer:  TelemetryConsumer | None = None
@@ -110,23 +119,27 @@ def create_app() -> FastAPI:
     # ── App ───────────────────────────────────────────────────────────────────
     app = FastAPI(title="mac_intel Manager", version="1.0.0", docs_url=None)
 
+    # CORS: default to same-origin only in production.
+    # Set CORS_ORIGINS=https://your-dashboard.example.com in production env.
+    # Use CORS_ORIGINS=* only for local development.
+    _cors_origins = [
+        o.strip()
+        for o in os.environ.get("CORS_ORIGINS", "").split(",")
+        if o.strip()
+    ] or ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        allow_credentials=True,
+        max_age=600,
     )
 
-    # ── Nonce cache (replay prevention) ──────────────────────────────────────
+    # Nonce cache is now DB-backed (nonce_cache table in manager.db).
+    # This dict is kept for API compatibility with make_ingest_router signature
+    # but is no longer used for deduplication logic.
     nonce_cache: dict[str, float] = {}
-
-    async def _evict_nonces():
-        while True:
-            await asyncio.sleep(60)
-            cutoff = time.time() - REPLAY_WINDOW_SECONDS
-            stale  = [k for k, t in nonce_cache.items() if t < cutoff]
-            for k in stale:
-                del nonce_cache[k]
 
     async def _cleanup_store():
         """Hourly file-store cleanup job."""
@@ -169,45 +182,44 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        nonlocal _tel_worker, _jar_worker, _intel_worker, _enrich_worker, _tel_consumer, _nvd_sync
+        nonlocal _tel_worker, _al_worker, _intel_worker, _enrich_worker, _tel_consumer, _nvd_sync
         setup_logging(
             logfile=os.environ.get("LOG_FILE", "manager/logs/manager.log"),
             level=os.environ.get("LOG_LEVEL", "INFO"),
         )
-        await db.init()
+        await db.init()  # initialises the SQLitePool (readers=4)
         await _dev_bootstrap_agent_key()
         await store.init()
         await intel_db.init()
-        await jarvis.start()
-        asyncio.create_task(_evict_nonces())
+        await engine.start()
         asyncio.create_task(_cleanup_store())
         asyncio.create_task(_expire_chunks())
 
         if producer is not None:
             await producer.start()
             _tel_worker = TelemetryWorker(rabbitmq_url, db, store, hub, producer)
-            _jar_worker = JarvisWorker(rabbitmq_url, jarvis, chunk_tracker)
+            _al_worker  = AttackLensWorker(rabbitmq_url, engine, chunk_tracker)
             asyncio.create_task(_tel_worker.run())
-            asyncio.create_task(_jar_worker.run())
-            _tel_consumer = TelemetryConsumer(rabbitmq_url, db, store, hub, producer, jarvis)
+            asyncio.create_task(_al_worker.run())
+            _tel_consumer = TelemetryConsumer(rabbitmq_url, db, store, hub, producer, engine)
             asyncio.create_task(_tel_consumer.run())
             log.info("RabbitMQ: producer + workers + consumer started (url=%s)", rabbitmq_url)
         else:
             log.info("RabbitMQ: not configured — sync pipeline active")
 
         if embedded_threat_intel:
-            _intel_worker = ThreatIntelWorker(intel_db, db, jarvis.feeds, jarvis.nvd)
+            _intel_worker = ThreatIntelWorker(intel_db, db, engine.feeds, engine.nvd)
             await _intel_worker.start()
         else:
             log.info("Threat intel: central mode enabled (url=%s)", threat_intel_url or "not set")
 
         # AI analyst + email notifier — attach to app.state for route access
-        ai_analyst     = AIAnalyst(intel_db, jarvis.feeds)
+        ai_analyst     = AIAnalyst(intel_db, engine.feeds)
         email_notifier = EmailNotifier()
         app.state.intel_db      = intel_db
         app.state.ai_analyst    = ai_analyst
         app.state.email_notifier = email_notifier
-        app.state.feeds         = jarvis.feeds
+        app.state.feeds         = engine.feeds
         log.info("AI Analyst enabled=%s  Email enabled=%s",
                  ai_analyst.enabled, email_notifier.enabled)
 
@@ -235,21 +247,28 @@ def create_app() -> FastAPI:
             await _intel_worker.stop()
         if _tel_worker:
             await _tel_worker.stop()
-        if _jar_worker:
-            await _jar_worker.stop()
+        if _al_worker:
+            await _al_worker.stop()
         if producer is not None:
             await producer.stop()
         await store.close()
-        await intel_db.close()
+        await intel_db.close()   # closes the SQLitePool
+        await db.close()         # closes the SQLitePool
 
     # ── Mount routers ─────────────────────────────────────────────────────────
     from .api.ingest    import make_ingest_router
     from .api.agents    import make_agents_router
     from .api.enroll    import make_enroll_router
-    from .api.jarvis    import make_jarvis_router
+    from .api.attacklens import make_attacklens_router
     from .api.keys      import make_keys_router
     from .api.findings  import make_findings_router
     from .api.threat    import make_threat_router
+    from .api.raw       import make_raw_router
+    from .api.assets    import make_assets_router
+    from .api.posture    import make_posture_router
+    from .api.detection  import make_detection_router
+    from .api.accuracy   import make_accuracy_router
+    from .api.settings   import make_settings_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
@@ -262,21 +281,38 @@ def create_app() -> FastAPI:
 
     admin_token = os.environ.get("ADMIN_TOKEN", "").strip()
 
-    ingest_router    = make_ingest_router(db, store, hub, nonce_cache, jarvis, producer=producer)
-    agents_router    = make_agents_router(db, store)
-    enroll_router    = make_enroll_router(db, enrollment_tokens, open_enrollment)
-    jarvis_router    = make_jarvis_router(intel_db, jarvis)
+    ingest_router    = make_ingest_router(
+        db, store, hub, nonce_cache, engine,
+        producer=producer,
+        rate_limiter=rate_limiter,
+    )
+    agents_router      = make_agents_router(db, store)
+    enroll_router      = make_enroll_router(db, enrollment_tokens, open_enrollment)
+    attacklens_router  = make_attacklens_router(intel_db, engine)
     keys_router      = make_keys_router(db, admin_token)
     findings_router  = make_findings_router(intel_db)
     threat_router    = make_threat_router(intel_db, central_url=threat_intel_url)
 
-    app.include_router(ingest_router,    prefix="/api/v1")
-    app.include_router(agents_router,    prefix="/api/v1/agents")
-    app.include_router(enroll_router,    prefix="/api/v1")
-    app.include_router(jarvis_router,    prefix="/api/v1/jarvis")
+    raw_router    = make_raw_router(db)
+    assets_router  = make_assets_router(db, intel_db)
+    posture_router    = make_posture_router(db, intel_db)
+    detection_router  = make_detection_router(intel_db)
+    accuracy_router   = make_accuracy_router(intel_db)
+    settings_router   = make_settings_router(intel_db)
+
+    app.include_router(ingest_router,       prefix="/api/v1")
+    app.include_router(agents_router,       prefix="/api/v1/agents")
+    app.include_router(enroll_router,       prefix="/api/v1")
+    app.include_router(attacklens_router,   prefix="/api/v1/attacklens")
     app.include_router(keys_router,      prefix="/api/v1/keys")
     app.include_router(findings_router,  prefix="/api/v1/soc")
     app.include_router(threat_router,    prefix="/api/v1/threat")
+    app.include_router(raw_router,       prefix="/api/v1/raw")
+    app.include_router(assets_router,    prefix="/api/v1/assets")
+    app.include_router(posture_router,    prefix="/api/v1/posture")
+    app.include_router(detection_router,  prefix="/api/v1/detection")
+    app.include_router(accuracy_router,   prefix="/api/v1/accuracy")
+    app.include_router(settings_router,   prefix="/api/v1/settings")
     app.include_router(remediation_router)  # prefixes defined inline
 
     # ── Global exception handler ──────────────────────────────────────────────
@@ -371,16 +407,20 @@ def create_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard():
-        html_path = os.path.join(_pkg_root, "dashboard", "templates", "index.html")
-        try:
-            with open(html_path) as f:
-                return f.read()
-        except FileNotFoundError:
-            log.error("Dashboard template not found: %s", html_path)
-            return HTMLResponse(
-                "<h1>Dashboard unavailable</h1><p>Template file not found.</p>",
-                status_code=503,
-            )
+        # Serve from static/index.html — vite build keeps this current.
+        # templates/index.html is a stale copy; reading from static avoids drift.
+        for candidate in [
+            os.path.join(_pkg_root, "dashboard", "static", "index.html"),
+            os.path.join(_pkg_root, "dashboard", "templates", "index.html"),
+        ]:
+            if os.path.isfile(candidate):
+                with open(candidate) as f:
+                    return f.read()
+        log.error("Dashboard index.html not found under dashboard/static or dashboard/templates")
+        return HTMLResponse(
+            "<h1>Dashboard unavailable</h1><p>Run: npm run build inside the frontend directory.</p>",
+            status_code=503,
+        )
 
     return app
 

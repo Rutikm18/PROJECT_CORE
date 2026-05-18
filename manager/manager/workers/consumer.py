@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import aio_pika
 
 from ..queue.connection import declare_topology
-from ..queue.schemas    import QUEUE_TELEMETRY, build_jarvis_msg
+from ..queue.schemas    import QUEUE_TELEMETRY, build_attacklens_msg
 from ..chunker          import split as chunk_split
 
 if TYPE_CHECKING:
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ..store           import TelemetryStore
     from ..ws_hub          import WebSocketHub
     from ..queue.producer  import QueueProducer
-    from ..jarvis.engine   import JarvisEngine
+    from ..attacklens.engine   import AttackLensEngine
 
 log = logging.getLogger("manager.workers.consumer")
 
@@ -29,7 +29,7 @@ _RETRY_MAX   = 60
 
 
 class TelemetryConsumer:
-    """At-least-once consumer of agent.telemetry — drives store, db, jarvis, ws."""
+    """At-least-once consumer of agent.telemetry — drives store, db, detection engine, ws."""
 
     def __init__(
         self,
@@ -38,14 +38,14 @@ class TelemetryConsumer:
         store:        "TelemetryStore",
         hub:          "WebSocketHub",
         producer:     "QueueProducer",
-        jarvis:       "JarvisEngine | None" = None,
+        engine:       "AttackLensEngine | None" = None,
     ) -> None:
         self._url      = rabbitmq_url
         self._db       = db
         self._store    = store
         self._hub      = hub
         self._producer = producer
-        self._jarvis   = jarvis
+        self._engine   = engine
         self._running  = True
         self._sem      = asyncio.Semaphore(_MAX_INFLIGHT)
 
@@ -167,12 +167,12 @@ class TelemetryConsumer:
             except Exception as exc:
                 log.debug("db insert skipped agent=%s section=%s: %s", agent_id, section, exc)
 
-        # 3. Fan-out to jarvis.work (chunked for large list payloads)
+        # 3. Fan-out to attacklens.work (chunked for large list payloads)
         try:
             chunks = chunk_split(data)
             for chunk in chunks:
-                await self._producer.publish_jarvis_work(
-                    build_jarvis_msg(
+                await self._producer.publish_attacklens_work(
+                    build_attacklens_msg(
                         agent_id=agent_id,
                         section=section,
                         collected_at=collected,
@@ -183,7 +183,7 @@ class TelemetryConsumer:
                     )
                 )
         except Exception as exc:
-            log.warning("jarvis publish failed agent=%s section=%s: %s", agent_id, section, exc)
+            log.warning("attacklens publish failed agent=%s section=%s: %s", agent_id, section, exc)
 
         # 4. WebSocket broadcast — best-effort
         try:

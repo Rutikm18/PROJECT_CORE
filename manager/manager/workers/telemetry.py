@@ -5,7 +5,7 @@ Consumes the "agent.telemetry" queue and performs the storage pipeline:
   1. Write payload to three-tier file store (NDJSON+gzip)
   2. Insert payload summary into SQLite (section timestamps for dashboard)
   3. Broadcast to WebSocket subscribers
-  4. Publish pre-validated payload to "jarvis.work" queue
+  4. Publish pre-validated payload to "attacklens.work" queue
 
 This offloads all heavy I/O from the ingest HTTP request path.
 The HTTP handler now returns in <5ms (crypto + publish only).
@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 import aio_pika
 
 from ..queue.connection import declare_topology
-from ..queue.schemas import QUEUE_TELEMETRY, build_jarvis_msg
+from ..queue.schemas import QUEUE_TELEMETRY, build_attacklens_msg
 from ..queue.producer import QueueProducer
 from ..chunker import split as chunk_split
 
@@ -152,12 +152,12 @@ class TelemetryWorker:
         except Exception as exc:
             log.debug("WS broadcast failed agent=%s: %s", agent_id, exc)
 
-        # 4. Fan-out to jarvis.work — chunk large list payloads
+        # 4. Fan-out to attacklens.work — chunk large list payloads
         try:
             chunks = chunk_split(data)
             for chunk in chunks:
-                await self._producer.publish_jarvis_work(
-                    build_jarvis_msg(
+                await self._producer.publish_attacklens_work(
+                    build_attacklens_msg(
                         agent_id=agent_id,
                         section=section,
                         collected_at=collected,

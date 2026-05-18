@@ -2,13 +2,13 @@
 manager/manager/chunk_tracker.py — In-memory chunk-completion tracker.
 
 Tracks which chunks of a logical ChunkSet have been processed so that
-JarvisWorker can trigger cross-section correlation exactly once — when
+AttackLensWorker can trigger cross-section correlation exactly once — when
 the last chunk in a set completes — rather than once per chunk.
 
 Design
 ------
 - Pure-asyncio; all mutations are protected by a single asyncio.Lock so
-  concurrent JarvisWorker tasks cannot race.
+  concurrent AttackLensWorker tasks cannot race.
 - TTL-based expiry (default 1 h) prevents unbounded memory growth when
   a chunk set is abandoned (e.g. a message was nack'd to the DLQ).
 - register() is idempotent — safe to call from any chunk, in any order.
@@ -28,7 +28,7 @@ _TTL_SECONDS: int = 3600   # abandon chunk sets after 1 h
 class ChunkTracker:
     """
     Register chunk sets, mark individual chunks done, detect set completion.
-    Create a single instance at server startup and share it with JarvisWorker.
+    Create a single instance at server startup and share it with AttackLensWorker.
     """
 
     def __init__(self) -> None:

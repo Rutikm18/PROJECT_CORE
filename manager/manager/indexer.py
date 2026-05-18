@@ -8,6 +8,7 @@ Algorithms:
   • FTS5 virtual table      — full-text search across all findings
   • Welford baseline store  — persisted mean/m2/n for behavioral analysis
   • Change timeline         — append-only log; never mutates history
+  • SQLitePool (readers=3)  — concurrent reads, serialised writes
 
 Dedup rule (user requirement):
   If (agent_id, category, item_key) already exists AND fingerprint is unchanged
@@ -25,6 +26,8 @@ import time
 from typing import Any, Optional
 
 import aiosqlite
+
+from .pool import SQLitePool
 
 log = logging.getLogger("manager.indexer")
 
@@ -299,6 +302,15 @@ CREATE TABLE IF NOT EXISTS nvd_sync_state (
     value TEXT NOT NULL DEFAULT ''
 );
 
+-- ── Organisation & platform settings ─────────────────────────────────────
+-- Generic key/value store for all configurable settings.
+-- Typed fields (dates, booleans, ints) are stored as strings; callers coerce.
+CREATE TABLE IF NOT EXISTS org_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
 -- ── CISA Known Exploited Vulnerabilities ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS cisa_kev (
     cve_id          TEXT PRIMARY KEY,
@@ -464,16 +476,27 @@ _SOC_MIGRATIONS = [
 
 
 class IntelDB:
-    """Async SQLite wrapper for the intel database."""
+    """
+    Async SQLite wrapper for the intel database.
+
+    Uses SQLitePool: reader connections for all SELECT queries (concurrent),
+    the write connection for all INSERT/UPDATE/DELETE (serialised via pool lock).
+    self._conn is aliased to the pool's write connection for backwards
+    compatibility with all existing write methods — no logic changes needed.
+    """
 
     def __init__(self, path: str) -> None:
         self._path = path
+        self._pool: Optional[SQLitePool] = None
         self._conn: Optional[aiosqlite.Connection] = None
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # kept for write-serialisation within Python
 
     async def init(self) -> None:
-        self._conn = await aiosqlite.connect(self._path)
-        self._conn.row_factory = aiosqlite.Row
+        self._pool = SQLitePool(self._path, readers=3)
+        await self._pool.init()
+        # Alias write connection for all existing write code (zero changes needed)
+        self._conn = self._pool._write_conn  # type: ignore[attr-defined]
+
         # Migrations must run before executescript so new columns exist
         # before _SCHEMA tries to build indexes that reference them.
         for table, col, defn in _SOC_MIGRATIONS:
@@ -503,11 +526,12 @@ class IntelDB:
         async with self._conn.executescript(_SCHEMA):
             pass
         await self._conn.commit()
-        log.info("IntelDB initialised at %s", self._path)
+        log.info("IntelDB initialised at %s (pool readers=3)", self._path)
 
     async def close(self) -> None:
-        if self._conn:
-            await self._conn.close()
+        if self._pool:
+            await self._pool.close()
+            self._conn = None
 
     # ── Findings ──────────────────────────────────────────────────────────────
 
@@ -1006,7 +1030,13 @@ class IntelDB:
             parts.append("f.agent_id=?"); args.append(agent_id)
         if severity:
             parts.append("f.severity=?"); args.append(severity)
-        if status:
+        _TERMINAL_SET = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
+        if status == "__closed__":
+            # Show all terminal-state findings (used by view=closed)
+            placeholders = ",".join("?" * len(_TERMINAL_SET))
+            parts.append(f"f.status IN ({placeholders})")
+            args.extend(sorted(_TERMINAL_SET))
+        elif status:
             parts.append("f.status=?"); args.append(status)
         if category:
             parts.append("f.category=?"); args.append(category)
@@ -1015,8 +1045,13 @@ class IntelDB:
         if sla_breached:
             parts.append("f.sla_due > 0 AND f.sla_due < ?")
             args.append(time.time())
-        if active_only:
+        # Terminal states always have is_active=0; applying is_active=1 would
+        # return zero rows, so skip the filter when a terminal status is requested.
+        _TERMINAL = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
+        if active_only and status not in _TERMINAL:
             parts.append("f.is_active=1")
+        elif active_only and status in _TERMINAL:
+            parts.append("f.is_active=0")   # terminal states are always inactive
 
         where = ("WHERE " + " AND ".join(parts)) if parts else ""
         valid_sorts = {"score": "f.score DESC", "last_detected_at": "f.last_detected_at DESC",
@@ -1760,12 +1795,20 @@ class IntelDB:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     async def _fetchone(self, sql: str, args: tuple) -> Optional[aiosqlite.Row]:
-        async with self._conn.execute(sql, args) as cur:
-            return await cur.fetchone()
+        """Concurrent read — uses a pool reader connection."""
+        if self._pool is None:
+            raise RuntimeError("IntelDB not initialised")
+        async with self._pool.read() as conn:
+            async with conn.execute(sql, args) as cur:
+                return await cur.fetchone()
 
     async def _fetchall(self, sql: str, args: tuple) -> list[aiosqlite.Row]:
-        async with self._conn.execute(sql, args) as cur:
-            return await cur.fetchall()
+        """Concurrent read — uses a pool reader connection."""
+        if self._pool is None:
+            raise RuntimeError("IntelDB not initialised")
+        async with self._pool.read() as conn:
+            async with conn.execute(sql, args) as cur:
+                return await cur.fetchall()
 
 
 def _sla_status(sla_due: float, status: str) -> str:

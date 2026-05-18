@@ -4,8 +4,8 @@ manager/manager/queue/schemas.py — Queue topology constants and message builde
 Queue topology
 --------------
     Exchange: mac_intel.direct  (direct, durable)
-        routing_key "telemetry" → queue "agent.telemetry"  (durable)
-        routing_key "jarvis"    → queue "jarvis.work"       (durable)
+        routing_key "telemetry"  → queue "agent.telemetry"    (durable)
+        routing_key "attacklens" → queue "attacklens.work"    (durable)
 
     Dead Letter Exchange: mac_intel.dlx  (fanout, durable)
         all rejected / expired messages → queue "mac_intel.dead"
@@ -14,8 +14,8 @@ Message versions
 ----------------
     v=1  current format
 
-    agent.telemetry  →  built by build_telemetry_msg()
-    jarvis.work      →  built by build_jarvis_msg()
+    agent.telemetry   →  built by build_telemetry_msg()
+    attacklens.work   →  built by build_attacklens_msg()
 """
 from __future__ import annotations
 
@@ -26,17 +26,17 @@ from typing import Any
 EXCHANGE_MAIN = "mac_intel.direct"
 EXCHANGE_DLX  = "mac_intel.dlx"
 
-QUEUE_TELEMETRY = "agent.telemetry"
-QUEUE_JARVIS    = "jarvis.work"
-QUEUE_DEAD      = "mac_intel.dead"
+QUEUE_TELEMETRY  = "agent.telemetry"
+QUEUE_ATTACKLENS = "attacklens.work"
+QUEUE_DEAD       = "mac_intel.dead"
 
-ROUTING_TELEMETRY = "telemetry"
-ROUTING_JARVIS    = "jarvis"
+ROUTING_TELEMETRY  = "telemetry"
+ROUTING_ATTACKLENS = "attacklens"
 
 # ── Queue settings ────────────────────────────────────────────────────────────
-MSG_TTL_MS          = 3_600_000   # 1 h — drop messages older than this
-QUEUE_MAX_TELEMETRY = 200_000     # ~200k agent payloads buffered max
-QUEUE_MAX_JARVIS    = 50_000      # jarvis is slower, smaller buffer
+MSG_TTL_MS           = 3_600_000   # 1 h — drop messages older than this
+QUEUE_MAX_TELEMETRY  = 200_000     # ~200k agent payloads buffered max
+QUEUE_MAX_ATTACKLENS = 50_000      # detection engine is slower, smaller buffer
 
 
 # ── Message builders ──────────────────────────────────────────────────────────
@@ -66,7 +66,7 @@ def build_telemetry_msg(
     }
 
 
-def build_jarvis_msg(
+def build_attacklens_msg(
     *,
     agent_id:     str,
     section:      str,

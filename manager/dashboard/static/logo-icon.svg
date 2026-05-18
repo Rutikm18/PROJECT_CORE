@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 132" fill="none">
+  <defs>
+    <!-- Shield body: silver-metallic with purple tint -->
+    <linearGradient id="shieldBody" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#EEEEF8"/>
+      <stop offset="35%"  stop-color="#D4D4E8"/>
+      <stop offset="70%"  stop-color="#B8B8D0"/>
+      <stop offset="100%" stop-color="#9898BC"/>
+    </linearGradient>
+    <!-- Shield edge highlight (left) -->
+    <linearGradient id="shieldHL" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Shield shadow (right) -->
+    <linearGradient id="shieldShadow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#6060A0" stop-opacity="0.25"/>
+    </linearGradient>
+    <!-- Purple ring gradient -->
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <!-- Arrow gradient -->
+    <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#6D28D9"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <!-- Center dot gradient -->
+    <radialGradient id="dotGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#C4B5FD"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </radialGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- ── Shield body ── -->
+  <path
+    d="M60 4 L110 22 L110 64 Q110 100 60 126 Q10 100 10 64 L10 22 Z"
+    fill="url(#shieldBody)"
+    stroke="#C0C0D8"
+    stroke-width="1.5"
+  />
+
+  <!-- Highlight overlay (left edge shine) -->
+  <path
+    d="M60 4 L110 22 L110 64 Q110 100 60 126 Q10 100 10 64 L10 22 Z"
+    fill="url(#shieldHL)"
+  />
+
+  <!-- Shadow overlay (right edge) -->
+  <path
+    d="M60 4 L110 22 L110 64 Q110 100 60 126 Q10 100 10 64 L10 22 Z"
+    fill="url(#shieldShadow)"
+  />
+
+  <!-- Inner rim / inset -->
+  <path
+    d="M60 14 L100 28 L100 64 Q100 95 60 116 Q20 95 20 64 L20 28 Z"
+    fill="none"
+    stroke="#B0A0D8"
+    stroke-width="0.8"
+    opacity="0.5"
+  />
+
+  <!-- ── Concentric target rings ── -->
+  <!-- Ring 4 (outermost) -->
+  <circle cx="60" cy="68" r="35" stroke="url(#ringGrad)" stroke-width="1.8" opacity="0.35" fill="none"/>
+  <!-- Ring 3 -->
+  <circle cx="60" cy="68" r="26" stroke="url(#ringGrad)" stroke-width="1.8" opacity="0.50" fill="none"/>
+  <!-- Ring 2 -->
+  <circle cx="60" cy="68" r="17" stroke="url(#ringGrad)" stroke-width="1.8" opacity="0.65" fill="none"/>
+  <!-- Ring 1 (innermost ring) -->
+  <circle cx="60" cy="68" r="8"  stroke="url(#ringGrad)" stroke-width="1.8" opacity="0.80" fill="none"/>
+  <!-- Center dot -->
+  <circle cx="60" cy="68" r="4"  fill="url(#dotGrad)" filter="url(#glow)"/>
+
+  <!-- ── Arrow (top-left → center) ── -->
+  <!-- Arrow shaft -->
+  <line
+    x1="32" y1="40"
+    x2="56" y2="64"
+    stroke="url(#arrowGrad)"
+    stroke-width="3"
+    stroke-linecap="round"
+    filter="url(#glow)"
+  />
+  <!-- Arrow head -->
+  <polygon
+    points="56,64 44,42 34,50"
+    fill="url(#arrowGrad)"
+    opacity="0.9"
+  />
+  <!-- Arrow tail bracket -->
+  <path
+    d="M32 40 L32 52 M32 40 L44 40"
+    stroke="url(#arrowGrad)"
+    stroke-width="2.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    fill="none"
+  />
+</svg>

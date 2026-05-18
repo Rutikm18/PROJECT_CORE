@@ -1,12 +1,27 @@
-"""manager/db.py — Async SQLite layer (aiosqlite)."""
+"""
+manager/db.py — Async SQLite layer backed by SQLitePool.
+
+All reads use the shared reader pool (concurrent).
+All writes use the single write connection (serialised, non-blocking for readers).
+
+Nonce deduplication is now DB-backed so it survives manager restarts and is
+safe for future horizontal scaling behind a shared SQLite (NFS/tmpfs).
+"""
 
 import json
 import time
+import logging
 import aiosqlite
 
+from .pool import SQLitePool
+
+log = logging.getLogger("manager.db")
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
 SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS agents (
     agent_id   TEXT PRIMARY KEY,
@@ -16,17 +31,15 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at INTEGER DEFAULT 0
 );
 
--- Per-agent API keys. The manager generates keys on enrollment and returns
--- them to the agent. Supports expiry and revocation.
 CREATE TABLE IF NOT EXISTS agent_keys (
     agent_id      TEXT PRIMARY KEY,
     api_key_hex   TEXT NOT NULL,
     enrolled_at   INTEGER NOT NULL,
     enrollment_ip TEXT DEFAULT '',
-    expires_at    INTEGER DEFAULT 0,   -- unix epoch; 0 = never expires
-    revoked       INTEGER DEFAULT 0,   -- 1 = revoked
-    rotated_at    INTEGER DEFAULT 0,   -- last rotation timestamp
-    key_label     TEXT    DEFAULT '',  -- operator note
+    expires_at    INTEGER DEFAULT 0,
+    revoked       INTEGER DEFAULT 0,
+    rotated_at    INTEGER DEFAULT 0,
+    key_label     TEXT    DEFAULT '',
     FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
 );
 
@@ -42,6 +55,10 @@ CREATE TABLE IF NOT EXISTS payloads (
 
 CREATE INDEX IF NOT EXISTS idx_payloads_agent_section_ts
     ON payloads(agent_id, section, collected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_payloads_received
+    ON payloads(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_payloads_section
+    ON payloads(section, collected_at DESC);
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,10 +75,16 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent_ts
     ON agent_sessions(agent_id, connected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_open
     ON agent_sessions(agent_id, status, last_seen DESC);
+
+-- Nonce dedup table: survives restarts, bounded by TTL cleanup.
+-- Index on expires_at allows O(log n) cleanup of expired nonces.
+CREATE TABLE IF NOT EXISTS nonce_cache (
+    nonce      TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nonce_exp ON nonce_cache(expires_at);
 """
 
-# Idempotent migration: add new columns to agent_keys if upgrading from
-# an older schema that didn't have them.
 _MIGRATIONS = [
     ("agent_keys", "expires_at",  "INTEGER DEFAULT 0"),
     ("agent_keys", "revoked",     "INTEGER DEFAULT 0"),
@@ -71,42 +94,60 @@ _MIGRATIONS = [
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str) -> None:
         self.path = path
+        self._pool = SQLitePool(path, readers=4)
 
-    async def init(self):
-        async with aiosqlite.connect(self.path) as db:
+    async def init(self) -> None:
+        await self._pool.init()
+        async with self._pool.write() as db:
             await db.executescript(SCHEMA)
             await db.commit()
-            # Apply migrations for any existing DBs that predate these columns
             for table, col, defn in _MIGRATIONS:
                 try:
-                    await db.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {col} {defn}"
-                    )
+                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
                     await db.commit()
                 except Exception:
-                    pass  # column already exists
+                    pass
 
     async def ping(self) -> bool:
-        try:
-            async with aiosqlite.connect(self.path) as db:
-                await db.execute("SELECT 1")
-            return True
-        except Exception:
-            return False
+        return await self._pool.ping()
+
+    async def close(self) -> None:
+        await self._pool.close()
+
+    # ── Nonce cache (DB-backed, restart-safe) ─────────────────────────────────
+
+    async def check_and_store_nonce(self, nonce: str, ttl: float) -> bool:
+        """
+        Returns True if nonce is new (accepted), False if already seen (replay).
+        Atomically checks + inserts to prevent races.
+        Cleans expired nonces opportunistically (every ~100 calls, amortised).
+        """
+        now = time.time()
+        expires_at = now + ttl
+        async with self._pool.write() as db:
+            # Cleanup expired nonces — INSERT OR IGNORE is O(log n) + index scan
+            # We piggyback cleanup here to avoid a separate background task.
+            await db.execute("DELETE FROM nonce_cache WHERE expires_at < ?", (now,))
+            try:
+                await db.execute(
+                    "INSERT INTO nonce_cache(nonce, expires_at) VALUES(?, ?)",
+                    (nonce, expires_at),
+                )
+                await db.commit()
+                return True
+            except Exception:
+                # UNIQUE constraint violation → replay
+                await db.rollback()
+                return False
 
     # ── Agent key management ──────────────────────────────────────────────────
 
     async def get_agent_key(self, agent_id: str) -> str | None:
-        """
-        Return the active 64-hex-char API key for agent_id.
-        Returns None if the key is revoked or expired.
-        """
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             async with db.execute(
-                """SELECT api_key_hex, revoked, expires_at
-                   FROM agent_keys WHERE agent_id=?""",
+                "SELECT api_key_hex, revoked, expires_at FROM agent_keys WHERE agent_id=?",
                 (agent_id,),
             ) as cur:
                 row = await cur.fetchone()
@@ -127,9 +168,8 @@ class Database:
         expires_at: int = 0,
         label: str = "",
     ) -> None:
-        """Store or update a per-agent API key (enrollment / key rotation)."""
         now = int(time.time())
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.write() as db:
             await db.execute("""
                 INSERT INTO agent_keys(
                     agent_id, api_key_hex, enrolled_at, enrollment_ip,
@@ -147,8 +187,7 @@ class Database:
             await db.commit()
 
     async def get_key_meta(self, agent_id: str) -> dict | None:
-        """Return key metadata (not the key itself) for one agent."""
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """SELECT agent_id, enrolled_at, enrollment_ip,
@@ -167,8 +206,7 @@ class Database:
         return d
 
     async def list_key_meta(self) -> list[dict]:
-        """Return key metadata for all agents."""
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """SELECT a.agent_id, a.name, a.last_seen, a.last_ip,
@@ -194,8 +232,7 @@ class Database:
         return out
 
     async def revoke_key(self, agent_id: str) -> bool:
-        """Mark the key as revoked. Returns True if the key existed."""
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.write() as db:
             cur = await db.execute(
                 "UPDATE agent_keys SET revoked=1 WHERE agent_id=?", (agent_id,)
             )
@@ -203,8 +240,7 @@ class Database:
             return cur.rowcount > 0
 
     async def set_key_expiry(self, agent_id: str, expires_at: int) -> bool:
-        """Set key expiry (unix epoch). 0 = never. Returns True if updated."""
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.write() as db:
             cur = await db.execute(
                 "UPDATE agent_keys SET expires_at=?, revoked=0 WHERE agent_id=?",
                 (expires_at, agent_id),
@@ -213,8 +249,7 @@ class Database:
             return cur.rowcount > 0
 
     async def delete_agent_key(self, agent_id: str) -> bool:
-        """Hard-delete the key record. Agent must re-enroll to send data."""
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.write() as db:
             cur = await db.execute(
                 "DELETE FROM agent_keys WHERE agent_id=?", (agent_id,)
             )
@@ -223,9 +258,9 @@ class Database:
 
     # ── Agent registry ────────────────────────────────────────────────────────
 
-    async def upsert_agent(self, agent_id: str, name: str, ip: str):
+    async def upsert_agent(self, agent_id: str, name: str, ip: str) -> None:
         now = int(time.time())
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.write() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT last_seen FROM agents WHERE agent_id=?", (agent_id,)
@@ -233,8 +268,7 @@ class Database:
                 existing = await cur.fetchone()
             previous_last_seen = int(existing["last_seen"] or 0) if existing else 0
             starts_new_session = (
-                previous_last_seen <= 0
-                or now - previous_last_seen >= 300
+                previous_last_seen <= 0 or now - previous_last_seen >= 300
             )
             await db.execute("""
                 INSERT INTO agents(agent_id, name, last_seen, last_ip, created_at)
@@ -250,7 +284,10 @@ class Database:
                     SET disconnected_at=?, status='disconnected',
                         close_reason=CASE WHEN close_reason='' THEN 'timeout' ELSE close_reason END
                     WHERE agent_id=? AND status='connected'
-                """, (min(previous_last_seen + 300, now) if previous_last_seen else now, agent_id))
+                """, (
+                    min(previous_last_seen + 300, now) if previous_last_seen else now,
+                    agent_id,
+                ))
                 await db.execute("""
                     INSERT INTO agent_sessions(
                         agent_id, connected_at, disconnected_at,
@@ -258,16 +295,15 @@ class Database:
                     ) VALUES(?,?,0,?,?,'connected','')
                 """, (agent_id, now, now, ip))
             else:
-                cur = await db.execute("""
-                    UPDATE agent_sessions
-                    SET last_seen=?, last_ip=?
+                cur2 = await db.execute("""
+                    UPDATE agent_sessions SET last_seen=?, last_ip=?
                     WHERE id = (
                         SELECT id FROM agent_sessions
                         WHERE agent_id=? AND status='connected'
                         ORDER BY connected_at DESC LIMIT 1
                     )
                 """, (now, ip, agent_id))
-                if cur.rowcount == 0:
+                if cur2.rowcount == 0:
                     await db.execute("""
                         INSERT INTO agent_sessions(
                             agent_id, connected_at, disconnected_at,
@@ -279,7 +315,7 @@ class Database:
     async def close_stale_agent_sessions(self, stale_after: int = 300) -> int:
         now = int(time.time())
         cutoff = now - stale_after
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.write() as db:
             cur = await db.execute("""
                 UPDATE agent_sessions
                 SET disconnected_at=CASE
@@ -288,40 +324,36 @@ class Database:
                     END,
                     status='disconnected',
                     close_reason='timeout'
-                WHERE status='connected'
-                  AND last_seen <= ?
+                WHERE status='connected' AND last_seen <= ?
             """, (stale_after, now, stale_after, now, cutoff))
             await db.commit()
             return cur.rowcount
 
     async def get_agent_sessions(self, agent_id: str, limit: int = 5) -> list[dict]:
         await self.close_stale_agent_sessions()
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
                 SELECT id, agent_id, connected_at, disconnected_at,
                        last_seen, last_ip, status, close_reason
-                FROM agent_sessions
-                WHERE agent_id=?
-                ORDER BY connected_at DESC
-                LIMIT ?
+                FROM agent_sessions WHERE agent_id=?
+                ORDER BY connected_at DESC LIMIT ?
             """, (agent_id, limit)) as cur:
                 rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
     async def get_agent_session_counts(self) -> dict[str, int]:
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             async with db.execute("""
-                SELECT agent_id, COUNT(*) AS cnt
-                FROM agent_sessions
-                GROUP BY agent_id
+                SELECT agent_id, COUNT(*) AS cnt FROM agent_sessions GROUP BY agent_id
             """) as cur:
                 rows = await cur.fetchall()
         return {r[0]: int(r[1] or 0) for r in rows}
 
-    async def insert_payload(self, agent_id: str, section: str,
-                             collected_at: int, data: dict):
-        async with aiosqlite.connect(self.path) as db:
+    async def insert_payload(
+        self, agent_id: str, section: str, collected_at: int, data: dict
+    ) -> None:
+        async with self._pool.write() as db:
             await db.execute("""
                 INSERT INTO payloads(agent_id, section, collected_at, received_at, data)
                 VALUES(?,?,?,?,?)
@@ -331,7 +363,7 @@ class Database:
 
     async def get_all_agents(self) -> list:
         await self.close_stale_agent_sessions()
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM agents ORDER BY last_seen DESC"
@@ -340,7 +372,7 @@ class Database:
 
     async def get_agent(self, agent_id: str) -> dict | None:
         await self.close_stale_agent_sessions()
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM agents WHERE agent_id=?", (agent_id,)
@@ -349,41 +381,37 @@ class Database:
                 return dict(row) if row else None
 
     async def get_section_last_times(self, agent_id: str) -> dict:
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             async with db.execute("""
                 SELECT section, MAX(collected_at) as last_ts
-                FROM payloads WHERE agent_id=?
-                GROUP BY section
+                FROM payloads WHERE agent_id=? GROUP BY section
             """, (agent_id,)) as cur:
                 return {r[0]: r[1] for r in await cur.fetchall()}
 
-    async def query_section(self, agent_id: str, section: str,
-                            limit: int = 100,
-                            start: int = 0, end: int = 0) -> list:
-        async with aiosqlite.connect(self.path) as db:
+    async def query_section(
+        self,
+        agent_id: str,
+        section: str,
+        limit: int = 100,
+        start: int = 0,
+        end: int = 0,
+    ) -> list:
+        async with self._pool.read() as db:
             async with db.execute("""
                 SELECT collected_at, received_at, data
                 FROM payloads
                 WHERE agent_id=? AND section=?
                   AND collected_at BETWEEN ? AND ?
-                ORDER BY collected_at DESC
-                LIMIT ?
+                ORDER BY collected_at DESC LIMIT ?
             """, (agent_id, section, start, end or int(time.time()), limit)) as cur:
                 rows = await cur.fetchall()
         return [
-            {"collected_at": r[0], "received_at": r[1],
-             "data": json.loads(r[2])}
+            {"collected_at": r[0], "received_at": r[1], "data": json.loads(r[2])}
             for r in rows
         ]
 
     async def get_latest_packages_per_agent(self) -> list[tuple[str, list]]:
-        """
-        Return the most-recent packages payload for every agent.
-        Used by ThreatIntelWorker for proactive CVE re-scanning.
-        Returns list of (agent_id, packages_list) tuples.
-        """
-        import json as _json
-        async with aiosqlite.connect(self.path) as db:
+        async with self._pool.read() as db:
             async with db.execute("""
                 SELECT p.agent_id, p.data
                 FROM payloads p
@@ -399,9 +427,115 @@ class Database:
         result: list[tuple[str, list]] = []
         for agent_id, data_text in rows:
             try:
-                data = _json.loads(data_text) if data_text else []
+                data = json.loads(data_text) if data_text else []
                 if isinstance(data, list):
                     result.append((agent_id, data))
             except Exception:
                 pass
         return result
+
+    # ── Raw data queries for the Deep Analysis module ─────────────────────────
+
+    async def query_payloads(
+        self,
+        *,
+        agent_id: str | None = None,
+        section: str | None = None,
+        start: int = 0,
+        end: int = 0,
+        search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict]:
+        """
+        Flexible raw-data query used by the Deep Analysis UI.
+        Combines exact index lookups with optional JSON-field search.
+        All filters are optional and composable.
+        """
+        parts: list[str] = []
+        args: list = []
+        if agent_id:
+            parts.append("agent_id=?")
+            args.append(agent_id)
+        if section:
+            parts.append("section=?")
+            args.append(section)
+        if start:
+            parts.append("collected_at >= ?")
+            args.append(start)
+        if end:
+            parts.append("collected_at <= ?")
+            args.append(end)
+        if search:
+            parts.append("data LIKE ?")
+            args.append(f"%{search}%")
+
+        where = ("WHERE " + " AND ".join(parts)) if parts else ""
+        async with self._pool.read() as db:
+            async with db.execute(
+                f"SELECT id, agent_id, section, collected_at, received_at, data "
+                f"FROM payloads {where} "
+                f"ORDER BY collected_at DESC LIMIT ? OFFSET ?",
+                (*args, limit, offset),
+            ) as cur:
+                rows = await cur.fetchall()
+
+        result = []
+        for r in rows:
+            try:
+                data = json.loads(r[5])
+            except Exception:
+                data = {}
+            result.append({
+                "id":           r[0],
+                "agent_id":     r[1],
+                "section":      r[2],
+                "collected_at": r[3],
+                "received_at":  r[4],
+                "data":         data,
+            })
+        return result
+
+    async def get_latest_section_per_agent(self, section: str) -> dict[str, dict]:
+        """
+        Return the most-recent payload for EACH agent for a given section.
+        One SQL query regardless of agent count — O(n log n) via covered index.
+        Returns {agent_id: data_dict}.
+        """
+        async with self._pool.read() as db:
+            async with db.execute("""
+                SELECT p.agent_id, p.data
+                FROM payloads p
+                INNER JOIN (
+                    SELECT agent_id, MAX(collected_at) AS max_ts
+                    FROM payloads WHERE section = ?
+                    GROUP BY agent_id
+                ) latest ON p.agent_id = latest.agent_id
+                        AND p.collected_at = latest.max_ts
+                        AND p.section = ?
+            """, (section, section)) as cur:
+                rows = await cur.fetchall()
+        result: dict[str, dict] = {}
+        for agent_id, data_text in rows:
+            try:
+                data = json.loads(data_text) if data_text else {}
+                if isinstance(data, dict):
+                    result[agent_id] = data
+            except Exception:
+                pass
+        return result
+
+    async def get_distinct_sections(self, agent_id: str | None = None) -> list[str]:
+        if agent_id:
+            async with self._pool.read() as db:
+                async with db.execute(
+                    "SELECT DISTINCT section FROM payloads WHERE agent_id=? ORDER BY section",
+                    (agent_id,),
+                ) as cur:
+                    return [r[0] for r in await cur.fetchall()]
+        else:
+            async with self._pool.read() as db:
+                async with db.execute(
+                    "SELECT DISTINCT section FROM payloads ORDER BY section"
+                ) as cur:
+                    return [r[0] for r in await cur.fetchall()]

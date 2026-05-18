@@ -1,0 +1,476 @@
+/* AttackLens Global Utility Classes */
+
+/* ─── Severity Badges (60-30-10 palette) ─────────────────────────────────── */
+/* Usage: <span className="sev-badge sev-critical">CRITICAL</span>            */
+
+.sev-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.sev-critical {
+  background-color: var(--red-50);
+  color: var(--red-700);
+  border-color: var(--red-200);
+}
+
+.sev-high {
+  background-color: var(--amber-50);
+  color: var(--amber-700);
+  border-color: var(--amber-200);
+}
+
+.sev-medium {
+  background-color: var(--blue-50);
+  color: var(--blue-700);
+  border-color: var(--blue-200);
+}
+
+.sev-low {
+  background-color: var(--green-50);
+  color: var(--green-700);
+  border-color: var(--green-200);
+}
+
+.sev-info {
+  background-color: var(--gray-100);
+  color: var(--gray-600);
+  border-color: var(--gray-200);
+}
+
+/* ─── Finding Status Badges ───────────────────────────────────────────────── */
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.status-open {
+  background-color: var(--red-50);
+  color: var(--red-600);
+  border-color: var(--red-200);
+}
+
+.status-in-progress {
+  background-color: var(--amber-50);
+  color: var(--amber-700);
+  border-color: var(--amber-200);
+}
+
+.status-resolved {
+  background-color: var(--green-50);
+  color: var(--green-700);
+  border-color: var(--green-200);
+}
+
+.status-accepted {
+  background-color: var(--blue-50);
+  color: var(--blue-700);
+  border-color: var(--blue-200);
+}
+
+.status-fp {
+  background-color: var(--gray-100);
+  color: var(--gray-500);
+  border-color: var(--gray-200);
+}
+
+/* ─── SLA Badges ──────────────────────────────────────────────────────────── */
+
+.sla-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.sla-breached {
+  background-color: var(--red-100);
+  color: var(--red-700);
+}
+
+.sla-due-soon {
+  background-color: var(--amber-100);
+  color: var(--amber-900);
+}
+
+.sla-ok {
+  background-color: var(--green-100);
+  color: var(--green-800);
+}
+
+/* ─── Validation / Feed Badges ────────────────────────────────────────────── */
+
+.badge-kev {
+  background-color: var(--red-600);
+  color: var(--white);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.05em;
+}
+
+.badge-epss {
+  background-color: var(--amber-100);
+  color: var(--amber-900);
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.badge-nvd {
+  background-color: var(--blue-100);
+  color: var(--blue-700);
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* ─── Improvement / Pass Indicators ──────────────────────────────────────── */
+/* Green = improvement, positive change, passing check                        */
+
+.improvement-positive {
+  color: var(--green-600);
+  font-weight: 600;
+}
+
+.improvement-negative {
+  color: var(--red-600);
+  font-weight: 600;
+}
+
+.improvement-neutral {
+  color: var(--gray-400);
+}
+
+/* ─── Agent Status Dots ───────────────────────────────────────────────────── */
+
+.agent-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.agent-online  { background-color: var(--green-500); }
+.agent-stale   { background-color: var(--amber-500); }
+.agent-offline { background-color: var(--gray-300); }
+
+/* ─── Card Base ───────────────────────────────────────────────────────────── */
+
+.al-card {
+  background-color: var(--white);
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  box-shadow: var(--shadow-card);
+}
+
+.al-card-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--gray-100);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.al-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gray-800);
+  letter-spacing: -0.01em;
+}
+
+/* ─── Section / Group Label ───────────────────────────────────────────────── */
+
+.section-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--gray-400);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* ─── Scrollbar Styling ───────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--gray-200);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--gray-300);
+}
+
+/* ─── Focus Rings ─────────────────────────────────────────────────────────── */
+
+.al-focus:focus-visible {
+  outline: 2px solid var(--brand-orange);
+  outline-offset: 2px;
+}
+
+/* ─── Transition Defaults ─────────────────────────────────────────────────── */
+
+.al-transition {
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   DETECTION MODULE — ANIMATION SYSTEM
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Sonar ping — expands outward from critical severity dot */
+@keyframes sonar-ping {
+  0%   { transform: scale(0.8); opacity: 0.9; }
+  100% { transform: scale(2.8); opacity: 0; }
+}
+
+/* Heartbeat — used on live indicator and LIVE badge */
+@keyframes heartbeat {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  14%       { transform: scale(1.5); opacity: 1; }
+  28%       { transform: scale(1);   opacity: 0.8; }
+  42%       { transform: scale(1.35);opacity: 1; }
+  70%       { transform: scale(1);   opacity: 1; }
+}
+
+/* Slide in from the right — detail panel entry */
+@keyframes slide-in-right {
+  from { transform: translateX(28px); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+/* Fade + rise — table rows stagger in */
+@keyframes fade-up {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}
+
+/* Scan line — sweeps across header left→right */
+@keyframes scan-sweep {
+  0%   { transform: translateX(-120%); opacity: 0; }
+  8%   { opacity: 0.7; }
+  92%  { opacity: 0.7; }
+  100% { transform: translateX(220%);  opacity: 0; }
+}
+
+/* ECG / waveform pulse */
+@keyframes ecg-line {
+  0%   { stroke-dashoffset: 300; }
+  100% { stroke-dashoffset: 0;   }
+}
+
+/* Width fill — confidence / score bars */
+@keyframes bar-fill {
+  from { width: 0 !important; }
+}
+
+/* Glow pulse — critical rows breathe red */
+@keyframes glow-critical {
+  0%, 100% { box-shadow: inset 3px 0 0 #ef4444, 0 0 0 0 rgba(239,68,68,0); }
+  50%       { box-shadow: inset 3px 0 0 #ef4444, 0 0 18px 2px rgba(239,68,68,0.18); }
+}
+
+/* Bounce in — KPI tiles on mount */
+@keyframes bounce-in {
+  0%   { transform: scale(0.88); opacity: 0; }
+  60%  { transform: scale(1.04); opacity: 1; }
+  80%  { transform: scale(0.97); }
+  100% { transform: scale(1);    opacity: 1; }
+}
+
+/* Tab indicator slide */
+@keyframes tab-slide {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+/* Number count-up flicker */
+@keyframes num-appear {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Utility classes ─────────────────────────────────────────────────────── */
+
+.al-sonar-dot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.al-sonar-dot::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0;
+  animation: sonar-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.al-sonar-dot::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0;
+  animation: sonar-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite 0.5s;
+}
+
+.al-heartbeat  { animation: heartbeat 1.8s ease-in-out infinite; }
+.al-panel-in   { animation: slide-in-right 0.28s cubic-bezier(0.34, 1.4, 0.64, 1) both; }
+.al-row-in     { animation: fade-up 0.32s ease both; }
+.al-bounce-in  { animation: bounce-in 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+.al-bar-fill   { animation: bar-fill 0.9s cubic-bezier(0.22, 1, 0.36, 1) both 0.15s; }
+.al-scan       { animation: scan-sweep 4s ease-in-out infinite 1s; }
+.al-num        { animation: num-appear 0.4s ease both; }
+
+.al-glow-critical {
+  animation: glow-critical 2.5s ease-in-out infinite;
+}
+
+/* ── Severity row left-border colors ─────────────────────────────────────── */
+.row-critical { box-shadow: inset 3px 0 0 #ef4444; }
+.row-high     { box-shadow: inset 3px 0 0 #f59e0b; }
+.row-medium   { box-shadow: inset 3px 0 0 #3b82f6; }
+.row-low      { box-shadow: inset 3px 0 0 #22c55e; }
+.row-info     { box-shadow: inset 3px 0 0 #d1d5db; }
+
+.row-critical-hover:hover { background: rgba(239,68,68,0.04) !important; box-shadow: inset 3px 0 0 #ef4444, 0 1px 3px rgba(239,68,68,0.1) !important; }
+.row-high-hover:hover     { background: rgba(245,158,11,0.04) !important; box-shadow: inset 3px 0 0 #f59e0b !important; }
+.row-medium-hover:hover   { background: rgba(59,130,246,0.04) !important; box-shadow: inset 3px 0 0 #3b82f6 !important; }
+.row-low-hover:hover      { background: rgba(34,197,94,0.04)  !important; box-shadow: inset 3px 0 0 #22c55e !important; }
+
+/* ── Selected row ────────────────────────────────────────────────────────── */
+.row-selected { background: rgba(249,115,22,0.06) !important; box-shadow: inset 3px 0 0 #f97316 !important; }
+
+/* ── ECG waveform path ───────────────────────────────────────────────────── */
+.ecg-path {
+  stroke-dasharray: 300;
+  stroke-dashoffset: 300;
+  animation: ecg-line 1.8s ease-out forwards;
+}
+
+/* ── Glassmorphism card overlay ──────────────────────────────────────────── */
+.glass-card {
+  background: rgba(255,255,255,0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* ── Critical badge pulse ────────────────────────────────────────────────── */
+@keyframes badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.4); }
+  50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0); }
+}
+.badge-kev-pulse {
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   DARK SIDEBAR — STYLES & ANIMATIONS
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Nav item entrance stagger */
+@keyframes al-nav-enter {
+  from { opacity: 0; transform: translateX(-10px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Logo glow breathe — purple to match Attacklens brand */
+@keyframes al-logo-glow-pulse {
+  0%, 100% { filter: drop-shadow(0 0 5px rgba(124,58,237,0.4)) drop-shadow(0 0 2px rgba(139,92,246,0.3)); }
+  50%       { filter: drop-shadow(0 0 12px rgba(124,58,237,0.7)) drop-shadow(0 0 5px rgba(167,139,250,0.5)); }
+}
+.al-logo-glow {
+  animation: al-logo-glow-pulse 3s ease-in-out infinite;
+}
+
+/* Nav button hover — does NOT override active state */
+.al-nav-btn:not([data-active]):hover {
+  background: rgba(255,255,255,0.07) !important;
+  color:      rgba(255,255,255,0.88) !important;
+  border-color: rgba(255,255,255,0.08) !important;
+}
+
+/* Thin dark scrollbar for sidebar */
+.al-sidebar-nav::-webkit-scrollbar       { width: 3px; }
+.al-sidebar-nav::-webkit-scrollbar-track { background: transparent; }
+.al-sidebar-nav::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+.al-sidebar-nav::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   GLOBAL LAYOUT POLISH
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Page enter animation for content area */
+@keyframes al-page-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.al-page-enter {
+  animation: al-page-enter 0.25s ease both;
+}
+
+/* Frosted glass for top header overlays */
+.al-glass {
+  background: rgba(255,255,255,0.88);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+/* KPI card shimmer loading state */
+@keyframes al-shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+.al-shimmer {
+  background: linear-gradient(90deg, #f0f0f0 25%, #e8e8e8 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  animation: al-shimmer 1.4s ease infinite;
+  border-radius: 4px;
+}
+
+/* Subtle pulsing dot — used in header "Live" indicators */
+@keyframes al-dot-breathe {
+  0%, 100% { transform: scale(1);    opacity: 1; }
+  50%       { transform: scale(1.35); opacity: 0.75; }
+}
+.al-dot-breathe { animation: al-dot-breathe 2.2s ease-in-out infinite; }
+
+/* Active top-bar accent stripe for pages */
+.al-page-stripe {
+  height: 3px;
+  background: linear-gradient(90deg, #E8581A 0%, #f97316 40%, #fbbf24 100%);
+  border-radius: 0 0 3px 3px;
+}

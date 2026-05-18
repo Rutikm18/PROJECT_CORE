@@ -1,5 +1,5 @@
 # =============================================================================
-#  docker-compose.yml — Jarvis Manager (Caddy reverse proxy + Manager)
+#  docker-compose.yml — AttackLens Manager (Caddy reverse proxy + Manager)
 #
 #  SETUP (run once before first boot):
 #    bash env.sh          ← generates .env + Caddyfile interactively
@@ -31,18 +31,18 @@ services:
   # ── Message broker ───────────────────────────────────────────────────────────
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
-    container_name: jarvis-rabbitmq
+    container_name: attacklens-rabbitmq
     restart: unless-stopped
     ports:
       - "5672:5672"
       - "15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-jarvis}"
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-attacklens}"
       RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-changeme}"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     networks:
-      - jarvis_internal
+      - attacklens_internal
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_port_listener", "5672"]
       interval: 10s
@@ -53,7 +53,7 @@ services:
   # ── TLS reverse proxy ────────────────────────────────────────────────────────
   caddy:
     image: caddy:2-alpine
-    container_name: jarvis-caddy
+    container_name: attacklens-caddy
     restart: unless-stopped
 
     # Exposes the public-facing port(s) set by env.sh:
@@ -69,7 +69,7 @@ services:
       - caddy_config:/config                   # Caddy runtime config
 
     networks:
-      - jarvis_internal
+      - attacklens_internal
 
     depends_on:
       manager:
@@ -87,8 +87,8 @@ services:
     build:
       context: .
       dockerfile: manager/Dockerfile
-    image: jarvis-manager:latest
-    container_name: jarvis-manager
+    image: attacklens-manager:latest
+    container_name: attacklens-manager
     restart: unless-stopped
 
     # Manager exposed on 8080 for direct agent access (no TLS — use on trusted networks)
@@ -116,7 +116,7 @@ services:
       TLS_MODE:                "none"
 
       # RabbitMQ — async ingest pipeline
-      RABBITMQ_URL:            "amqp://${RABBITMQ_USER:-jarvis}:${RABBITMQ_PASS:-changeme}@rabbitmq:5672/"
+      RABBITMQ_URL:            "amqp://${RABBITMQ_USER:-attacklens}:${RABBITMQ_PASS:-changeme}@rabbitmq:5672/"
 
       # Central threat-intel API. Manager still degrades gracefully if unavailable.
       THREAT_INTEL_URL:        "http://threat-intel:8090"
@@ -159,7 +159,7 @@ services:
       - ./manager/dashboard:/app/manager/dashboard:ro     # live-reload static UI without rebuild
 
     networks:
-      - jarvis_internal
+      - attacklens_internal
 
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8080/health"]
@@ -199,7 +199,7 @@ services:
       - ./logs:/app/logs
 
     networks:
-      - jarvis_internal
+      - attacklens_internal
 
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8090/health"]
@@ -216,7 +216,7 @@ volumes:
 
 # ── Networks ──────────────────────────────────────────────────────────────────
 networks:
-  jarvis_internal:
+  attacklens_internal:
     driver: bridge
     # Manager has no public IP — only reachable from caddy via this network
     internal: false   # set true to block all outbound internet from manager

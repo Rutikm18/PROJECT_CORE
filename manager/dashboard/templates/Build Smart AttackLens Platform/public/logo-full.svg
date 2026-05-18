@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 128" fill="none">
+  <defs>
+    <linearGradient id="shieldBody2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#EEEEF8"/>
+      <stop offset="40%"  stop-color="#D4D4E8"/>
+      <stop offset="100%" stop-color="#9898BC"/>
+    </linearGradient>
+    <linearGradient id="shieldHL2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="ringGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="wordGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#7C3AED"/>
+      <stop offset="60%"  stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <radialGradient id="dotGrad2" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#C4B5FD"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </radialGradient>
+    <linearGradient id="arrowGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#6D28D9"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ── Shield (scaled to 110px tall) ── -->
+  <!-- Body -->
+  <path
+    d="M56 6 L102 21 L102 58 Q102 92 56 114 Q10 92 10 58 L10 21 Z"
+    fill="url(#shieldBody2)"
+    stroke="#C0C0D8"
+    stroke-width="1.2"
+  />
+  <path
+    d="M56 6 L102 21 L102 58 Q102 92 56 114 Q10 92 10 58 L10 21 Z"
+    fill="url(#shieldHL2)"
+  />
+  <!-- Inner rim -->
+  <path
+    d="M56 14 L94 26 L94 58 Q94 88 56 106 Q18 88 18 58 L18 26 Z"
+    fill="none" stroke="#B0A0D8" stroke-width="0.7" opacity="0.45"
+  />
+  <!-- Rings -->
+  <circle cx="56" cy="62" r="30" stroke="url(#ringGrad2)" stroke-width="1.5" opacity="0.35" fill="none"/>
+  <circle cx="56" cy="62" r="22" stroke="url(#ringGrad2)" stroke-width="1.5" opacity="0.52" fill="none"/>
+  <circle cx="56" cy="62" r="14" stroke="url(#ringGrad2)" stroke-width="1.5" opacity="0.68" fill="none"/>
+  <circle cx="56" cy="62" r="7"  stroke="url(#ringGrad2)" stroke-width="1.5" opacity="0.82" fill="none"/>
+  <circle cx="56" cy="62" r="3.5" fill="url(#dotGrad2)"/>
+  <!-- Arrow -->
+  <line x1="30" y1="38" x2="52" y2="58" stroke="url(#arrowGrad2)" stroke-width="2.5" stroke-linecap="round"/>
+  <polygon points="52,58 41,38 31,46" fill="url(#arrowGrad2)" opacity="0.88"/>
+  <path d="M30 38 L30 49 M30 38 L41 38" stroke="url(#arrowGrad2)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+  <!-- ── Wordmark ── -->
+  <!-- "Attacklens" -->
+  <text
+    x="124" y="68"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif"
+    font-size="52"
+    font-weight="800"
+    letter-spacing="-1"
+    fill="url(#wordGrad)"
+  >Attacklens</text>
+
+  <!-- "Continuous Threat Exposure Management" -->
+  <text
+    x="125" y="94"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif"
+    font-size="16"
+    font-weight="400"
+    letter-spacing="0.2"
+    fill="#2D2D2D"
+  >Continuous Threat Exposure Management</text>
+</svg>

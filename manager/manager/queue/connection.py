@@ -14,9 +14,9 @@ from aio_pika import Channel, Exchange, ExchangeType
 
 from .schemas import (
     EXCHANGE_MAIN, EXCHANGE_DLX,
-    QUEUE_TELEMETRY, QUEUE_JARVIS, QUEUE_DEAD,
-    ROUTING_TELEMETRY, ROUTING_JARVIS,
-    MSG_TTL_MS, QUEUE_MAX_TELEMETRY, QUEUE_MAX_JARVIS,
+    QUEUE_TELEMETRY, QUEUE_ATTACKLENS, QUEUE_DEAD,
+    ROUTING_TELEMETRY, ROUTING_ATTACKLENS,
+    MSG_TTL_MS, QUEUE_MAX_TELEMETRY, QUEUE_MAX_ATTACKLENS,
 )
 
 log = logging.getLogger("manager.queue")
@@ -49,27 +49,27 @@ async def declare_topology(channel: Channel) -> Tuple[Exchange, Exchange]:
         arguments={
             "x-message-ttl":          MSG_TTL_MS,
             "x-max-length":           QUEUE_MAX_TELEMETRY,
-            "x-overflow":             "drop-head",       # drop oldest on overflow
+            "x-overflow":             "drop-head",
             "x-dead-letter-exchange": EXCHANGE_DLX,
         },
     )
     await tel_q.bind(main_ex, routing_key=ROUTING_TELEMETRY)
 
-    # jarvis.work queue
-    jar_q = await channel.declare_queue(
-        QUEUE_JARVIS,
+    # attacklens.work queue
+    al_q = await channel.declare_queue(
+        QUEUE_ATTACKLENS,
         durable=True,
         arguments={
             "x-message-ttl":          MSG_TTL_MS,
-            "x-max-length":           QUEUE_MAX_JARVIS,
+            "x-max-length":           QUEUE_MAX_ATTACKLENS,
             "x-overflow":             "drop-head",
             "x-dead-letter-exchange": EXCHANGE_DLX,
         },
     )
-    await jar_q.bind(main_ex, routing_key=ROUTING_JARVIS)
+    await al_q.bind(main_ex, routing_key=ROUTING_ATTACKLENS)
 
     log.info(
         "Queue topology declared: %s → [%s, %s]",
-        EXCHANGE_MAIN, QUEUE_TELEMETRY, QUEUE_JARVIS,
+        EXCHANGE_MAIN, QUEUE_TELEMETRY, QUEUE_ATTACKLENS,
     )
     return main_ex, dlx

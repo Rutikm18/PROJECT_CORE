@@ -23,7 +23,7 @@ Design
 - Each task runs immediately on startup, then sleeps for its interval.
 - Feed health is persisted to intel.db after every attempt (success or fail).
 - Proactive CVE scan uses the existing CVELookup instance (shared rate-limit
-  lock with the JarvisEngine NVD worker — they serialize fairly).
+  lock with the AttackLensEngine NVD worker — they serialize fairly).
 - Fully cancellable: stop() cancels all tasks and awaits them.
 """
 from __future__ import annotations
@@ -36,8 +36,8 @@ from typing import TYPE_CHECKING, Callable, Awaitable
 if TYPE_CHECKING:
     from ..indexer       import IntelDB
     from ..db            import Database
-    from ..jarvis.feeds  import FeedManager
-    from ..jarvis.nvd    import CVELookup
+    from ..attacklens.feeds  import FeedManager
+    from ..attacklens.nvd    import CVELookup
 
 log = logging.getLogger("manager.workers.intel")
 

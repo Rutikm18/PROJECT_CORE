@@ -15,6 +15,7 @@
 #    make certs           generate self-signed TLS certs (dev only)
 #    make run-manager     start manager server (export API_KEY first)
 #    make run-agent       start agent (requires agent.conf)
+#    make build-dashboard build React AttackLens dashboard
 #    make build-binaries  build arm64 agent + watchdog binaries
 #    make build-pkg       build arm64 .pkg installer
 #    make build           build all Docker images
@@ -136,6 +137,16 @@ certs: ## Generate self-signed TLS certificate (dev use only)
 	  -addext "subjectAltName=IP:127.0.0.1,IP:0.0.0.0"
 	@echo "\n  Certs written to: certs/server.{crt,key}"
 	@echo "  Remember: set tls_verify = false in agent.toml for self-signed certs\n"
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+DASHBOARD_DIR := manager/dashboard/templates/Build Smart AttackLens Platform
+
+.PHONY: build-dashboard
+build-dashboard: ## Build React AttackLens dashboard and deploy to static/
+	@cd "$(DASHBOARD_DIR)" && npm install --legacy-peer-deps
+	@cd "$(DASHBOARD_DIR)" && npm run build
+	@cp manager/dashboard/static/index.html manager/dashboard/templates/index.html
+	@echo "  Dashboard built → manager/dashboard/static/assets/ + templates/index.html"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 .PHONY: run-manager

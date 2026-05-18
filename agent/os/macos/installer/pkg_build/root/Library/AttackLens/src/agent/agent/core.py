@@ -157,6 +157,19 @@ class Orchestrator:
         self._executor  = None
         self._cbr       = CircuitBreakerRegistry(fail_threshold=3, cooldown_sec=60)
 
+        # Overflow spool: when the in-memory queue is saturated we write
+        # encrypted envelopes straight to disk rather than silently dropping them.
+        # The sender drains this same file when the manager comes back online.
+        from .sender import DiskSpool
+        if sys.platform == "darwin":
+            _default_spool = "/Library/AttackLens/spool"
+        elif sys.platform == "win32":
+            _default_spool = r"C:\Program Files (x86)\AttackLens\spool"
+        else:
+            _default_spool = "/var/lib/attacklens/spool"
+        _spool_dir = config.get("paths", {}).get("spool_dir", _default_spool)
+        self._overflow_spool = DiskSpool(os.path.join(_spool_dir, "unsent.ndjson"))
+
     def start(self):
         import concurrent.futures
         self._stop.clear()
@@ -252,11 +265,16 @@ class Orchestrator:
             envelope["section"] = section   # plaintext routing hint for manager
             maxq = self.config["manager"].get("max_queue_size", 500)
             if self.send_queue.qsize() >= maxq:
+                # Spool to disk instead of silently dropping — zero data loss
+                # during manager outages. The sender auto-drains the spool file
+                # when the manager comes back online.
                 try:
-                    self.send_queue.get_nowait()   # drop oldest
-                    log.warning("Send queue full — dropped oldest item")
-                except queue.Empty:
-                    pass
+                    self._overflow_spool.write(envelope)
+                    log.debug("Queue full — overflow-spooled %s to disk", section)
+                except Exception as spool_exc:
+                    log.warning("Queue full, spool also failed for %s: %s",
+                                section, spool_exc)
+                return
             self.send_queue.put_nowait(envelope)
         except Exception as exc:
             log.error("Encrypt/enqueue failed for %s: %s", section, exc)
