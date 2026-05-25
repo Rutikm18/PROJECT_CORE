@@ -87,9 +87,11 @@ def make_ingest_router(
                 raise HTTPException(400, f"Missing field: {field}")
 
         # ── 3. Timestamp replay window ────────────────────────────────────────
+        # 401 (not 400): stale timestamp is a security rejection (replay protection),
+        # not a client schema error.
         skew = abs(time.time() - float(envelope["timestamp"]))
         if skew > REPLAY_WINDOW_SECONDS:
-            raise HTTPException(400, "Timestamp out of window")
+            raise HTTPException(401, "Timestamp out of window — replay rejected")
 
         raw_agent_id = envelope.get("agent_id", "")
 
@@ -170,27 +172,65 @@ def make_ingest_router(
                     )
 
             # ── 11b–14b. Sync pipeline ────────────────────────────────────────
+
+            # Step 1: persist to file store.
+            # On failure return 503 so the agent spools and retries — never
+            # return 200 here, that would cause silent permanent data loss.
             try:
                 await store.write(
                     agent_id=agent_id, section=section, ts=float(collected),
                     data=data, os=os_name, hostname=hostname,
                 )
+            except OSError as exc:
+                log.error(
+                    "Store write I/O error agent=%s section=%s path=%s: %s",
+                    agent_id, section,
+                    getattr(exc, "filename", "unknown"),
+                    exc,
+                )
+                raise HTTPException(
+                    503,
+                    detail="Storage unavailable — agent should retry",
+                ) from exc
             except Exception as exc:
-                log.error("Store write failed agent=%s section=%s: %s",
-                          agent_id, section, exc)
+                log.error(
+                    "Store write failed agent=%s section=%s: %s",
+                    agent_id, section, exc,
+                )
+                raise HTTPException(
+                    503,
+                    detail="Storage error — agent should retry",
+                ) from exc
 
-            await db.insert_payload(agent_id, section, collected, data)
+            # Step 2: update SQLite index. Failure here is non-fatal for the
+            # file-store record (already written above) but we log clearly so
+            # operators can detect index drift.
+            try:
+                await db.insert_payload(agent_id, section, int(float(collected)), data)
+            except Exception as exc:
+                log.error(
+                    "DB index write failed agent=%s section=%s ts=%s: %s — "
+                    "file-store record exists but DB index is behind",
+                    agent_id, section, collected, exc,
+                )
+                # Do NOT raise — file-store record is safe; index can be rebuilt.
 
+            # Step 3: run detection engine (non-blocking, never crashes ingest).
             if engine is not None:
                 asyncio.create_task(engine.process(agent_id, section, data))
 
-            await hub.broadcast(agent_id, {
-                "type":         "payload",
-                "agent_id":     agent_id,
-                "section":      section,
-                "collected_at": collected,
-                "data":         data,
-            })
+            # Step 4: push to live dashboard — totally optional; never crashes ingest.
+            try:
+                await hub.broadcast(agent_id, {
+                    "type":         "payload",
+                    "agent_id":     agent_id,
+                    "section":      section,
+                    "collected_at": collected,
+                    "data":         data,
+                })
+            except Exception as exc:
+                log.debug("WebSocket broadcast failed (non-fatal) agent=%s: %s",
+                          agent_id, exc)
 
             return IngestResponse(status="ok", queued=False)
 

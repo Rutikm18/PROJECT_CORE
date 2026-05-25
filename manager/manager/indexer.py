@@ -38,7 +38,7 @@ PRAGMA foreign_keys = ON;
 -- ── Findings ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS findings (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    external_id       TEXT,
+    external_id       TEXT    NOT NULL DEFAULT '',
     agent_id          TEXT    NOT NULL,
     category          TEXT    NOT NULL,
     item_key          TEXT    NOT NULL,
@@ -58,11 +58,11 @@ CREATE TABLE IF NOT EXISTS findings (
     epss_score        REAL    NOT NULL DEFAULT 0,
     kev               INTEGER NOT NULL DEFAULT 0,
     exploit_available INTEGER NOT NULL DEFAULT 0,
-    exploit_sources   TEXT,
+    exploit_sources   TEXT    NOT NULL DEFAULT '[]',
     asset_tier        TEXT    NOT NULL DEFAULT '',
     asset_importance  REAL    NOT NULL DEFAULT 0,
-    priority_reason   TEXT,
-    action_plan       TEXT,
+    priority_reason   TEXT    NOT NULL DEFAULT '',
+    action_plan       TEXT    NOT NULL DEFAULT '[]',
     mitre_technique   TEXT,
     mitre_tactic      TEXT,
     first_detected_at REAL    NOT NULL,
@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS findings (
     is_active         INTEGER NOT NULL DEFAULT 1,
     resolved_at       REAL,
     tags              TEXT,
+    -- SOC workflow columns (were migrations; now canonical schema for fresh DBs)
+    status            TEXT    NOT NULL DEFAULT 'new',
+    assignee          TEXT    NOT NULL DEFAULT '',
+    sla_due           REAL    NOT NULL DEFAULT 0,
+    closed_at         REAL,
+    priority          INTEGER NOT NULL DEFAULT 0,
+    analyst_notes     TEXT    NOT NULL DEFAULT '',
+    ai_analysed       INTEGER NOT NULL DEFAULT 0,
+    threat_actor_match TEXT   NOT NULL DEFAULT '',
+    news_refs         TEXT    NOT NULL DEFAULT '[]',
     UNIQUE(agent_id, category, item_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_find_external_id ON findings(external_id);
@@ -311,6 +321,20 @@ CREATE TABLE IF NOT EXISTS org_settings (
     updated_at REAL NOT NULL DEFAULT 0
 );
 
+-- ── Settings audit log ─────────────────────────────────────────────────────
+-- Immutable record of every settings change: who changed what, from/to, when.
+CREATE TABLE IF NOT EXISTS settings_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    key        TEXT NOT NULL,
+    old_value  TEXT NOT NULL DEFAULT '',
+    new_value  TEXT NOT NULL DEFAULT '',
+    actor      TEXT NOT NULL DEFAULT 'system',
+    ip         TEXT NOT NULL DEFAULT '',
+    changed_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_audit_key ON settings_audit(key, changed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_ts  ON settings_audit(changed_at DESC);
+
 -- ── CISA Known Exploited Vulnerabilities ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS cisa_kev (
     cve_id          TEXT PRIMARY KEY,
@@ -497,8 +521,12 @@ class IntelDB:
         # Alias write connection for all existing write code (zero changes needed)
         self._conn = self._pool._write_conn  # type: ignore[attr-defined]
 
-        # Migrations must run before executescript so new columns exist
-        # before _SCHEMA tries to build indexes that reference them.
+        # 1. Migrations first: add columns that exist in _SOC_MIGRATIONS but may
+        #    be absent on old databases.  Must run before executescript because
+        #    _SCHEMA creates indexes that reference these migrated columns
+        #    (e.g. idx_find_composite on composite_score).  Errors are silently
+        #    ignored — the column already exists, or the table doesn't exist yet
+        #    (fresh DB) and will be created by executescript below.
         for table, col, defn in _SOC_MIGRATIONS:
             try:
                 await self._conn.execute(
@@ -506,9 +534,12 @@ class IntelDB:
                 )
                 await self._conn.commit()
             except Exception:
-                pass  # column already exists, or table not yet created (fresh db)
-        # Backfill external_id for existing rows so the UNIQUE index creation
-        # doesn't fail on rows that all share the '' default.
+                pass  # column already exists — no-op
+
+        # 2. Backfill external_id before creating the UNIQUE INDEX on it.
+        #    On existing DBs all rows may have external_id=''; giving each a
+        #    distinct value here prevents the CREATE UNIQUE INDEX in step 3
+        #    from failing with a UNIQUE constraint violation.
         try:
             async with self._conn.execute(
                 "SELECT id FROM findings WHERE external_id IS NULL OR external_id = ''"
@@ -522,7 +553,11 @@ class IntelDB:
             if rows:
                 await self._conn.commit()
         except Exception:
-            pass  # findings table doesn't exist yet on a fresh db
+            pass  # findings table doesn't exist yet on a fresh DB — skip
+
+        # 3. Create all tables + indexes (idempotent CREATE IF NOT EXISTS).
+        #    Migrations and backfill above ensure existing data is clean before
+        #    the UNIQUE INDEX on external_id is (re-)created.
         async with self._conn.executescript(_SCHEMA):
             pass
         await self._conn.commit()
@@ -713,12 +748,13 @@ class IntelDB:
                 "UPDATE findings SET is_active=0, resolved_at=? WHERE agent_id=? AND id=?",
                 (ts, agent_id, finding_id),
             )
-            await self._conn.commit()
             if row:
                 await self._append_timeline(
                     agent_id, row["category"], "resolved",
                     row["item_key"], row["title"], None, None, ts,
                 )
+            # Single commit covers both the UPDATE and the timeline INSERT.
+            await self._conn.commit()
 
     # ── Change timeline ───────────────────────────────────────────────────────
 

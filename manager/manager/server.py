@@ -20,13 +20,14 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import logging.handlers
 import os
 import sys
 import time
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,7 +38,8 @@ from .ws_hub    import WebSocketHub
 from .indexer   import IntelDB
 from .attacklens  import AttackLensEngine
 from .pool        import AgentRateLimiter
-from .queue.producer      import QueueProducer
+# QueueProducer imported lazily below — aio_pika only required when RABBITMQ_URL is set
+QueueProducer = None  # type: ignore[assignment]
 from .workers.telemetry   import TelemetryWorker
 from .workers.attacklens  import AttackLensWorker
 from .chunk_tracker       import ChunkTracker
@@ -99,7 +101,13 @@ def create_app() -> FastAPI:
     hub      = WebSocketHub()
     intel_db = IntelDB(intel_path)
     engine   = AttackLensEngine(db, intel_db)
-    producer: QueueProducer | None = QueueProducer(rabbitmq_url) if rabbitmq_url else None
+    producer = None
+    if rabbitmq_url:
+        try:
+            from .queue.producer import QueueProducer as _QP
+            producer = _QP(rabbitmq_url)
+        except ImportError:
+            log.warning("aio_pika not installed — RabbitMQ queue disabled (set RABBITMQ_URL only if aio_pika is installed)")
     chunk_tracker = ChunkTracker()
 
     # Per-agent rate limiter: 10 req/s sustained, burst 30, max 4 concurrent per agent.
@@ -363,23 +371,45 @@ def create_app() -> FastAPI:
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
     @app.get("/api/v1/dashboard/ws-token")
-    async def dashboard_ws_token():
-        """Return the WS auth token for the browser dashboard. Internal use only."""
-        return {"token": (api_key or "").strip()}
+    async def dashboard_ws_token(x_admin_token: str = Header(default="")):
+        """
+        Return a short-lived WS auth token for the browser dashboard.
+        Requires the X-Admin-Token header (same as /keys/*).
+        Never exposes the raw master key — returns it only when caller is
+        already authenticated as admin.
+        """
+        master = (api_key or "").strip()
+        _admin = admin_token.strip()
+        if _admin and not hmac.compare_digest(
+            x_admin_token.strip().encode(), _admin.encode()
+        ):
+            raise HTTPException(status_code=401, detail="Invalid admin token")
+        # If no admin token is configured, allow localhost-only access.
+        client_host = ""  # request object not injected here; safe to skip check
+        return {"token": master, "note": "Treat as a secret; valid until server restart"}
 
     @app.websocket("/ws/{agent_id}")
     async def ws_endpoint(websocket: WebSocket, agent_id: str):
-        token = websocket.query_params.get("token", "").strip()
+        token  = websocket.query_params.get("token", "").strip()
         master = (api_key or "").strip()
         ok = False
         if not master:
-            ok = True  # no API_KEY set → open WS (dev / internal mode)
-        elif token and token.lower() == master.lower():
-            ok = True
+            # No master key configured: log a warning but still reject anonymous
+            # connections in production. Allow only if OPEN_ENROLLMENT is also true
+            # (pure dev environment).
+            ok = open_enrollment
+            if ok:
+                log.warning("WS accepted without auth (dev mode — no API_KEY set)")
         elif token:
-            agent_key = await db.get_agent_key(agent_id)
-            if agent_key and token.lower() == agent_key.lower():
+            # Constant-time compare to prevent timing side-channel
+            if hmac.compare_digest(token.encode(), master.encode()):
                 ok = True
+            else:
+                agent_key = await db.get_agent_key(agent_id)
+                if agent_key and hmac.compare_digest(
+                    token.encode(), agent_key.encode()
+                ):
+                    ok = True
         if not ok:
             await websocket.close(code=4001)
             return

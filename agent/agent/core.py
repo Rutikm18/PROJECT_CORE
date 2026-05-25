@@ -250,16 +250,34 @@ class Orchestrator:
             envelope = encrypt(payload, self.enc_key, self.mac_key,
                                self.agent_id, int(time.time()))
             envelope["section"] = section   # plaintext routing hint for manager
-            maxq = self.config["manager"].get("max_queue_size", 500)
-            if self.send_queue.qsize() >= maxq:
-                try:
-                    self.send_queue.get_nowait()   # drop oldest
-                    log.warning("Send queue full — dropped oldest item")
-                except queue.Empty:
-                    pass
-            self.send_queue.put_nowait(envelope)
         except Exception as exc:
-            log.error("Encrypt/enqueue failed for %s: %s", section, exc)
+            log.error("Encrypt failed for %s — payload dropped: %s", section, exc)
+            return
+
+        maxq = self.config["manager"].get("max_queue_size", 500)
+        if self.send_queue.qsize() >= maxq:
+            # Queue is full — evict the oldest item.
+            # Log at WARNING so operators can tune max_queue_size or investigate
+            # why the sender isn't draining (network down? manager slow?).
+            try:
+                evicted = self.send_queue.get_nowait()
+                evicted_section = evicted.get("section", "unknown")
+                log.warning(
+                    "Send queue full (max=%d) — evicted oldest item section=%s. "
+                    "Increase [manager] max_queue_size or check network connectivity.",
+                    maxq, evicted_section,
+                )
+            except queue.Empty:
+                pass
+
+        try:
+            self.send_queue.put_nowait(envelope)
+        except queue.Full:
+            # Highly unlikely (we just evicted above) but guard anyway.
+            log.error(
+                "Send queue still full after eviction for section=%s — dropping",
+                section,
+            )
 
     def _emit_health(self) -> None:
         """Emit a synthetic agent_health section with diagnostics."""

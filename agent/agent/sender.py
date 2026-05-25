@@ -247,14 +247,28 @@ class Sender:
 
     # ── Send with retry ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _read_error_body(exc: urllib.error.HTTPError, limit: int = 512) -> str:
+        """Read and truncate the response body from an HTTPError for logging."""
+        try:
+            raw = exc.read(limit)
+            text = raw.decode("utf-8", errors="replace").strip()
+            return text[:limit]
+        except Exception:
+            return ""
+
     def _send_with_retry(self, envelope: dict) -> bool:
         """
         Try to POST envelope to manager.
         Returns True on success, False if all attempts failed.
         4xx client errors are dropped (not retried, not spooled).
+        503 (storage unavailable on manager) is retried and spooled — it means
+        the data was not persisted and the agent must hold onto it.
         """
-        body  = json.dumps(envelope).encode()
-        delay = self.retry_del
+        body    = json.dumps(envelope).encode()
+        delay   = self.retry_del
+        section = envelope.get("section", "unknown")
+        agent   = envelope.get("agent_id", "unknown")
 
         for attempt in range(1, self.max_retry + 1):
             try:
@@ -263,8 +277,8 @@ class Sender:
                     data=body,
                     headers={
                         "Content-Type": "application/json",
-                        "X-Agent-ID":   envelope.get("agent_id", ""),
-                        "X-Section":    envelope.get("section", ""),
+                        "X-Agent-ID":   agent,
+                        "X-Section":    section,
                         "User-Agent":   "attacklens-agent/2.0",
                     },
                     method="POST",
@@ -278,48 +292,111 @@ class Sender:
                             log.info("Manager connection restored")
                         self._online = True
                         self._auth_fail_count = 0
-                        log.debug("Sent %s → 200", envelope.get("section"))
+                        log.debug("Sent %s → 200", section)
                         return True
                     elif resp.status == 401:
                         self._auth_fail_count += 1
                         log.warning(
-                            "HTTP 401 (count=%d) section=%s — spooling for re-auth",
-                            self._auth_fail_count, envelope.get("section"),
+                            "HTTP 401 (count=%d) agent=%s section=%s — "
+                            "key rejected, spooling for re-auth",
+                            self._auth_fail_count, agent, section,
                         )
                         return False
+                    elif resp.status == 429:
+                        retry_after = resp.headers.get("Retry-After", "?")
+                        log.warning(
+                            "HTTP 429 rate-limited agent=%s section=%s "
+                            "retry-after=%ss (attempt %d/%d)",
+                            agent, section, retry_after, attempt, self.max_retry,
+                        )
+                        # treat as transient — fall through to backoff
+                    elif resp.status == 503:
+                        log.warning(
+                            "HTTP 503 storage unavailable agent=%s section=%s "
+                            "(attempt %d/%d) — will spool",
+                            agent, section, attempt, self.max_retry,
+                        )
+                        # 503 = manager accepted but couldn't persist; must spool
                     elif 400 <= resp.status < 500:
                         self._auth_fail_count = 0
-                        log.error("Manager rejected (HTTP %d) section=%s — dropping",
-                                  resp.status, envelope.get("section"))
-                        return True   # "handled" — don't spool
+                        log.error(
+                            "Manager rejected HTTP %d agent=%s section=%s — "
+                            "dropping (unrecoverable client error)",
+                            resp.status, agent, section,
+                        )
+                        return True   # "handled" — don't spool a bad payload
                     else:
-                        log.warning("Manager HTTP %d (attempt %d/%d)",
-                                    resp.status, attempt, self.max_retry)
+                        log.warning(
+                            "Manager HTTP %d agent=%s section=%s (attempt %d/%d)",
+                            resp.status, agent, section, attempt, self.max_retry,
+                        )
 
             except urllib.error.HTTPError as exc:
+                body_text = self._read_error_body(exc)
                 if exc.code == 401:
-                    # Auth expired (manager restart, key rotation) — spool, do NOT drop.
                     self._auth_fail_count += 1
                     log.warning(
-                        "HTTP 401 (count=%d) section=%s — spooling for re-auth",
-                        self._auth_fail_count, envelope.get("section"),
+                        "HTTP 401 (count=%d) agent=%s section=%s — "
+                        "manager says: %r — spooling for re-auth",
+                        self._auth_fail_count, agent, section, body_text,
                     )
-                    return False   # spool it
-                if 400 <= exc.code < 500:
-                    # True client errors (bad payload, forbidden) — drop permanently.
+                    return False
+                if exc.code == 429:
+                    retry_after = exc.headers.get("Retry-After", "?")
+                    log.warning(
+                        "HTTP 429 rate-limited agent=%s section=%s "
+                        "retry-after=%ss (attempt %d/%d): %r",
+                        agent, section, retry_after, attempt, self.max_retry, body_text,
+                    )
+                elif exc.code == 503:
+                    log.warning(
+                        "HTTP 503 storage unavailable agent=%s section=%s "
+                        "(attempt %d/%d): %r — will spool",
+                        agent, section, attempt, self.max_retry, body_text,
+                    )
+                elif 400 <= exc.code < 500:
                     self._auth_fail_count = 0
-                    log.error("Manager rejected (HTTP %d) section=%s — dropping",
-                              exc.code, envelope.get("section"))
+                    log.error(
+                        "Manager rejected HTTP %d agent=%s section=%s — "
+                        "dropping: %r",
+                        exc.code, agent, section, body_text,
+                    )
                     return True
-                log.warning("HTTP error %d (attempt %d/%d): %s",
-                            exc.code, attempt, self.max_retry, exc)
+                else:
+                    log.warning(
+                        "HTTP error %d agent=%s section=%s (attempt %d/%d): %r",
+                        exc.code, agent, section, attempt, self.max_retry, body_text,
+                    )
+            except ssl.SSLError as exc:
+                log.error(
+                    "TLS error agent=%s section=%s (attempt %d/%d): %s — "
+                    "check tls_verify setting and manager certificate",
+                    agent, section, attempt, self.max_retry, exc,
+                )
+            except TimeoutError as exc:
+                log.warning(
+                    "Send timeout agent=%s section=%s (attempt %d/%d) "
+                    "timeout=%ss: %s",
+                    agent, section, attempt, self.max_retry, self.timeout, exc,
+                )
+            except OSError as exc:
+                log.warning(
+                    "Network error agent=%s section=%s (attempt %d/%d): %s",
+                    agent, section, attempt, self.max_retry, exc,
+                )
             except Exception as exc:
-                log.warning("Send failed (attempt %d/%d): %s",
-                            attempt, self.max_retry, exc)
+                log.warning(
+                    "Send failed agent=%s section=%s (attempt %d/%d): %s",
+                    agent, section, attempt, self.max_retry, exc,
+                )
 
             if attempt < self.max_retry:
                 jitter = random.uniform(0, delay * 0.3)
                 time.sleep(min(delay + jitter, 60))
                 delay *= 2
 
-        return False   # all retries exhausted — caller will spool to disk
+        log.warning(
+            "All %d send attempts exhausted agent=%s section=%s — spooling to disk",
+            self.max_retry, agent, section,
+        )
+        return False   # caller will spool to disk

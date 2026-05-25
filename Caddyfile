@@ -4,5 +4,5 @@
 }
 
 :80 {
-    reverse_proxy jarvis-manager:8080
+    reverse_proxy manager:8080
 }

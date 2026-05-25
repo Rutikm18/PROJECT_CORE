@@ -121,15 +121,21 @@ class Database:
     async def check_and_store_nonce(self, nonce: str, ttl: float) -> bool:
         """
         Returns True if nonce is new (accepted), False if already seen (replay).
-        Atomically checks + inserts to prevent races.
-        Cleans expired nonces opportunistically (every ~100 calls, amortised).
+        Cleanup of expired nonces runs probabilistically (~1% of calls).
+        Uses a subquery for the row cap — standard SQLite doesn't support
+        DELETE...LIMIT without SQLITE_ENABLE_UPDATE_DELETE_LIMIT.
         """
+        import random
         now = time.time()
         expires_at = now + ttl
         async with self._pool.write() as db:
-            # Cleanup expired nonces — INSERT OR IGNORE is O(log n) + index scan
-            # We piggyback cleanup here to avoid a separate background task.
-            await db.execute("DELETE FROM nonce_cache WHERE expires_at < ?", (now,))
+            # Probabilistic cleanup — avoids a DELETE scan on every hot-path call.
+            if random.random() < 0.01:
+                await db.execute(
+                    "DELETE FROM nonce_cache WHERE rowid IN "
+                    "(SELECT rowid FROM nonce_cache WHERE expires_at < ? LIMIT 500)",
+                    (now,),
+                )
             try:
                 await db.execute(
                     "INSERT INTO nonce_cache(nonce, expires_at) VALUES(?, ?)",
@@ -138,7 +144,7 @@ class Database:
                 await db.commit()
                 return True
             except Exception:
-                # UNIQUE constraint violation → replay
+                # UNIQUE constraint violation → replay attack
                 await db.rollback()
                 return False
 
@@ -495,6 +501,30 @@ class Database:
                 "data":         data,
             })
         return result
+
+    async def count_payloads(
+        self, *,
+        agent_id: str | None = None,
+        section:  str | None = None,
+        start:    int | None = None,
+        end:      int | None = None,
+        search:   str | None = None,
+    ) -> int:
+        """Efficient COUNT(*) for the payload table — never loads row data."""
+        parts: list[str] = []
+        args:  list      = []
+        if agent_id: parts.append("agent_id=?");       args.append(agent_id)
+        if section:  parts.append("section=?");        args.append(section)
+        if start:    parts.append("collected_at >= ?"); args.append(start)
+        if end:      parts.append("collected_at <= ?"); args.append(end)
+        if search:   parts.append("data LIKE ?");      args.append(f"%{search}%")
+        where = ("WHERE " + " AND ".join(parts)) if parts else ""
+        async with self._pool.read() as db:
+            async with db.execute(
+                f"SELECT COUNT(*) FROM payloads {where}", args
+            ) as cur:
+                row = await cur.fetchone()
+        return row[0] if row else 0
 
     async def get_latest_section_per_agent(self, section: str) -> dict[str, dict]:
         """

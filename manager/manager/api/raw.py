@@ -81,16 +81,15 @@ def make_raw_router(db: "Database") -> APIRouter:
         """Row count matching the current filter set (for pagination UI)."""
         now = int(time.time())
         resolved_start, resolved_end = _resolve_window(window, start, end, now)
-        rows = await db.query_payloads(
+        # Use an efficient COUNT(*) query rather than loading all rows.
+        count = await db.count_payloads(
             agent_id=agent_id,
             section=section,
             start=resolved_start,
             end=resolved_end,
             search=search,
-            limit=1_000_000,  # large enough to get the real count
-            offset=0,
         )
-        return {"count": len(rows)}
+        return {"count": count}
 
     @router.get("/query")
     async def query_payloads(

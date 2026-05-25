@@ -36,8 +36,14 @@ class MockDB:
     async def get_agent_key(self, agent_id: str) -> str | None:
         return self.keys.get(agent_id)
 
-    async def upsert_agent_key(self, agent_id: str, api_key_hex: str,
-                                enrolled_ip: str = "") -> None:
+    async def upsert_agent_key(
+        self,
+        agent_id: str,
+        api_key_hex: str,
+        enrolled_ip: str = "",
+        expires_at: float | None = None,
+        label: str = "",
+    ) -> None:
         self.keys[agent_id] = api_key_hex
 
     async def upsert_agent(self, agent_id: str, name: str, ip: str) -> None:
@@ -46,10 +52,16 @@ class MockDB:
 
 # ── Test fixtures ─────────────────────────────────────────────────────────────
 
-def make_app(tokens: list[str]) -> tuple[FastAPI, MockDB]:
+def make_app(tokens: list[str], open_enrollment: bool | None = None) -> tuple[FastAPI, MockDB]:
     db  = MockDB()
     app = FastAPI()
-    app.include_router(make_enroll_router(db, tokens), prefix="/api/v1")
+    # Infer open_enrollment: closed when a token list is supplied; open otherwise.
+    if open_enrollment is None:
+        open_enrollment = len(tokens) == 0
+    app.include_router(
+        make_enroll_router(db, tokens, open_enrollment=open_enrollment),
+        prefix="/api/v1",
+    )
     return app, db
 
 
@@ -91,11 +103,13 @@ class TestEnrollAuth:
         assert r.status_code == 401
 
     def test_empty_token_list_rejects_all(self):
-        app, _ = make_app([])
+        # When token mode is on but no tokens are configured, the server
+        # returns 503 (misconfiguration) rather than 401 (bad credentials).
+        app, _ = make_app([], open_enrollment=False)
         c = TestClient(app)
         r = c.post("/api/v1/enroll", json=valid_body(),
                    headers={"X-Enrollment-Token": "any-token"})
-        assert r.status_code == 401
+        assert r.status_code == 503
 
 
 # ── Input validation ──────────────────────────────────────────────────────────

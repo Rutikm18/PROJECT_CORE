@@ -17,6 +17,7 @@ The new key is returned only on POST /rotate (one-time visibility).
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import secrets
 import time
@@ -37,7 +38,7 @@ def _make_admin_auth(admin_token: str):
                 status_code=503,
                 detail="Key management API unavailable: ADMIN_TOKEN not configured",
             )
-        if x_admin_token.strip() != admin_token:
+        if not hmac.compare_digest(x_admin_token.strip().encode(), admin_token.encode()):
             raise HTTPException(status_code=401, detail="Invalid admin token")
     return _check
 

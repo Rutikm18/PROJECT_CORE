@@ -70,7 +70,7 @@ def _notifier(request: Request):
 @router.get("/api/v1/remediation/{finding_id}")
 async def get_remediation_plan(
     finding_id: int,
-    os_type: str = Query("macos", regex="^(macos|windows|linux)$"),
+    os_type: str = Query("macos", pattern="^(macos|windows|linux)$"),
     idb=Depends(_idb),
 ):
     plan = await idb.get_remediation_plan(finding_id, os_type)
@@ -83,7 +83,7 @@ async def get_remediation_plan(
 async def generate_remediation_plan(
     finding_id: int,
     request: Request,
-    os_type: str = Query("macos", regex="^(macos|windows|linux)$"),
+    os_type: str = Query("macos", pattern="^(macos|windows|linux)$"),
     force: bool = Query(False),
     notify: bool = Query(False),
     idb=Depends(_idb),
