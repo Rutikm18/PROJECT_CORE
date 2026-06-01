@@ -41,8 +41,8 @@ function ConfPct({ f }: { f: DetectionFinding }) {
 export default function NetworkThreats() {
   return (
     <GenericDetectionPage
-      title="Network Threats"
-      subtitle="Active connections matched against threat feeds · IOC correlation · JA3 fingerprinting · beacon detection"
+      title="Vector"
+      subtitle="Network connectivity · ports · interfaces · mounts · shares · communication paths · IOC correlation"
       apiUrl="/api/v1/detection/network"
       accent="red"
       icon={<Globe className="w-5 h-5 text-orange-500" />}

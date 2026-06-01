@@ -26,7 +26,7 @@
 Every component that touches I/O is async. The HTTP ingest path does zero I/O except for crypto verification — it publishes to RabbitMQ and returns 202 in < 5 ms. All storage, detection, and enrichment runs in background workers.
 
 ### Allowlist-First Detection
-Before any rule fires, each telemetry item passes through `allowlist.py`. Apple system processes, trusted CDN IP ranges, and benign IDE→tool process spawns are suppressed or downgraded. This is the primary mechanism for false-positive reduction.
+Before any rule fires, each telemetry item passes through pple system processes, trusted CDN IP ranges, and benign IDE→tool process spawns are suppressed or downgraded. This is the primary`allowlist.py`. A mechanism for false-positive reduction.
 
 ### Defense in Depth
 Four detection layers operate independently and in sequence:

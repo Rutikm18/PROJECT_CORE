@@ -38,8 +38,8 @@ function CategoryChip({ f }: { f: DetectionFinding }) {
 export default function ExecutionThreats() {
   return (
     <GenericDetectionPage
-      title="Execution & Malware"
-      subtitle="Process-based detections · offensive tools · obfuscation · parent-child spawn analysis · binary entropy"
+      title="Citadels"
+      subtitle="Processes · execution paths · containers · scheduled tasks · startup mechanisms · persistence indicators"
       apiUrl="/api/v1/detection/processes"
       accent="red"
       icon={<Terminal className="w-5 h-5 text-orange-500" />}

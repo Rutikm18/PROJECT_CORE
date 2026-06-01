@@ -18,6 +18,7 @@ import Timeline             from "./pages/Timeline";
 import AssetRegistry        from "./pages/AssetRegistry";
 import DeepAnalysis         from "./pages/DeepAnalysis";
 import Accuracy             from "./pages/Accuracy";
+import DetectionCoverage    from "./pages/DetectionCoverage";
 import Settings             from "./pages/Settings";
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -35,9 +36,10 @@ function PageRouter({ page }: { page: PageId }) {
     case "threat-intel":     return <ThreatIntelligence />;
     case "timeline":         return <Timeline />;
     case "assets":           return <AssetRegistry />;
-    case "raw-data":         return <DeepAnalysis />;
-    case "accuracy":         return <Accuracy />;
-    case "settings":         return <Settings />;
+    case "raw-data":              return <DeepAnalysis />;
+    case "accuracy":              return <Accuracy />;
+    case "detection-coverage":    return <DetectionCoverage />;
+    case "settings":              return <Settings />;
     default:                 return <SecurityDashboard />;
   }
 }

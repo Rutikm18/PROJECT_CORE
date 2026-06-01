@@ -14,19 +14,20 @@ import { cn } from "../../lib/utils";
 const PAGE_LABELS: Record<PageId, string> = {
   "dashboard":       "Security Dashboard",
   "threat-queue":    "Findings",
-  "execution":       "Execution & Malware",
-  "network":         "Network Threats",
-  "vulnerabilities": "Vulnerability Surface",
-  "persistence":     "Persistence & Backdoors",
+  "execution":       "Citadels",
+  "network":         "Vector",
+  "vulnerabilities": "Origin",
+  "persistence":     "Backdoor & Services",
   "identity":        "Identity & Access",
   "security-posture":"Security Posture",
   "compliance":      "CIS Compliance",
   "threat-intel":    "Threat Intelligence",
   "timeline":        "Timeline & History",
   "assets":          "Asset Registry",
-  "raw-data":        "Deep Analysis",
-  "accuracy":        "Detection Accuracy",
-  "settings":        "Settings",
+  "raw-data":           "Deep Analysis",
+  "accuracy":           "Detection Accuracy",
+  "detection-coverage": "Detection Coverage",
+  "settings":           "Settings",
 };
 
 const ROLE_COLORS: Record<Role, string> = {

@@ -76,30 +76,44 @@ const STATUS_MAP = Object.fromEntries(STATUS_FLOW.map(s => [s.key, s]));
 const WORKFLOW_STEPS = ["new","triaging","investigating","in_remediation","closed"];
 
 const CAT_CONFIG: Record<string, { label: string; color: string; dot: string; bg: string }> = {
-  execution:      { label: "Execution",       color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
-  malware:        { label: "Malware",          color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
-  process:        { label: "Process",          color: "text-orange-700", dot: "bg-orange-500", bg: "bg-orange-50 border-orange-200" },
-  network:        { label: "Network",          color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
-  connection:     { label: "Connection",       color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
-  package:        { label: "Vulnerability",    color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
-  vulnerability:  { label: "Vulnerability",    color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
-  persistence:    { label: "Persistence",      color: "text-purple-700", dot: "bg-purple-500", bg: "bg-purple-50 border-purple-200" },
-  service:        { label: "Persistence",      color: "text-purple-700", dot: "bg-purple-500", bg: "bg-purple-50 border-purple-200" },
-  task:           { label: "Persistence",      color: "text-purple-700", dot: "bg-purple-500", bg: "bg-purple-50 border-purple-200" },
-  config:         { label: "Config",           color: "text-indigo-700", dot: "bg-indigo-500", bg: "bg-indigo-50 border-indigo-200" },
-  user:           { label: "Identity",         color: "text-indigo-700", dot: "bg-indigo-500", bg: "bg-indigo-50 border-indigo-200" },
-  identity:       { label: "Identity",         color: "text-indigo-700", dot: "bg-indigo-500", bg: "bg-indigo-50 border-indigo-200" },
-  security:       { label: "Posture",          color: "text-green-700",  dot: "bg-green-500",  bg: "bg-green-50 border-green-200" },
+  // Persistence terrain — execution paths, processes, containers, tasks, startup
+  execution:      { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  malware:        { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  process:        { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  script:         { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  container:      { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  persistence:    { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  service:        { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  task:           { label: "Citadels",   color: "text-red-700",    dot: "bg-red-500",    bg: "bg-red-50 border-red-200"    },
+  // Reachability terrain — network, ports, connections, shares
+  network:        { label: "Vector",  color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
+  connection:     { label: "Vector",  color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
+  port:           { label: "Vector",  color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
+  arp:            { label: "Vector",  color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
+  covert:         { label: "Vector",  color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
+  lateral:        { label: "Vector",  color: "text-blue-700",   dot: "bg-blue-500",   bg: "bg-blue-50 border-blue-200"  },
+  // Surface terrain — apps, packages, SBOMs, configs, system components
+  package:        { label: "Origin",       color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
+  vulnerability:  { label: "Origin",       color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
+  sbom:           { label: "Origin",       color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
+  config:         { label: "Origin",       color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
+  binary:         { label: "Origin",       color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
+  sysctl:         { label: "Origin",       color: "text-amber-700",  dot: "bg-amber-500",  bg: "bg-amber-50 border-amber-200"},
+  // Identity and Posture stay unchanged
+  user:           { label: "Identity",      color: "text-indigo-700", dot: "bg-indigo-500", bg: "bg-indigo-50 border-indigo-200" },
+  identity:       { label: "Identity",      color: "text-indigo-700", dot: "bg-indigo-500", bg: "bg-indigo-50 border-indigo-200" },
+  account:        { label: "Identity",      color: "text-indigo-700", dot: "bg-indigo-500", bg: "bg-indigo-50 border-indigo-200" },
+  security:       { label: "Posture",       color: "text-green-700",  dot: "bg-green-500",  bg: "bg-green-50 border-green-200" },
+  posture:        { label: "Posture",       color: "text-green-700",  dot: "bg-green-500",  bg: "bg-green-50 border-green-200" },
 };
 
 const CAT_GROUPS = [
-  { key: "all",         label: "All Findings" },
-  { key: "execution",   label: "Execution" },
-  { key: "network",     label: "Network" },
-  { key: "package",     label: "Vulnerability" },
-  { key: "persistence", label: "Persistence" },
-  { key: "user",        label: "Identity" },
-  { key: "security",    label: "Posture" },
+  { key: "all",        label: "All Findings" },
+  { key: "surface",    label: "Origin"    },
+  { key: "reach",      label: "Vector"    },
+  { key: "persist",    label: "Citadels"  },
+  { key: "user",       label: "Identity"     },
+  { key: "security",   label: "Posture"      },
 ];
 
 const PRIORITIES: Record<number, { label: string; color: string }> = {
@@ -135,11 +149,19 @@ function relTime(ts: number): string {
 
 function catKey(cat: string): string {
   const c = cat.toLowerCase();
-  if (c.includes("exec") || c.includes("malware") || c.includes("script")) return "execution";
-  if (c.includes("network") || c.includes("connection") || c.includes("c2") || c.startsWith("feed")) return "network";
-  if (c.includes("package") || c.includes("vuln") || c.includes("cve")) return "package";
-  if (c.includes("persist") || c.includes("service") || c.includes("task") || c.includes("config")) return "persistence";
-  if (c.includes("user") || c.includes("identity") || c.includes("account")) return "user";
+  // Persistence terrain: execution paths, processes, containers, tasks, startup mechanisms
+  if (c.includes("exec") || c.includes("malware") || c.includes("script") || c.includes("process") ||
+      c.includes("persist") || c.includes("service") || c.includes("task") || c.includes("container") ||
+      c.includes("lateral") || c.includes("covert")) return "persist";
+  // Reachability terrain: network, ports, interfaces, shares, connections
+  if (c.includes("network") || c.includes("connection") || c.includes("c2") || c.startsWith("feed") ||
+      c.includes("port") || c.includes("arp") || c.includes("dns") || c.includes("tunnel")) return "reach";
+  // Surface terrain: packages, SBOMs, configs, apps, system components
+  if (c.includes("package") || c.includes("vuln") || c.includes("cve") || c.includes("sbom") ||
+      c.includes("config") || c.includes("binary") || c.includes("sysctl") || c.includes("app")) return "surface";
+  // Identity
+  if (c.includes("user") || c.includes("identity") || c.includes("account") || c.includes("credential")) return "user";
+  // Posture
   if (c.includes("security") || c.includes("posture") || c.includes("sip") || c.includes("firewall")) return "security";
   return c;
 }
@@ -669,12 +691,11 @@ export default function ThreatQueue() {
     if (catTab !== "all") {
       const k = catKey(f.category);
       const grouped: Record<string, string[]> = {
-        execution: ["execution","malware","process","script"],
-        network:   ["network","connection","c2"],
-        package:   ["package","vulnerability","cve","sbom"],
-        persistence:["persistence","service","task","config","backdoor"],
-        user:      ["user","identity","account","credential"],
-        security:  ["security","posture","sip","firewall"],
+        persist: ["persist","execution","malware","script","process","container","service","task","lateral","covert"],
+        reach:   ["reach","network","connection","c2","port","arp","dns","tunnel"],
+        surface: ["surface","package","vulnerability","cve","sbom","config","binary","sysctl","app"],
+        user:    ["user","identity","account","credential"],
+        security:["security","posture","sip","firewall"],
       };
       const allowed = grouped[catTab] ?? [catTab];
       if (!allowed.includes(k) && !f.category.toLowerCase().includes(catTab)) return false;
@@ -847,12 +868,11 @@ export default function ThreatQueue() {
           const count = g.key === "all" ? findings.length : findings.filter(f => {
             const k = catKey(f.category);
             const grouped: Record<string, string[]> = {
-              execution: ["execution","malware","process"],
-              network:   ["network","connection"],
-              package:   ["package","vulnerability"],
-              persistence:["persistence","service","task","config"],
-              user:      ["user","identity","account"],
-              security:  ["security","posture"],
+              persist: ["persist","execution","malware","process","script","container","service","task","lateral","covert"],
+              reach:   ["reach","network","connection","c2","port","arp","dns","tunnel"],
+              surface: ["surface","package","vulnerability","sbom","config","binary","sysctl","app"],
+              user:    ["user","identity","account","credential"],
+              security:["security","posture","sip","firewall"],
             };
             return (grouped[g.key] ?? [g.key]).includes(k) || f.category.toLowerCase().includes(g.key);
           }).length;

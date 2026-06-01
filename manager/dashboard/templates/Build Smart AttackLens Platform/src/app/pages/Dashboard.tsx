@@ -327,10 +327,15 @@ export default function SecurityDashboard() {
   // Category data for horizontal bars
   const catMax   = Math.max(...catDist.map(d => d.count), 1);
   const catColors: Record<string, string> = {
-    package: C.high, connection: C.medium, network: C.medium,
+    // Surface terrain
+    package: C.high, vulnerability: C.high, sbom: C.high, config: C.high, binary: C.high, sysctl: C.high,
+    // Reachability terrain
+    connection: C.medium, network: C.medium, port: C.medium, arp: C.medium,
+    // Persistence terrain
     process: C.critical, execution: C.critical, malware: C.critical,
-    service: C.purple, task: C.purple, config: C.purple,
-    user: C.indigo, identity: C.indigo, security: "#22c55e",
+    service: C.critical, task: C.critical, persistence: C.critical, container: C.critical,
+    // Identity & Posture
+    user: C.indigo, identity: C.indigo, account: C.indigo, security: "#22c55e",
   };
   const topCats = [...catDist].sort((a, b) => b.count - a.count).slice(0, 8);
 

@@ -3,7 +3,7 @@ import {
   AlertTriangle, Terminal, Globe, PackageOpen, Anchor, Users,
   ShieldCheck, Crosshair, BarChart3, Monitor, Database,
   ClipboardList, FlaskConical, LayoutDashboard, Activity,
-  Settings, Server, Building2, MapPin,
+  Settings, Server, Building2, MapPin, Layers,
 } from "lucide-react";
 
 export type PageId =
@@ -21,6 +21,7 @@ export type PageId =
   | "assets"
   | "raw-data"
   | "accuracy"
+  | "detection-coverage"
   | "settings";
 
 interface NavItem {
@@ -40,18 +41,24 @@ interface NavGroup {
 }
 
 // Category keyword → PageId mapping (mirrors ThreatQueue catKey logic)
+// Attack Terrain routing: Persistence → execution page, Reachability → network page, Surface → vulnerabilities page
 const CAT_MAP: Record<string, PageId> = {
+  // Persistence terrain
   execution: "execution", malware: "execution", process: "execution",
-  script: "execution", binary: "execution",
+  script: "execution", container: "execution", lateral: "execution", covert: "execution",
+  persistence: "execution", service: "execution", task: "execution",
+  // Reachability terrain
   network: "network", connection: "network", c2: "network", dns: "network",
-  tunnel: "network", beacon: "network",
+  tunnel: "network", beacon: "network", port: "network", arp: "network",
+  // Surface terrain
   package: "vulnerabilities", vuln: "vulnerabilities", cve: "vulnerabilities",
-  sbom: "vulnerabilities",
-  persistence: "persistence", service: "persistence", task: "persistence",
-  config: "persistence", launchd: "persistence", plist: "persistence",
-  backdoor: "persistence",
+  sbom: "vulnerabilities", config: "vulnerabilities", binary: "vulnerabilities", sysctl: "vulnerabilities",
+  // Backdoor & Services
+  launchd: "persistence", plist: "persistence", backdoor: "persistence",
+  // Identity
   user: "identity", identity: "identity", account: "identity",
   credential: "identity", keychain: "identity",
+  // Posture
   security: "security-posture", posture: "security-posture", sip: "security-posture",
   firewall: "security-posture", gatekeeper: "security-posture",
 };
@@ -73,13 +80,11 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Detections",
+    label: "Attack Terrain",
     items: [
-      { id: "execution",       label: "Execution & Malware",     icon: Terminal,    badgeColor: "red"   },
-      { id: "network",         label: "Network Threats",         icon: Globe,       badgeColor: "red"   },
-      { id: "vulnerabilities", label: "Vulnerability Surface",   icon: PackageOpen, badgeColor: "amber" },
-      { id: "persistence",     label: "Persistence & Backdoors", icon: Anchor,      badgeColor: "amber" },
-      { id: "identity",        label: "Identity & Access",       icon: Users,       badgeColor: "amber" },
+      { id: "vulnerabilities", label: "Origin",   icon: PackageOpen, badgeColor: "amber" },
+      { id: "network",         label: "Vector",   icon: Globe,       badgeColor: "red"   },
+      { id: "execution",       label: "Citadels", icon: Terminal,    badgeColor: "red"   },
     ],
   },
   {
@@ -92,11 +97,14 @@ const GROUPS: NavGroup[] = [
   {
     label: "Management",
     items: [
+      { id: "identity",     label: "Identity & Access",   icon: Users,       badgeColor: "amber" },
+      { id: "persistence",  label: "Backdoor & Services", icon: Anchor,      badgeColor: "amber" },
       { id: "threat-intel", label: "Threat Intelligence", icon: Crosshair    },
       { id: "timeline",     label: "Timeline & History",  icon: BarChart3    },
       { id: "assets",       label: "Asset Registry",      icon: Monitor      },
-      { id: "raw-data",     label: "Deep Analysis",       icon: Database     },
-      { id: "accuracy",     label: "Detection Accuracy",  icon: FlaskConical },
+      { id: "raw-data",          label: "Deep Analysis",        icon: Database     },
+      { id: "accuracy",          label: "Detection Accuracy",   icon: FlaskConical },
+      { id: "detection-coverage", label: "Detection Coverage",  icon: Layers       },
     ],
   },
 ];

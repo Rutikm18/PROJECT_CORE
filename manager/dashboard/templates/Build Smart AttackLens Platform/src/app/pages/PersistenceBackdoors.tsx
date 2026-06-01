@@ -35,7 +35,7 @@ function RiskScore({ f }: { f: DetectionFinding }) {
 export default function PersistenceBackdoors() {
   return (
     <GenericDetectionPage
-      title="Persistence & Backdoors"
+      title="Backdoor & Services"
       subtitle="LaunchDaemons · cron/launchd tasks · shell config injection · SUID binaries · world-writable PATH"
       apiUrl="/api/v1/detection/persistence"
       accent="amber"
