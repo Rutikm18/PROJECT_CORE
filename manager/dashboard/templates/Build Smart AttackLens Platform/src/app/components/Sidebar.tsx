@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import {
-  AlertTriangle, Terminal, Globe, PackageOpen, Anchor, Users,
-  ShieldCheck, Crosshair, BarChart3, Monitor, Database,
-  ClipboardList, FlaskConical, LayoutDashboard, Activity,
-  Settings, Server, Building2, MapPin, Layers,
+  AlertTriangle, Terminal, Globe, PackageOpen,
+  Crosshair, BarChart3, Monitor, Database,
+  ClipboardList, LayoutDashboard, Activity,
+  Settings, Server, Building2, MapPin,
 } from "lucide-react";
 
 export type PageId =
@@ -76,7 +76,7 @@ const GROUPS: NavGroup[] = [
     label: "Operations",
     items: [
       { id: "dashboard",    label: "Dashboard",  icon: LayoutDashboard },
-      { id: "threat-queue", label: "Findings",   icon: AlertTriangle,  badgeColor: "red", badgePulse: true },
+      { id: "threat-queue", label: "Validated Findings",   icon: AlertTriangle,  badgeColor: "red", badgePulse: true },
     ],
   },
   {
@@ -90,21 +90,21 @@ const GROUPS: NavGroup[] = [
   {
     label: "Posture",
     items: [
-      { id: "security-posture", label: "Security Posture", icon: ShieldCheck, badgeColor: "red" },
       { id: "compliance",       label: "CIS Compliance",   icon: ClipboardList },
     ],
   },
   {
-    label: "Management",
+    label: "Intelligence",
     items: [
-      { id: "identity",     label: "Identity & Access",   icon: Users,       badgeColor: "amber" },
-      { id: "persistence",  label: "Backdoor & Services", icon: Anchor,      badgeColor: "amber" },
-      { id: "threat-intel", label: "Threat Intelligence", icon: Crosshair    },
-      { id: "timeline",     label: "Timeline & History",  icon: BarChart3    },
-      { id: "assets",       label: "Asset Registry",      icon: Monitor      },
-      { id: "raw-data",          label: "Deep Analysis",        icon: Database     },
-      { id: "accuracy",          label: "Detection Accuracy",   icon: FlaskConical },
-      { id: "detection-coverage", label: "Detection Coverage",  icon: Layers       },
+      { id: "threat-intel", label: "Threat Intelligence", icon: Crosshair },
+    ],
+  },
+  {
+    label: "Asset Inventory",
+    items: [
+      { id: "timeline",  label: "Timeline & History", icon: BarChart3 },
+      { id: "raw-data",  label: "Deep Analysis",      icon: Database  },
+      { id: "assets",    label: "Asset Registry",      icon: Monitor  },
     ],
   },
 ];
@@ -224,7 +224,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
               className="text-[9px] font-bold mt-[5px] tracking-widest uppercase"
               style={{ color: "rgba(255,255,255,0.72)", letterSpacing: "0.09em" }}
             >
-              Continuous Threat Exposure
+              Agentic Exposure Management
             </div>
           </div>
         </div>
@@ -358,7 +358,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                     key={item.id}
                     data-active={isActive ? "true" : undefined}
                     onClick={() => onNavigate(item.id)}
-                    className="al-nav-btn w-full flex items-center justify-between gap-2 px-2.5 py-[7px] rounded-lg mb-[2px] cursor-pointer text-left relative overflow-hidden"
+                    className="al-nav-btn w-full flex items-start justify-between gap-2 px-2.5 py-2 rounded-lg mb-[2px] cursor-pointer text-left relative overflow-hidden"
                     style={{
                       background: isActive ? "rgba(124,58,237,0.14)" : "transparent",
                       border: `1px solid ${isActive ? "rgba(124,58,237,0.30)" : "transparent"}`,
@@ -371,7 +371,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                     {isActive && (
                       <span
                         aria-hidden
-                        className="absolute left-0 top-1/2 -translate-y-1/2 rounded-r-full"
+                        className="absolute left-0 top-[6px] rounded-r-full"
                         style={{
                           width: "2.5px",
                           height: "16px",
@@ -381,13 +381,13 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                       />
                     )}
 
-                    <div className="flex items-center gap-2.5 pl-1 min-w-0">
+                    <div className="flex items-start gap-2.5 pl-1 min-w-0">
                       <Icon
-                        className="w-3.5 h-3.5 flex-shrink-0"
+                        className="w-3.5 h-3.5 flex-shrink-0 mt-[1px]"
                         style={{ color: isActive ? "#A78BFA" : "rgba(255,255,255,0.32)" }}
                       />
                       <span
-                        className="text-[11.5px] leading-tight truncate"
+                        className="text-[11px] leading-snug break-words"
                         style={{ fontWeight: isActive ? 600 : 450, letterSpacing: "-0.01em" }}
                       >
                         {item.label}
