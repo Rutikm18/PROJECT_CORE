@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from collections import Counter
 from typing import Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
@@ -41,6 +43,7 @@ from ..models import IngestResponse
 from shared.wire import (
     REQUIRED_ENVELOPE_FIELDS,
     REPLAY_WINDOW_SECONDS,
+    validate_payload,
 )
 
 if TYPE_CHECKING:
@@ -51,6 +54,43 @@ if TYPE_CHECKING:
     from ..pool           import AgentRateLimiter
 
 log = logging.getLogger("manager.api.ingest")
+
+# Payload-schema validation mode. Default OFF (flag-and-tag) for backward
+# compatibility — set ATTACKLENS_INGEST_STRICT_PAYLOAD=1 to reject payloads
+# missing required fields with HTTP 422.
+_STRICT_PAYLOAD = os.environ.get(
+    "ATTACKLENS_INGEST_STRICT_PAYLOAD", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+# In-process observability: per-field gap counts since boot, so the validation
+# status page / a metrics scrape can surface "which fields are empty" as a real
+# signal instead of silent blanks. Bounded by the fixed field vocabulary.
+_SCHEMA_GAPS: Counter = Counter()
+
+
+def schema_gap_stats() -> dict:
+    """Snapshot of payload-schema gaps seen since boot (field → count)."""
+    return dict(_SCHEMA_GAPS)
+
+
+def _record_schema_gaps(agent_id: str, section: str, report: dict) -> None:
+    """Count + log a payload that failed schema validation (degraded mode)."""
+    for f in report["missing"]:
+        _SCHEMA_GAPS[f"missing:{f}"] += 1
+    for f in report["empty"]:
+        _SCHEMA_GAPS[f"empty:{f}"] += 1
+    for f in report["recommended_missing"]:
+        _SCHEMA_GAPS[f"recommended_missing:{f}"] += 1
+    if report["data_error"]:
+        _SCHEMA_GAPS["data_error"] += 1
+    elif report["data_empty"]:
+        _SCHEMA_GAPS["data_empty"] += 1
+    log.warning(
+        "payload schema gap agent=%s section=%s missing=%s empty=%s "
+        "data_empty=%s data_error=%s recommended_missing=%s",
+        agent_id, section, report["missing"], report["empty"],
+        report["data_empty"], report["data_error"], report["recommended_missing"],
+    )
 
 
 def make_ingest_router(
@@ -134,6 +174,25 @@ def make_ingest_router(
             accepted = await db.check_and_store_nonce(nonce, REPLAY_WINDOW_SECONDS)
             if not accepted:
                 raise HTTPException(401, "Duplicate nonce — replay rejected")
+
+            # ── 8b. Payload-schema validation ─────────────────────────────────
+            # The envelope was validated at step 2; the *payload* historically
+            # was not — missing/empty inner fields were silently defaulted. Now
+            # we validate against the canonical contract and either flag (count +
+            # log, default) or reject (HTTP 422, strict mode). Backward-compatible.
+            report = validate_payload(payload)
+            if not report["ok"]:
+                _record_schema_gaps(
+                    payload.get("agent_id", raw_agent_id),
+                    payload.get("section", envelope.get("section", "unknown")),
+                    report,
+                )
+                if _STRICT_PAYLOAD and (report["missing"] or report["empty"]):
+                    raise HTTPException(
+                        422,
+                        detail=("Payload schema invalid — "
+                                f"missing={report['missing']} empty={report['empty']}"),
+                    )
 
             # ── 9. Extract fields ─────────────────────────────────────────────
             agent_id   = payload.get("agent_id",    envelope["agent_id"])

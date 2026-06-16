@@ -50,6 +50,8 @@ from .threat.nvd_sync     import NVDSyncWorker
 from .ai_analyst          import AIAnalyst
 from .notifications.email import EmailNotifier
 from .api.remediation     import router as remediation_router
+from .intel               import IntelPipeline
+from .api.intel           import router as intel_router
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
@@ -117,12 +119,13 @@ def create_app() -> FastAPI:
         burst=float(os.environ.get("AGENT_BURST", "30")),
         max_slots=int(os.environ.get("AGENT_SLOTS", "4")),
     )
-    _tel_worker:    TelemetryWorker | None = None
-    _al_worker:     AttackLensWorker | None = None
-    _intel_worker:  ThreatIntelWorker | None = None
-    _enrich_worker: EnrichmentWorker | None = None
-    _tel_consumer:  TelemetryConsumer | None = None
-    _nvd_sync:      NVDSyncWorker | None = None
+    _tel_worker:      TelemetryWorker | None = None
+    _al_worker:       AttackLensWorker | None = None
+    _intel_worker:    ThreatIntelWorker | None = None
+    _enrich_worker:   EnrichmentWorker | None = None
+    _tel_consumer:    TelemetryConsumer | None = None
+    _nvd_sync:        NVDSyncWorker | None = None
+    _intel_pipeline:  IntelPipeline | None = None
 
     # ── App ───────────────────────────────────────────────────────────────────
     app = FastAPI(title="mac_intel Manager", version="1.0.0", docs_url=None)
@@ -190,7 +193,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        nonlocal _tel_worker, _al_worker, _intel_worker, _enrich_worker, _tel_consumer, _nvd_sync
+        nonlocal _tel_worker, _al_worker, _intel_worker, _enrich_worker, _tel_consumer, _nvd_sync, _intel_pipeline
         setup_logging(
             logfile=os.environ.get("LOG_FILE", "manager/logs/manager.log"),
             level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -216,18 +219,33 @@ def create_app() -> FastAPI:
             log.info("RabbitMQ: not configured — sync pipeline active")
 
         if embedded_threat_intel:
-            _intel_worker = ThreatIntelWorker(intel_db, db, engine.feeds, engine.nvd)
+            github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+            _intel_pipeline = IntelPipeline(engine.feeds, engine.nvd, github_token=github_token)
+            await _intel_pipeline.start()
+            app.state.intel_pipeline = _intel_pipeline
+
+            _intel_worker = ThreatIntelWorker(
+                intel_db, db, engine.feeds, engine.nvd,
+                intel_pipeline=_intel_pipeline,
+            )
             await _intel_worker.start()
         else:
+            app.state.intel_pipeline = None
             log.info("Threat intel: central mode enabled (url=%s)", threat_intel_url or "not set")
+
+        # Shared state for route dependencies
+        app.state.intel_db          = intel_db
+        app.state.feeds             = engine.feeds
+        app.state.threat_intel_url  = threat_intel_url  # empty string in embedded mode
 
         # AI analyst + email notifier — attach to app.state for route access
         ai_analyst     = AIAnalyst(intel_db, engine.feeds)
         email_notifier = EmailNotifier()
-        app.state.intel_db      = intel_db
+        # Make the AI analyst available to the AttackLens precision validator
+        # (the engine looks for this on its own attribute to call validate_with_ai).
+        engine.attach_ai_analyst(ai_analyst)
         app.state.ai_analyst    = ai_analyst
         app.state.email_notifier = email_notifier
-        app.state.feeds         = engine.feeds
         log.info("AI Analyst enabled=%s  Email enabled=%s",
                  ai_analyst.enabled, email_notifier.enabled)
 
@@ -253,6 +271,8 @@ def create_app() -> FastAPI:
             await _tel_consumer.stop()
         if _intel_worker:
             await _intel_worker.stop()
+        if _intel_pipeline:
+            await _intel_pipeline.stop()
         if _tel_worker:
             await _tel_worker.stop()
         if _al_worker:
@@ -277,6 +297,7 @@ def create_app() -> FastAPI:
     from .api.detection  import make_detection_router
     from .api.accuracy   import make_accuracy_router
     from .api.settings   import make_settings_router
+    from .api.allowlist  import make_allowlist_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
@@ -307,6 +328,7 @@ def create_app() -> FastAPI:
     detection_router  = make_detection_router(intel_db)
     accuracy_router   = make_accuracy_router(intel_db)
     settings_router   = make_settings_router(intel_db)
+    allowlist_router  = make_allowlist_router(intel_db)
 
     app.include_router(ingest_router,       prefix="/api/v1")
     app.include_router(agents_router,       prefix="/api/v1/agents")
@@ -321,7 +343,9 @@ def create_app() -> FastAPI:
     app.include_router(detection_router,  prefix="/api/v1/detection")
     app.include_router(accuracy_router,   prefix="/api/v1/accuracy")
     app.include_router(settings_router,   prefix="/api/v1/settings")
-    app.include_router(remediation_router)  # prefixes defined inline
+    app.include_router(allowlist_router,  prefix="/api/v1/allowlist")
+    app.include_router(intel_router)        # prefix=/api/v1/intel defined inline — registered first so it wins over remediation duplicates
+    app.include_router(remediation_router)  # prefixes defined inline (actors, news, overview — no overlap with intel_router)
 
     # ── Global exception handler ──────────────────────────────────────────────
     @app.exception_handler(Exception)

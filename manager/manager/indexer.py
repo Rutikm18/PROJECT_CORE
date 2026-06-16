@@ -81,6 +81,19 @@ CREATE TABLE IF NOT EXISTS findings (
     ai_analysed       INTEGER NOT NULL DEFAULT 0,
     threat_actor_match TEXT   NOT NULL DEFAULT '',
     news_refs         TEXT    NOT NULL DEFAULT '[]',
+    -- Detection Confidence Engine (canonical for fresh DBs)
+    signal_cluster_id INTEGER,
+    confidence        REAL,
+    validation_gates_passed TEXT NOT NULL DEFAULT '[]',
+    layers_involved   TEXT    NOT NULL DEFAULT '[]',
+    host_class        TEXT    NOT NULL DEFAULT '',
+    -- AI Precision Validation (canonical for fresh DBs)
+    precision_score   REAL    NOT NULL DEFAULT 0.0,
+    precision_factors TEXT    NOT NULL DEFAULT '{}',
+    ai_verdict        TEXT    NOT NULL DEFAULT '{}',
+    ai_validation_used INTEGER NOT NULL DEFAULT 0,
+    -- Terrain-aware validation (per-criterion checklist)
+    terrain_validation TEXT   NOT NULL DEFAULT '{}',
     UNIQUE(agent_id, category, item_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_find_external_id ON findings(external_id);
@@ -455,6 +468,84 @@ CREATE TABLE IF NOT EXISTS org_groups (
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
+
+-- ── Detection Confidence Engine tables ───────────────────────────────────
+
+-- Raw signals emitted by rules before clustering / validation
+CREATE TABLE IF NOT EXISTS signals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id          TEXT NOT NULL,
+    layer            TEXT NOT NULL CHECK (layer IN ('surface','exposure','execution')),
+    data_point       TEXT NOT NULL,
+    entity_key       TEXT NOT NULL,
+    agent_id         TEXT NOT NULL,
+    severity_hint    TEXT NOT NULL DEFAULT 'medium',
+    evidence         TEXT NOT NULL DEFAULT '{}',
+    weight           REAL NOT NULL DEFAULT 0.5,
+    strength         REAL NOT NULL DEFAULT 0.5,
+    detected_at      REAL NOT NULL,
+    created_at       REAL NOT NULL,
+    cluster_id       INTEGER,          -- set after cluster is persisted
+    validation_status TEXT,            -- 'promoted' | 'rejected_G<n>' | 'low_confidence'
+    rejection_reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_signals_agent ON signals(agent_id, detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_rule  ON signals(rule_id);
+CREATE INDEX IF NOT EXISTS idx_signals_cluster ON signals(cluster_id);
+
+-- Persisted signal clusters (one row per cluster)
+CREATE TABLE IF NOT EXISTS signal_clusters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id        TEXT NOT NULL,
+    entity_key      TEXT NOT NULL,
+    layers_covered  TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    confidence      REAL,
+    validation_status TEXT,
+    rejection_reason  TEXT,
+    finding_id      INTEGER,                       -- FK to findings (if promoted)
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clusters_agent ON signal_clusters(agent_id, created_at DESC);
+
+-- Table-backed allowlist (complements static attacklens/allowlist.py lists)
+CREATE TABLE IF NOT EXISTS detection_allowlist (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id    TEXT,        -- NULL = all rules
+    entity_key TEXT,        -- NULL = all entities
+    agent_id   TEXT,        -- NULL = all agents
+    reason     TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT 'system',
+    created_at REAL NOT NULL,
+    expires_at REAL          -- NULL = never expires
+);
+CREATE INDEX IF NOT EXISTS idx_allowlist_lookup
+    ON detection_allowlist(rule_id, entity_key, agent_id);
+
+-- FP-history per rule + host class + ISO week (drives confidence FP penalty)
+CREATE TABLE IF NOT EXISTS rule_fp_stats (
+    rule_id       TEXT NOT NULL,
+    host_class    TEXT NOT NULL,
+    window_start  TEXT NOT NULL,    -- ISO week 'YYYY-WW'
+    tp_count      INTEGER DEFAULT 0,
+    fp_count      INTEGER DEFAULT 0,
+    accepted_risk INTEGER DEFAULT 0,
+    updated_at    REAL,
+    PRIMARY KEY (rule_id, host_class, window_start)
+);
+
+-- Auto-generated allowlist suggestions for engineer review
+CREATE TABLE IF NOT EXISTS allowlist_suggestions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id      TEXT NOT NULL,
+    entity_key   TEXT NOT NULL,
+    fp_count     INTEGER NOT NULL DEFAULT 0,
+    last_fp_at   REAL,
+    suggested_at REAL NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',    -- 'pending'|'approved'|'rejected'
+    reviewed_by  TEXT,
+    reviewed_at  REAL,
+    UNIQUE(rule_id, entity_key)
+);
 """
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -496,6 +587,18 @@ _SOC_MIGRATIONS = [
     ("findings", "ai_analysed",        "INTEGER DEFAULT 0"),
     ("findings", "threat_actor_match", "TEXT    DEFAULT ''"),
     ("findings", "news_refs",          "TEXT    DEFAULT '[]'"),
+    # Detection Confidence Engine columns (added on existing findings rows)
+    ("findings", "signal_cluster_id",       "INTEGER"),
+    ("findings", "confidence",              "REAL"),
+    ("findings", "validation_gates_passed", "TEXT    DEFAULT '[]'"),
+    ("findings", "layers_involved",         "TEXT    DEFAULT '[]'"),
+    ("findings", "host_class",              "TEXT    DEFAULT ''"),
+    # AI Precision Validation columns
+    ("findings", "precision_score",         "REAL    DEFAULT 0.0"),
+    ("findings", "precision_factors",       "TEXT    DEFAULT '{}'"),
+    ("findings", "ai_verdict",              "TEXT    DEFAULT '{}'"),
+    ("findings", "ai_validation_used",      "INTEGER DEFAULT 0"),
+    ("findings", "terrain_validation",      "TEXT    DEFAULT '{}'"),
 ]
 
 
@@ -593,6 +696,24 @@ class IntelDB:
         asset_imp  = float(f.get("asset_importance") or 0)
         priority_reason = str(f.get("priority_reason") or _priority_reason(f))
 
+        # AI precision validation fields
+        precision_score   = float(f.get("precision_score") or 0.0)
+        precision_factors_j = json.dumps(f.get("precision_factors") or {}, default=str)
+        ai_verdict_j      = json.dumps(f.get("ai_verdict") or {}, default=str)
+        # `ai_validation_used` = LLM verdict actually ran (not just deterministic
+        # scoring).  Respect an explicit 0 from the engine's legacy-precision
+        # path; only auto-detect when the caller didn't set it.
+        if "ai_validation_used" in f:
+            ai_validation_used = 1 if f.get("ai_validation_used") else 0
+        else:
+            av = f.get("ai_verdict") or {}
+            # A non-empty ai_verdict dict with a real label means the LLM ran.
+            llm_actually_ran = isinstance(av, dict) and bool(av.get("label"))
+            ai_validation_used = 1 if llm_actually_ran else 0
+
+        # Terrain validation (per-criterion checklist) — see terrain_validators.py
+        terrain_validation_j = json.dumps(f.get("terrain_validation") or {}, default=str)
+
         async with self._lock:
             row = await self._fetchone(
                 "SELECT id, fingerprint, first_detected_at FROM findings "
@@ -611,9 +732,11 @@ class IntelDB:
                      exploit_available,exploit_sources,asset_tier,asset_importance,
                      priority_reason,action_plan,mitre_technique,mitre_tactic,
                      first_detected_at,last_detected_at,scan_count,is_active,tags,
-                     status,assignee,sla_due,priority,analyst_notes)
+                     status,assignee,sla_due,priority,analyst_notes,
+                     precision_score,precision_factors,ai_verdict,ai_validation_used,
+                     terrain_validation)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
-                           'new','',?,0,'')
+                           'new','',?,0,'',?,?,?,?,?)
                 """, (agent_id, category, item_key, fp,
                       sev, f.get("score",0),
                       f.get("title",""), f.get("description",""),
@@ -622,7 +745,9 @@ class IntelDB:
                       composite, epss, kev, exploit, exploit_j, asset_tier,
                       asset_imp, priority_reason, action_j,
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
-                      ts, ts, tags_j, sla_due))
+                      ts, ts, tags_j, sla_due,
+                      precision_score, precision_factors_j, ai_verdict_j,
+                      ai_validation_used, terrain_validation_j))
                 await self._conn.commit()
                 # Log creation in SOC activity
                 cur2 = await self._conn.execute(
@@ -660,7 +785,10 @@ class IntelDB:
                         asset_importance=?, priority_reason=?, action_plan=?,
                         mitre_technique=?, mitre_tactic=?,
                         last_detected_at=?, scan_count=scan_count+1,
-                        is_active=1, tags=?
+                        is_active=1, tags=?,
+                        precision_score=?, precision_factors=?,
+                        ai_verdict=?, ai_validation_used=?,
+                        terrain_validation=?
                     WHERE agent_id=? AND category=? AND item_key=?
                 """, (fp, f.get("severity","info"), f.get("score",0),
                       f.get("title",""), f.get("description",""),
@@ -669,7 +797,10 @@ class IntelDB:
                       composite, epss, kev, exploit, exploit_j, asset_tier,
                       asset_imp, priority_reason, action_j,
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
-                      ts, tags_j, agent_id, category, item_key))
+                      ts, tags_j,
+                      precision_score, precision_factors_j, ai_verdict_j,
+                      ai_validation_used, terrain_validation_j,
+                      agent_id, category, item_key))
                 await self._conn.commit()
                 await self._append_timeline(agent_id, category, "modified",
                                             item_key, f.get("title",""),
@@ -736,6 +867,54 @@ class IntelDB:
             (agent_id,),
         )
         return dict(row) if row else {}
+
+    async def auto_resolve_absent(
+        self,
+        agent_id: str,
+        categories: list[str],
+        cutoff_ts: float,
+        reason: str = "evidence_cleared",
+    ) -> int:
+        """Auto-resolve active findings whose evidence vanished from a fresh snapshot.
+
+        A finding is resolved when `last_detected_at < cutoff_ts` — i.e. the agent
+        re-collected the section AFTER cutoff_ts and the entity was NOT in it, so it
+        was never re-confirmed. This is how a closed port / removed package / exited
+        process turns its incident from active → resolved instead of lingering as a
+        false positive.
+
+        Returns the count resolved. The caller MUST only pass categories from a
+        fresh, non-empty snapshot — never resolve on an empty/errored section
+        (that's "data missed", not "evidence gone").
+        """
+        if not categories:
+            return 0
+        ts = time.time()
+        cat_ph = ",".join("?" * len(categories))
+        async with self._lock:
+            rows = await self._fetchall(
+                f"SELECT id, category, item_key, title FROM findings "
+                f"WHERE agent_id=? AND is_active=1 "
+                f"AND category IN ({cat_ph}) AND last_detected_at < ?",
+                (agent_id, *categories, cutoff_ts),
+            )
+            if not rows:
+                return 0
+            id_ph = ",".join("?" * len(rows))
+            ids = [r["id"] for r in rows]
+            await self._conn.execute(
+                f"UPDATE findings SET is_active=0, resolved_at=?, status='auto_resolved' "
+                f"WHERE agent_id=? AND id IN ({id_ph})",
+                (ts, agent_id, *ids),
+            )
+            for r in rows:
+                # reason carried in the timeline note (item_data) field
+                await self._append_timeline(
+                    agent_id, r["category"], "auto_resolved",
+                    r["item_key"], r["title"], reason, None, ts,
+                )
+            await self._conn.commit()
+        return len(rows)
 
     async def mark_resolved(self, agent_id: str, finding_id: int) -> None:
         ts = time.time()
@@ -895,6 +1074,17 @@ class IntelDB:
             (ioc_type, time.time()),
         )
         return [dict(r) for r in rows]
+
+    async def is_malicious_hash(self, sha256: str) -> bool:
+        """True iff sha256 is present in ioc_cache as a non-expired malicious hash."""
+        if not sha256:
+            return False
+        row = await self._fetchone(
+            "SELECT 1 FROM ioc_cache "
+            "WHERE ioc_type='hash' AND ioc_value=? AND expires_at>? LIMIT 1",
+            (sha256.lower(), time.time()),
+        )
+        return row is not None
 
     # ── CVE cache ─────────────────────────────────────────────────────────────
 
@@ -1058,14 +1248,26 @@ class IntelDB:
         limit: int = 200,
         offset: int = 0,
         sort_by: str = "score",
+        min_precision: float | None = None,
     ) -> list[dict]:
-        """Global findings list with full SOC filters."""
+        """Global findings list with full SOC filters.
+
+        `min_precision` filters by the AI Precision Validator composite score
+        (precision_score in [0,1]).  The Validated Findings page uses 0.9 to
+        only show high-confidence findings.
+
+        Each row is left-joined to asset_registry so the response carries the
+        agent's OS as `agent_os` — the UI uses this to lock the remediation
+        panel to the right command set per finding.
+        """
         parts: list[str] = []
         args: list = []
         if agent_id:
             parts.append("f.agent_id=?"); args.append(agent_id)
         if severity:
             parts.append("f.severity=?"); args.append(severity)
+        if min_precision is not None:
+            parts.append("COALESCE(f.precision_score, 0) >= ?"); args.append(float(min_precision))
         _TERMINAL_SET = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
         if status == "__closed__":
             # Show all terminal-state findings (used by view=closed)
@@ -1102,8 +1304,14 @@ class IntelDB:
         if search:
             # Full-text search path
             rows = await self._fetchall(
-                f"SELECT f.*, a.name AS agent_name FROM findings f "
+                f"SELECT f.*, "
+                f"       ar.os         AS agent_os, "
+                f"       ar.hostname   AS agent_hostname, "
+                f"       ar.os_version AS agent_os_version, "
+                f"       a.name        AS agent_name "
+                f"FROM findings f "
                 f"JOIN findings_fts fts ON f.id=fts.rowid "
+                f"LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
                 f"LEFT JOIN (SELECT agent_id, name FROM (SELECT DISTINCT agent_id, "
                 f"(SELECT name FROM agents WHERE agents.agent_id=f2.agent_id LIMIT 1) AS name "
                 f"FROM findings f2) sub) a ON f.agent_id=a.agent_id "
@@ -1113,7 +1321,13 @@ class IntelDB:
             )
         else:
             rows = await self._fetchall(
-                f"SELECT f.* FROM findings f {where} "
+                f"SELECT f.*, "
+                f"       ar.os         AS agent_os, "
+                f"       ar.hostname   AS agent_hostname, "
+                f"       ar.os_version AS agent_os_version "
+                f"FROM findings f "
+                f"LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
+                f"{where} "
                 f"ORDER BY {order} LIMIT ? OFFSET ?",
                 (*args, limit, offset),
             )
@@ -1127,9 +1341,43 @@ class IntelDB:
 
     async def get_finding_by_id(self, finding_id: int) -> dict | None:
         row = await self._fetchone(
-            "SELECT * FROM findings WHERE id=?", (finding_id,)
+            "SELECT f.*, "
+            "       ar.os         AS agent_os, "
+            "       ar.hostname   AS agent_hostname, "
+            "       ar.os_version AS agent_os_version "
+            "FROM findings f "
+            "LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
+            "WHERE f.id = ?",
+            (finding_id,),
         )
         return _shape_finding(dict(row)) if row else None
+
+    async def get_agent_os(self, agent_id: str) -> str:
+        """
+        Best-effort agent OS lookup, normalised to {macos, linux, windows, unknown}.
+        Used by the remediation recipe endpoint to filter commands per host.
+        """
+        try:
+            row = await self._fetchone(
+                "SELECT os, os_version FROM asset_registry WHERE agent_id=?",
+                (agent_id,),
+            )
+        except Exception:
+            row = None
+        if not row:
+            return "unknown"
+        raw = (row["os"] or "").strip().lower()
+        if not raw:
+            return "unknown"
+        # Many possible spellings — normalise.
+        if any(k in raw for k in ("darwin", "macos", "mac os", "osx")):
+            return "macos"
+        if "win" in raw:
+            return "windows"
+        if any(k in raw for k in ("linux", "ubuntu", "debian", "rhel", "centos",
+                                   "fedora", "arch", "alpine", "suse")):
+            return "linux"
+        return "unknown"
 
     async def update_finding(
         self, finding_id: int, *,
@@ -1827,6 +2075,455 @@ class IntelDB:
     async def get_org_group(self, name: str) -> Optional[dict]:
         row = await self._fetchone("SELECT * FROM org_groups WHERE name=?", (name,))
         return dict(row) if row else None
+
+    # ── Detection Confidence Engine methods ───────────────────────────────────
+
+    async def execute(self, sql: str, args: tuple = ()) -> None:
+        """Generic write — used by feedback.py and validation tests."""
+        async with self._lock:
+            await self._conn.execute(sql, args)
+            await self._conn.commit()
+
+    async def upsert_signal(self, sig) -> int:
+        """Persist a Signal to the signals table; return its rowid."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT INTO signals "
+                "(rule_id, layer, data_point, entity_key, agent_id, severity_hint, "
+                "evidence, weight, strength, detected_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                sig.to_db_row(),
+            )
+            await self._conn.commit()
+            return cur.lastrowid
+
+    async def get_recent_signals(self, agent_id: str, since: float) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM signals WHERE agent_id=? AND detected_at>=? ORDER BY detected_at DESC",
+            (agent_id, since),
+        )
+        return [dict(r) for r in rows]
+
+    async def persist_cluster(self, cluster) -> int:
+        """Insert a SignalCluster row; return its id.  Updates cluster.id in place."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT INTO signal_clusters "
+                "(agent_id, entity_key, layers_covered, confidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    cluster.agent_id,
+                    cluster.entity_key,
+                    json.dumps(sorted(cluster.layers_covered)),
+                    cluster.confidence,
+                    time.time(),
+                ),
+            )
+            cluster_id = cur.lastrowid
+            # Link all signals to this cluster
+            for sig in cluster.signals:
+                if sig.id:
+                    await self._conn.execute(
+                        "UPDATE signals SET cluster_id=? WHERE id=?", (cluster_id, sig.id)
+                    )
+            await self._conn.commit()
+        cluster.id = cluster_id
+        return cluster_id
+
+    async def mark_cluster_rejected(self, cluster, gate: str, detail: str) -> None:
+        async with self._lock:
+            if cluster.id:
+                await self._conn.execute(
+                    "UPDATE signal_clusters SET validation_status=?, rejection_reason=? WHERE id=?",
+                    (f"rejected_{gate}", detail, cluster.id),
+                )
+                for sig in cluster.signals:
+                    if sig.id:
+                        await self._conn.execute(
+                            "UPDATE signals SET validation_status=?, rejection_reason=? WHERE id=?",
+                            (f"rejected_{gate}", detail, sig.id),
+                        )
+            await self._conn.commit()
+
+    async def mark_cluster_promoted(self, cluster_id: int, finding_id: int) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE signal_clusters SET validation_status='promoted', finding_id=? WHERE id=?",
+                (finding_id, cluster_id),
+            )
+            await self._conn.execute(
+                "UPDATE signals SET validation_status='promoted' WHERE cluster_id=?",
+                (cluster_id,),
+            )
+            await self._conn.commit()
+
+    async def get_signals_for_cluster(self, cluster_id: int) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM signals WHERE cluster_id=?", (cluster_id,)
+        )
+        return [dict(r) for r in rows]
+
+    async def record_cluster_rejection(self, cluster, reason: str) -> None:
+        if cluster.id:
+            await self.mark_cluster_rejected(cluster, reason, reason)
+
+    async def is_allowlisted(self, rule_id: str, entity_key: str, agent_id: str) -> bool:
+        row = await self._fetchone(
+            "SELECT 1 FROM detection_allowlist WHERE "
+            "(rule_id IS NULL OR rule_id=?) AND "
+            "(entity_key IS NULL OR entity_key=?) AND "
+            "(agent_id IS NULL OR agent_id=?) AND "
+            "(expires_at IS NULL OR expires_at>?) LIMIT 1",
+            (rule_id, entity_key, agent_id, time.time()),
+        )
+        return row is not None
+
+    async def get_fp_rate_for_rules(
+        self, rule_ids: list[str], host_class: str, window_days: int = 7
+    ) -> float:
+        """FP rate = fp / (tp + fp) across all rules in the list over recent weeks."""
+        if not rule_ids:
+            return 0.0
+        try:
+            from datetime import date, timedelta
+            cutoff_week = (date.today() - timedelta(days=window_days)).strftime("%G-%V")
+            placeholders = ",".join("?" * len(rule_ids))
+            rows = await self._fetchall(
+                f"SELECT SUM(tp_count) AS tp, SUM(fp_count) AS fp FROM rule_fp_stats "
+                f"WHERE rule_id IN ({placeholders}) AND host_class=? AND window_start>=?",
+                (*rule_ids, host_class, cutoff_week),
+            )
+            if rows and rows[0]:
+                tp = rows[0]["tp"] or 0
+                fp = rows[0]["fp"] or 0
+                total = tp + fp
+                return fp / total if total > 0 else 0.0
+        except Exception:
+            pass
+        return 0.0
+
+    async def rules_with_recent_fp(
+        self,
+        rule_ids: list[str],
+        host_class: str,
+        window_days: int = 7,
+        threshold: float = 0.5,
+    ) -> list[str]:
+        """Return rule_ids whose recent FP rate exceeds threshold."""
+        if not rule_ids:
+            return []
+        result: list[str] = []
+        for rid in rule_ids:
+            rate = await self.get_fp_rate_for_rules([rid], host_class, window_days)
+            if rate > threshold:
+                result.append(rid)
+        return result
+
+    async def has_active_finding_for_cluster(self, cluster, since: float) -> bool:
+        """Check if an active finding exists for the cluster's entity_key in the last N hours."""
+        row = await self._fetchone(
+            "SELECT 1 FROM findings WHERE agent_id=? AND is_active=1 "
+            "AND last_detected_at>=? "
+            "AND (item_key=? OR item_key LIKE ?) LIMIT 1",
+            (cluster.agent_id, since, cluster.entity_key, f"%{cluster.entity_key}%"),
+        )
+        return row is not None
+
+    async def get_agent_last_seen(self, agent_id: str) -> Optional[float]:
+        try:
+            row = await self._fetchone(
+                "SELECT last_seen FROM asset_registry WHERE agent_id=?", (agent_id,)
+            )
+            return float(row["last_seen"]) if row else None
+        except Exception:
+            return None
+
+    async def get_asset_tier(self, agent_id: str) -> str:
+        try:
+            row = await self._fetchone(
+                "SELECT asset_tier FROM asset_registry WHERE agent_id=?", (agent_id,)
+            )
+            return str(row["asset_tier"]) if row else "endpoint"
+        except Exception:
+            return "endpoint"
+
+    async def get_host_class(self, agent_id: str) -> str:
+        return await self.get_asset_tier(agent_id)
+
+    async def get_compensating_controls(self, agent_id: str) -> list[str]:
+        """Return names of active compensating controls for the agent (empty list if none)."""
+        try:
+            row = await self._fetchone(
+                "SELECT * FROM asset_registry WHERE agent_id=?", (agent_id,)
+            )
+            if not row:
+                return []
+            tags: list = json.loads(row["tags"] or "[]")
+            return [t for t in tags if str(t).startswith("ctrl:")]
+        except Exception:
+            return []
+
+    async def recent_fp_count(self, rule_id: str, entity_key: str, days: int = 30) -> int:
+        """Count FPs for a (rule_id, entity_key) pair in the last N days."""
+        try:
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=days)).strftime("%G-%V")
+            row = await self._fetchone(
+                "SELECT SUM(fp_count) AS total FROM rule_fp_stats "
+                "WHERE rule_id=? AND window_start>=?",
+                (rule_id, cutoff),
+            )
+            return int(row["total"] or 0) if row else 0
+        except Exception:
+            return 0
+
+    async def upsert_allowlist_suggestion(
+        self, rule_id: str, entity_key: str, fp_count: int
+    ) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO allowlist_suggestions "
+                "(rule_id, entity_key, fp_count, last_fp_at, suggested_at, status) "
+                "VALUES (?, ?, ?, ?, ?, 'pending') "
+                "ON CONFLICT(rule_id, entity_key) DO UPDATE SET "
+                "fp_count=excluded.fp_count, last_fp_at=excluded.last_fp_at, "
+                "suggested_at=excluded.suggested_at",
+                (rule_id, entity_key, fp_count, time.time(), time.time()),
+            )
+            await self._conn.commit()
+
+    async def list_allowlist_suggestions(self, status: str = "pending") -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM allowlist_suggestions WHERE status=? ORDER BY fp_count DESC, suggested_at DESC",
+            (status,),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_allowlist_suggestion(self, sid: int) -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT * FROM allowlist_suggestions WHERE id=?", (sid,)
+        )
+        return dict(row) if row else None
+
+    async def update_suggestion_status(
+        self, sid: int, status: str, reviewed_by: str = "system"
+    ) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE allowlist_suggestions SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?",
+                (status, reviewed_by, time.time(), sid),
+            )
+            await self._conn.commit()
+
+    async def upsert_allowlist_entry(
+        self,
+        rule_id: Optional[str],
+        entity_key: Optional[str],
+        reason: str,
+        created_by: str = "system",
+        agent_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
+    ) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO detection_allowlist "
+                "(rule_id, entity_key, agent_id, reason, created_by, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (rule_id, entity_key, agent_id, reason, created_by, time.time(), expires_at),
+            )
+            await self._conn.commit()
+
+    async def list_allowlist_entries(self) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM detection_allowlist ORDER BY created_at DESC", ()
+        )
+        return [dict(r) for r in rows]
+
+    async def compute_confidence_metrics(self) -> dict:
+        """Compute per-rule and engine-wide precision from rule_fp_stats."""
+        try:
+            rows = await self._fetchall(
+                "SELECT rule_id, SUM(tp_count) AS tp, SUM(fp_count) AS fp "
+                "FROM rule_fp_stats GROUP BY rule_id ORDER BY fp DESC",
+                (),
+            )
+            per_rule = []
+            total_tp = total_fp = 0
+            for r in rows:
+                tp, fp = (r["tp"] or 0), (r["fp"] or 0)
+                tot = tp + fp
+                prec = tp / tot if tot > 0 else None
+                per_rule.append({
+                    "rule_id": r["rule_id"],
+                    "tp": tp, "fp": fp,
+                    "precision": round(prec, 3) if prec is not None else None,
+                })
+                total_tp += tp
+                total_fp += fp
+            grand_total = total_tp + total_fp
+            overall = round(total_tp / grand_total, 3) if grand_total > 0 else None
+
+            # Gate rejection breakdown
+            gate_rows = await self._fetchall(
+                "SELECT validation_status, COUNT(*) AS n FROM signal_clusters "
+                "WHERE validation_status IS NOT NULL GROUP BY validation_status",
+                (),
+            )
+            gates = {r["validation_status"]: r["n"] for r in gate_rows}
+
+            return {
+                "precision_overall": overall,
+                "precision_by_rule": per_rule,
+                "rejected_by_gate": gates,
+                "total_tp": total_tp,
+                "total_fp": total_fp,
+            }
+        except Exception as exc:
+            log.warning("compute_confidence_metrics: %s", exc)
+            return {"error": str(exc)}
+
+    async def get_finding_by_id(self, finding_id: int) -> Optional[dict]:
+        """
+        Single finding fetch with asset_registry JOIN so the response carries
+        the agent's actual OS (used by the remediation recipe endpoint and the
+        OS-aware UI panel).  This intentionally shadows the earlier definition
+        above to keep the asset context attached to every single-row lookup.
+        """
+        row = await self._fetchone(
+            "SELECT f.*, "
+            "       ar.os         AS agent_os, "
+            "       ar.hostname   AS agent_hostname, "
+            "       ar.os_version AS agent_os_version "
+            "FROM findings f "
+            "LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
+            "WHERE f.id = ?",
+            (finding_id,),
+        )
+        return _shape_finding(dict(row)) if row else None
+
+    async def recompute_terrain_validation_all(
+        self, *, only_unscored: bool = False, limit: int = 5000,
+    ) -> dict:
+        """
+        Re-evaluate every active finding against the terrain validator and
+        persist the new `terrain_validation` + `precision_score`.
+
+        Why this exists: when validation was added, findings already in the DB
+        have `precision_score = 0` and an empty `terrain_validation` blob,
+        so they never pass the Validated Findings threshold filter even when
+        they obviously should.  Calling this once after configuration brings
+        historical findings up to date.
+
+        only_unscored=True skips findings that already have a non-zero score.
+        """
+        try:
+            from .attacklens.terrain_validators import evaluate_finding
+        except ImportError:
+            from manager.attacklens.terrain_validators import evaluate_finding
+        rows = await self._fetchall(
+            "SELECT id, agent_id, category, item_key, severity, score, "
+            "       evidence, source, rule_id, cve_ids, cvss_score, kev, "
+            "       epss_score, asset_tier, host_class, ai_verdict, "
+            "       precision_score, terrain_validation "
+            "FROM findings WHERE is_active=1 LIMIT ?",
+            (limit,),
+        )
+        updated = 0
+        scanned = 0
+        score_hist = {"00-49": 0, "50-69": 0, "70-84": 0, "85-89": 0, "90-100": 0}
+        for r in rows:
+            scanned += 1
+            f = dict(r)
+            if only_unscored and float(f.get("precision_score") or 0) > 0:
+                continue
+
+            # Parse JSON columns so the evaluator sees structured input
+            for k, default in [("evidence", {}), ("cve_ids", []),
+                                ("ai_verdict", {})]:
+                v = f.get(k)
+                if isinstance(v, str):
+                    try:
+                        f[k] = json.loads(v) if v else default
+                    except json.JSONDecodeError:
+                        f[k] = default
+
+            # Build the same enriched context the engine's legacy path uses
+            ev = f.get("evidence") if isinstance(f.get("evidence"), dict) else {}
+            kev = bool(f.get("kev") or ev.get("kev")
+                       or (isinstance(ev.get("cve"), dict) and ev["cve"].get("kev")))
+            agent_id = f.get("agent_id", "")
+
+            # Cross-finding peek for package_running / port_open / paired-persistence
+            sibs = await self._fetchall(
+                "SELECT category, evidence FROM findings "
+                "WHERE agent_id=? AND is_active=1 AND id != ? LIMIT 100",
+                (agent_id, f["id"]),
+            )
+            package_running = False
+            port_open       = False
+            paired_persist  = False
+            controls_off    = 0
+            pkg_name = str(ev.get("name") or "").lower() if isinstance(ev, dict) else ""
+            for s in sibs:
+                cat = s["category"]
+                if cat == "port":
+                    port_open = True
+                if cat in ("service", "task"):
+                    paired_persist = True
+                if cat == "security":
+                    controls_off += 1
+                if cat == "process" and pkg_name:
+                    try:
+                        sev_ev = json.loads(s["evidence"] or "{}")
+                    except Exception:
+                        sev_ev = {}
+                    if pkg_name in str(sev_ev.get("process") or "").lower() \
+                       or pkg_name in str(sev_ev.get("path") or "").lower():
+                        package_running = True
+
+            enriched = {
+                "kev_hit":                kev,
+                "malicious_ip_hit":       bool(str(f.get("source", "")).startswith("feed:") or f.get("source") == "abuseipdb"),
+                "malicious_hash_hit":     bool(ev.get("malware_hash_hit") if isinstance(ev, dict) else False),
+                "epss_scores":            [float(f.get("epss_score") or 0)] if (f.get("epss_score") or 0) > 0 else [],
+                "asset_tier":             f.get("asset_tier") or "endpoint",
+                "host_class":             f.get("host_class") or "unknown",
+                "compensating_controls":  [],
+                "package_running":        package_running,
+                "port_open":              port_open,
+                "paired_with_persistence": paired_persist,
+                "cross_layer_match":      paired_persist,
+                "controls_disabled_count": controls_off,
+                "threat_intel_source_count": (1 if str(f.get("source","")).startswith("feed:") or f.get("source") == "abuseipdb" else 0) + (1 if kev else 0),
+            }
+            ai_dict = f.get("ai_verdict") if isinstance(f.get("ai_verdict"), dict) else None
+
+            tv = evaluate_finding(f, enriched, ai_dict)
+            new_score = float(tv["score"])
+
+            await self._conn.execute(
+                "UPDATE findings SET "
+                "   precision_score=?, "
+                "   terrain_validation=? "
+                "WHERE id=?",
+                (new_score, json.dumps(tv, default=str), f["id"]),
+            )
+            updated += 1
+
+            # Histogram for the UI
+            p = int(new_score * 100)
+            if   p >= 90: score_hist["90-100"] += 1
+            elif p >= 85: score_hist["85-89"]  += 1
+            elif p >= 70: score_hist["70-84"]  += 1
+            elif p >= 50: score_hist["50-69"]  += 1
+            else:         score_hist["00-49"]  += 1
+
+        await self._conn.commit()
+        return {
+            "scanned":   scanned,
+            "updated":   updated,
+            "histogram": score_hist,
+        }
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

@@ -161,6 +161,10 @@ run-manager: ## Start manager server (API_KEY read from agent.toml)
 	 fi
 	./scripts/run_manager.sh
 
+.PHONY: check-kev-findings
+check-kev-findings: ## Print KEV-flagged SOC findings (MANAGER_API_URL, LIMIT env)
+	@bash ./scripts/check_kev_findings.sh
+
 .PHONY: stop-manager
 stop-manager: ## Kill any process running on port 8443
 	@PORT=$${BIND_PORT:-8443}; \

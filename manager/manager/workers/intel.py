@@ -9,13 +9,21 @@ Responsibilities
   1. Feodo Tracker IP feed          — every 1 h
   2. Emerging Threats IP feed       — every 1 h
   3. URLhaus domain/URL feed        — every 2 h
-  4. Proactive CVE re-scan          — every 6 h
+  4. CISA KEV catalog               — every 24 h
+     Downloads the full Known Exploited Vulnerabilities JSON from CISA,
+     upserts each entry into intel.db, and hydrates the in-memory _kev_set
+     so finding correlation picks up new KEV entries immediately.
+  5. Proactive CVE re-scan          — every 6 h
      Queries the latest packages payload per agent, checks each package
      against the NVD cache, and emits new critical/high findings directly
      into IntelDB — without waiting for fresh telemetry from the agent.
-  5. NVD modified CVE sync          — every 2 h
+  6. NVD modified CVE sync          — every 2 h
      Pulls recently changed CVEs into the local threat-intel cache so package
      correlation can use fresh intelligence without blocking ingest requests.
+  7. ExploitDB + Metasploit offline index refresh — every 7 days
+     Forces re-download of the ExploitDB CSV (~35 MB) and Metasploit CVE list
+     via IntelPipeline.refresh_offline().  Only runs when IntelPipeline is
+     attached (embedded_threat_intel=True).
 
 Design
 ------
@@ -34,19 +42,22 @@ import time
 from typing import TYPE_CHECKING, Callable, Awaitable
 
 if TYPE_CHECKING:
-    from ..indexer       import IntelDB
-    from ..db            import Database
+    from ..indexer           import IntelDB
+    from ..db                import Database
     from ..attacklens.feeds  import FeedManager
     from ..attacklens.nvd    import CVELookup
+    from ..intel.pipeline    import IntelPipeline
 
 log = logging.getLogger("manager.workers.intel")
 
 # Schedules (seconds)
-_INTERVAL_FEODO    =  3_600   # 1 h
-_INTERVAL_EMERGING =  3_600   # 1 h
-_INTERVAL_URLHAUS  =  7_200   # 2 h
-_INTERVAL_NVD_SYNC =  7_200   # 2 h
-_INTERVAL_CVE_SCAN = 21_600   # 6 h
+_INTERVAL_FEODO    =   3_600   # 1 h
+_INTERVAL_EMERGING =   3_600   # 1 h
+_INTERVAL_URLHAUS  =   7_200   # 2 h
+_INTERVAL_NVD_SYNC =   7_200   # 2 h
+_INTERVAL_CVE_SCAN =  21_600   # 6 h
+_INTERVAL_KEV      =  86_400   # 24 h — CISA updates KEV daily
+_INTERVAL_OFFLINE  = 604_800   # 7 days — ExploitDB + Metasploit CSV refresh
 
 # Proactive CVE scan: only emit findings at or above this CVSS threshold
 _CVE_MIN_SCORE = 7.0
@@ -60,41 +71,55 @@ class ThreatIntelWorker:
 
     def __init__(
         self,
-        intel_db: "IntelDB",
-        db:       "Database",
-        feeds:    "FeedManager",
-        nvd:      "CVELookup",
+        intel_db:       "IntelDB",
+        db:             "Database",
+        feeds:          "FeedManager",
+        nvd:            "CVELookup",
+        intel_pipeline: "IntelPipeline | None" = None,
     ) -> None:
-        self._intel_db = intel_db
-        self._db       = db
-        self._feeds    = feeds
-        self._nvd      = nvd
-        self._tasks:   list[asyncio.Task] = []
+        self._intel_db        = intel_db
+        self._db              = db
+        self._feeds           = feeds
+        self._nvd             = nvd
+        self._intel_pipeline  = intel_pipeline
+        self._tasks:          list[asyncio.Task] = []
 
     async def start(self) -> None:
         """Spawn one asyncio task per scheduled job."""
         self._tasks = [
             asyncio.create_task(
-                self._feed_loop("feodo",       self._feeds.refresh_feodo,    _INTERVAL_FEODO),
+                self._feed_loop("feodo",       self._feeds.refresh_feodo,       _INTERVAL_FEODO),
                 name="intel:feodo",
             ),
             asyncio.create_task(
-                self._feed_loop("emerging",    self._feeds.refresh_emerging, _INTERVAL_EMERGING),
+                self._feed_loop("emerging",    self._feeds.refresh_emerging,    _INTERVAL_EMERGING),
                 name="intel:emerging",
             ),
             asyncio.create_task(
-                self._feed_loop("urlhaus",     self._feeds.refresh_urlhaus,  _INTERVAL_URLHAUS),
+                self._feed_loop("urlhaus",     self._feeds.refresh_urlhaus,     _INTERVAL_URLHAUS),
                 name="intel:urlhaus",
             ),
             asyncio.create_task(
-                self._feed_loop("nvd_recent",  self._nvd_recent_sync,        _INTERVAL_NVD_SYNC),
+                self._feed_loop("cisa_kev",    self._feeds.refresh_cisa_kev,   _INTERVAL_KEV),
+                name="intel:cisa_kev",
+            ),
+            asyncio.create_task(
+                self._feed_loop("nvd_recent",  self._nvd_recent_sync,           _INTERVAL_NVD_SYNC),
                 name="intel:nvd_recent",
             ),
             asyncio.create_task(
-                self._feed_loop("proactive_cve", self._proactive_cvescan,    _INTERVAL_CVE_SCAN),
+                self._feed_loop("proactive_cve", self._proactive_cvescan,       _INTERVAL_CVE_SCAN),
                 name="intel:proactive_cve",
             ),
         ]
+        # Offline exploit-index refresh (ExploitDB + Metasploit) — only when
+        # IntelPipeline is attached.  Indexes are already loaded at pipeline.start();
+        # this task forces a re-download every 7 days so new CVE mappings land.
+        if self._intel_pipeline is not None:
+            self._tasks.append(asyncio.create_task(
+                self._feed_loop("offline_indexes", self._offline_refresh, _INTERVAL_OFFLINE),
+                name="intel:offline_indexes",
+            ))
         log.info("ThreatIntelWorker started — %d feed tasks", len(self._tasks))
 
     async def stop(self) -> None:
@@ -106,6 +131,11 @@ class ThreatIntelWorker:
 
     # ── Feed loop ─────────────────────────────────────────────────────────────
 
+    # Retry policy: up to 3 attempts with exponential backoff before giving up
+    # and waiting for the next scheduled interval.
+    _MAX_RETRIES    = 3
+    _RETRY_BASE_SEC = 30   # 30s → 60s → 120s
+
     async def _feed_loop(
         self,
         name:     str,
@@ -114,30 +144,76 @@ class ThreatIntelWorker:
     ) -> None:
         """
         Run *fn* immediately, then every *interval* seconds.
-        Records health in intel.db after every attempt.
+        On failure, retries up to _MAX_RETRIES times with exponential backoff
+        before recording a health failure and waiting for the next interval.
+        Records health in intel.db after every final outcome.
         """
         delay = 0  # run on first iteration without waiting
         while True:
             await asyncio.sleep(delay)
             delay = interval  # subsequent iterations use full interval
 
-            attempt_ts = time.time()
-            try:
-                count = await fn()
-                await self._intel_db.record_feed_attempt(
-                    name, success=True, entry_count=count,
-                )
-                log.info("Feed '%s': %d entries refreshed", name, count)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning("Feed '%s' failed: %s", name, exc)
+            last_exc: Exception | None = None
+            for attempt in range(1, self._MAX_RETRIES + 1):
+                try:
+                    count = await fn()
+                    await self._intel_db.record_feed_attempt(
+                        name, success=True, entry_count=count,
+                    )
+                    if attempt > 1:
+                        log.info("Feed '%s': recovered on attempt %d — %d entries", name, attempt, count)
+                    else:
+                        log.info("Feed '%s': %d entries refreshed", name, count)
+                    last_exc = None
+                    break  # success — stop retrying
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < self._MAX_RETRIES:
+                        backoff = self._RETRY_BASE_SEC * (2 ** (attempt - 1))
+                        log.warning(
+                            "Feed '%s' attempt %d/%d failed: %s — retrying in %ds",
+                            name, attempt, self._MAX_RETRIES, exc, backoff,
+                        )
+                        try:
+                            await asyncio.sleep(backoff)
+                        except asyncio.CancelledError:
+                            raise
+
+            if last_exc is not None:
+                log.error("Feed '%s' failed after %d attempts: %s", name, self._MAX_RETRIES, last_exc)
                 try:
                     await self._intel_db.record_feed_attempt(
-                        name, success=False, error=str(exc),
+                        name, success=False, error=str(last_exc),
                     )
                 except Exception:
                     pass  # don't let health recording crash the loop
+
+    # ── Offline exploit index refresh ────────────────────────────────────────
+
+    async def _offline_refresh(self) -> int:
+        """
+        Force re-download of ExploitDB and Metasploit offline indexes.
+        Called weekly; returns 0 (count not meaningful for offline indexes).
+        """
+        if self._intel_pipeline is None:
+            return 0
+        try:
+            await self._intel_pipeline.refresh_offline()
+            health = self._intel_pipeline.get_source_health()
+            edb_cves = health.get("exploitdb", {}).get("total_cves", 0)
+            msf_cves = health.get("metasploit", {}).get("total_cves", 0)
+            log.info(
+                "Offline indexes refreshed: exploitdb=%d CVEs  metasploit=%d CVEs",
+                edb_cves, msf_cves,
+            )
+            return edb_cves + msf_cves
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Offline index refresh failed: %s", exc)
+            return 0
 
     # ── Proactive CVE scanner ─────────────────────────────────────────────────
 

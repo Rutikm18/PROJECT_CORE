@@ -1,5 +1,5 @@
 import { Terminal } from "lucide-react";
-import { GenericDetectionPage, type DetectionFinding } from "./DetectionShared";
+import { TerrainDetectionPage, type DetectionFinding } from "./DetectionShared";
 import { cn } from "../../lib/utils";
 
 function RiskScore({ f }: { f: DetectionFinding }) {
@@ -37,7 +37,7 @@ function CategoryChip({ f }: { f: DetectionFinding }) {
 
 export default function ExecutionThreats() {
   return (
-    <GenericDetectionPage
+    <TerrainDetectionPage
       title="Citadels"
       subtitle="Processes · execution paths · containers · scheduled tasks · startup mechanisms · persistence indicators"
       apiUrl="/api/v1/detection/processes"

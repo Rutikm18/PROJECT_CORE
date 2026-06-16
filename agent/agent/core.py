@@ -144,7 +144,8 @@ class Orchestrator:
     """
 
     def __init__(self, config: dict, enc_key: bytes, mac_key: bytes,
-                 send_queue: "queue.Queue"):
+                 send_queue: "queue.Queue", link_state=None, policy_state=None,
+                 overflow_sink=None):
         self.config     = config
         self.enc_key    = enc_key
         self.mac_key    = mac_key
@@ -156,12 +157,26 @@ class Orchestrator:
         self._last_health = 0.0
         self._executor  = None
         self._cbr       = CircuitBreakerRegistry(fail_threshold=3, cooldown_sec=60)
+        # Optional callable -> dict: manager connectivity snapshot from the
+        # Sender, surfaced in the agent_health heartbeat for dashboard link
+        # status. Kept as an attribute so it survives SIGHUP __init__ re-runs.
+        self.link_state = link_state
+        # Optional callable -> dict: ConfigEngine snapshot (accepted policy
+        # versions + response gate), surfaced in the heartbeat so the manager
+        # can see which signed policies each agent is actually running.
+        self.policy_state = policy_state
+        # Optional callable(envelope) -> None: where an evicted envelope goes
+        # when the in-memory queue is full. Wired to the Sender's disk spool so
+        # backpressure overflow is PERSISTED, never silently dropped. Survives
+        # SIGHUP re-init like the other providers above.
+        self.overflow_sink = overflow_sink
 
     def start(self):
         import concurrent.futures
         self._stop.clear()
         self._last_run    = {}
         self._last_health = 0.0
+        self._seed_phase()
         self._executor    = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(4, len(COLLECTORS)),
             thread_name_prefix="collector",
@@ -172,6 +187,22 @@ class Orchestrator:
         log.info("Orchestrator started — %d sections, circuit breakers active",
                  len(self._sections()))
         return t
+
+    def _seed_phase(self) -> None:
+        """Stagger each section's first fire by a stable per-section phase so
+        same-interval collectors don't all stampede on the same tick (which
+        spikes CPU and trips the manager's per-agent rate limit → 429s → queue
+        overflow). Phase is deterministic (hash of name) so the spread is stable
+        across restarts; sections then keep their natural cadence, spread apart.
+        """
+        import hashlib
+        now = time.time()
+        for name, cfg in self._sections().items():
+            interval = max(1, cfg.get("interval_sec", 60))
+            h = int(hashlib.sha256(name.encode()).hexdigest(), 16)
+            phase = h % interval            # 0 .. interval-1 seconds
+            # Set last_run in the past so the first fire lands at now+phase.
+            self._last_run[name] = now - interval + phase
 
     def stop(self):
         self._stop.set()
@@ -256,28 +287,45 @@ class Orchestrator:
 
         maxq = self.config["manager"].get("max_queue_size", 500)
         if self.send_queue.qsize() >= maxq:
-            # Queue is full — evict the oldest item.
-            # Log at WARNING so operators can tune max_queue_size or investigate
-            # why the sender isn't draining (network down? manager slow?).
+            # Queue is full — evict the oldest item to make room. Instead of
+            # DROPPING it (the historical silent-data-loss path), spill it to the
+            # Sender's disk spool so it is replayed once the backlog clears.
             try:
                 evicted = self.send_queue.get_nowait()
-                evicted_section = evicted.get("section", "unknown")
-                log.warning(
-                    "Send queue full (max=%d) — evicted oldest item section=%s. "
-                    "Increase [manager] max_queue_size or check network connectivity.",
-                    maxq, evicted_section,
-                )
+                if self.overflow_sink is not None:
+                    try:
+                        self.overflow_sink(evicted)
+                        log.warning(
+                            "Send queue full (max=%d) — spilled oldest section=%s "
+                            "to disk spool (backpressure). Check sender/network.",
+                            maxq, evicted.get("section", "unknown"),
+                        )
+                    except Exception as exc:
+                        log.error("Overflow spill failed section=%s: %s — dropped",
+                                  evicted.get("section", "unknown"), exc)
+                else:
+                    log.warning(
+                        "Send queue full (max=%d) — no overflow sink; dropped "
+                        "oldest section=%s.", maxq, evicted.get("section", "unknown"),
+                    )
             except queue.Empty:
                 pass
 
         try:
             self.send_queue.put_nowait(envelope)
         except queue.Full:
-            # Highly unlikely (we just evicted above) but guard anyway.
-            log.error(
-                "Send queue still full after eviction for section=%s — dropping",
-                section,
-            )
+            # Highly unlikely (we just evicted above) — spill rather than drop.
+            if self.overflow_sink is not None:
+                try:
+                    self.overflow_sink(envelope)
+                except Exception:
+                    log.error("Send queue full after eviction section=%s — dropped",
+                              section)
+            else:
+                log.error(
+                    "Send queue still full after eviction for section=%s — dropping",
+                    section,
+                )
 
     def _emit_health(self) -> None:
         """Emit a synthetic agent_health section with diagnostics."""
@@ -290,6 +338,22 @@ class Orchestrator:
             "queue_depth": self.send_queue.qsize(),
             "sections":    self._cbr.snapshot(),
         }
+        # Manager link health (probe state / spool backlog / auth failures).
+        if self.link_state is not None:
+            try:
+                health_data["link"] = self.link_state()
+            except Exception as exc:
+                log.debug("link_state() failed: %s", exc)
+        # Signed-policy state: which verified policy versions are active and
+        # whether the active-response gate is open. Lets the manager confirm
+        # fleet-wide policy convergence and spot agents stuck on a stale policy.
+        if self.policy_state is not None:
+            try:
+                ps = self.policy_state()
+                health_data["policy_versions"] = ps.get("policy_versions", {})
+                health_data["response_enabled"] = ps.get("response_enabled", False)
+            except Exception as exc:
+                log.debug("policy_state() failed: %s", exc)
         self._enqueue("agent_health", health_data)
 
 
@@ -504,7 +568,52 @@ def main():
     sender = Sender(cfg, send_queue)
     sender_thread = sender.start()
 
-    orch = Orchestrator(cfg, enc_key, mac_key, send_queue)
+    # ── Signed-policy control plane ───────────────────────────────────────────
+    # Replaces the static agent.toml-only posture for the policy-controlled
+    # sections (security/response/telemetry/compliance): the ConfigEngine merges
+    # baseline ◅ verified manager policies ◅ tighten-only overrides into one
+    # immutable RuntimeConfig, fails closed on the response gate, and refreshes
+    # cache-first/non-blocking. Construction must never abort agent startup.
+    config_engine = None
+    try:
+        from .config_engine import (ConfigEngine, HttpPolicyTransport,
+                                     PathProvider)
+        from .policy import TrustStore
+
+        _base = os.path.dirname(os.path.abspath(args.config))
+        _paths = PathProvider(base=_base)
+        _trust = TrustStore(keystore_dir=_paths.keystore_dir)
+        _transport = HttpPolicyTransport(
+            cfg["manager"]["url"],
+            agent_id=agent_id,
+            tls_verify=cfg["manager"].get("tls_verify", True),
+            timeout_sec=cfg["manager"].get("timeout_sec", 10),
+        )
+        _group_ids = cfg.get("agent", {}).get("group_ids", []) \
+            or cfg.get("policy", {}).get("group_ids", [])
+        config_engine = ConfigEngine(
+            paths=_paths, trust=_trust, transport=_transport,
+            agent_id=agent_id, group_ids=_group_ids,
+        )
+        config_engine.load()                 # cache-first, non-blocking
+        config_engine.start_background()     # refresh on a monotonic cadence + reconnect
+        rc = config_engine.current()
+        log.info("ConfigEngine ready — policy_versions=%s response_enabled=%s",
+                 dict(rc.policy_versions), rc.response_enabled)
+    except Exception as exc:
+        log.error("ConfigEngine init failed (%s) — running on baseline only", exc)
+
+    def _policy_state():
+        if config_engine is None:
+            return {"policy_versions": {}, "response_enabled": False}
+        rc = config_engine.current()
+        return {"policy_versions": dict(rc.policy_versions),
+                "response_enabled": rc.response_enabled}
+
+    orch = Orchestrator(cfg, enc_key, mac_key, send_queue,
+                        link_state=sender.link_state,
+                        policy_state=_policy_state,
+                        overflow_sink=sender.spool_envelope)
     orch_thread  = orch.start()
 
     # Re-enrollment callback: called by sender when persistent 401 detected.
@@ -551,6 +660,8 @@ def main():
         log.info("Shutting down (signal %d)", signum)
         orch.stop()
         sender.stop()
+        if config_engine is not None:
+            config_engine.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -563,10 +674,21 @@ def main():
             try:
                 cfg = load_config(args.config)
                 log.info("Config reloaded on SIGHUP")
+                # Re-pull verified policies on reload too (SIGHUP == reload_config).
+                if config_engine is not None:
+                    try:
+                        result = config_engine.refresh()
+                        log.info("Policy refresh on SIGHUP: %s", result.outcomes)
+                    except Exception as exc:
+                        log.error("Policy refresh on SIGHUP failed: %s", exc)
                 orch.stop()
                 # Use orch.enc_key/mac_key — not startup enc_key/mac_key — so
                 # any keys updated via re-enrollment are preserved across reloads.
-                orch.__init__(cfg, orch.enc_key, orch.mac_key, send_queue)
+                # Preserve link_state + policy_state providers across the re-init.
+                orch.__init__(cfg, orch.enc_key, orch.mac_key, send_queue,
+                              link_state=orch.link_state,
+                              policy_state=orch.policy_state,
+                              overflow_sink=orch.overflow_sink)
                 orch.start()
             except Exception as exc:
                 log.error("Config reload failed: %s", exc)

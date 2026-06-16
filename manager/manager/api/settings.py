@@ -21,14 +21,15 @@ Design:
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import logging
 from datetime import date
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, field_validator, model_validator
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 log = logging.getLogger("manager.settings")
 
@@ -59,6 +60,54 @@ DEFAULTS: dict[str, str] = {
 REQUIRED_FIELDS   = {"org_name", "issue_date", "valid_until"}
 BOOLEAN_FIELDS    = {"notif_critical_email", "notif_sla_breach", "notif_digest_daily"}
 DATE_FIELDS       = {"issue_date", "valid_until"}
+
+# ── Validation / Confidence Scoring keys ──────────────────────────────────────
+# All persisted in the same org_settings table. JSON-encoded keys hold maps.
+VALIDATION_DEFAULTS: dict[str, str] = {
+    # Default 0.80 — anchor criteria (KEV, UID 0, IOC hit, SIP off) floor a
+    # finding's Detection Confidence at 80 %, so this lets any finding with a
+    # smoking-gun signal pass without configuration.  Bump to 0.90 once the
+    # operator has calibrated their own corroboration sources.
+    "validation_global_threshold":   "0.80",
+    "validation_terrain_thresholds": "{}",     # JSON: {terrain: float}
+    "validation_agent_thresholds":   "{}",     # JSON: {agent_id: float}
+    "validation_use_ai_verdict":     "true",   # bool — whether to call the LLM
+    "validation_min_strength":       "0.6",    # float — quality floor (G7)
+}
+VALIDATION_KEYS = set(VALIDATION_DEFAULTS.keys())
+
+# Terrains shown in the dashboard sidebar. Order matters — UI renders them
+# in the same order.  Each maps to one or more finding categories.
+VALIDATION_TERRAINS: list[str] = ["citadels", "vector", "origin", "identity", "posture"]
+VALIDATION_TERRAIN_CATEGORIES: dict[str, list[str]] = {
+    "citadels": ["execution","process","script","container","persistence","service","task","malware"],
+    "vector":   ["network","connection","port","arp","covert","lateral"],
+    "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app"],
+    "identity": ["user","identity","account","credential"],
+    "posture":  ["security","posture","sip","firewall"],
+}
+VALIDATION_TERRAIN_LABELS: dict[str, str] = {
+    "citadels": "Citadels (Execution & Persistence)",
+    "vector":   "Vector (Network & Reachability)",
+    "origin":   "Origin (Surface, Packages, Configs)",
+    "identity": "Identity (Accounts & Credentials)",
+    "posture":  "Posture (Security Controls)",
+}
+VALIDATION_THRESHOLD_BOUNDS = (0.50, 1.00)   # inclusive — 0.50 floor prevents footgun
+
+
+def _clamp_threshold(value: float) -> float:
+    lo, hi = VALIDATION_THRESHOLD_BOUNDS
+    return max(lo, min(hi, float(value)))
+
+
+def category_to_terrain(category: str) -> Optional[str]:
+    """Map a finding category to its dashboard terrain (None if unknown)."""
+    c = (category or "").lower()
+    for terrain, cats in VALIDATION_TERRAIN_CATEGORIES.items():
+        if c in cats:
+            return terrain
+    return None
 
 NUMERIC_BOUNDS: dict[str, tuple[int, int]] = {
     "platform_refresh_secs": (10, 3600),
@@ -131,6 +180,33 @@ PERMISSION_LABELS: dict[str, str] = {
 }
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
+
+class ValidationUpdate(BaseModel):
+    """Body for PUT /api/v1/settings/validation."""
+    global_threshold:   Optional[float] = Field(None, ge=0.0, le=1.0)
+    terrain_thresholds: Optional[dict[str, float]] = None
+    agent_thresholds:   Optional[dict[str, float]] = None
+    use_ai_verdict:     Optional[bool] = None
+    min_strength:       Optional[float] = Field(None, ge=0.0, le=1.0)
+
+    @field_validator("terrain_thresholds")
+    @classmethod
+    def _validate_terrain(cls, v):
+        if v is None:
+            return v
+        unknown = sorted(set(v.keys()) - set(VALIDATION_TERRAINS))
+        if unknown:
+            raise ValueError(f"Unknown terrain(s): {unknown}. "
+                             f"Valid: {VALIDATION_TERRAINS}")
+        return {k: _clamp_threshold(float(val)) for k, val in v.items()}
+
+    @field_validator("agent_thresholds")
+    @classmethod
+    def _validate_agents(cls, v):
+        if v is None:
+            return v
+        return {k: _clamp_threshold(float(val)) for k, val in v.items() if k}
+
 
 class SettingsUpdate(BaseModel):
     org_name:               Optional[str] = None
@@ -522,5 +598,302 @@ def make_settings_router(intel_db) -> APIRouter:
         except Exception as exc:
             log.exception("import_settings failed")
             raise HTTPException(500, f"Failed to import settings: {exc}")
+
+    # ── GET /validation ──────────────────────────────────────────────────────
+    @router.get("/validation")
+    async def get_validation_settings():
+        """
+        Return the AI Precision Validator thresholds — global, per-terrain,
+        per-agent — together with the agent list (so the UI can render an
+        agent picker without a second round-trip) and the terrain catalogue.
+        """
+        try:
+            raw = await _load()
+
+            global_thr = float(raw.get("validation_global_threshold")
+                                or VALIDATION_DEFAULTS["validation_global_threshold"])
+            try:
+                terrain_thr = json.loads(raw.get("validation_terrain_thresholds") or "{}")
+            except json.JSONDecodeError:
+                terrain_thr = {}
+            try:
+                agent_thr = json.loads(raw.get("validation_agent_thresholds") or "{}")
+            except json.JSONDecodeError:
+                agent_thr = {}
+
+            use_ai = (raw.get("validation_use_ai_verdict")
+                      or VALIDATION_DEFAULTS["validation_use_ai_verdict"]).lower() == "true"
+            min_strength = float(raw.get("validation_min_strength")
+                                 or VALIDATION_DEFAULTS["validation_min_strength"])
+
+            # Best-effort agent enumeration for the picker. Uses asset_registry
+            # (preferred — has OS/hostname) and falls back to nothing if missing.
+            agents: list[dict] = []
+            try:
+                rows = await intel_db._fetchall(
+                    "SELECT agent_id, hostname, os, asset_tier "
+                    "FROM asset_registry "
+                    "ORDER BY (CASE asset_tier "
+                    "  WHEN 'crown_jewel' THEN 0 "
+                    "  WHEN 'server' THEN 1 "
+                    "  WHEN 'workstation' THEN 2 "
+                    "  WHEN 'endpoint' THEN 3 "
+                    "  ELSE 4 END), hostname",
+                    (),
+                )
+                for r in rows:
+                    aid = r["agent_id"]
+                    agents.append({
+                        "agent_id":   aid,
+                        "hostname":   r["hostname"] or aid,
+                        "os":         r["os"] or "",
+                        "asset_tier": r["asset_tier"] or "endpoint",
+                        "threshold":  float(agent_thr.get(aid)) if aid in agent_thr else None,
+                    })
+            except Exception as exc:
+                log.debug("agent enumeration failed: %s", exc)
+
+            return {
+                "global_threshold":    _clamp_threshold(global_thr),
+                "terrain_thresholds":  {
+                    t: float(terrain_thr.get(t)) for t in VALIDATION_TERRAINS
+                    if t in terrain_thr
+                },
+                "agent_thresholds":    {k: float(v) for k, v in agent_thr.items()},
+                "use_ai_verdict":      use_ai,
+                "min_strength":        max(0.0, min(1.0, min_strength)),
+                "terrains":            [
+                    {
+                        "id":          t,
+                        "label":       VALIDATION_TERRAIN_LABELS[t],
+                        "categories":  VALIDATION_TERRAIN_CATEGORIES[t],
+                        "threshold":   float(terrain_thr.get(t)) if t in terrain_thr else None,
+                    }
+                    for t in VALIDATION_TERRAINS
+                ],
+                "agents":              agents,
+                "bounds":              {"min": VALIDATION_THRESHOLD_BOUNDS[0],
+                                         "max": VALIDATION_THRESHOLD_BOUNDS[1]},
+            }
+        except Exception as exc:
+            log.exception("get_validation_settings failed")
+            raise HTTPException(500, f"Failed to load validation settings: {exc}")
+
+    # ── PUT /validation ──────────────────────────────────────────────────────
+    @router.put("/validation")
+    async def update_validation_settings(body: ValidationUpdate, request: Request):
+        """
+        Persist per-key updates.  Only fields supplied in the body are written;
+        omitted keys keep their current value.  Every change is journalled in
+        settings_audit just like every other setting.
+        """
+        actor, ip = _actor_ip(request)
+        payload = body.model_dump(exclude_unset=True)
+        if not payload:
+            raise HTTPException(400, "No fields provided — nothing to update")
+
+        updates: dict[str, str] = {}
+        if "global_threshold" in payload:
+            updates["validation_global_threshold"] = str(_clamp_threshold(payload["global_threshold"]))
+        if "terrain_thresholds" in payload:
+            # Drop empty / None entries so the JSON stays compact.
+            tt = {k: float(v) for k, v in (payload["terrain_thresholds"] or {}).items() if v is not None}
+            updates["validation_terrain_thresholds"] = json.dumps(tt, sort_keys=True)
+        if "agent_thresholds" in payload:
+            at = {k: float(v) for k, v in (payload["agent_thresholds"] or {}).items() if v is not None}
+            updates["validation_agent_thresholds"] = json.dumps(at, sort_keys=True)
+        if "use_ai_verdict" in payload:
+            updates["validation_use_ai_verdict"] = "true" if payload["use_ai_verdict"] else "false"
+        if "min_strength" in payload:
+            updates["validation_min_strength"] = f"{max(0.0, min(1.0, float(payload['min_strength']))):.3f}"
+
+        try:
+            async with intel_db._lock:
+                for key, value in updates.items():
+                    await _write(key, value, actor, ip)
+                await intel_db._conn.commit()
+        except Exception as exc:
+            log.exception("update_validation_settings failed")
+            raise HTTPException(500, f"Failed to save validation settings: {exc}")
+
+        # Tell the engine to pick up the new thresholds on the next cluster
+        # without waiting for the 30s TTL.
+        try:
+            from ..attacklens.ai_validator import invalidate_validation_settings_cache
+            invalidate_validation_settings_cache()
+        except Exception:
+            pass
+
+        # When the analyst changes a validation knob, historical findings
+        # still carry their old precision_score.  Run the rescore INLINE so
+        # the immediately-following GET reflects the new configuration —
+        # background scheduling left the UI stale for the analyst's first
+        # refresh and caused "I configured it but nothing shows up" reports.
+        rescore_report = None
+        if "global_threshold" in payload or "terrain_thresholds" in payload \
+                or "agent_thresholds" in payload:
+            try:
+                rescore_report = await intel_db.recompute_terrain_validation_all()
+            except Exception as exc:
+                log.warning("inline recompute on settings change failed: %s", exc)
+
+        # Return the fresh canonical shape via the same loader as GET.
+        result = await get_validation_settings()
+        if rescore_report is not None:
+            result["rescore"] = rescore_report
+        return result
+
+    # ── POST /validation/recompute ───────────────────────────────────────────
+    @router.post("/validation/recompute")
+    async def recompute_validation(
+        only_unscored: bool = Query(
+            False,
+            description="If true, only re-evaluate findings whose precision_score is 0. "
+                        "Faster but won't fix already-rescored findings whose criteria changed.",
+        ),
+        limit: int = Query(5000, ge=1, le=100000),
+    ):
+        """
+        Manually trigger a full retro-rescore of every active finding against
+        the current terrain validators.  Use this after upgrading the manager,
+        after changing the criteria catalogue, or whenever Validated Findings
+        unexpectedly shows fewer results than the active-findings count.
+
+        Returns a histogram of how many findings landed in each score band so
+        the analyst can immediately tell whether to relax the threshold.
+        """
+        try:
+            result = await intel_db.recompute_terrain_validation_all(
+                only_unscored=only_unscored, limit=limit,
+            )
+            return {"status": "ok", **result}
+        except Exception as exc:
+            log.exception("recompute_validation failed")
+            raise HTTPException(500, f"Recompute failed: {exc}")
+
+    # ── GET /validation/status ────────────────────────────────────────────────
+    @router.get("/validation/status")
+    async def validation_status(request: Request):
+        """
+        Runtime status of the AI Precision Validator and the threat-intel
+        feeds it depends on. The Validated Findings UI calls this to decide
+        whether to show the panel as 'active', 'partial', or 'disabled' —
+        instead of misleading the analyst with a 0% rejection state when the
+        validator never actually ran.
+
+        Reports:
+          • pipeline_enabled    — ATTACKLENS_VALIDATION env / ENGINE_CONFIG
+          • ai_validation_on    — ATTACKLENS_AI_VALIDATION + Settings toggle
+          • ai_analyst_ready    — Anthropic API key present + client built
+          • kev_status          — last-loaded count + freshness from CISA KEV
+          • threshold_summary   — global + override counts
+          • last_error          — most recent validator failure (if any)
+        """
+        import os as _os
+        try:
+            from ..attacklens.config       import ENGINE_CONFIG as _CFG
+            from ..attacklens.ai_validator import _load_validation_settings
+        except Exception:
+            _CFG = {}
+
+        pipeline_on = bool(_CFG.get("validation_pipeline_enabled", False))
+        ai_on_env   = (_os.getenv("ATTACKLENS_AI_VALIDATION", "").strip().lower()
+                       in ("true","1","yes","on"))
+
+        # Read the settings-level master switch
+        ai_on_settings = True
+        try:
+            v = await _load_validation_settings(intel_db)
+            ai_on_settings = bool(v.get("use_ai", True))
+        except Exception:
+            pass
+        ai_validation_on = (ai_on_env or _CFG.get("ai_validation_enabled", False)) and ai_on_settings
+
+        # AI analyst readiness — check the app-state instance
+        analyst = getattr(request.app.state, "ai_analyst", None)
+        ai_analyst_ready = bool(analyst and getattr(analyst, "enabled", False))
+
+        # KEV feed status — pulled from FeedManager + DB
+        kev_status = {"loaded": 0, "last_refresh_ts": None, "freshness_hours": None, "source": "CISA KEV"}
+        try:
+            feeds = getattr(request.app.state, "feeds", None)
+            if feeds is not None and hasattr(feeds, "get_stats"):
+                stats = feeds.get_stats()
+                kev_status["loaded"] = int(stats.get("kev_cves") or 0)
+            # Most-recent CISA KEV upsert in DB (so we know when it was last refreshed)
+            row = await intel_db._fetchone(
+                "SELECT MAX(cached_at) AS last_ts FROM cisa_kev", (),
+            )
+            if row and row["last_ts"]:
+                last = float(row["last_ts"])
+                kev_status["last_refresh_ts"] = last
+                kev_status["freshness_hours"] = round((time.time() - last) / 3600, 2)
+        except Exception as exc:
+            log.debug("kev_status probe error: %s", exc)
+            kev_status["error"] = str(exc)[:160]
+
+        # Threshold summary
+        global_thr   = 0.90
+        terrain_n    = 0
+        agent_n      = 0
+        try:
+            raw = await _load()
+            global_thr = float(raw.get("validation_global_threshold")
+                               or VALIDATION_DEFAULTS["validation_global_threshold"])
+            try:
+                terrain_n = len(json.loads(raw.get("validation_terrain_thresholds") or "{}"))
+            except Exception:
+                terrain_n = 0
+            try:
+                agent_n = len(json.loads(raw.get("validation_agent_thresholds") or "{}"))
+            except Exception:
+                agent_n = 0
+        except Exception:
+            pass
+
+        # Last validator error (logged via SOC activity if we ever wire it)
+        last_error: Optional[str] = None
+        try:
+            row = await intel_db._fetchone(
+                "SELECT detail FROM signal_clusters "
+                "WHERE status LIKE 'ai_precision:%' AND detail IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1", (),
+            )
+            if row and row["detail"]:
+                last_error = str(row["detail"])[:240]
+        except Exception:
+            pass
+
+        # Compute a single banner status the UI can render directly.
+        if not pipeline_on:
+            banner_status = "disabled"
+            banner_msg    = "Validation pipeline is OFF. Set ATTACKLENS_VALIDATION=true and restart."
+        elif not ai_validation_on:
+            banner_status = "deterministic_only"
+            banner_msg    = "AI verdict step is OFF — findings use deterministic factors only."
+        elif not ai_analyst_ready:
+            banner_status = "degraded"
+            banner_msg    = "LLM verdict configured ON but ANTHROPIC_API_KEY missing — degrading to deterministic."
+        elif kev_status["loaded"] == 0:
+            banner_status = "warning"
+            banner_msg    = "CISA KEV feed has not loaded yet — KEV multiplier and gate G4 unavailable."
+        else:
+            banner_status = "active"
+            banner_msg    = f"Active. {kev_status['loaded']} KEV CVEs loaded."
+
+        return {
+            "pipeline_enabled":  pipeline_on,
+            "ai_validation_on":  ai_validation_on,
+            "ai_analyst_ready":  ai_analyst_ready,
+            "ai_settings_on":    ai_on_settings,
+            "kev_status":        kev_status,
+            "thresholds": {
+                "global":  global_thr,
+                "terrain_overrides": terrain_n,
+                "agent_overrides":   agent_n,
+            },
+            "last_rejection_reason": last_error,
+            "banner": {"status": banner_status, "message": banner_msg},
+        }
 
     return router

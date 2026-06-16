@@ -25,6 +25,7 @@ import argparse
 import logging
 import logging.handlers
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -58,6 +59,16 @@ class Watchdog:
         paths  = cfg.get("paths",    {})
 
         self.agent_bin       = bins.get("agent", "/Library/AttackLens/bin/attacklens-agent")
+        # The agent target may be a native PyInstaller binary OR a .py entry
+        # script (the current macOS deployment ships `run_agent.py`, which is not
+        # executable). For a .py target we launch it via a Python interpreter
+        # instead of exec'ing it directly — exec'ing a non-executable .py was the
+        # historical bug that made the watchdog FATAL-loop and never start the
+        # agent. The interpreter defaults to the one running the watchdog
+        # (`sys.executable`, the framework python3.13 in deployment) and can be
+        # overridden with [binaries] python = "...".
+        self.python_bin      = bins.get("python") or sys.executable or "python3"
+        self._use_interpreter = self.agent_bin.endswith(".py")
         self.config_path     = cfg.get("_config_path", "")
         self.pid_file        = paths.get("pid_file", "/Library/AttackLens/attacklens-agent.pid")
         self.check_interval  = int(wdcfg.get("check_interval_sec", 30))
@@ -99,23 +110,55 @@ class Watchdog:
 
     # ── Binary verification ───────────────────────────────────────────────────
 
+    def _interpreter_path(self) -> str | None:
+        """Resolve the configured Python interpreter to a runnable path, or None."""
+        p = self.python_bin
+        if os.path.isabs(p):
+            return p if (os.path.isfile(p) and os.access(p, os.X_OK)) else None
+        return shutil.which(p)
+
     def _verify_binary(self) -> bool:
-        """Check binary exists, is executable, and has expected permissions."""
+        """Check the agent target exists and is launchable, and warn on tampering.
+
+        Two launch modes:
+          • native binary  → the target itself must be executable (X_OK)
+          • .py entry script → the target must be readable AND a usable Python
+            interpreter must exist (the script need not be executable)
+        """
         if not os.path.isfile(self.agent_bin):
             log.critical(
-                "FATAL: agent binary not found at %s. "
-                "Re-install or update [binaries] agent = ... in agent.conf.",
+                "FATAL: agent target not found at %s. "
+                "Re-install or update [binaries] agent = ... in agent.toml.",
                 self.agent_bin,
             )
             return False
-        if not os.access(self.agent_bin, os.X_OK):
-            log.critical("FATAL: agent binary %s is not executable.", self.agent_bin)
-            return False
-        # Warn if binary is world-writable (tampering risk)
+
+        if self._use_interpreter:
+            if not os.access(self.agent_bin, os.R_OK):
+                log.critical("FATAL: agent script %s is not readable.", self.agent_bin)
+                return False
+            if not self._interpreter_path():
+                log.critical(
+                    "FATAL: Python interpreter %r not found for launching %s — "
+                    "set [binaries] python = \"/path/to/python3\" in agent.toml.",
+                    self.python_bin, self.agent_bin,
+                )
+                return False
+        else:
+            if not os.access(self.agent_bin, os.X_OK):
+                log.critical(
+                    "FATAL: agent binary %s is not executable. If this is a Python "
+                    "entry script, give it a .py suffix so the watchdog launches it "
+                    "via the interpreter.",
+                    self.agent_bin,
+                )
+                return False
+
+        # Warn if the launched file is world-writable (tampering risk)
         mode = os.stat(self.agent_bin).st_mode & 0o777
         if mode & 0o002:
             log.error(
-                "SECURITY WARNING: agent binary %s is world-writable (%o). "
+                "SECURITY WARNING: agent target %s is world-writable (%o). "
                 "This is a tampering risk. Fix: chmod 755 %s",
                 self.agent_bin, mode, self.agent_bin,
             )
@@ -123,13 +166,21 @@ class Watchdog:
 
     # ── Process management ────────────────────────────────────────────────────
 
+    def _build_cmd(self) -> list[str]:
+        """Build the agent launch command (interpreter-prefixed for .py targets)."""
+        if self._use_interpreter:
+            cmd = [self._interpreter_path() or self.python_bin, self.agent_bin]
+        else:
+            cmd = [self.agent_bin]
+        if self.config_path:
+            cmd += ["--config", self.config_path]
+        return cmd
+
     def _start_agent(self) -> None:
         if not self._verify_binary():
             return
 
-        cmd = [self.agent_bin]
-        if self.config_path:
-            cmd += ["--config", self.config_path]
+        cmd = self._build_cmd()
 
         try:
             self._proc = subprocess.Popen(

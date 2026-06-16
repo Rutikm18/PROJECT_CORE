@@ -67,16 +67,142 @@ def _notifier(request: Request):
 
 # ── Remediation plans ─────────────────────────────────────────────────────────
 
+async def _load_finding(idb, finding_id: int) -> Optional[dict]:
+    """Single-row finding loader used by remediation routes."""
+    async with idb._conn.execute(
+        "SELECT * FROM findings WHERE id=?", (finding_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return None
+    f = dict(row)
+    # Parse JSON columns so the KB sees structured evidence
+    import json
+    for col, default in [("evidence", {}), ("cve_ids", []), ("tags", []),
+                          ("exploit_sources", []), ("action_plan", [])]:
+        v = f.get(col)
+        if isinstance(v, str):
+            try:
+                f[col] = json.loads(v) if v else default
+            except Exception:
+                f[col] = default
+    return f
+
+
+@router.get("/api/v1/remediation/{finding_id}/recipe")
+async def get_remediation_recipe(
+    finding_id: int,
+    os_type: Optional[str] = Query(
+        None, pattern="^(macos|windows|linux)$",
+        description="Override agent OS. If omitted, the agent's actual OS is used.",
+    ),
+    idb=Depends(_idb),
+):
+    """
+    Deterministic remediation recipe — always returns a result.
+    Use POST /generate for the richer LLM-elaborated plan.
+
+    The recipe is keyed by (category, rule_id, evidence shape) so it never
+    needs an API key and never depends on background generation.
+
+    OS auto-detection: when `os_type` is omitted, the response is filtered to
+    the agent's actual OS (looked up from asset_registry).  Analysts then see
+    only commands that apply to the host the finding came from.
+    """
+    finding = await _load_finding(idb, finding_id)
+    if not finding:
+        raise HTTPException(404, f"Finding {finding_id} not found.")
+
+    # Auto-detect agent OS unless caller forced one.
+    agent_id = finding.get("agent_id", "")
+    agent_os_raw = "unknown"
+    if agent_id:
+        try:
+            agent_os_raw = await idb.get_agent_os(agent_id)
+        except Exception:
+            agent_os_raw = "unknown"
+
+    effective_os = os_type or (agent_os_raw if agent_os_raw in ("macos","linux","windows") else "macos")
+    auto_detected = os_type is None
+
+    from ..attacklens.remediation_kb import recipe_for_finding
+    recipe = recipe_for_finding(finding)
+
+    # Trim each step's commands to just the effective OS for a slim UI payload,
+    # but keep the full command map so the UI can switch if the analyst wants.
+    os_filtered_steps = []
+    for step in recipe.get("steps", []):
+        cmds = (step.get("commands") or {})
+        os_filtered_steps.append({
+            **step,
+            "commands_for_os": cmds.get(effective_os, []),
+        })
+    return {
+        **recipe,
+        "os_type":          effective_os,
+        "agent_os":         agent_os_raw,
+        "agent_os_locked":  auto_detected and agent_os_raw in ("macos","linux","windows"),
+        "steps":            os_filtered_steps,
+        "kev":              bool(finding.get("kev")),
+        "cve_ids":          finding.get("cve_ids") or [],
+        "precision_score":  finding.get("precision_score"),
+        "source":           "deterministic_kb",
+    }
+
+
 @router.get("/api/v1/remediation/{finding_id}")
 async def get_remediation_plan(
     finding_id: int,
-    os_type: str = Query("macos", pattern="^(macos|windows|linux)$"),
+    os_type: Optional[str] = Query(
+        None, pattern="^(macos|windows|linux)$",
+        description="Override agent OS. If omitted, the agent's actual OS is used.",
+    ),
     idb=Depends(_idb),
 ):
-    plan = await idb.get_remediation_plan(finding_id, os_type)
-    if not plan:
-        raise HTTPException(404, "No remediation plan found. POST /generate to create one.")
-    return plan
+    """
+    Cached AI-generated remediation plan. If none exists, fall back to the
+    deterministic KB recipe so the UI never has to render an empty state.
+    """
+    finding = await _load_finding(idb, finding_id)
+    if not finding:
+        raise HTTPException(404, f"Finding {finding_id} not found.")
+
+    # Pin to agent OS unless caller overrode it.
+    agent_id = finding.get("agent_id", "")
+    agent_os_raw = "unknown"
+    if agent_id:
+        try:
+            agent_os_raw = await idb.get_agent_os(agent_id)
+        except Exception:
+            agent_os_raw = "unknown"
+    effective_os = os_type or (agent_os_raw if agent_os_raw in ("macos","linux","windows") else "macos")
+
+    plan = await idb.get_remediation_plan(finding_id, effective_os)
+    if plan:
+        return {
+            **plan,
+            "source":           "ai_cached",
+            "agent_os":         agent_os_raw,
+            "agent_os_locked":  os_type is None and agent_os_raw in ("macos","linux","windows"),
+        }
+
+    from ..attacklens.remediation_kb import recipe_for_finding
+    recipe = recipe_for_finding(finding)
+    os_filtered_steps = []
+    for step in recipe.get("steps", []):
+        cmds = (step.get("commands") or {})
+        os_filtered_steps.append({**step, "commands_for_os": cmds.get(effective_os, [])})
+    return {
+        **recipe,
+        "os_type":          effective_os,
+        "agent_os":         agent_os_raw,
+        "agent_os_locked":  os_type is None and agent_os_raw in ("macos","linux","windows"),
+        "steps":            os_filtered_steps,
+        "kev":              bool(finding.get("kev")),
+        "cve_ids":          finding.get("cve_ids") or [],
+        "precision_score":  finding.get("precision_score"),
+        "source":           "deterministic_kb",
+    }
 
 
 @router.post("/api/v1/remediation/{finding_id}/generate")

@@ -36,25 +36,51 @@ log = logging.getLogger("manager.api.detection")
 
 # Source string → confidence level (0–1)
 _SOURCE_CONFIDENCE: dict[str, float] = {
+    # Threat feeds
     "feed:feodo":              0.97,
     "feed:emerging":           0.90,
     "feed:threatfox":          0.95,
+    "feed:urlhaus":            0.93,
+    "feed:spamhaus":           0.94,
     "abuseipdb":               0.78,
+    "greynoise":               0.82,
+    "shodan":                  0.80,
+    # Vulnerability databases
     "nvd":                     0.88,
+    # Network / Vector rules
     "rule:malicious_port":     0.92,
+    "rule:wildcard_bind":      0.88,
+    "rule:arp_spoofing":       0.90,
+    "rule:covert_channel":     0.86,
+    # Execution / process rules
     "rule:process_lineage":    0.88,
     "rule:process_pattern":    0.75,
     "rule:obfuscation":        0.82,
+    "rule:suid_process":       0.85,
+    # Persistence rules
     "rule:suspicious_service": 0.80,
-    "rule:risky_package":      0.72,
+    "rule:task_pattern":       0.82,
+    "rule:config_pattern":     0.80,
     "rule:suspicious_path":    0.78,
+    # Posture / package / identity
+    "rule:risky_package":      0.72,
     "rule:suid_binary":        0.85,
     "rule:world_writable":     0.75,
     "rule:uid0":               0.98,
-    "rule:config_pattern":     0.80,
-    "rule:task_pattern":       0.82,
     "rule:security_posture":   0.95,
+    "rule:not_notarized":      0.78,
+    "rule:unsigned_app":       0.80,
+    "rule:quarantine":         0.75,
+    # Behavioural analyser
     "behavioral":              0.70,
+    "behavioral_new_entity":   0.72,
+    "behavioral_change":       0.78,
+    "behavioral_threshold":    0.75,
+    "behavioral_velocity":     0.74,
+    "behavioral_zscore":       0.80,
+    "behavioral_entropy":      0.82,
+    # Correlator
+    "correlation_engine":      0.92,
 }
 
 # Category → human label + icon hint
@@ -62,21 +88,32 @@ _CAT_META: dict[str, dict] = {
     "package":    {"label": "Vulnerable Package",    "icon": "package",    "group": "vulnerability"},
     "port":       {"label": "Risky Open Port",       "icon": "port",       "group": "network"},
     "connection": {"label": "Network Threat",        "icon": "network",    "group": "network"},
+    "network":    {"label": "Network Anomaly",       "icon": "network",    "group": "network"},
     "service":    {"label": "Persistence Service",   "icon": "service",    "group": "persistence"},
     "task":       {"label": "Persistence Task",      "icon": "task",       "group": "persistence"},
     "config":     {"label": "Config Anomaly",        "icon": "config",     "group": "persistence"},
     "binary":     {"label": "Suspicious Binary",     "icon": "binary",     "group": "persistence"},
     "process":    {"label": "Execution Threat",      "icon": "process",    "group": "execution"},
     "app":        {"label": "Suspicious App",        "icon": "app",        "group": "execution"},
+    "container":  {"label": "Container Threat",      "icon": "container",  "group": "execution"},
     "user":       {"label": "Account Anomaly",       "icon": "user",       "group": "identity"},
     "security":   {"label": "Posture Finding",       "icon": "shield",     "group": "posture"},
+    "sysctl":     {"label": "Kernel Parameter",      "icon": "shield",     "group": "posture"},
 }
+
+# Categories that belong to the "Vector" (network) panel in the dashboard.
+# Connection IOCs, behavioural/ARP/covert-channel events, and risky open ports
+# all surface here because the sidebar has no separate Ports page.
+_VECTOR_CATEGORIES: list[str] = ["connection", "network", "port"]
 
 # Impact descriptions by category
 _IMPACT: dict[str, str] = {
     "package":    "Exploiting this vulnerability can lead to remote code execution, data exfiltration, or privilege escalation depending on the service exposure.",
     "port":       "An attacker discovering this open port could use it as a command-and-control channel, lateral movement pivot, or exploitation gateway.",
     "connection": "Active connections to known-malicious infrastructure indicate potential C2 communication, data exfiltration, or active compromise.",
+    "network":    "Unexpected interface/route changes, ARP anomalies, or covert tunnels indicate either active attacker manipulation of the host network stack or a compromised network neighbour.",
+    "container":  "Containerised workloads with privileged or unconfined capabilities allow container-escape and host compromise.",
+    "sysctl":     "Kernel parameter tampering disables runtime protections (ASLR, ptrace_scope, kptr_restrict) and enables exploitation primitives.",
     "service":    "Persistence mechanisms survive reboots. An attacker who establishes persistence can maintain access even after credential rotation.",
     "task":       "Scheduled tasks can execute attacker code at system startup or intervals, maintaining stealth persistence.",
     "config":     "Malicious patterns in shell configs are a common persistence technique, injecting backdoors into every interactive shell session.",
@@ -213,24 +250,76 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
             "offset":   offset,
         }
 
-    # ── Network threat findings ────────────────────────────────────────────────
+    # ── Network threat findings (the "Vector" panel) ───────────────────────────
     @router.get("/network")
     async def network(
         agent_id: Optional[str] = Query(None),
         severity: Optional[str] = Query(None),
+        sub_type: Optional[str] = Query(
+            None,
+            description="Restrict to one category: connection | network | port",
+        ),
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
     ):
-        rows = await intel_db.get_soc_findings(
-            agent_id=agent_id,
-            category="connection",
-            severity=severity,
-            active_only=True,
-            sort_by="composite_score",
-            limit=limit,
-            offset=offset,
+        """
+        Aggregate every category that belongs to the dashboard's Vector panel:
+          • connection — outbound/inbound IOC matches (Feodo, URLhaus, AbuseIPDB)
+          • network    — behavioural interface changes, ARP-spoofing, covert
+                         channels, DNS tunnelling
+          • port       — risky open ports (no dedicated sidebar entry)
+
+        Each category is fetched concurrently and merged sorted by
+        composite_score so the Vector page sees one unified stream.
+        """
+        wanted_cats = (
+            [sub_type] if sub_type in _VECTOR_CATEGORIES else _VECTOR_CATEGORIES
         )
-        return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
+
+        results = await asyncio.gather(*[
+            intel_db.get_soc_findings(
+                agent_id=agent_id,
+                category=cat,
+                severity=severity,
+                active_only=True,
+                sort_by="composite_score",
+                # Pull enough per category to give the merge headroom before paging.
+                limit=limit + offset,
+                offset=0,
+            )
+            for cat in wanted_cats
+        ], return_exceptions=True)
+
+        all_rows: list[dict] = []
+        for batch in results:
+            if isinstance(batch, Exception):
+                log.warning("Vector fetch failed for one sub-category: %s", batch)
+                continue
+            all_rows.extend(batch)
+
+        # De-duplicate by id (a finding could only be in one category, but be safe).
+        seen: set = set()
+        unique: list[dict] = []
+        for r in all_rows:
+            fid = r.get("id")
+            if fid is not None and fid in seen:
+                continue
+            if fid is not None:
+                seen.add(fid)
+            unique.append(r)
+
+        unique.sort(
+            key=lambda r: (r.get("composite_score") or r.get("score") or 0),
+            reverse=True,
+        )
+        paged = unique[offset: offset + limit]
+        return {
+            "findings":   [_enrich(r) for r in paged],
+            "count":      len(paged),
+            "total":      len(unique),
+            "offset":     offset,
+            "categories": wanted_cats,
+        }
 
     # ── Execution / process findings ───────────────────────────────────────────
     @router.get("/processes")
@@ -272,7 +361,38 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
         sort_by:   str           = Query("composite_score"),
         limit:     int           = Query(200, ge=1, le=1000),
         offset:    int           = Query(0, ge=0),
+        validated_only: bool     = Query(
+            True,
+            description="Apply the configured Settings → Validation thresholds "
+                        "(per-agent → per-terrain → global) so the All Incidents "
+                        "queue shows only findings whose precision ≥ threshold. "
+                        "Pass false to see every active finding.",
+        ),
     ):
+        # When validated_only is on, resolve the per-agent → per-terrain → global
+        # threshold from Settings → Validation and keep only findings whose
+        # precision_score clears it — the SAME bar the engine used to promote
+        # them, so the page stays consistent with the Validated Findings queue.
+        min_precision_sql: Optional[float] = None
+        global_threshold:  Optional[float] = None
+        if validated_only:
+            try:
+                from ..attacklens.ai_validator import _load_validation_settings
+                vs = await _load_validation_settings(intel_db)
+                global_threshold = float(vs.get("global", 0.90))
+                # SQL pre-filter at the LOWEST configured threshold so per-agent
+                # overrides set below the global aren't pre-dropped; the exact
+                # per-row bar is enforced in Python after fetch.
+                floors = [global_threshold]
+                floors.extend((vs.get("terrain") or {}).values())
+                floors.extend((vs.get("agent") or {}).values())
+                min_precision_sql = min(floors) if floors else global_threshold
+            except Exception as exc:
+                log.warning("detection/all validated_only settings load failed: %s "
+                            "— defaulting to 0.90 floor", exc)
+                min_precision_sql = 0.90
+                global_threshold = 0.90
+
         rows = await intel_db.get_soc_findings(
             agent_id=agent_id,
             category=category,
@@ -284,8 +404,33 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
             sort_by=sort_by,
             limit=limit,
             offset=offset,
+            min_precision=min_precision_sql,
         )
-        return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
+
+        below = 0
+        if validated_only and rows:
+            from ..attacklens.ai_validator import resolve_threshold
+            kept: list[dict] = []
+            for r in rows:
+                try:
+                    thr = await resolve_threshold(
+                        intel_db, r.get("agent_id", ""), r.get("category", ""),
+                    )
+                except Exception:
+                    thr = global_threshold or 0.90
+                r["effective_threshold"] = round(thr, 3)
+                if float(r.get("precision_score") or 0.0) >= thr:
+                    kept.append(r)
+                else:
+                    below += 1
+            rows = kept
+
+        body = {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
+        if validated_only:
+            body["validated_only"]   = True
+            body["global_threshold"] = global_threshold
+            body["below_threshold"]  = below
+        return body
 
     return router
 
@@ -304,8 +449,15 @@ def _enrich(f: dict) -> dict:
       cve_ids         — always a parsed list
     """
     # Parse JSON fields that come back as strings from SQLite
-    for field, default in [("evidence", {}), ("action_plan", []), ("cve_ids", []),
-                            ("exploit_sources", []), ("tags", [])]:
+    for field, default in [
+        ("evidence", {}), ("action_plan", []), ("cve_ids", []),
+        ("exploit_sources", []), ("tags", []),
+        # AI Precision Validation outputs
+        ("precision_factors", {}), ("ai_verdict", {}),
+        ("layers_involved", []), ("validation_gates_passed", []),
+        # Terrain-aware validation
+        ("terrain_validation", {}),
+    ]:
         v = f.get(field)
         if isinstance(v, str):
             try:
@@ -338,8 +490,14 @@ def _enrich(f: dict) -> dict:
 
 
 def _source_confidence_guess(source: str) -> float:
-    if source.startswith("feed:"):   return 0.92
-    if source.startswith("rule:"):   return 0.75
-    if source == "nvd":              return 0.85
-    if source == "behavioral":       return 0.68
+    if not source:
+        return 0.70
+    if source.startswith("feed:"):       return 0.92
+    if source.startswith("rule:"):       return 0.75
+    if source.startswith("behavioral"):  return 0.72
+    if source.startswith("corr"):        return 0.90
+    if source.startswith("C-"):          return 0.90    # correlator signal rule_id
+    if source.startswith(("S-", "E-", "X-")):  return 0.85  # confidence-engine rule IDs
+    if source == "nvd":                  return 0.85
+    if source == "abuseipdb":            return 0.78
     return 0.70

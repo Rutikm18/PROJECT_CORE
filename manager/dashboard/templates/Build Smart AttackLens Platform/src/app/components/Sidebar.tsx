@@ -3,12 +3,13 @@ import {
   AlertTriangle, Terminal, Globe, PackageOpen,
   Crosshair, BarChart3, Monitor, Database,
   ClipboardList, LayoutDashboard, Activity,
-  Settings, Server, Building2, MapPin,
+  Settings, Server, Building2, MapPin, Layers,
 } from "lucide-react";
 
 export type PageId =
   | "dashboard"
   | "threat-queue"
+  | "incidents"
   | "execution"
   | "network"
   | "vulnerabilities"
@@ -77,6 +78,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { id: "dashboard",    label: "Dashboard",  icon: LayoutDashboard },
       { id: "threat-queue", label: "Validated Findings",   icon: AlertTriangle,  badgeColor: "red", badgePulse: true },
+      { id: "incidents",    label: "All Incidents",        icon: Layers,         badgeColor: "red" },
     ],
   },
   {

@@ -113,6 +113,8 @@ PYTHONPATH="${REPO_ROOT}" python3 -m PyInstaller \
     --hidden-import "agent.agent.keystore" \
     --hidden-import "agent.agent.crypto" \
     --hidden-import "agent.agent.sender" \
+    --hidden-import "agent.agent.policy" \
+    --hidden-import "agent.agent.config_engine" \
     --hidden-import "agent.os.macos.collectors" \
     --hidden-import "agent.os.macos.collectors.volatile" \
     --hidden-import "agent.os.macos.collectors.network" \
@@ -124,6 +126,10 @@ PYTHONPATH="${REPO_ROOT}" python3 -m PyInstaller \
     --hidden-import "psutil" \
     --hidden-import "cryptography" \
     --hidden-import "cryptography.hazmat.primitives.ciphers.aead" \
+    --hidden-import "cryptography.hazmat.primitives.asymmetric.ed25519" \
+    --hidden-import "cryptography.hazmat.primitives.asymmetric.rsa" \
+    --hidden-import "cryptography.hazmat.primitives.asymmetric.padding" \
+    --hidden-import "cryptography.hazmat.primitives.serialization" \
     --hidden-import "keyring" \
     --hidden-import "keyring.backends.macOS" \
     --hidden-import "tomllib" \

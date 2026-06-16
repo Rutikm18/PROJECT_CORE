@@ -1,5 +1,5 @@
 import { Globe } from "lucide-react";
-import { GenericDetectionPage, type DetectionFinding } from "./DetectionShared";
+import { TerrainDetectionPage, type DetectionFinding } from "./DetectionShared";
 import { cn } from "../../lib/utils";
 
 function RiskScore({ f }: { f: DetectionFinding }) {
@@ -40,7 +40,7 @@ function ConfPct({ f }: { f: DetectionFinding }) {
 
 export default function NetworkThreats() {
   return (
-    <GenericDetectionPage
+    <TerrainDetectionPage
       title="Vector"
       subtitle="Network connectivity · ports · interfaces · mounts · shares · communication paths · IOC correlation"
       apiUrl="/api/v1/detection/network"

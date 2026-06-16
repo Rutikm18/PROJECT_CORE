@@ -11,6 +11,7 @@ import {
   Building2, MapPin, Mail, Calendar, ShieldCheck, Settings2,
   Bell, RefreshCw, Save, AlertTriangle, CheckCircle2, Info,
   Clock, Users, Lock, Unlock, Globe, RotateCcw, ChevronRight,
+  Brain, Target, Trash2, Plus,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -54,7 +55,7 @@ interface RoleEntry {
   color:       string;
 }
 
-type TabId = "org" | "license" | "roles" | "platform";
+type TabId = "org" | "license" | "roles" | "platform" | "validation";
 
 const EMPTY: OrgSettings = {
   org_name: "", org_description: "", org_location: "", contact_email: "",
@@ -221,10 +222,11 @@ export default function Settings() {
   const licC = license ? licenseColor(license.status) : licenseColor("unconfigured");
 
   const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
-    { id: "org",      label: "Organisation",   icon: Building2  },
-    { id: "license",  label: "License",        icon: ShieldCheck },
-    { id: "roles",    label: "Role Access",    icon: Users      },
-    { id: "platform", label: "Platform",       icon: Settings2  },
+    { id: "org",        label: "Organisation",  icon: Building2  },
+    { id: "license",    label: "License",       icon: ShieldCheck },
+    { id: "roles",      label: "Role Access",   icon: Users      },
+    { id: "platform",   label: "Platform",      icon: Settings2  },
+    { id: "validation", label: "Validation",    icon: Brain      },
   ];
 
   return (
@@ -725,6 +727,13 @@ export default function Settings() {
           </div>
         </div>
       )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          TAB: Validation & Confidence Scoring
+      ══════════════════════════════════════════════════════════════════════ */}
+      {tab === "validation" && (
+        <ValidationSettingsPanel />
+      )}
     </div>
   );
 }
@@ -734,6 +743,382 @@ function SectionLabel({ icon: Icon, children }: { icon: React.ElementType; child
     <div className="flex items-center gap-2">
       <Icon className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "#7C3AED" }} />
       <h2 className="text-[11px] font-bold text-[--gray-700] uppercase tracking-wide">{children}</h2>
+    </div>
+  );
+}
+
+// ── Validation & Confidence Scoring panel ──────────────────────────────────
+// Lets analysts configure the AI Precision Validator threshold globally, per
+// attack terrain (Citadels / Vector / Origin / Identity / Posture), and per
+// agent.  Higher threshold → fewer findings but higher precision.
+// Resolution priority at evaluation time: per-agent > per-terrain > global.
+
+interface VTerrain {
+  id:         string;
+  label:      string;
+  categories: string[];
+  threshold:  number | null;
+}
+interface VAgent {
+  agent_id:   string;
+  hostname:   string;
+  os:         string;
+  asset_tier: string;
+  threshold:  number | null;
+}
+interface VSettings {
+  global_threshold:    number;
+  terrain_thresholds:  Record<string, number>;
+  agent_thresholds:    Record<string, number>;
+  use_ai_verdict:      boolean;
+  min_strength:        number;
+  terrains:            VTerrain[];
+  agents:              VAgent[];
+  bounds:              { min: number; max: number };
+}
+
+const VAPI = "/api/v1/settings/validation";
+
+function thresholdTone(t: number): string {
+  if (t >= 0.95) return "text-emerald-700";
+  if (t >= 0.90) return "text-emerald-600";
+  if (t >= 0.80) return "text-amber-600";
+  return "text-red-600";
+}
+
+function ThresholdSlider({
+  value,
+  bounds,
+  onChange,
+  label,
+  description,
+  disabled,
+}: {
+  value: number;
+  bounds: { min: number; max: number };
+  onChange: (v: number) => void;
+  label?: string;
+  description?: string;
+  disabled?: boolean;
+}) {
+  const pct = Math.round(value * 100);
+  return (
+    <div className="space-y-1.5">
+      {label && (
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-[11px] font-semibold text-[--gray-700]">{label}</div>
+            {description && <div className="text-[9px] text-[--gray-400] mt-0.5">{description}</div>}
+          </div>
+          <div className={cn("text-[13px] font-black tabular-nums", thresholdTone(value))}>
+            {pct}%
+          </div>
+        </div>
+      )}
+      <input
+        type="range"
+        min={Math.round(bounds.min * 100)}
+        max={Math.round(bounds.max * 100)}
+        step={1}
+        value={pct}
+        disabled={disabled}
+        onChange={e => onChange(Number(e.target.value) / 100)}
+        className="w-full accent-purple-600 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+      />
+      <div className="flex items-center justify-between text-[8px] text-[--gray-300] font-mono">
+        <span>{Math.round(bounds.min * 100)}%</span>
+        <span className="text-[--gray-400]">higher = stricter</span>
+        <span>{Math.round(bounds.max * 100)}%</span>
+      </div>
+    </div>
+  );
+}
+
+function ValidationSettingsPanel() {
+  const [data,    setData]    = useState<VSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+  const [saved,   setSaved]   = useState(false);
+  const [pickerAgent, setPickerAgent] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch(VAPI);
+      if (!r.ok) throw new Error(`${r.status}`);
+      const d: VSettings = await r.json();
+      // Make sure each terrain has its current effective threshold in the map.
+      const tt = { ...d.terrain_thresholds };
+      d.terrains.forEach(t => {
+        if (t.threshold != null && tt[t.id] == null) tt[t.id] = t.threshold;
+      });
+      setData({ ...d, terrain_thresholds: tt });
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (patch: Partial<{
+    global_threshold:   number;
+    terrain_thresholds: Record<string, number>;
+    agent_thresholds:   Record<string, number>;
+    use_ai_verdict:     boolean;
+    min_strength:       number;
+  }>) => {
+    setSaving(true); setSaved(false);
+    try {
+      const r = await fetch(VAPI, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const d: VSettings = await r.json();
+      setData(d);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+      setError(null);
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  if (loading || !data) {
+    return (
+      <div className="bg-white border border-[--gray-200] rounded-2xl p-8 text-center text-[11px] text-[--gray-400]">
+        <RefreshCw className="w-4 h-4 animate-spin inline mr-2" />Loading validation settings…
+      </div>
+    );
+  }
+
+  const unconfiguredAgents = data.agents.filter(
+    a => !(a.agent_id in (data.agent_thresholds || {}))
+  );
+
+  return (
+    <div className="space-y-4">
+
+      {/* ── Global threshold + LLM toggle ──────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
+        <SectionLabel icon={Brain}>Global Detection Confidence Threshold</SectionLabel>
+        <p className="text-[10px] text-[--gray-500] leading-relaxed">
+          The Validated Findings page only shows findings whose AI Precision composite score is at least this value.
+          Per-terrain and per-agent overrides below take priority over this global default.
+        </p>
+
+        <ThresholdSlider
+          value={data.global_threshold}
+          bounds={data.bounds}
+          onChange={v => setData({ ...data, global_threshold: v })}
+          label="Global Detection Confidence threshold"
+          description="Applies to every finding that has no terrain or agent override."
+        />
+
+        <div className="flex items-center justify-between gap-3 pt-3 border-t border-[--gray-100]">
+          <div>
+            <div className="text-[11px] font-semibold text-[--gray-700]">Use LLM verdict</div>
+            <div className="text-[9px] text-[--gray-400] mt-0.5">
+              When OFF the validator falls back to deterministic factors only. Useful if Anthropic credits are tight.
+            </div>
+          </div>
+          <Toggle
+            value={data.use_ai_verdict}
+            onChange={v => setData({ ...data, use_ai_verdict: v })}
+            label=""
+          />
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-2">
+          {error && <span className="text-[10px] text-red-600">{error}</span>}
+          {saved && <span className="text-[10px] text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" />Saved</span>}
+          <button
+            disabled={saving}
+            onClick={() => save({
+              global_threshold: data.global_threshold,
+              use_ai_verdict:   data.use_ai_verdict,
+            })}
+            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
+            <Save className="w-3.5 h-3.5" />Save global
+          </button>
+        </div>
+      </div>
+
+      {/* ── Per-terrain overrides ──────────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
+        <SectionLabel icon={Target}>Per-Terrain Overrides</SectionLabel>
+        <p className="text-[10px] text-[--gray-500] leading-relaxed">
+          Tighten or loosen the threshold for an entire attack terrain (Citadels = execution &amp; persistence, Vector = network, Origin = surface &amp; CVEs, Identity = accounts, Posture = security controls).
+        </p>
+        <div className="space-y-3">
+          {data.terrains.map(terrain => {
+            const enabled = terrain.id in data.terrain_thresholds;
+            const value   = data.terrain_thresholds[terrain.id] ?? data.global_threshold;
+            return (
+              <div key={terrain.id}
+                   className={cn(
+                     "rounded-xl border p-3 space-y-2 transition-all",
+                     enabled ? "border-purple-200 bg-purple-50/30" : "border-[--gray-200] bg-white"
+                   )}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[12px] font-bold text-[--gray-800]">{terrain.label}</span>
+                      {enabled && (
+                        <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[8px] font-bold uppercase tracking-wide">override active</span>
+                      )}
+                    </div>
+                    <div className="text-[9px] text-[--gray-400] mt-0.5 truncate">
+                      Categories: {terrain.categories.join(", ")}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const next = { ...data.terrain_thresholds };
+                      if (enabled) delete next[terrain.id];
+                      else next[terrain.id] = data.global_threshold;
+                      setData({ ...data, terrain_thresholds: next });
+                    }}
+                    className={cn(
+                      "px-2 py-1 rounded-lg text-[10px] font-bold border transition-colors",
+                      enabled
+                        ? "bg-white text-red-600 border-red-200 hover:bg-red-50"
+                        : "bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
+                    )}>
+                    {enabled ? <Trash2 className="w-3 h-3 inline" /> : <Plus className="w-3 h-3 inline" />}
+                  </button>
+                </div>
+                {enabled && (
+                  <ThresholdSlider
+                    value={value}
+                    bounds={data.bounds}
+                    onChange={v => {
+                      const next = { ...data.terrain_thresholds, [terrain.id]: v };
+                      setData({ ...data, terrain_thresholds: next });
+                    }}
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <button
+            disabled={saving}
+            onClick={() => save({ terrain_thresholds: data.terrain_thresholds })}
+            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
+            <Save className="w-3.5 h-3.5" />Save terrain overrides
+          </button>
+        </div>
+      </div>
+
+      {/* ── Per-agent overrides ────────────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
+        <SectionLabel icon={Users}>Per-Agent Overrides</SectionLabel>
+        <p className="text-[10px] text-[--gray-500] leading-relaxed">
+          Pin a stricter (or looser) threshold to specific hosts — e.g. crown-jewel servers
+          might require 95%, sandbox dev laptops can drop to 80%. Per-agent overrides beat
+          terrain and global settings.
+        </p>
+
+        {/* Add agent picker */}
+        {unconfiguredAgents.length > 0 && (
+          <div className="flex items-center gap-2 pb-3 border-b border-[--gray-100]">
+            <select
+              value={pickerAgent}
+              onChange={e => setPickerAgent(e.target.value)}
+              className={selectCls + " flex-1"}
+            >
+              <option value="">Add agent…</option>
+              {unconfiguredAgents.map(a => (
+                <option key={a.agent_id} value={a.agent_id}>
+                  {a.hostname} · {a.asset_tier} · {a.os || "—"}
+                </option>
+              ))}
+            </select>
+            <button
+              disabled={!pickerAgent}
+              onClick={() => {
+                if (!pickerAgent) return;
+                const next = { ...data.agent_thresholds, [pickerAgent]: data.global_threshold };
+                setData({ ...data, agent_thresholds: next });
+                setPickerAgent("");
+              }}
+              className="flex items-center gap-1 px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-[--gray-300] text-white text-[10px] font-bold rounded-xl transition-colors">
+              <Plus className="w-3 h-3" />Add
+            </button>
+          </div>
+        )}
+
+        {/* Configured agents list */}
+        <div className="space-y-2">
+          {Object.keys(data.agent_thresholds).length === 0 && (
+            <div className="text-[10px] text-[--gray-400] italic text-center py-4">
+              No per-agent overrides yet. Pick an agent above to add one.
+            </div>
+          )}
+          {Object.entries(data.agent_thresholds).map(([aid, val]) => {
+            const agent = data.agents.find(a => a.agent_id === aid);
+            return (
+              <div key={aid} className="rounded-xl border border-purple-200 bg-purple-50/30 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[12px] font-bold text-[--gray-800]">{agent?.hostname || aid}</span>
+                      {agent?.asset_tier && (
+                        <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[8px] font-mono">{agent.asset_tier}</span>
+                      )}
+                      {agent?.os && (
+                        <span className="px-1.5 py-0.5 bg-blue-50 text-blue-700 rounded text-[8px] font-mono">{agent.os}</span>
+                      )}
+                    </div>
+                    <div className="text-[9px] text-[--gray-400] mt-0.5 font-mono truncate">{aid}</div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const next = { ...data.agent_thresholds };
+                      delete next[aid];
+                      setData({ ...data, agent_thresholds: next });
+                    }}
+                    className="px-2 py-1 rounded-lg text-[10px] font-bold border bg-white text-red-600 border-red-200 hover:bg-red-50 transition-colors">
+                    <Trash2 className="w-3 h-3 inline" />
+                  </button>
+                </div>
+                <ThresholdSlider
+                  value={val}
+                  bounds={data.bounds}
+                  onChange={v => {
+                    const next = { ...data.agent_thresholds, [aid]: v };
+                    setData({ ...data, agent_thresholds: next });
+                  }}
+                />
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <button
+            disabled={saving}
+            onClick={() => save({ agent_thresholds: data.agent_thresholds })}
+            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
+            <Save className="w-3.5 h-3.5" />Save agent overrides
+          </button>
+        </div>
+      </div>
+
+      {/* ── Info footer ────────────────────────────────────────────────── */}
+      <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 flex items-start gap-2 text-[10px] text-blue-800">
+        <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+        <div className="leading-relaxed">
+          <strong>How resolution works:</strong> when a cluster is evaluated, the threshold is taken from
+          the first match in this priority order — <strong>per-agent override</strong> →
+          <strong> per-terrain override</strong> → <strong>global threshold</strong>. Changes apply within ~30s
+          (settings cache); cluster rejections show the effective threshold in the engine log.
+        </div>
+      </div>
     </div>
   );
 }

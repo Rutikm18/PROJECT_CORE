@@ -82,19 +82,31 @@ attacklens/
 │   │   │   ├── ingest.py               # POST /api/v1/ingest (auth + decrypt + queue)
 │   │   │   ├── agents.py               # Agent CRUD, section data, timelines
 │   │   │   ├── enroll.py               # Enrollment handshake
-│   │   │   ├── findings.py             # Findings + correlations read API
-│   │   │   ├── jarvis.py               # Findings + correlation write API
+│   │   │   ├── findings.py             # SOC case management (mounted at /api/v1/soc)
+│   │   │   ├── intel.py                # Multi-source CVE/KEV/EPSS/exploit intel (/api/v1/intel)
 │   │   │   ├── keys.py                 # Key management (rotate, expire, revoke)
-│   │   │   ├── remediation.py          # AI remediation + asset registry + intel proxy
-│   │   │   └── threat.py               # Threat intel endpoints
-│   │   ├── jarvis/                     # Detection engine
+│   │   │   ├── remediation.py          # AI remediation + asset registry + threat actors/news
+│   │   │   ├── threat.py               # Threat feed stats + IOC + NVD search (/api/v1/threat)
+│   │   │   ├── detection.py            # Per-category detection endpoints (/api/v1/detection)
+│   │   │   ├── attacklens.py           # AttackLens engine API (/api/v1/attacklens)
+│   │   │   ├── posture.py              # Security posture endpoints (/api/v1/posture)
+│   │   │   ├── accuracy.py             # Detection accuracy + coverage (/api/v1/accuracy)
+│   │   │   ├── assets.py               # Asset registry (/api/v1/assets)
+│   │   │   ├── raw.py                  # Raw telemetry query (/api/v1/raw)
+│   │   │   └── settings.py             # Platform settings (/api/v1/settings)
+│   │   ├── attacklens/                 # Detection engine (primary)
 │   │   │   ├── allowlist.py            # FP suppression library
-│   │   │   ├── rules.py                # 26+5+5 static detection rules
 │   │   │   ├── behavioral.py           # Welford z-score + entropy + velocity
 │   │   │   ├── correlator.py           # 21 time-gated ATT&CK correlation rules
-│   │   │   ├── engine.py               # Main dispatcher + NVD async worker
+│   │   │   ├── engine.py               # AttackLensEngine: main dispatcher
 │   │   │   ├── feeds.py                # Threat feed manager (in-memory + DB)
-│   │   │   └── nvd.py                  # NVD CVE lookup + caching
+│   │   │   ├── nvd.py                  # NVD CVE lookup + caching
+│   │   │   └── rules.py                # Static detection rules
+│   │   ├── intel/                      # Multi-source vulnerability intelligence pipeline
+│   │   │   ├── pipeline.py             # IntelPipeline: orchestrates all intel sources
+│   │   │   ├── sources.py              # NVD, CISA KEV, EPSS, ExploitDB, Metasploit, GitHub PoC, GHSA, OSV, CIRCL
+│   │   │   ├── scorer.py               # Intel-aware composite risk scorer
+│   │   │   └── validator.py            # CVE ID validation + normalisation
 │   │   ├── notifications/
 │   │   │   ├── __init__.py
 │   │   │   └── email.py                # EmailNotifier (SMTP + Graph API)
@@ -102,16 +114,15 @@ attacklens/
 │   │   │   ├── connection.py           # RabbitMQ topology declaration
 │   │   │   ├── producer.py             # QueueProducer (publish)
 │   │   │   └── schemas.py              # Queue names + message schemas
-│   │   ├── threat/
+│   │   ├── threat/                     # Threat data helpers
 │   │   │   ├── scoring.py              # Composite risk score matrix
-│   │   │   ├── engine.py               # (legacy path alias)
-│   │   │   ├── feeds.py                # (legacy path alias)
-│   │   │   ├── nvd.py                  # (legacy path alias)
-│   │   │   ├── nvd_sync.py             # NVDSyncWorker (7-day rolling sync)
-│   │   │   └── rules.py                # (legacy path alias)
+│   │   │   ├── feeds.py                # Feed manager aliases
+│   │   │   ├── nvd.py                  # NVD lookup aliases
+│   │   │   ├── nvd_sync.py             # NVDSyncWorker (7-day rolling NVD sync)
+│   │   │   └── rules.py                # Rule aliases
 │   │   ├── workers/
 │   │   │   ├── telemetry.py            # TelemetryWorker (store + broadcast + queue)
-│   │   │   ├── jarvis.py               # JarvisWorker (detection pipeline)
+│   │   │   ├── attacklens.py           # AttackLensWorker (detection pipeline consumer)
 │   │   │   ├── intel.py                # ThreatIntelWorker (feed refresh loops)
 │   │   │   ├── enrichment.py           # EnrichmentWorker (background AI analysis)
 │   │   │   └── consumer.py             # TelemetryConsumer (RabbitMQ main consumer)
@@ -125,6 +136,7 @@ attacklens/
 │   │   ├── index.py                    # Hot-tier payload index queries
 │   │   ├── indexer.py                  # IntelDB (intel.db) — all intelligence tables
 │   │   ├── models.py                   # Pydantic request/response models
+│   │   ├── pool.py                     # Async connection pool helpers
 │   │   ├── server.py                   # FastAPI app factory + startup wiring
 │   │   ├── store.py                    # Three-tier NDJSON+gzip file store
 │   │   ├── threat_intel_service.py     # Central threat intel microservice (standalone)
@@ -275,62 +287,81 @@ Network failure during send:
 @app.on_event("startup")
 async def startup():
     # 1. Setup logging (rotating file handler)
-    setup_logging(level, logfile)
+    setup_logging(level=LOG_LEVEL, logfile=LOG_FILE)
 
     # 2. Init databases
-    await db.init()        # manager.db — agents, keys, nonces
+    await db.init()        # manager.db — agents, keys, nonces (SQLitePool readers=4)
+    await store.init()     # three-tier NDJSON+gzip file store
     await intel_db.init()  # intel.db  — findings, baselines, AI cache
 
-    # 3. Connect to RabbitMQ + declare topology
-    producer = QueueProducer()
-    await producer.connect()
-    await declare_topology(producer.channel)
+    # 3. Start detection engine (loads feed cache, initialises NVD index)
+    await engine.start()   # AttackLensEngine
 
-    # 4. Start background workers
-    asyncio.create_task(TelemetryWorker(db, store, intel_db, hub, producer).run())
-    asyncio.create_task(JarvisWorker(intel_db, engine).run())
-    asyncio.create_task(ThreatIntelWorker(intel_db, engine).run())
-    asyncio.create_task(EnrichmentWorker(intel_db, analyst).run())
-    asyncio.create_task(NVDSyncWorker(intel_db).run())
-    asyncio.create_task(TelemetryConsumer(db, store, hub, producer).run())
+    # 4. Start background maintenance tasks
+    asyncio.create_task(_cleanup_store())   # hourly hot→warm demotion
+    asyncio.create_task(_expire_chunks())   # 5-min chunk-tracker expiry
 
-    # 5. Start Jarvis engine (loads feed cache, starts NVD worker)
-    await engine.start()
+    # 5. If RabbitMQ is configured, start queue workers
+    if producer is not None:
+        await producer.start()
+        asyncio.create_task(TelemetryWorker(rabbitmq_url, db, store, hub, producer).run())
+        asyncio.create_task(AttackLensWorker(rabbitmq_url, engine, chunk_tracker).run())
+        asyncio.create_task(TelemetryConsumer(rabbitmq_url, db, store, hub, producer, engine).run())
+    # else: sync pipeline — ingest handler calls engine.process() inline
 
-    # 6. Wire state to app
-    app.state.db = db
-    app.state.intel_db = intel_db
-    app.state.ai_analyst = AIAnalyst(intel_db, engine.feeds)
-    app.state.email_notifier = EmailNotifier()
-    app.state.feeds = engine.feeds
+    # 6. Start threat intel subsystem (embedded mode, default)
+    if embedded_threat_intel:
+        _intel_pipeline = IntelPipeline(engine.feeds, engine.nvd, github_token=...)
+        await _intel_pipeline.start()
+        app.state.intel_pipeline = _intel_pipeline
+        await ThreatIntelWorker(intel_db, db, engine.feeds, engine.nvd,
+                                intel_pipeline=_intel_pipeline).start()
+
+    # 7. Start AI enrichment + NVD sync workers
+    await EnrichmentWorker(intel_db, rabbitmq_url or None).start()
+    await NVDSyncWorker(intel_db).start()
+
+    # 8. Wire shared state for route dependencies
+    app.state.intel_db         = intel_db
+    app.state.feeds            = engine.feeds
+    app.state.threat_intel_url = threat_intel_url  # empty in embedded mode
+    app.state.ai_analyst       = AIAnalyst(intel_db, engine.feeds)
+    app.state.email_notifier   = EmailNotifier()
 ```
 
 ### Worker Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  RabbitMQ                                                       │
+│  RabbitMQ  (optional — sync fallback if RABBITMQ_URL unset)     │
 │                                                                 │
 │  Exchanges:                                                     │
 │    mac_intel.telemetry (direct)                                 │
-│    mac_intel.jarvis (direct)                                    │
+│    mac_intel.attacklens (direct)                                │
 │                                                                 │
 │  Queues:                                                        │
-│    agent.telemetry     → TelemetryConsumer (prefetch=20)        │
-│    jarvis.work         → JarvisWorker (prefetch=10)             │
-│    mac_intel.dead      → Dead letter queue (nack'd messages)    │
+│    agent.telemetry  → TelemetryConsumer (prefetch=20)           │
+│    attacklens.work  → AttackLensWorker  (prefetch=10)           │
+│    mac_intel.dead   → Dead letter queue (nack'd messages)       │
 └─────────────────────────────────────────────────────────────────┘
          │                              │
          ▼                              ▼
-  TelemetryConsumer              JarvisWorker
-  ┌─────────────────┐         ┌─────────────────────────────────┐
-  │ 1. Decrypt      │         │ 1. JarvisEngine.process()       │
-  │ 2. Write store  │         │    a. _dispatch(section, data)  │
-  │ 3. Index SQLite │         │    b. BehavioralAnalyzer.analyze│
-  │ 4. WS broadcast │         │    c. Upsert findings to DB     │
-  │ 5. Pub jarvis.w │         │    d. CorrelationEngine (every3)│
-  │ 6. ACK          │         │ 2. ACK                          │
-  └─────────────────┘         └─────────────────────────────────┘
+  TelemetryConsumer           AttackLensWorker
+  ┌─────────────────┐       ┌───────────────────────────────────┐
+  │ 1. Decrypt      │       │ 1. AttackLensEngine.process()     │
+  │ 2. Write store  │       │    a. _dispatch(section, data)    │
+  │ 3. Index SQLite │       │    b. BehavioralAnalyzer.analyze  │
+  │ 4. WS broadcast │       │    c. Upsert findings to DB       │
+  │ 5. Pub al.work  │       │    d. CorrelationEngine (every 3) │
+  │ 6. ACK          │       │ 2. ACK                            │
+  └─────────────────┘       └───────────────────────────────────┘
+
+  Background workers (always-on, no queue dependency):
+  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+  │ ThreatIntelWorker│  │ EnrichmentWorker │  │  NVDSyncWorker  │
+  │ 7 feed loops    │  │ AI background    │  │ 7-day NVD sync  │
+  │ (see §9)        │  │ enrichment queue │  │ FTS5 rebuild    │
+  └─────────────────┘  └──────────────────┘  └─────────────────┘
 ```
 
 ---
@@ -569,7 +600,7 @@ score = min(10.0, rule["score"] + 0.25 * bonus + intel_boost)
 
 ## 9. Threat Feed Pipeline
 
-### FeedManager (`jarvis/feeds.py`)
+### FeedManager (`attacklens/feeds.py`)
 
 ```python
 class FeedManager:
@@ -577,8 +608,6 @@ class FeedManager:
     _malicious_ips: dict[str, dict]   # ip → {severity, source, description}
     _malicious_domains: set[str]
     _kev_set: set[str]                 # CVE-IDs in CISA KEV
-    _actor_meta: dict[str, dict]       # ransomware group name → metadata
-    _news_cache: list[dict]            # recent security news items
     _spamhaus_cidrs: list[ipaddress.IPv4Network]  # bad CIDR ranges
 
     def is_malicious_ip(self, ip: str) -> bool:
@@ -593,23 +622,23 @@ class FeedManager:
 ### Feed Refresh Intervals
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ ThreatIntelWorker starts 9 async loops on startup:  │
-│                                                     │
-│  feodo         → every  1 hr                        │
-│  emerging      → every  1 hr                        │
-│  urlhaus        → every  2 hr                       │
-│  threatfox     → every  2 hr                        │
-│  spamhaus      → every  6 hr                        │
-│  cisa_kev      → every  4 hr                        │
-│  nvd_recent    → every  2 hr                        │
-│  ransomware_live → every 3 hr                       │
-│  security_news → every  2 hr                        │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ ThreatIntelWorker starts 7 async loops on startup:   │
+│                                                      │
+│  feodo           → every  1 h   (_INTERVAL_FEODO)    │
+│  emerging        → every  1 h   (_INTERVAL_EMERGING) │
+│  urlhaus         → every  2 h   (_INTERVAL_URLHAUS)  │
+│  cisa_kev        → every 24 h   (_INTERVAL_KEV)      │
+│  nvd_recent      → every  2 h   (_INTERVAL_NVD_SYNC) │
+│  proactive_cve   → every  6 h   (_INTERVAL_CVE_SCAN) │
+│  offline_indexes → every  7 d   (_INTERVAL_OFFLINE)  │
+└──────────────────────────────────────────────────────┘
 ```
 
 Each loop: `sleep(delay)` → `fn()` → `record_feed_attempt(success/fail)` → repeat.
 First iteration: `delay=0` (immediate refresh at startup).
+
+`offline_indexes` refreshes ExploitDB and Metasploit CSV files from GitHub; the 7-day interval avoids hammering the large archives. In-memory KEV lookup uses `engine.feeds._kev_set` (a `set[str]` of CVE IDs) for O(1) checks during finding emission.
 
 ### NVD CVE Lookup Architecture
 
@@ -945,66 +974,182 @@ CREATE TABLE remediation_plans (
 
 ## 15. API Reference
 
-### Ingest
+### Ingest & Enrollment
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/v1/ingest` | Agent key | Receive encrypted telemetry payload |
-| POST | `/api/v1/enroll` | Enrollment token | Register new agent |
+| POST | `/api/v1/ingest` | Agent key | Receive encrypted + signed telemetry payload |
+| POST | `/api/v1/enroll` | Enrollment token (or open) | Register new agent, receive session key |
 
-### Agent Management
+### Agent Management (`/api/v1/agents`)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/v1/agents` | Admin token | List all enrolled agents |
 | GET | `/api/v1/agents/{id}` | Admin token | Agent detail + last-seen sections |
+| GET | `/api/v1/agents/{id}/sections` | Admin token | List sections with data for agent |
 | GET | `/api/v1/agents/{id}/{section}` | Admin token | Latest section data for agent |
 | DELETE | `/api/v1/agents/{id}` | Admin token | Deregister agent |
 
-### Findings & Correlations
+### Key Management (`/api/v1/keys`)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/v1/findings` | Admin token | All active findings (filterable by agent, severity, category) |
-| GET | `/api/v1/findings/{id}` | Admin token | Single finding detail |
-| POST | `/api/v1/findings/{id}/close` | Admin token | Close / suppress finding |
-| GET | `/api/v1/correlations` | Admin token | Active attack-chain correlations |
-| POST | `/api/v1/remediation/prioritize` | Admin token | AI-prioritized finding list |
+| GET | `/api/v1/keys` | Admin token | List agent keys + expiry status |
+| POST | `/api/v1/keys/{agent_id}/rotate` | Admin token | Issue new session key for agent |
+| POST | `/api/v1/keys/{agent_id}/revoke` | Admin token | Revoke agent key |
+| POST | `/api/v1/keys/{agent_id}/expire` | Admin token | Set key expiry date |
 
-### AI & Remediation
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| GET | `/api/v1/remediation/{id}` | Admin token | Get cached remediation plan |
-| POST | `/api/v1/remediation/{id}/generate` | Admin token | Generate AI remediation plan |
-| GET | `/api/v1/remediation/{id}/analysis` | Admin token | Get cached AI analysis |
-| POST | `/api/v1/remediation/{id}/analysis/generate` | Admin token | Generate AI analysis |
-
-### Asset Registry
+### SOC Case Management (`/api/v1/soc`)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/v1/assets` | Admin token | List asset registry |
-| GET | `/api/v1/assets/{agent_id}` | Admin token | Get asset tier/group |
-| PUT | `/api/v1/assets/{agent_id}` | Admin token | Update asset tier, owner, department |
+| GET | `/api/v1/soc/dashboard` | Admin token | Aggregate SOC dashboard metrics |
+| GET | `/api/v1/soc/sla` | Admin token | SLA compliance metrics |
+| GET | `/api/v1/soc/findings` | Admin token | All findings (filterable by agent, severity, category, status) |
+| GET | `/api/v1/soc/findings/{id}` | Admin token | Single finding detail |
+| PATCH | `/api/v1/soc/findings/{id}` | Admin token | Update finding fields (assignee, priority, notes) |
+| GET | `/api/v1/soc/findings/{id}/comments` | Admin token | Get analyst comments on finding |
+| POST | `/api/v1/soc/findings/{id}/comments` | Admin token | Add analyst comment |
+| GET | `/api/v1/soc/findings/{id}/activity` | Admin token | Finding audit trail |
+| GET | `/api/v1/soc/findings/{id}/exploitability` | Admin token | Exploit intelligence for finding CVEs |
+| POST | `/api/v1/soc/findings/{id}/close` | Admin token | Close / suppress finding |
+| POST | `/api/v1/soc/findings/{id}/accept-risk` | Admin token | Mark as accepted risk |
+| POST | `/api/v1/soc/findings/{id}/false-positive` | Admin token | Mark as false positive |
+| POST | `/api/v1/soc/findings/{id}/reopen` | Admin token | Reopen closed finding |
+| POST | `/api/v1/soc/findings/{id}/open` | Admin token | Transition to open state |
+| POST | `/api/v1/soc/bulk` | Admin token | Bulk status update across multiple findings |
+| GET | `/api/v1/soc/historical` | Admin token | Historical finding trends |
+| GET | `/api/v1/soc/metrics` | Admin token | SOC operational metrics |
+
+### AttackLens Engine (`/api/v1/attacklens`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/attacklens/stats` | Admin token | Engine-wide detection statistics |
+| GET | `/api/v1/attacklens/{agent_id}/summary` | Admin token | Agent detection summary |
+| GET | `/api/v1/attacklens/{agent_id}/findings` | Admin token | Agent findings (engine view) |
+| GET | `/api/v1/attacklens/{agent_id}/findings/{id}` | Admin token | Single finding detail (engine view) |
+| GET | `/api/v1/attacklens/{agent_id}/timeline` | Admin token | Finding timeline for agent |
+| GET | `/api/v1/attacklens/{agent_id}/search` | Admin token | Full-text search across agent findings |
+| POST | `/api/v1/attacklens/{agent_id}/resolve/{id}` | Admin token | Resolve finding |
+| GET | `/api/v1/attacklens/{agent_id}/correlations` | Admin token | Active attack-chain correlations for agent |
+
+### Detection Categories (`/api/v1/detection`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/detection/summary` | Admin token | Cross-category detection summary |
+| GET | `/api/v1/detection/packages` | Admin token | Vulnerable packages with CVE detail |
+| GET | `/api/v1/detection/ports` | Admin token | Exposed ports and services |
+| GET | `/api/v1/detection/persistence` | Admin token | Persistence mechanisms (services, tasks, startup) |
+| GET | `/api/v1/detection/network` | Admin token | Network anomalies and C2 indicators |
+| GET | `/api/v1/detection/processes` | Admin token | Suspicious process detections |
+| GET | `/api/v1/detection/all` | Admin token | All categories in one response |
+
+### Threat Intelligence (`/api/v1/threat`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/threat/intel/dashboard` | Admin token | Threat intel overview panel data |
+| GET | `/api/v1/threat/intel/actors` | Admin token | Active threat actor / ransomware group list |
+| GET | `/api/v1/threat/intel/news` | Admin token | Recent security news items |
+| GET | `/api/v1/threat/intel/kev` | Admin token | CISA KEV catalog (from threat router) |
+| GET | `/api/v1/threat/intel/epss/top` | Admin token | Top EPSS-scored CVEs in current environment |
+| GET | `/api/v1/threat/intel/summary` | Admin token | Aggregated feed summary |
+| GET | `/api/v1/threat/intel/cves` | Admin token | CVE list enriched with EPSS + KEV flags |
+| GET | `/api/v1/threat/intel/architecture` | Admin token | Architecture/topology intel |
+| GET | `/api/v1/threat/stats` | Admin token | Feed health + IOC counts |
+| GET | `/api/v1/threat/nvd/stats` | Admin token | NVD sync statistics |
+| GET | `/api/v1/threat/nvd/search` | Admin token | NVD FTS5 CVE search |
+| GET | `/api/v1/threat/feeds` | Admin token | Feed status and last-sync timestamps |
+| GET | `/api/v1/threat/iocs` | Admin token | Current IOC (IP/domain) list |
+| GET | `/api/v1/threat/{agent_id}/summary` | Admin token | Per-agent threat summary |
+| GET | `/api/v1/threat/{agent_id}/findings` | Admin token | Agent findings (threat view) |
+| GET | `/api/v1/threat/{agent_id}/findings/{id}` | Admin token | Single finding (threat view) |
+| GET | `/api/v1/threat/{agent_id}/timeline` | Admin token | Agent threat timeline |
+| GET | `/api/v1/threat/{agent_id}/search` | Admin token | Search findings for agent |
+| POST | `/api/v1/threat/{agent_id}/resolve/{id}` | Admin token | Resolve finding (threat view) |
+
+### Intel Pipeline (`/api/v1/intel`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/intel/status` | Admin token | Pipeline health + circuit breaker states |
+| GET | `/api/v1/intel/cve/{cve_id}` | Admin token | Full multi-source CVE enrichment (NVD, KEV, EPSS, exploits, GHSA, OSV, CIRCL) |
+| POST | `/api/v1/intel/enrich` | Admin token | Batch enrich up to 50 CVE IDs |
+| GET | `/api/v1/intel/kev` | Admin token | CISA KEV catalog (paginated + searchable) |
+| GET | `/api/v1/intel/epss/{cve_id}` | Admin token | EPSS score for single CVE |
+| GET | `/api/v1/intel/exploits/{cve_id}` | Admin token | Exploit presence (ExploitDB + Metasploit + GitHub PoC) |
+
+### Remediation & AI (`/api/v1/remediation`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/remediation/{id}` | Admin token | Get cached OS-specific remediation plan |
+| POST | `/api/v1/remediation/{id}/generate` | Admin token | Generate AI remediation plan via Claude |
+| GET | `/api/v1/remediation/{id}/analysis` | Admin token | Get cached AI threat analysis |
+| POST | `/api/v1/remediation/{id}/analysis/generate` | Admin token | Generate AI threat analysis |
+| POST | `/api/v1/remediation/prioritize` | Admin token | AI-ranked finding prioritization |
+
+### Asset Registry (`/api/v1/assets`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/assets` | Admin token | List all assets with tier and group |
+| GET | `/api/v1/assets/{agent_id}` | Admin token | Get asset tier/group/owner |
+| PUT | `/api/v1/assets/{agent_id}` | Admin token | Update tier, owner, department, crown-jewel flag |
 | GET | `/api/v1/org-groups` | Admin token | List org groups |
 | POST | `/api/v1/org-groups` | Admin token | Create/update org group |
 
-### Threat Intelligence
+### Security Posture (`/api/v1/posture`)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/v1/intel/kev` | Admin token | CISA KEV list |
-| GET | `/api/v1/intel/actors` | Admin token | Active threat actors (ransomware groups) |
-| GET | `/api/v1/intel/news` | Admin token | Recent security news |
-| GET | `/api/v1/intel/epss/{cve_id}` | Admin token | EPSS score for CVE |
-| GET | `/api/v1/intel/overview` | Admin token | Full threat intel summary |
+| GET | `/api/v1/posture/agents` | Admin token | Posture summary across all agents |
+| GET | `/api/v1/posture/{agent_id}` | Admin token | Detailed posture for single agent |
+
+### Detection Accuracy (`/api/v1/accuracy`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/accuracy/report` | Admin token | Full accuracy + coverage report |
+| GET | `/api/v1/accuracy/fp_risk` | Admin token | False-positive risk analysis |
+| GET | `/api/v1/accuracy/calibration` | Admin token | Severity calibration metrics |
+| GET | `/api/v1/accuracy/correlation` | Admin token | Correlation rule effectiveness |
+
+### Raw Telemetry (`/api/v1/raw`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/raw/{agent_id}/{section}` | Admin token | Query raw telemetry from hot/warm store |
+
+### Platform Settings (`/api/v1/settings`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/settings` | Admin token | Get platform configuration |
+| PUT | `/api/v1/settings` | Admin token | Update platform configuration |
+| GET | `/api/v1/settings/license` | Admin token | License information |
+| GET | `/api/v1/settings/roles` | Admin token | Role and permission definitions |
+| GET | `/api/v1/settings/audit` | Admin token | Settings change audit log |
+| POST | `/api/v1/settings/reset` | Admin token | Reset settings to defaults |
+| GET | `/api/v1/settings/export` | Admin token | Export settings as JSON |
+| POST | `/api/v1/settings/import` | Admin token | Import settings from JSON |
+
+### Enrichment & Misc
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/v1/enrich/{finding_id}` | — | Trigger on-demand AI enrichment for a finding |
+| GET | `/api/v1/dashboard/ws-token` | Admin token (`X-Admin-Token`) | Issue short-lived WebSocket token for browser dashboard |
+| GET | `/health` | None | Database + store + intel health check |
 
 ### WebSocket
 
 | Protocol | Path | Auth | Description |
 |---|---|---|---|
-| WS | `/ws/{agent_id}` | Token param | Live telemetry + finding push stream |
+| WS | `/ws/{agent_id}` | `?token=` query param | Live telemetry + finding push stream |
 
 ---
 

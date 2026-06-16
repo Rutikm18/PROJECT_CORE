@@ -21,6 +21,19 @@ export default defineConfig({
   build: {
     outDir: '../../static',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        // Split heavy third-party libs into stable, long-cached vendor chunks
+        // (separate from app code, which changes far more often). Charts
+        // (recharts/d3) only download on pages that actually render them.
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return;
+          if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) return 'react-vendor';
+          if (/[\\/]node_modules[\\/](recharts|d3-|victory|internmap|robust-predicates|decimal\.js)/.test(id)) return 'charts';
+          return 'vendor';
+        },
+      },
+    },
   },
   plugins: [
     figmaAssetResolver(),

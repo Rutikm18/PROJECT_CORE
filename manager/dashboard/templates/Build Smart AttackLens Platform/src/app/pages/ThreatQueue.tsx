@@ -20,6 +20,7 @@
  *   Any closed state → REOPENED → back to TRIAGING
  */
 import { useState, useEffect, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertTriangle, RefreshCw, CheckCircle2, XCircle, Shield,
   Clock, ChevronDown, ChevronRight, Filter, Search,
@@ -30,7 +31,16 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRBAC } from "../context/RBACContext";
-import { fmtTs, type DetectionFinding } from "./DetectionShared";
+import {
+  fmtTs,
+  type DetectionFinding,
+  AIPrecisionPanel,
+  OSRemediationPanel,
+  TerrainValidationPanel,
+  AdvancedFilter,
+  applyAdvancedConditions,
+  type FilterCondition,
+} from "./DetectionShared";
 
 const SOC = "/api/v1/soc";
 
@@ -47,6 +57,9 @@ interface Finding extends DetectionFinding {
   external_id?:    string;
   display_id?:     string;
   tags?:           string | string[];
+  // Threshold the AI Precision Validator resolved for this row's (agent, category).
+  // Populated by /findings when ?validated_only=true.
+  effective_threshold?: number;
 }
 
 interface ActivityEntry {
@@ -244,9 +257,25 @@ function WorkflowStrip({ current }: { current: string }) {
   );
 }
 
-// ── Finding detail panel ──────────────────────────────────────────────────────
+// ── Finding detail drawer (fixed right-side overlay) ─────────────────────────
 
 type DetailTab = "overview" | "case" | "timeline";
+
+const SEV_STRIPE: Record<string, string> = {
+  critical: "from-red-500 via-red-500 to-rose-600",
+  high:     "from-amber-500 via-orange-500 to-amber-500",
+  medium:   "from-blue-500 via-blue-400 to-indigo-500",
+  low:      "from-green-500 via-emerald-500 to-green-500",
+  info:     "from-gray-400 via-gray-300 to-gray-400",
+};
+
+const SEV_ICON_BG: Record<string, string> = {
+  critical: "bg-red-100 text-red-600",
+  high:     "bg-amber-100 text-amber-600",
+  medium:   "bg-blue-100 text-blue-600",
+  low:      "bg-green-100 text-green-600",
+  info:     "bg-gray-100 text-gray-500",
+};
 
 function FindingDetailPanel({
   finding: f, onClose, onRefresh, canEdit,
@@ -270,14 +299,31 @@ function FindingDetailPanel({
   const cveIds     = parseArr(f.cve_ids);
   const tags       = parseArr(f.tags);
   const evidence   = typeof f.evidence === "string" ? {} : (f.evidence ?? {});
-  const actionPlan = parseArr(f.action_plan as unknown);
+  // action_plan now rendered via shared OSRemediationPanel — see Overview tab.
   const findingId  = f.external_id ?? f.display_id ?? `AL-${f.id}`;
   const cat        = catCfg(f.category);
   const score      = f.composite_score ?? f.score;
+  const stripe     = SEV_STRIPE[f.severity] ?? SEV_STRIPE.info;
+  const iconBg     = SEV_ICON_BG[f.severity] ?? SEV_ICON_BG.info;
 
   useEffect(() => {
     fetch(`${SOC}/findings/${f.id}/activity`).then(r => r.ok ? r.json() : { activity: [] }).then(d => setActivity(d.activity ?? [])).catch(() => {});
   }, [f.id]);
+
+  // Escape key to close.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  // Freeze background scroll while drawer is open. Safe here because the
+  // drawer is portaled to document.body and won't lose its own scrollTop.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, []);
 
   const act = async (newStatus: string) => {
     setActing(true);
@@ -302,321 +348,399 @@ function FindingDetailPanel({
   const copyId = () => { navigator.clipboard?.writeText(findingId); setCopied(true); setTimeout(() => setCopied(false), 1400); };
 
   const TABS: { id: DetailTab; label: string; icon: React.ReactNode }[] = [
-    { id: "overview", label: "Overview",  icon: <FileText className="w-3 h-3" /> },
-    { id: "case",     label: "Case",      icon: <Shield className="w-3 h-3" /> },
-    { id: "timeline", label: "Timeline",  icon: <Activity className="w-3 h-3" /> },
+    { id: "overview", label: "Overview",  icon: <FileText className="w-3.5 h-3.5" /> },
+    { id: "case",     label: "Case",      icon: <Shield className="w-3.5 h-3.5" /> },
+    { id: "timeline", label: "Timeline",  icon: <Activity className="w-3.5 h-3.5" /> },
   ];
 
   const nextStatuses = STATUS_MAP[f.status]?.next ?? [];
 
-  return (
-    <div className="w-[480px] flex-shrink-0 bg-white border border-gray-200 rounded-2xl shadow-lg overflow-hidden self-start sticky top-0 max-h-[calc(100vh-120px)] flex flex-col al-panel-in">
-      {/* Severity top stripe */}
-      <div className={cn("h-1", f.severity === "critical" ? "bg-gradient-to-r from-red-500 to-red-600" : f.severity === "high" ? "bg-gradient-to-r from-amber-500 to-orange-500" : "bg-gradient-to-r from-orange-400 to-amber-400")} />
+  return createPortal(
+    <>
+      {/* Backdrop — portaled to body so fixed positioning is always viewport-relative */}
+      <div
+        className="al-backdrop-in"
+        style={{ position: "fixed", top: 44, left: 0, right: 0, bottom: 0, zIndex: 40, background: "rgba(0,0,0,0.35)", backdropFilter: "blur(2px)" }}
+        onClick={onClose}
+        onWheel={e => e.stopPropagation()}
+        onTouchMove={e => e.stopPropagation()}
+      />
 
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100 bg-gray-50/60 flex-shrink-0">
-        <div className="flex items-center gap-2 min-w-0 flex-wrap">
-          {/* Finding ID chip */}
-          <button onClick={copyId}
-            className="flex items-center gap-1 px-2 py-0.5 bg-orange-50 border border-orange-200 rounded-lg text-[9px] font-black text-orange-700 hover:bg-orange-100 transition-colors font-mono">
-            <Hash className="w-2.5 h-2.5" />
-            {findingId}
-            {copied ? <CheckCircle2 className="w-2.5 h-2.5 text-green-500" /> : <Copy className="w-2.5 h-2.5 opacity-50" />}
-          </button>
-          <span className={cn("px-2 py-0.5 text-[9px] font-bold rounded-full border uppercase tracking-wide", SEV_BADGE[f.severity])}>{f.severity}</span>
-          {f.kev && <span className="px-1.5 py-0.5 bg-red-600 text-white rounded text-[8px] font-black badge-kev-pulse">KEV</span>}
-          {f.exploit_available && <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 rounded text-[8px] font-bold">EXPLOIT</span>}
+      {/* Sliding drawer */}
+      <div
+        className="al-drawer-in flex flex-col overflow-hidden"
+        style={{ position: "fixed", top: 44, right: 0, bottom: 0, width: "min(520px, 100vw)", zIndex: 50, background: "#fff", boxShadow: "-4px 0 32px 0 rgba(0,0,0,0.15)" }}
+      >
+
+        {/* Severity gradient header bar */}
+        <div className={cn("h-1.5 bg-gradient-to-r flex-shrink-0", stripe)} />
+
+        {/* Drawer header */}
+        <div className="flex-shrink-0 px-5 pt-4 pb-3 border-b border-gray-100 bg-white">
+          {/* Top row: ID chip + badges + close */}
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div className="flex items-center gap-2 flex-wrap min-w-0">
+              <button onClick={copyId}
+                className="flex items-center gap-1 px-2 py-1 bg-orange-50 border border-orange-200 rounded-lg text-[10px] font-black text-orange-700 hover:bg-orange-100 transition-colors font-mono flex-shrink-0">
+                <Hash className="w-3 h-3" />{findingId}
+                {copied ? <CheckCircle2 className="w-2.5 h-2.5 text-green-500" /> : <Copy className="w-2.5 h-2.5 opacity-40" />}
+              </button>
+              <span className={cn("px-2.5 py-1 text-[10px] font-bold rounded-full border uppercase tracking-wide", SEV_BADGE[f.severity])}>{f.severity}</span>
+              {f.kev && <span className="px-2 py-0.5 bg-red-600 text-white rounded-lg text-[9px] font-black badge-kev-pulse">KEV</span>}
+              {f.exploit_available && <span className="px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 rounded-lg text-[9px] font-bold">EXPLOIT</span>}
+            </div>
+            <button onClick={onClose}
+              className="w-7 h-7 flex-shrink-0 flex items-center justify-center rounded-full hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-700">
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Finding title */}
+          <h2 className="text-[15px] font-bold text-gray-900 leading-snug mb-2">{f.title}</h2>
+
+          {/* Meta row: category · agent · time */}
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className={cn("flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-semibold", cat.bg, cat.color)}>
+              <span className={cn("w-1.5 h-1.5 rounded-full", cat.dot)} />{cat.label}
+            </span>
+            {f.mitre_technique && (
+              <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-lg text-[10px] font-mono font-semibold">{f.mitre_technique}</span>
+            )}
+            {f.mitre_tactic && (
+              <span className="px-2 py-0.5 bg-purple-50 text-purple-600 border border-purple-200 rounded-lg text-[10px] font-semibold">{f.mitre_tactic}</span>
+            )}
+            {tags.map(t => <span key={t} className="px-1.5 py-0.5 bg-gray-100 text-gray-500 border border-gray-200 rounded text-[9px]">{t}</span>)}
+          </div>
+
+          {/* Score strip */}
+          <div className="grid grid-cols-3 gap-2.5 mt-3">
+            {[
+              { l: "Risk Score", v: `${score.toFixed(1)}`, sub: "/ 10",
+                c: score >= 8 ? "text-red-600" : score >= 6 ? "text-amber-600" : "text-blue-600",
+                bg: score >= 8 ? "bg-red-50 border-red-200" : score >= 6 ? "bg-amber-50 border-amber-200" : "bg-blue-50 border-blue-200" },
+              { l: "CVSS",       v: f.cvss_score != null ? f.cvss_score.toFixed(1) : "—", sub: f.cvss_score != null ? "/ 10" : "",
+                c: f.cvss_score != null && f.cvss_score >= 9 ? "text-red-600" : f.cvss_score != null && f.cvss_score >= 7 ? "text-amber-600" : "text-gray-700",
+                bg: "bg-gray-50 border-gray-200" },
+              { l: "EPSS", v: f.epss_score != null ? `${Math.round(f.epss_score * 100)}` : "—", sub: f.epss_score != null ? "%" : "",
+                c: f.epss_score != null && f.epss_score >= 0.5 ? "text-red-600" : f.epss_score != null && f.epss_score >= 0.2 ? "text-amber-600" : "text-gray-700",
+                bg: "bg-gray-50 border-gray-200" },
+            ].map(s => (
+              <div key={s.l} className={cn("rounded-xl border px-3 py-2.5 al-bounce-in", s.bg)}>
+                <div className="flex items-baseline gap-0.5">
+                  <span className={cn("text-lg font-black leading-none tabular-nums", s.c)}>{s.v}</span>
+                  {s.sub && <span className="text-[10px] text-gray-400 font-medium">{s.sub}</span>}
+                </div>
+                <div className="text-[9px] text-gray-500 font-semibold mt-0.5 uppercase tracking-wide">{s.l}</div>
+              </div>
+            ))}
+          </div>
         </div>
-        <button onClick={onClose} className="p-1.5 hover:bg-gray-200 rounded-lg transition-colors flex-shrink-0 ml-2">
-          <XCircle className="w-3.5 h-3.5 text-gray-400" />
-        </button>
-      </div>
 
-      {/* Tabs */}
-      <div className="flex border-b border-gray-100 flex-shrink-0 bg-white">
-        {TABS.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)}
-            className={cn("flex-1 flex items-center justify-center gap-1 py-2.5 text-[10px] font-bold transition-all relative", tab === t.id ? "text-orange-600" : "text-gray-400 hover:text-gray-600")}>
-            {t.icon}{t.label}
-            {tab === t.id && <span className="absolute bottom-0 left-2 right-2 h-0.5 bg-orange-500 rounded-t-full" style={{ animation: "tab-slide 0.2s ease both", transformOrigin: "left" }} />}
-          </button>
-        ))}
-      </div>
-
-      <div className="overflow-y-auto flex-1">
-
-        {/* ── OVERVIEW ────────────────────────────────────────────────────── */}
-        {tab === "overview" && (
-          <div className="divide-y divide-gray-50">
-            <div className="px-4 py-3">
-              <p className="text-[12px] font-bold text-gray-900 leading-snug">{f.title}</p>
-              <div className="flex flex-wrap gap-1 mt-1.5">
-                <span className={cn("px-2 py-0.5 rounded-full border text-[9px] font-semibold", cat.bg, cat.color)}>{cat.label}</span>
-                {f.mitre_technique && <span className="px-1.5 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded text-[8px] font-mono font-semibold">{f.mitre_technique}</span>}
-                {f.mitre_tactic && <span className="px-1.5 py-0.5 bg-purple-50 text-purple-600 border border-purple-200 rounded text-[8px] font-semibold">{f.mitre_tactic}</span>}
-                {tags.map(t => <span key={t} className="px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded text-[8px]">{t}</span>)}
-              </div>
-            </div>
-
-            {/* Score tiles */}
-            <div className="px-4 py-3 grid grid-cols-3 gap-2">
-              {[
-                { l: "Risk Score", v: `${score.toFixed(1)}/10`, c: score >= 8 ? "text-red-600" : score >= 6 ? "text-amber-600" : "text-blue-600", bg: score >= 8 ? "bg-red-50 border-red-100" : "bg-gray-50 border-gray-100" },
-                { l: "CVSS",       v: f.cvss_score != null ? f.cvss_score.toFixed(1) : "—", c: f.cvss_score != null && f.cvss_score >= 9 ? "text-red-600" : "text-gray-600", bg: "bg-gray-50 border-gray-100" },
-                { l: "EPSS",       v: f.epss_score != null ? `${Math.round(f.epss_score * 100)}%` : "—", c: f.epss_score != null && f.epss_score >= 0.5 ? "text-red-600" : "text-gray-600", bg: "bg-gray-50 border-gray-100" },
-              ].map(s => (
-                <div key={s.l} className={cn("rounded-xl border py-2.5 text-center al-bounce-in", s.bg)}>
-                  <div className={cn("text-sm font-black leading-none", s.c)}>{s.v}</div>
-                  <div className="text-[9px] text-gray-500 mt-1">{s.l}</div>
-                </div>
-              ))}
-            </div>
-
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1.5">Description</div>
-              <p className="text-[11px] text-gray-700 leading-relaxed">{f.description}</p>
-            </div>
-
-            {f.impact && (
-              <div className="px-4 py-3">
-                <div className="text-[9px] font-bold text-amber-600 uppercase tracking-wide mb-1.5 flex items-center gap-1"><AlertTriangle className="w-3 h-3" />Business Impact</div>
-                <p className="text-[10px] text-amber-900 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 leading-relaxed">{f.impact}</p>
-              </div>
-            )}
-
-            {/* CVEs */}
-            {cveIds.length > 0 && (
-              <div className="px-4 py-3">
-                <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1.5">CVE References</div>
-                <div className="flex flex-wrap gap-1">
-                  {cveIds.map(c => (
-                    <a key={c} href={`https://nvd.nist.gov/vuln/detail/${c}`} target="_blank" rel="noopener noreferrer"
-                      className="flex items-center gap-0.5 font-mono text-[9px] px-1.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded hover:bg-blue-100 transition-colors">
-                      {c}<ExternalLink className="w-2 h-2" />
-                    </a>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Remediation */}
-            {actionPlan.length > 0 && (
-              <div className="px-4 py-3">
-                <div className="text-[9px] font-bold text-green-700 uppercase tracking-wide mb-2 flex items-center gap-1"><Shield className="w-3 h-3" />Remediation</div>
-                <ol className="space-y-2">
-                  {(actionPlan as { title: string; detail: string }[]).map((step, i) => (
-                    <li key={i} className="flex items-start gap-2">
-                      <span className="w-4 h-4 rounded-full bg-orange-500 text-white flex items-center justify-center text-[8px] font-bold flex-shrink-0 mt-0.5">{i+1}</span>
-                      <div><p className="text-[10px] font-semibold text-gray-800">{step.title}</p><p className="text-[10px] text-gray-600">{step.detail}</p></div>
-                    </li>
-                  ))}
-                </ol>
-              </div>
-            )}
-
-            {/* Evidence */}
-            {Object.keys(evidence).length > 0 && (
-              <div className="px-4 py-3">
-                <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1.5">Evidence</div>
-                <pre className="text-[9px] font-mono text-green-400 bg-gray-900 rounded-xl p-3 overflow-auto max-h-36 whitespace-pre-wrap break-words border border-gray-700">{JSON.stringify(evidence, null, 2)}</pre>
-              </div>
-            )}
-
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1.5">Detection Metadata</div>
-              {[["Source", f.source ?? "—"],["Agent", f.agent_id],["First seen", fmtTs(f.first_detected_at)],["Last seen", fmtTs(f.last_detected_at)],["Scan count", String(f.scan_count)]].map(([l,v]) => (
-                <div key={l} className="flex items-center gap-2 py-0.5">
-                  <span className="w-20 text-[9px] text-gray-400 font-medium flex-shrink-0">{l}</span>
-                  <span className="text-[10px] text-gray-700 font-mono">{v}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* ── CASE MANAGEMENT ─────────────────────────────────────────────── */}
-        {tab === "case" && (
-          <div className="divide-y divide-gray-50">
-            {/* Resolved banner — shown for closed/accepted/FP findings */}
-            {["closed","false_positive","accepted_risk","duplicate"].includes(f.status) && (
-              <div className={cn(
-                "mx-4 mt-3 flex items-center justify-between px-3 py-2.5 rounded-xl border text-[10px] font-semibold",
-                f.status === "closed"         ? "bg-green-50 border-green-200 text-green-800" :
-                f.status === "false_positive" ? "bg-gray-100 border-gray-300 text-gray-600" :
-                f.status === "accepted_risk"  ? "bg-amber-50 border-amber-200 text-amber-800" :
-                "bg-gray-50 border-gray-200 text-gray-500"
+        {/* Tabs */}
+        <div className="flex border-b border-gray-100 flex-shrink-0 bg-white">
+          {TABS.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={cn(
+                "flex-1 flex items-center justify-center gap-1.5 py-3 text-[11px] font-bold transition-all relative",
+                tab === t.id ? "text-orange-600" : "text-gray-400 hover:text-gray-600 hover:bg-gray-50"
               )}>
-                <div className="flex items-center gap-2">
-                  {f.status === "closed"         && <CheckCircle2 className="w-3.5 h-3.5 text-green-600" />}
-                  {f.status === "false_positive" && <XCircle className="w-3.5 h-3.5 text-gray-500" />}
-                  {f.status === "accepted_risk"  && <Shield className="w-3.5 h-3.5 text-amber-600" />}
-                  <span>
-                    {f.status === "closed"         && "Finding closed"}
-                    {f.status === "false_positive" && "Marked false positive"}
-                    {f.status === "accepted_risk"  && "Risk accepted"}
-                    {f.status === "duplicate"      && "Marked duplicate"}
-                  </span>
-                  {f.closed_at && <span className="opacity-60">· {relTime(f.closed_at)}</span>}
-                </div>
-                {canEdit && (
-                  <button
-                    onClick={() => act("triaging")}
-                    disabled={acting}
-                    className="flex items-center gap-1.5 px-2.5 py-1 bg-white border border-blue-200 text-blue-700 rounded-lg text-[9px] font-bold hover:bg-blue-50 transition-colors disabled:opacity-50"
-                  >
-                    <RotateCcw className="w-2.5 h-2.5" />Reopen
-                  </button>
-                )}
-              </div>
-            )}
-
-            {/* Workflow strip */}
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-2">Case Workflow</div>
-              <div className="overflow-x-auto pb-1">
-                <WorkflowStrip current={f.status} />
-              </div>
-            </div>
-
-            {/* Status transitions */}
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-2 flex items-center gap-1"><GitBranch className="w-3 h-3 text-orange-500" />Transition To</div>
-              {nextStatuses.length > 0 ? (
-                <div className="flex flex-wrap gap-1.5">
-                  {nextStatuses.map(ns => {
-                    const sc = STATUS_MAP[ns];
-                    if (!sc) return null;
-                    const isClose = ["closed","false_positive","accepted_risk","duplicate"].includes(ns);
-                    return (
-                      <button key={ns} onClick={() => act(ns)} disabled={acting || !canEdit}
-                        className={cn(
-                          "flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-[10px] font-bold transition-all hover:shadow-sm disabled:opacity-50",
-                          sc.badge
-                        )}>
-                        {ns === "closed" && <CheckCircle2 className="w-3 h-3" />}
-                        {ns === "false_positive" && <XCircle className="w-3 h-3" />}
-                        {ns === "new" && <RotateCcw className="w-3 h-3" />}
-                        {ns === "triaging" && <AlertTriangle className="w-3 h-3" />}
-                        {ns === "investigating" && <Search className="w-3 h-3" />}
-                        {ns === "in_remediation" && <Shield className="w-3 h-3" />}
-                        {ns === "accepted_risk" && <Shield className="w-3 h-3" />}
-                        {ns === "duplicate" && <Layers className="w-3 h-3" />}
-                        {sc.label}
-                        {isClose && <span className="text-[8px] opacity-60">→ close</span>}
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="text-[10px] text-gray-400">No further transitions from this state.</p>
+              {t.icon}{t.label}
+              {tab === t.id && (
+                <span className="absolute bottom-0 left-4 right-4 h-[2px] bg-orange-500 rounded-t-full"
+                  style={{ animation: "tab-slide 0.2s ease both", transformOrigin: "left" }} />
               )}
-            </div>
+            </button>
+          ))}
+        </div>
 
-            {/* Assignee + Priority + Due date */}
-            <div className="px-4 py-3 space-y-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1"><User className="w-3 h-3 text-orange-500" />Assignment</div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-[9px] text-gray-500 font-semibold block mb-1">Assignee</label>
-                  <input type="text" placeholder="analyst@company.com" value={assigneeVal} onChange={e => setAssignee(e.target.value)}
-                    className="w-full px-3 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 transition-all" />
+        {/* Scrollable content */}
+        <div className="overflow-y-auto flex-1 bg-gray-50/30">
+
+          {/* ── OVERVIEW ────────────────────────────────────────────────── */}
+          {tab === "overview" && (
+            <div className="space-y-px">
+
+              {/* Description */}
+              <div className="bg-white px-5 py-4">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Description</div>
+                <p className="text-[12px] text-gray-700 leading-relaxed">{f.description}</p>
+              </div>
+
+              {/* Business impact */}
+              {f.impact && (
+                <div className="bg-white px-5 py-4">
+                  <div className="text-[10px] font-bold text-amber-600 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5" />Business Impact
+                  </div>
+                  <div className="flex items-start gap-3 px-3 py-3 bg-amber-50 border border-amber-200 rounded-xl">
+                    <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                    <p className="text-[11px] text-amber-900 leading-relaxed">{f.impact}</p>
+                  </div>
                 </div>
-                <div>
-                  <label className="text-[9px] text-gray-500 font-semibold block mb-1">Priority</label>
-                  <select value={priorityVal} onChange={e => setPriority(Number(e.target.value))}
-                    className="w-full px-3 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 cursor-pointer">
-                    {Object.entries(PRIORITIES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-                  </select>
-                </div>
-              </div>
-              <div>
-                <label className="text-[9px] text-gray-500 font-semibold block mb-1 flex items-center gap-1"><Calendar className="w-3 h-3" />Due Date</label>
-                <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)}
-                  className="w-full px-3 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 transition-all" />
-              </div>
-              <div>
-                <label className="text-[9px] text-gray-500 font-semibold block mb-1 flex items-center gap-1"><FileText className="w-3 h-3" />Analyst Notes</label>
-                <textarea rows={3} value={noteVal} onChange={e => setNoteVal(e.target.value)} placeholder="Investigation notes, context, justification…"
-                  className="w-full px-3 py-2 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none transition-all" />
-              </div>
-              {canEdit && (
-                <button onClick={save} disabled={acting}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white text-[10px] font-bold rounded-xl transition-all shadow-sm hover:shadow-md w-full justify-center disabled:opacity-60">
-                  <CheckCircle2 className="w-3.5 h-3.5" />Save Case Updates
-                </button>
               )}
-            </div>
 
-            {/* SLA */}
-            {f.sla_status && (
-              <div className="px-4 py-3">
-                <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1.5 flex items-center gap-1"><Clock className="w-3 h-3" />SLA Status</div>
-                <div className={cn("flex items-center gap-2 px-3 py-2 rounded-xl border text-[10px] font-semibold",
-                  f.sla_status === "breached" ? "bg-red-50 border-red-200 text-red-700" :
-                  f.sla_status === "warning"  ? "bg-amber-50 border-amber-200 text-amber-700" :
-                  "bg-green-50 border-green-200 text-green-700")}>
-                  <Clock className="w-3.5 h-3.5 flex-shrink-0" />
-                  SLA {f.sla_status.toUpperCase()}
-                  {f.sla_due && <span className="ml-auto text-[9px] opacity-70">Due {fmtTs(f.sla_due)}</span>}
+              {/* CVEs */}
+              {cveIds.length > 0 && (
+                <div className="bg-white px-5 py-4">
+                  <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2.5">CVE References</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {cveIds.map(c => (
+                      <a key={c} href={`https://nvd.nist.gov/vuln/detail/${c}`} target="_blank" rel="noopener noreferrer"
+                        className="flex items-center gap-1 font-mono text-[10px] px-2.5 py-1.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors">
+                        {c}<ExternalLink className="w-3 h-3 opacity-60" />
+                      </a>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
-        )}
+              )}
 
-        {/* ── TIMELINE ────────────────────────────────────────────────────── */}
-        {tab === "timeline" && (
-          <div className="divide-y divide-gray-50">
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-3 flex items-center gap-1"><Activity className="w-3 h-3 text-orange-500" />Activity Log</div>
-              {activity.length === 0 ? (
-                <div className="py-8 text-center text-[10px] text-gray-400">No activity recorded yet</div>
-              ) : (
-                <div className="relative space-y-3">
-                  <div className="absolute left-3.5 top-0 bottom-0 w-0.5 bg-gray-100" />
-                  {activity.map((a, i) => (
-                    <div key={i} className="flex items-start gap-3 al-row-in" style={{ animationDelay: `${i * 40}ms` }}>
-                      <div className="w-7 h-7 rounded-full bg-orange-50 border-2 border-white ring-1 ring-gray-100 flex items-center justify-center flex-shrink-0 z-10">
-                        <span className="text-[9px] font-black text-orange-600">{(a.actor?.[0] ?? "?").toUpperCase()}</span>
-                      </div>
-                      <div className="flex-1 min-w-0 pb-2">
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <span className="text-[10px] font-bold text-gray-700">{a.actor}</span>
-                          <span className="text-[10px] text-gray-500">{a.action.replace(/_/g, " ")}</span>
-                          {a.old_value && a.new_value && (
-                            <span className="text-[9px] text-gray-400 font-mono">{a.old_value} <ArrowRight className="w-2 h-2 inline" /> {a.new_value}</span>
-                          )}
-                          <span className="ml-auto text-[9px] text-gray-400 flex-shrink-0">{relTime(a.created_at)}</span>
-                        </div>
-                        {a.comment && <p className="text-[10px] text-gray-600 mt-0.5 bg-gray-50 rounded-lg px-2 py-1 border border-gray-100">{a.comment}</p>}
-                      </div>
+              {/* Terrain Validation — per-criterion checklist (KEV / AI / exploit / posture / …) */}
+              <div className="bg-white">
+                <TerrainValidationPanel f={f} />
+              </div>
+
+              {/* AI Precision validator — composite score, factor breakdown, LLM reasoning */}
+              <div className="bg-white">
+                <AIPrecisionPanel f={f} />
+              </div>
+
+              {/* OS-aware remediation — locked to the agent's actual OS */}
+              <div className="bg-white">
+                <OSRemediationPanel findingId={f.id} agentOs={f.agent_os} />
+              </div>
+
+              {/* Evidence */}
+              {Object.keys(evidence).length > 0 && (
+                <div className="bg-white px-5 py-4">
+                  <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Evidence</div>
+                  <pre className="text-[10px] font-mono text-emerald-300 bg-gray-950 rounded-xl p-4 overflow-auto max-h-48 whitespace-pre-wrap break-words border border-gray-800 shadow-inner leading-relaxed">
+                    {JSON.stringify(evidence, null, 2)}
+                  </pre>
+                </div>
+              )}
+
+              {/* Detection metadata */}
+              <div className="bg-white px-5 py-4">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3">Detection Metadata</div>
+                <div className="rounded-xl border border-gray-100 overflow-hidden divide-y divide-gray-50">
+                  {[
+                    ["Source",     f.source ?? "—"],
+                    ["Agent",      f.agent_id ?? "—"],
+                    ["First seen", fmtTs(f.first_detected_at)],
+                    ["Last seen",  fmtTs(f.last_detected_at)],
+                    ["Scan count", String(f.scan_count)],
+                  ].map(([l, v]) => (
+                    <div key={l} className="flex items-center gap-4 px-3 py-2 bg-white">
+                      <span className="w-20 text-[10px] text-gray-400 font-semibold flex-shrink-0">{l}</span>
+                      <span className="text-[11px] text-gray-700 font-mono">{v}</span>
                     </div>
                   ))}
                 </div>
-              )}
+              </div>
             </div>
+          )}
 
-            {/* Add comment */}
-            {canEdit && (
-              <div className="px-4 py-3">
-                <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-2 flex items-center gap-1"><MessageSquare className="w-3 h-3 text-blue-500" />Add Note</div>
-                <div className="space-y-2">
-                  <textarea rows={2} value={newComment} onChange={e => setNewComment(e.target.value)}
-                    onKeyDown={e => { if (e.key === "Enter" && e.ctrlKey) postComment(); }}
-                    placeholder="Add investigation note… (Ctrl+Enter to post)"
-                    className="w-full px-3 py-2 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none transition-all" />
-                  <button onClick={postComment} disabled={posting || !newComment.trim()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-500 hover:bg-orange-600 text-white text-[10px] font-bold rounded-xl transition-all disabled:opacity-50">
-                    <Send className="w-3 h-3" />{posting ? "Posting…" : "Post Note"}
-                  </button>
+          {/* ── CASE MANAGEMENT ─────────────────────────────────────────── */}
+          {tab === "case" && (
+            <div className="space-y-px">
+
+              {/* Resolved banner */}
+              {["closed","false_positive","accepted_risk","duplicate"].includes(f.status) && (
+                <div className={cn(
+                  "mx-4 mt-4 flex items-center justify-between px-4 py-3 rounded-2xl border text-[11px] font-semibold",
+                  f.status === "closed"         ? "bg-green-50 border-green-200 text-green-800" :
+                  f.status === "false_positive" ? "bg-gray-100 border-gray-300 text-gray-600" :
+                  f.status === "accepted_risk"  ? "bg-amber-50 border-amber-200 text-amber-800" :
+                  "bg-gray-50 border-gray-200 text-gray-500"
+                )}>
+                  <div className="flex items-center gap-2.5">
+                    {f.status === "closed"         && <CheckCircle2 className="w-4 h-4 text-green-600" />}
+                    {f.status === "false_positive" && <XCircle className="w-4 h-4 text-gray-500" />}
+                    {f.status === "accepted_risk"  && <Shield className="w-4 h-4 text-amber-600" />}
+                    <span>
+                      {f.status === "closed"         && "Finding closed"}
+                      {f.status === "false_positive" && "Marked false positive"}
+                      {f.status === "accepted_risk"  && "Risk accepted"}
+                      {f.status === "duplicate"      && "Marked duplicate"}
+                    </span>
+                    {f.closed_at && <span className="opacity-60 text-[10px]">· {relTime(f.closed_at)}</span>}
+                  </div>
+                  {canEdit && (
+                    <button onClick={() => act("triaging")} disabled={acting}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-blue-200 text-blue-700 rounded-xl text-[10px] font-bold hover:bg-blue-50 transition-colors disabled:opacity-50">
+                      <RotateCcw className="w-3 h-3" />Reopen
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Workflow strip */}
+              <div className="bg-white px-5 py-4">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3">Case Workflow</div>
+                <div className="overflow-x-auto pb-1">
+                  <WorkflowStrip current={f.status} />
                 </div>
               </div>
-            )}
-          </div>
-        )}
+
+              {/* Transitions */}
+              <div className="bg-white px-5 py-4">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                  <GitBranch className="w-3.5 h-3.5 text-orange-500" />Move To
+                </div>
+                {nextStatuses.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {nextStatuses.map(ns => {
+                      const sc = STATUS_MAP[ns];
+                      if (!sc) return null;
+                      const isClose = ["closed","false_positive","accepted_risk","duplicate"].includes(ns);
+                      return (
+                        <button key={ns} onClick={() => act(ns)} disabled={acting || !canEdit}
+                          className={cn(
+                            "flex items-center gap-1.5 px-3.5 py-2 rounded-xl border text-[11px] font-bold transition-all hover:shadow-sm disabled:opacity-50",
+                            sc.badge
+                          )}>
+                          {ns === "closed"        && <CheckCircle2 className="w-3.5 h-3.5" />}
+                          {ns === "false_positive" && <XCircle className="w-3.5 h-3.5" />}
+                          {ns === "new"            && <RotateCcw className="w-3.5 h-3.5" />}
+                          {ns === "triaging"       && <AlertTriangle className="w-3.5 h-3.5" />}
+                          {ns === "investigating"  && <Search className="w-3.5 h-3.5" />}
+                          {ns === "in_remediation" && <Shield className="w-3.5 h-3.5" />}
+                          {ns === "accepted_risk"  && <Shield className="w-3.5 h-3.5" />}
+                          {ns === "duplicate"      && <Layers className="w-3.5 h-3.5" />}
+                          {sc.label}
+                          {isClose && <span className="text-[9px] opacity-50">→ close</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-gray-400">No further transitions available.</p>
+                )}
+              </div>
+
+              {/* Assignment + Priority + Notes */}
+              <div className="bg-white px-5 py-4 space-y-4">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                  <User className="w-3.5 h-3.5 text-orange-500" />Assignment
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[10px] text-gray-500 font-semibold block mb-1.5">Assignee</label>
+                    <input type="text" placeholder="analyst@company.com" value={assigneeVal} onChange={e => setAssignee(e.target.value)}
+                      className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 transition-all" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500 font-semibold block mb-1.5">Priority</label>
+                    <select value={priorityVal} onChange={e => setPriority(Number(e.target.value))}
+                      className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 cursor-pointer">
+                      {Object.entries(PRIORITIES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 font-semibold block mb-1.5 flex items-center gap-1"><Calendar className="w-3.5 h-3.5" />Due Date</label>
+                  <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)}
+                    className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 transition-all" />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 font-semibold block mb-1.5 flex items-center gap-1"><FileText className="w-3.5 h-3.5" />Analyst Notes</label>
+                  <textarea rows={4} value={noteVal} onChange={e => setNoteVal(e.target.value)}
+                    placeholder="Investigation notes, context, justification…"
+                    className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none transition-all leading-relaxed" />
+                </div>
+                {canEdit && (
+                  <button onClick={save} disabled={acting}
+                    className="flex items-center gap-2 px-5 py-2.5 bg-orange-500 hover:bg-orange-600 text-white text-[11px] font-bold rounded-xl transition-all shadow-sm hover:shadow-md w-full justify-center disabled:opacity-60">
+                    <CheckCircle2 className="w-4 h-4" />Save Case Updates
+                    {acting && <span className="text-[10px] opacity-70">Saving…</span>}
+                  </button>
+                )}
+              </div>
+
+              {/* SLA */}
+              {f.sla_status && (
+                <div className="bg-white px-5 py-4">
+                  <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5" />SLA Status
+                  </div>
+                  <div className={cn("flex items-center gap-3 px-4 py-3 rounded-xl border text-[11px] font-semibold",
+                    f.sla_status === "breached" ? "bg-red-50 border-red-200 text-red-700" :
+                    f.sla_status === "warning"  ? "bg-amber-50 border-amber-200 text-amber-700" :
+                    "bg-green-50 border-green-200 text-green-700")}>
+                    <Clock className={cn("w-4 h-4 flex-shrink-0", f.sla_status === "breached" && "al-heartbeat")} />
+                    SLA {f.sla_status.toUpperCase()}
+                    {f.sla_due && <span className="ml-auto text-[10px] opacity-70">Due {fmtTs(f.sla_due)}</span>}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── TIMELINE ────────────────────────────────────────────────── */}
+          {tab === "timeline" && (
+            <div className="space-y-px">
+              <div className="bg-white px-5 py-4">
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4 flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-orange-500" />Activity Log
+                </div>
+                {activity.length === 0 ? (
+                  <div className="py-12 text-center">
+                    <Activity className="w-8 h-8 text-gray-200 mx-auto mb-2" />
+                    <p className="text-[11px] text-gray-400">No activity recorded yet</p>
+                  </div>
+                ) : (
+                  <div className="relative space-y-4">
+                    <div className="absolute left-4 top-0 bottom-0 w-0.5 bg-gray-100" />
+                    {activity.map((a, i) => (
+                      <div key={i} className="flex items-start gap-4 al-row-in" style={{ animationDelay: `${i * 40}ms` }}>
+                        <div className="w-8 h-8 rounded-full bg-orange-50 border-2 border-white ring-1 ring-gray-100 flex items-center justify-center flex-shrink-0 z-10 shadow-sm">
+                          <span className="text-[10px] font-black text-orange-600">{(a.actor?.[0] ?? "?").toUpperCase()}</span>
+                        </div>
+                        <div className="flex-1 min-w-0 pb-1">
+                          <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                            <span className="text-[11px] font-bold text-gray-800">{a.actor}</span>
+                            <span className="text-[11px] text-gray-500">{a.action.replace(/_/g, " ")}</span>
+                            {a.old_value && a.new_value && (
+                              <span className="text-[10px] text-gray-400 font-mono bg-gray-50 px-1.5 py-0.5 rounded border border-gray-100">
+                                {a.old_value} → {a.new_value}
+                              </span>
+                            )}
+                            <span className="ml-auto text-[10px] text-gray-400 flex-shrink-0">{relTime(a.created_at)}</span>
+                          </div>
+                          {a.comment && (
+                            <p className="text-[11px] text-gray-600 mt-1 bg-gray-50 rounded-xl px-3 py-2 border border-gray-100 leading-relaxed">{a.comment}</p>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Add comment */}
+              {canEdit && (
+                <div className="bg-white px-5 py-4">
+                  <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                    <MessageSquare className="w-3.5 h-3.5 text-blue-500" />Add Investigation Note
+                  </div>
+                  <div className="space-y-2.5">
+                    <textarea rows={3} value={newComment} onChange={e => setNewComment(e.target.value)}
+                      onKeyDown={e => { if (e.key === "Enter" && e.ctrlKey) postComment(); }}
+                      placeholder="Add investigation note… (Ctrl+Enter to post)"
+                      className="w-full px-3 py-2.5 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none transition-all leading-relaxed" />
+                    <button onClick={postComment} disabled={posting || !newComment.trim()}
+                      className="flex items-center gap-2 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white text-[11px] font-bold rounded-xl transition-all disabled:opacity-50">
+                      <Send className="w-3.5 h-3.5" />{posting ? "Posting…" : "Post Note"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </>,
+    document.body
   );
 }
 
@@ -630,6 +754,29 @@ export default function ThreatQueue() {
   const [loading,  setLoading]    = useState(true);
   const [error,    setError]      = useState<string | null>(null);
   const [lastSync, setLastSync]   = useState(0);
+
+  // Configured thresholds from /api/v1/settings/validation (echoed by the
+  // findings endpoint when validated_only=true so the UI doesn't need a
+  // separate round-trip).
+  const [globalThreshold,      setGlobalThreshold]      = useState<number | null>(null);
+  const [effectiveThresholds,  setEffectiveThresholds]  = useState<{
+    global?:  number;
+    terrain?: Record<string, number>;
+    agent?:   Record<string, number>;
+  } | null>(null);
+  const [filterStats, setFilterStats] = useState<{
+    active_total?:    number;
+    validated_count?: number;
+    below_threshold?: number;
+    highest_score?:   number | null;
+    top_scores?: Array<{ id: number; title: string; agent_id: string; category: string; precision_score: number }>;
+    by_terrain?: Record<string, { validated: number; below: number }>;
+  } | null>(null);
+  const [rescoring, setRescoring] = useState(false);
+  const [rescoreReport, setRescoreReport] = useState<{
+    scanned: number; updated: number;
+    histogram: Record<string, number>;
+  } | null>(null);
 
   // Selection
   const [selected, setSelected]   = useState<Set<number>>(new Set());
@@ -649,6 +796,7 @@ export default function ThreatQueue() {
   const [kevOnly,  setKevOnly]    = useState(false);
   const [search,   setSearch]     = useState("");
   const [rawSearch,setRawSearch]  = useState("");
+  const [adv,      setAdv]        = useState<FilterCondition[]>([]);
   const [sortKey,  setSortKey]    = useState("composite_score");
   const [sortAsc,  setSortAsc]    = useState(false);
   const debRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -658,7 +806,8 @@ export default function ThreatQueue() {
   const [page, setPage] = useState(0);
 
   // Reset to first page whenever any filter / sort / view changes
-  useEffect(() => { setPage(0); }, [catTab, severity, status, slaOnly, kevOnly, search, sortKey, sortAsc, viewMode]);
+  useEffect(() => { setPage(0); }, [catTab, severity, status, slaOnly, kevOnly, search, sortKey, sortAsc, viewMode, adv]);
+
 
   const load = useCallback(async () => {
     const p = new URLSearchParams({ limit: "500", sort_by: sortKey, view: viewMode });
@@ -667,11 +816,19 @@ export default function ThreatQueue() {
     if (status && viewMode !== "closed") p.set("status", status);
     if (slaOnly)  p.set("sla_breached", "true");
     if (search)   p.set("search",   search);
+    // Validated Findings page — apply the user-configured threshold
+    // resolution (per-agent → per-terrain → global from Settings →
+    // Validation).  Closed/historical views skip it so analysts can audit
+    // past decisions even if thresholds were tightened later.
+    if (viewMode !== "closed") p.set("validated_only", "true");
     try {
       const r = await fetch(`${SOC}/findings?${p}`);
       if (!r.ok) throw new Error(`${r.status}`);
       const d = await r.json();
       setFindings(d.findings ?? []);
+      setEffectiveThresholds(d.effective_thresholds ?? null);
+      setGlobalThreshold(typeof d.global_threshold === "number" ? d.global_threshold : null);
+      setFilterStats(d.stats ?? null);
       setError(null);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setLastSync(Math.floor(Date.now() / 1000)); }
@@ -687,7 +844,7 @@ export default function ThreatQueue() {
   };
 
   // Category filter
-  const filtered = findings.filter(f => {
+  const baseFiltered = findings.filter(f => {
     if (catTab !== "all") {
       const k = catKey(f.category);
       const grouped: Record<string, string[]> = {
@@ -703,6 +860,9 @@ export default function ThreatQueue() {
     if (kevOnly && !f.kev) return false;
     return true;
   });
+
+  // Advanced field+operator conditions (ANDed on top of the quick filters)
+  const filtered = applyAdvancedConditions(baseFiltered, adv);
 
   // Sort
   const sorted = [...filtered].sort((a, b) => {
@@ -766,7 +926,8 @@ export default function ThreatQueue() {
   const unassigned = findings.filter(f => !f.assignee && !["closed","false_positive","accepted_risk"].includes(f.status)).length;
   const kevCount   = findings.filter(f => f.kev).length;
 
-  const detailFinding = sorted.find(f => f.id === detailId) ?? null;
+  const detailFinding  = sorted.find(f => f.id === detailId) ?? null;
+  const closeDetail    = useCallback(() => setDetailId(null), []);
 
   // Sortable header
   const SortTh = ({ label, k }: { label: string; k: string }) => (
@@ -792,12 +953,32 @@ export default function ThreatQueue() {
                 <AlertTriangle className="w-5 h-5 text-orange-500" />
               </div>
               <div>
-                <div className="flex items-center gap-2">
-                  <h1 className="text-base font-bold text-gray-900">Findings</h1>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h1 className="text-base font-bold text-gray-900">Validated Findings</h1>
                   <span className="px-2 py-0.5 bg-orange-50 text-orange-700 border border-orange-200 rounded-full text-[9px] font-black">LIVE</span>
+                  {globalThreshold != null && (
+                    <span
+                      className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-[9px] font-black uppercase tracking-wide"
+                      title="Configured Detection Confidence threshold from Settings → Validation. Per-terrain and per-agent overrides apply on top of this."
+                    >
+                      Detection Confidence ≥ {Math.round(globalThreshold * 100)}%
+                    </span>
+                  )}
+                  {effectiveThresholds?.terrain && Object.keys(effectiveThresholds.terrain).length > 0 && (
+                    <span className="px-2 py-0.5 bg-purple-50 text-purple-700 border border-purple-200 rounded-full text-[9px] font-bold uppercase tracking-wide"
+                          title={"Per-terrain overrides:\n" + Object.entries(effectiveThresholds.terrain).map(([k,v]) => `  ${k}: ${Math.round(v*100)}%`).join("\n")}>
+                      {Object.keys(effectiveThresholds.terrain).length} terrain override{Object.keys(effectiveThresholds.terrain).length > 1 ? "s" : ""}
+                    </span>
+                  )}
+                  {effectiveThresholds?.agent && Object.keys(effectiveThresholds.agent).length > 0 && (
+                    <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-[9px] font-bold uppercase tracking-wide"
+                          title={"Per-agent overrides:\n" + Object.entries(effectiveThresholds.agent).map(([k,v]) => `  ${k}: ${Math.round(v*100)}%`).join("\n")}>
+                      {Object.keys(effectiveThresholds.agent).length} agent override{Object.keys(effectiveThresholds.agent).length > 1 ? "s" : ""}
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-gray-500 mt-0.5">
-                  All detection findings · case management · SLA tracking · bulk actions · auto-refresh 30s
+                  Filtered per attack terrain · Detection Confidence threshold resolved from <a href="#" onClick={e => { e.preventDefault(); window.location.hash = "#settings"; }} className="text-purple-600 hover:underline">Settings → Validation</a> · auto-refresh 30s
                 </p>
               </div>
             </div>
@@ -822,12 +1003,135 @@ export default function ThreatQueue() {
             <KpiTile label="Unassigned"  value={unassigned}  color={unassigned > 0 ? "text-amber-700" : "text-green-600"} bg={unassigned > 0 ? "bg-amber-50 border-amber-200" : "bg-green-50 border-green-200"} icon={<User className="w-3 h-3" />} delay={200} />
             <KpiTile label="KEV Listed"  value={kevCount}    color={kevCount > 0 ? "text-red-700" : "text-gray-500"}    bg={kevCount > 0 ? "bg-red-50 border-red-200" : "bg-gray-50 border-gray-200"}   icon={<Zap className="w-3 h-3" />} delay={240} />
           </div>
+
+          {/* ── Per-terrain breakdown — which terrains are clearing the threshold ── */}
+          {viewMode === "active" && filterStats?.by_terrain && (
+            <div className="mt-4 pt-3 border-t border-gray-100">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center gap-1.5">
+                  <Layers className="w-3 h-3 text-purple-500" />
+                  Filtered by Attack Terrain
+                </div>
+                <div className="text-[9px] text-gray-400">
+                  validated / active per terrain
+                </div>
+              </div>
+              <div className="grid grid-cols-5 gap-2">
+                {([
+                  { id: "citadels", label: "Citadels", desc: "Execution & persistence",  color: "red" },
+                  { id: "vector",   label: "Vector",   desc: "Network & reachability",   color: "blue" },
+                  { id: "origin",   label: "Origin",   desc: "Surface, packages, CVEs",  color: "amber" },
+                  { id: "identity", label: "Identity", desc: "Accounts & credentials",   color: "indigo" },
+                  { id: "posture",  label: "Posture",  desc: "Security controls",        color: "emerald" },
+                ] as { id: string; label: string; desc: string; color: string }[]).map(t => {
+                  const c     = filterStats.by_terrain?.[t.id] ?? { validated: 0, below: 0 };
+                  const total = c.validated + c.below;
+                  const pct   = total > 0 ? Math.round((c.validated / total) * 100) : 0;
+                  const colors: Record<string, { tint: string; text: string; bar: string }> = {
+                    red:     { tint: "bg-red-50 border-red-200",       text: "text-red-700",     bar: "bg-red-500" },
+                    blue:    { tint: "bg-blue-50 border-blue-200",     text: "text-blue-700",    bar: "bg-blue-500" },
+                    amber:   { tint: "bg-amber-50 border-amber-200",   text: "text-amber-700",   bar: "bg-amber-500" },
+                    indigo:  { tint: "bg-indigo-50 border-indigo-200", text: "text-indigo-700",  bar: "bg-indigo-500" },
+                    emerald: { tint: "bg-emerald-50 border-emerald-200", text: "text-emerald-700", bar: "bg-emerald-500" },
+                  };
+                  const C = colors[t.color];
+                  return (
+                    <div key={t.id} className={cn("rounded-xl border p-2.5", C.tint)}>
+                      <div className="flex items-baseline justify-between gap-1">
+                        <span className={cn("text-[10px] font-bold uppercase tracking-wide", C.text)}>{t.label}</span>
+                        <span className="text-[9px] tabular-nums text-gray-600">
+                          <strong>{c.validated}</strong>
+                          <span className="opacity-50"> / {total}</span>
+                        </span>
+                      </div>
+                      <div className="text-[8px] text-gray-500 mb-1.5 truncate">{t.desc}</div>
+                      <div className="h-1 bg-white rounded-full overflow-hidden">
+                        <div className={cn("h-full transition-all", C.bar)} style={{ width: `${pct}%` }} />
+                      </div>
+                      <div className="text-[8px] mt-1 text-gray-400 font-mono">
+                        {total === 0 ? "none active" : `${pct}% pass`}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
       {error && (
         <div className="px-4 py-3 bg-red-50 border border-red-200 rounded-2xl text-xs text-red-700 flex items-center gap-2 al-row-in">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />{error}
+        </div>
+      )}
+
+      {/* ── Threshold-aware "why are my findings missing" banner ─────────────────
+          Shown when validated_only is in effect AND there are active findings
+          that exist but fall below the configured threshold.  Lets the user
+          either drop the threshold or trigger a retro-rescore in one click. */}
+      {viewMode === "active" && filterStats
+        && (filterStats.active_total ?? 0) > 0
+        && (filterStats.below_threshold ?? 0) > 0
+        && (
+        <div className="px-4 py-3 bg-amber-50 border border-amber-200 rounded-2xl text-[11px] al-row-in">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="font-bold text-amber-900">
+                {filterStats.below_threshold} active finding{(filterStats.below_threshold ?? 0) > 1 ? "s" : ""} below your {Math.round((globalThreshold ?? 0.9) * 100)}% threshold
+              </div>
+              <div className="text-[10px] text-amber-800 mt-0.5">
+                {filterStats.validated_count ?? 0} of {filterStats.active_total ?? 0} active findings meet the configured Validated bar.
+                {filterStats.highest_score != null && (
+                  <> Highest score: <strong>{Math.round(filterStats.highest_score * 100)}%</strong>.</>
+                )}
+              </div>
+              {!!filterStats.top_scores?.length && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {filterStats.top_scores.map(s => (
+                    <span key={s.id}
+                          className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white border border-amber-200 text-amber-800">
+                      {Math.round(s.precision_score * 100)}% · {s.title.slice(0, 32)}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="mt-2 flex items-center gap-2 flex-wrap">
+                <button
+                  disabled={rescoring}
+                  onClick={async () => {
+                    setRescoring(true); setRescoreReport(null);
+                    try {
+                      const r = await fetch("/api/v1/settings/validation/recompute", { method: "POST" });
+                      if (r.ok) {
+                        const d = await r.json();
+                        setRescoreReport(d);
+                        await load();
+                      }
+                    } finally { setRescoring(false); }
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300 text-white text-[10px] font-bold rounded-lg transition-colors">
+                  <RefreshCw className={cn("w-3 h-3", rescoring && "animate-spin")} />
+                  {rescoring ? "Rescoring…" : "Rescore all findings"}
+                </button>
+                <span className="text-[9px] text-amber-700">
+                  Older findings may pre-date the validator. Rescoring recomputes them against the current criteria.
+                </span>
+              </div>
+              {rescoreReport && (
+                <div className="mt-2 px-2 py-1.5 rounded bg-white border border-emerald-200 text-[10px] text-emerald-800">
+                  <strong>Rescored {rescoreReport.updated} of {rescoreReport.scanned} findings.</strong>{" "}
+                  Score distribution:&nbsp;
+                  {Object.entries(rescoreReport.histogram).map(([band, n]) => (
+                    <span key={band} className="ml-1.5 inline-block font-mono">
+                      {band}%: <strong>{n}</strong>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -889,9 +1193,8 @@ export default function ThreatQueue() {
         })}
       </div>
 
-      {/* ── Main table ───────────────────────────────────────────────────────── */}
-      <div className="flex gap-4 items-start">
-        <div className="flex-1 min-w-0 bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
+      {/* ── Table card ─────────────────────────────────────────────────────────── */}
+      <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
           <div className="h-0.5 bg-gradient-to-r from-orange-400 via-amber-400 to-orange-500" />
 
           {/* Filter bar + bulk actions */}
@@ -920,6 +1223,9 @@ export default function ThreatQueue() {
               <input type="checkbox" checked={kevOnly} onChange={e => setKevOnly(e.target.checked)} className="rounded accent-red-500" />
               KEV Only
             </label>
+
+            {/* Advanced field+operator filter */}
+            <AdvancedFilter conditions={adv} setConditions={setAdv} />
 
             {/* Bulk action strip */}
             {selected.size > 0 && can("bulk_action") && (
@@ -1232,18 +1538,17 @@ export default function ThreatQueue() {
               </div>
             </div>
           )}
-        </div>
+      </div>{/* end table card */}
 
-        {/* Detail panel */}
-        {detailFinding && (
-          <FindingDetailPanel
-            finding={detailFinding}
-            onClose={() => setDetailId(null)}
-            onRefresh={load}
-            canEdit={can("update_finding")}
-          />
-        )}
-      </div>
+      {/* Fixed right-side drawer — rendered outside page flow */}
+      {detailFinding && (
+        <FindingDetailPanel
+          finding={detailFinding}
+          onClose={closeDetail}
+          onRefresh={load}
+          canEdit={can("update_finding")}
+        />
+      )}
     </div>
   );
 }

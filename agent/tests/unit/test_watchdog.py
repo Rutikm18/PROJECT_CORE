@@ -15,6 +15,7 @@ Failure points covered:
 from __future__ import annotations
 
 import os
+import sys
 import time
 from unittest.mock import MagicMock, patch
 
@@ -25,10 +26,13 @@ from agent.agent.watchdog import Watchdog
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def make_cfg(tmp_path, *, agent_bin=None, max_restarts=3, restart_window=60,
-             check_interval=1):
+def make_cfg(tmp_path, *, agent_bin=None, python=None, config_path="",
+             max_restarts=3, restart_window=60, check_interval=1):
+    binaries = {"agent": agent_bin or str(tmp_path / "fake-agent")}
+    if python is not None:
+        binaries["python"] = python
     return {
-        "binaries": {"agent": agent_bin or str(tmp_path / "fake-agent")},
+        "binaries": binaries,
         "watchdog": {
             "check_interval_sec": check_interval,
             "max_restarts":       max_restarts,
@@ -39,7 +43,7 @@ def make_cfg(tmp_path, *, agent_bin=None, max_restarts=3, restart_window=60,
             "log_dir":  str(tmp_path),
         },
         "logging": {"level": "DEBUG", "max_mb": 1, "backups": 1},
-        "_config_path": "",
+        "_config_path": config_path,
     }
 
 
@@ -73,6 +77,79 @@ class TestBinaryVerification:
         assert any("world-writable" in r.message.lower() or
                    "SECURITY" in r.message
                    for r in caplog.records)
+
+
+# ── Interpreter-launch mode (.py agent target) ────────────────────────────────
+
+class TestInterpreterMode:
+    """The macOS deployment ships a non-executable `run_agent.py`; the watchdog
+    must launch it via the interpreter instead of FATAL-ing on the X_OK check."""
+
+    def _stub_script(self, tmp_path, name="run_agent.py"):
+        script = tmp_path / name
+        script.write_text("import time\ntime.sleep(30)\n")
+        script.chmod(0o644)   # NOT executable — exactly the deployed case
+        return script
+
+    def test_py_target_uses_interpreter(self, tmp_path):
+        script = self._stub_script(tmp_path)
+        cfg = make_cfg(tmp_path, agent_bin=str(script), python=sys.executable)
+        w = Watchdog(cfg)
+        assert w._use_interpreter is True
+
+    def test_non_executable_py_verifies_ok(self, tmp_path):
+        """Regression: a non-executable .py must NOT FATAL — it launches via python."""
+        script = self._stub_script(tmp_path)
+        cfg = make_cfg(tmp_path, agent_bin=str(script), python=sys.executable)
+        w = Watchdog(cfg)
+        assert w._verify_binary() is True
+
+    def test_build_cmd_prefixes_interpreter_and_config(self, tmp_path):
+        script = self._stub_script(tmp_path)
+        cfg = make_cfg(tmp_path, agent_bin=str(script), python=sys.executable,
+                       config_path="/Library/AttackLens/agent.toml")
+        w = Watchdog(cfg)
+        assert w._build_cmd() == [
+            sys.executable, str(script), "--config", "/Library/AttackLens/agent.toml",
+        ]
+
+    def test_py_target_defaults_to_running_interpreter(self, tmp_path):
+        script = self._stub_script(tmp_path)
+        cfg = make_cfg(tmp_path, agent_bin=str(script))   # no [binaries] python
+        w = Watchdog(cfg)
+        assert w.python_bin == sys.executable
+        assert w._verify_binary() is True
+
+    def test_py_target_missing_interpreter_is_fatal(self, tmp_path):
+        script = self._stub_script(tmp_path)
+        cfg = make_cfg(tmp_path, agent_bin=str(script),
+                       python="/no/such/python-binary")
+        w = Watchdog(cfg)
+        assert w._verify_binary() is False
+        w._start_agent()
+        assert w._proc is None
+
+    def test_py_target_actually_starts(self, tmp_path):
+        script = self._stub_script(tmp_path)
+        cfg = make_cfg(tmp_path, agent_bin=str(script), python=sys.executable)
+        w = Watchdog(cfg)
+        try:
+            w._start_agent()
+            assert w._proc is not None, "interpreter-launched agent should start"
+            assert w._proc.poll() is None, "agent process should be running"
+            assert os.path.exists(cfg["paths"]["pid_file"])
+        finally:
+            w.stop()
+
+    def test_native_non_executable_still_fatal(self, tmp_path):
+        """Non-.py targets keep the strict X_OK contract (unchanged behaviour)."""
+        fake = tmp_path / "attacklens-agent"
+        fake.write_text("#!/bin/sh\n")
+        fake.chmod(0o644)
+        cfg = make_cfg(tmp_path, agent_bin=str(fake))
+        w = Watchdog(cfg)
+        assert w._use_interpreter is False
+        assert w._verify_binary() is False
 
 
 # ── Process monitoring ────────────────────────────────────────────────────────

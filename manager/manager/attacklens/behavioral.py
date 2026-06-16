@@ -573,6 +573,38 @@ class BehavioralAnalyzer:
             "updated_at":   time.time(),
         })
 
+    # ── Signal adapter ────────────────────────────────────────────────────────
+
+    async def analyze_as_signals(self, agent_id: str, section: str, data: Any) -> list:
+        """
+        Run behavioral analysis and return Signal objects instead of finding dicts.
+        Delegated to by the new confidence pipeline in engine.py.
+        Produces the same detections as analyze() but wrapped as Signal instances.
+        """
+        from .signals import Signal, layer_for
+        findings = await self.analyze(agent_id, section, data)
+        signals: list[Signal] = []
+        for f in findings:
+            # Normalise score→strength; behavioral signals carry lower weight (0.55)
+            strength = min(1.0, float(f.get("score", 5.0)) / 10.0)
+            # Boost strength for high-z scores captured in evidence
+            if isinstance(f.get("evidence"), dict):
+                z = abs(float(f["evidence"].get("zscore", 0) or 0))
+                if z > 0:
+                    strength = min(1.0, z / 6.0)   # 3σ → 0.5, 6σ → 1.0
+            signals.append(Signal(
+                rule_id=f"B-{f.get('source', 'behavioral').upper().replace('-', '_')}",
+                layer=layer_for(section),
+                data_point=section,
+                entity_key=f.get("item_key", f"{section}:{agent_id}"),
+                agent_id=agent_id,
+                severity_hint=f.get("severity", "medium"),
+                evidence=f.get("evidence") or {},
+                weight=0.55,
+                strength=strength,
+            ))
+        return signals
+
     # ── Finding factory ───────────────────────────────────────────────────────
 
     @staticmethod

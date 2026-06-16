@@ -16,6 +16,7 @@ false positives from week-old noise combining with today's data.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -684,7 +685,7 @@ class CorrelationEngine:
         score = min(10.0, rule.get("score", 0) + (0.25 * bonus) + _intel_boost(evidence_findings))
         blast = _blast_radius(agent_id, evidence_findings, confidence, rule)
 
-        return {
+        corr = {
             "rule_id":       rule["id"],
             "agent_id":      agent_id,
             "category":      "correlation",
@@ -706,6 +707,36 @@ class CorrelationEngine:
             "source":        "correlation_engine",
             "detected_at":   time.time(),
         }
+
+        # Emit a synthetic Signal so the confidence pipeline can track precision
+        # for correlation hits the same way it does for primary rule hits.
+        asyncio.create_task(self._emit_corr_signal(corr, agent_id, rule, evidence_findings))
+        return corr
+
+    async def _emit_corr_signal(
+        self, corr: dict, agent_id: str, rule: dict, evidence_findings: list[dict]
+    ) -> None:
+        try:
+            from .signals import Signal
+            sig = Signal(
+                rule_id=f"C-{rule['id']}",
+                layer="execution",
+                data_point="correlation",
+                entity_key=f"correlation:{rule['id']}:{agent_id}",
+                agent_id=agent_id,
+                severity_hint=rule["severity"],
+                evidence={
+                    "rule_name":              rule.get("title", ""),
+                    "constituent_finding_ids": [f.get("id") for f in evidence_findings],
+                    "mitre_chain":            [s.get("technique") for s in rule.get("attack_chain", [])],
+                    "time_window_hours":      rule.get("time_window_hours", 24),
+                },
+                weight=0.85,
+                strength=min(1.0, rule.get("confidence", 75) / 100.0),
+            )
+            await self._idb.upsert_signal(sig)
+        except Exception as exc:
+            log.debug("_emit_corr_signal: %s", exc)
 
 
 def build_correlation_summary(correlations: list[dict]) -> dict:
@@ -734,14 +765,26 @@ def build_correlation_summary(correlations: list[dict]) -> dict:
 
 
 def _intel_boost(findings: list[dict]) -> float:
+    """
+    Intel-driven score boost. Reads canonical fields from each finding and falls
+    back to nested evidence['cve'] when finding-level fields are absent (older
+    findings may not have the top-level kev/epss/exploit_available flags).
+    """
     boost = 0.0
     for f in findings:
-        if f.get("kev"):
+        ev_cve = (f.get("evidence") or {}).get("cve") or {}
+        kev = bool(f.get("kev") or ev_cve.get("kev") or ev_cve.get("cisa_kev"))
+        exploit = bool(f.get("exploit_available") or ev_cve.get("exploit_available"))
+        epss = float(f.get("epss_score") or ev_cve.get("epss_score") or ev_cve.get("epss") or 0)
+
+        if kev:
             boost += 0.4
-        if f.get("exploit_available"):
+        if exploit:
             boost += 0.3
-        if (f.get("epss_score") or 0) >= 0.7:
+        if epss >= 0.7:
             boost += 0.3
+        elif epss >= 0.5:
+            boost += 0.15
     return min(1.0, boost)
 
 

@@ -13,7 +13,8 @@ import { cn } from "../../lib/utils";
 
 const PAGE_LABELS: Record<PageId, string> = {
   "dashboard":       "Security Dashboard",
-  "threat-queue":    "Findings",
+  "threat-queue":    "Validated Findings",
+  "incidents":       "All Incidents",
   "execution":       "Citadels",
   "network":         "Vector",
   "vulnerabilities": "Origin",

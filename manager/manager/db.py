@@ -555,6 +555,60 @@ class Database:
                 pass
         return result
 
+    async def get_latest_section(self, agent_id: str, section: str):
+        """Most-recent payload for ONE agent+section.
+
+        Single covered-index lookup (idx_payloads_agent_section_ts) — does NOT
+        scan/parse the whole fleet like get_latest_section_per_agent. Use this for
+        single-agent detail views. Returns the parsed dict/list, or None.
+        """
+        async with self._pool.read() as db:
+            async with db.execute(
+                """SELECT data FROM payloads
+                   WHERE agent_id = ? AND section = ?
+                   ORDER BY collected_at DESC LIMIT 1""",
+                (agent_id, section),
+            ) as cur:
+                row = await cur.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
+
+    async def get_latest_sections(self, agent_id: str, sections: list[str]) -> dict:
+        """Latest payload for ONE agent across MANY sections in a single query.
+
+        Uses a per-section ROW_NUMBER() window (SQLite ≥ 3.25) over the covered
+        index, so a detail view that needs 7 sections costs one round-trip and
+        parses only this agent's rows — not the entire fleet × 7. Returns
+        {section: data}; missing sections are simply absent.
+        """
+        if not sections:
+            return {}
+        placeholders = ",".join("?" * len(sections))
+        async with self._pool.read() as db:
+            async with db.execute(
+                f"""SELECT section, data FROM (
+                        SELECT section, data,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY section ORDER BY collected_at DESC
+                               ) AS rn
+                        FROM payloads
+                        WHERE agent_id = ? AND section IN ({placeholders})
+                    ) WHERE rn = 1""",
+                (agent_id, *sections),
+            ) as cur:
+                rows = await cur.fetchall()
+        out: dict = {}
+        for section, data_text in rows:
+            try:
+                out[section] = json.loads(data_text) if data_text else {}
+            except Exception:
+                pass
+        return out
+
     async def get_distinct_sections(self, agent_id: str | None = None) -> list[str]:
         if agent_id:
             async with self._pool.read() as db:

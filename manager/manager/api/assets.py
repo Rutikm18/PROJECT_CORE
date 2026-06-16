@@ -52,6 +52,7 @@ def make_assets_router(db: "Database", intel_db: "IntelDB") -> APIRouter:
             battery_map,
             network_map,
             processes_map,
+            health_map,
         ) = await asyncio.gather(
             db.get_all_agents(),
             intel_db.list_assets(),
@@ -59,6 +60,7 @@ def make_assets_router(db: "Database", intel_db: "IntelDB") -> APIRouter:
             db.get_latest_section_per_agent("battery"),
             db.get_latest_section_per_agent("network"),
             db.get_latest_section_per_agent("processes"),
+            db.get_latest_section_per_agent("agent_health"),
         )
 
         # Index registry by agent_id for O(1) lookup
@@ -131,6 +133,8 @@ def make_assets_router(db: "Database", intel_db: "IntelDB") -> APIRouter:
                 "battery_charging": bat.get("charging"),
                 "battery_condition":bat.get("condition", ""),
                 "battery_cycles":   bat.get("cycle_count"),
+                # Manager link health (probe state / spool backlog)
+                "link":             _link_summary(health_map.get(aid, {})),
             })
 
         return result
@@ -209,35 +213,29 @@ def make_assets_router(db: "Database", intel_db: "IntelDB") -> APIRouter:
 
         now = int(time.time())
 
-        # Fetch all relevant sections concurrently
+        # Fetch all relevant sections for THIS agent in a single query (one
+        # round-trip, only this agent's rows parsed — not the whole fleet × 7).
         (
             reg,
-            metrics,
-            battery,
-            network,
-            processes,
-            storage_data,
-            users_data,
+            sections,
             sessions,
             findings_summary,
         ) = await asyncio.gather(
             intel_db.get_asset(agent_id),
-            db.get_latest_section_per_agent("metrics"),
-            db.get_latest_section_per_agent("battery"),
-            db.get_latest_section_per_agent("network"),
-            db.get_latest_section_per_agent("processes"),
-            db.get_latest_section_per_agent("storage"),
-            db.get_latest_section_per_agent("users"),
+            db.get_latest_sections(agent_id, [
+                "metrics", "battery", "network", "processes",
+                "storage", "users", "agent_health",
+            ]),
             db.get_agent_sessions(agent_id, limit=5),
             intel_db.get_summary(agent_id),
         )
 
-        m   = metrics.get(agent_id, {})
-        bat = battery.get(agent_id, {})
-        net = network.get(agent_id, {})
-        procs = processes.get(agent_id, [])
-        storage = storage_data.get(agent_id, {})
-        users   = users_data.get(agent_id, {})
+        m   = sections.get("metrics", {})
+        bat = sections.get("battery", {})
+        net = sections.get("network", {})
+        procs = sections.get("processes", [])
+        storage = sections.get("storage", {})
+        users   = sections.get("users", {})
 
         last_seen = int(agent.get("last_seen") or 0)
         elapsed   = now - last_seen if last_seen else 9999
@@ -259,6 +257,8 @@ def make_assets_router(db: "Database", intel_db: "IntelDB") -> APIRouter:
             "last_seen":   last_seen,
             "elapsed_s":   elapsed,
             "first_seen":  int((reg or {}).get("first_seen") or agent.get("created_at") or 0),
+            # Manager link health (probe state / spool backlog / auth failures)
+            "link":        _link_summary(sections.get("agent_health", {})),
             # Network
             "ip":          primary_ip,
             "mac":         primary_mac,
@@ -403,3 +403,32 @@ def _safe_list(v: object) -> list:
     if isinstance(v, str) and v:
         return [v]
     return []
+
+
+def _link_summary(health: dict) -> Optional[dict]:
+    """Per-agent manager-link health from the agent_health section's `link` block.
+
+    Returns None when the agent hasn't reported link state yet (older agents).
+    `status` is a dashboard-friendly rollup: degraded when telemetry is spooling
+    to disk or the manager rejected the key, healthy when the link is up.
+    """
+    link = (health or {}).get("link")
+    if not isinstance(link, dict):
+        return None
+    online   = bool(link.get("manager_online"))
+    spool    = int(link.get("spool_bytes") or 0)
+    authfail = int(link.get("auth_failures") or 0)
+    if authfail >= 3:
+        status = "auth_failed"
+    elif not online or spool > 0:
+        status = "degraded"
+    else:
+        status = "healthy"
+    return {
+        "status":                status,
+        "manager_online":        online,
+        "spool_bytes":           spool,
+        "auth_failures":         authfail,
+        "last_contact_ts":       int(link.get("last_contact_ts") or 0),
+        "seconds_since_contact": link.get("seconds_since_contact"),
+    }

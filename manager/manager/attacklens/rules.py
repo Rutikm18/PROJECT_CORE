@@ -5,6 +5,10 @@ Sources: SANS Internet Storm Center, Feodo Tracker, MITRE ATT&CK,
 Emerging Threats, NIST NVD, public security research, LOLBAS project.
 
 Each rule carries:
+  - id         : stable rule identifier (used by confidence engine)
+  - layer      : 'surface' | 'exposure' | 'execution' (ATT&CK kill-chain layer)
+  - data_point : telemetry section this rule fires on
+  - weight     : 0–1 how diagnostic the rule is when it fires in isolation
   - confidence : base confidence 0.0–1.0 (high = very few false positives)
   - dual_use   : True if tool is legitimately used by sysadmins/pentesters
   - severity   : critical / high / medium / low / info
@@ -54,88 +58,140 @@ MALICIOUS_PORTS: dict[int, dict] = {
 # ── Suspicious process name / cmdline patterns (compiled regex) ───────────────
 _PROC_RULES_RAW: list[dict] = [
     # ── Confirmed offensive tools ─────────────────────────────────────────────
-    {"pattern": r"(?i)(xmrig|xmr-?stak|minergate|cpuminer|minerd|cryptonight)",
+    {"id": "X-PROC-CRYPTOMINER",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)(xmrig|xmr-?stak|minergate|cpuminer|minerd|cryptonight)",
      "severity": "critical", "confidence": 0.97, "dual_use": False,
      "desc": "Cryptominer process", "mitre": "T1496"},
-    {"pattern": r"(?i)(msfconsole|msfvenom|msfd)",
+    {"id": "X-PROC-MSF",
+     "layer": "execution", "data_point": "processes", "weight": 0.85,
+     "pattern": r"(?i)(msfconsole|msfvenom|msfd)",
      "severity": "critical", "confidence": 0.92, "dual_use": True,
      "desc": "Metasploit component", "mitre": "T1587.001"},
-    {"pattern": r"(?i)(cobalt.?strike|cobaltstrike|beacon\.x64|beacon\.x86)",
+    {"id": "X-PROC-COBALTSTRIKE",
+     "layer": "execution", "data_point": "processes", "weight": 0.95,
+     "pattern": r"(?i)(cobalt.?strike|cobaltstrike|beacon\.x64|beacon\.x86)",
      "severity": "critical", "confidence": 0.98, "dual_use": False,
      "desc": "Cobalt Strike beacon", "mitre": "T1587.001"},
-    {"pattern": r"(?i)(empire|starkiller|powershell.empire)",
+    {"id": "X-PROC-EMPIRE",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)(empire|starkiller|powershell.empire)",
      "severity": "critical", "confidence": 0.95, "dual_use": False,
      "desc": "Empire C2 framework", "mitre": "T1059.001"},
-    {"pattern": r"(?i)(mimikatz|pypykatz|lsassdump|procdump.*lsass)",
+    {"id": "X-PROC-MIMIKATZ",
+     "layer": "execution", "data_point": "processes", "weight": 0.95,
+     "pattern": r"(?i)(mimikatz|pypykatz|lsassdump|procdump.*lsass)",
      "severity": "critical", "confidence": 0.98, "dual_use": False,
      "desc": "Credential dumping tool", "mitre": "T1003"},
-    {"pattern": r"(?i)(lazagne|credstealer|credgrap)",
+    {"id": "X-PROC-CREDSTEALER",
+     "layer": "execution", "data_point": "processes", "weight": 0.93,
+     "pattern": r"(?i)(lazagne|credstealer|credgrap)",
      "severity": "critical", "confidence": 0.97, "dual_use": False,
      "desc": "Credential harvester", "mitre": "T1003"},
-    {"pattern": r"(?i)(sliver|havoc.?\s*c2|brute.?ratel|nighthawk)",
+    {"id": "X-PROC-MODERN-C2",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)(sliver|havoc.?\s*c2|brute.?ratel|nighthawk)",
      "severity": "critical", "confidence": 0.97, "dual_use": False,
      "desc": "Modern C2 framework (Sliver/Havoc/BruteRatel)", "mitre": "T1587.001"},
-    {"pattern": r"(?i)(pwncat|platypus|villain\.py)",
+    {"id": "X-PROC-REVSHELL-FW",
+     "layer": "execution", "data_point": "processes", "weight": 0.88,
+     "pattern": r"(?i)(pwncat|platypus|villain\.py)",
      "severity": "critical", "confidence": 0.95, "dual_use": False,
      "desc": "Reverse shell framework", "mitre": "T1059"},
     # ── Tunnelling / proxy (dual-use) ─────────────────────────────────────────
-    {"pattern": r"(?i)(ngrok|frpc?|bore\.sh|chisel|ligolo|rpivot|rathole|cloudflared.*tunnel)",
+    {"id": "X-PROC-TUNNEL",
+     "layer": "execution", "data_point": "processes", "weight": 0.60,
+     "pattern": r"(?i)(ngrok|frpc?|bore\.sh|chisel|ligolo|rpivot|rathole|cloudflared.*tunnel)",
      "severity": "high", "confidence": 0.70, "dual_use": True,
      "desc": "Tunnelling / port-forward tool", "mitre": "T1090"},
     # ── Auth attack tools ─────────────────────────────────────────────────────
-    {"pattern": r"(?i)(ncrack|hydra|medusa|thc-?hydra)\s",
+    {"id": "X-PROC-BRUTEFORCE",
+     "layer": "execution", "data_point": "processes", "weight": 0.75,
+     "pattern": r"(?i)(ncrack|hydra|medusa|thc-?hydra)\s",
      "severity": "high", "confidence": 0.85, "dual_use": True,
      "desc": "Network brute-force tool", "mitre": "T1110.001"},
-    {"pattern": r"(?i)(hashcat|john.?the.?ripper|ophcrack)\s",
+    {"id": "X-PROC-PASSCRACK",
+     "layer": "execution", "data_point": "processes", "weight": 0.70,
+     "pattern": r"(?i)(hashcat|john.?the.?ripper|ophcrack)\s",
      "severity": "high", "confidence": 0.80, "dual_use": True,
      "desc": "Password cracking tool", "mitre": "T1110.002"},
-    {"pattern": r"(?i)(sqlmap|sqli.dumper)\s",
+    {"id": "X-PROC-SQLINJECT",
+     "layer": "execution", "data_point": "processes", "weight": 0.72,
+     "pattern": r"(?i)(sqlmap|sqli.dumper)\s",
      "severity": "high", "confidence": 0.82, "dual_use": True,
      "desc": "SQL injection tool", "mitre": "T1190"},
     # ── Scanners (dual-use, lower confidence) ─────────────────────────────────
-    {"pattern": r"(?i)(masscan|rustscan|zmap)\s",
+    {"id": "X-PROC-MASSCAN",
+     "layer": "execution", "data_point": "processes", "weight": 0.55,
+     "pattern": r"(?i)(masscan|rustscan|zmap)\s",
      "severity": "medium", "confidence": 0.65, "dual_use": True,
      "desc": "High-speed network/port scanner", "mitre": "T1046"},
-    {"pattern": r"(?i)nmap\s+.*(--script\s*(vuln|exploit|brute)|--open)\s",
+    {"id": "X-PROC-NMAP-VULN",
+     "layer": "execution", "data_point": "processes", "weight": 0.58,
+     "pattern": r"(?i)nmap\s+.*(--script\s*(vuln|exploit|brute)|--open)\s",
      "severity": "medium", "confidence": 0.70, "dual_use": True,
      "desc": "Nmap vulnerability/brute scan mode", "mitre": "T1046"},
     # ── Obfuscation / RCE patterns ────────────────────────────────────────────
-    {"pattern": r"(?i)python[23]?\s+-c\s+['\"].*base64",
+    {"id": "X-PROC-B64-PYTHON",
+     "layer": "execution", "data_point": "processes", "weight": 0.75,
+     "pattern": r"(?i)python[23]?\s+-c\s+['\"].*base64",
      "severity": "high", "confidence": 0.85, "dual_use": False,
      "desc": "Python executing base64-encoded payload", "mitre": "T1027"},
-    {"pattern": r"(?i)(bash|sh|zsh)\s+-c\s+['\"].*base64.*decode",
+    {"id": "X-PROC-B64-SHELL",
+     "layer": "execution", "data_point": "processes", "weight": 0.78,
+     "pattern": r"(?i)(bash|sh|zsh)\s+-c\s+['\"].*base64.*decode",
      "severity": "high", "confidence": 0.88, "dual_use": False,
      "desc": "Shell executing base64-decoded command", "mitre": "T1027"},
-    {"pattern": r"(?i)(curl|wget)\s+.*\|\s*(bash|sh|zsh|python)",
+    {"id": "X-PROC-PIPE-SHELL",
+     "layer": "execution", "data_point": "processes", "weight": 0.85,
+     "pattern": r"(?i)(curl|wget)\s+.*\|\s*(bash|sh|zsh|python)",
      "severity": "critical", "confidence": 0.93, "dual_use": False,
      "desc": "Remote code execution via pipe-to-shell", "mitre": "T1059"},
-    {"pattern": r"(?i)bash\s+-i\s+>&\s*/dev/tcp/",
+    {"id": "X-PROC-BASH-TCP",
+     "layer": "execution", "data_point": "processes", "weight": 0.92,
+     "pattern": r"(?i)bash\s+-i\s+>&\s*/dev/tcp/",
      "severity": "critical", "confidence": 0.97, "dual_use": False,
      "desc": "Bash TCP reverse shell", "mitre": "T1059.004"},
-    {"pattern": r"(?i)python[23]?\s+-c\s+['\"]import\s+socket",
+    {"id": "X-PROC-PY-REVSHELL",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)python[23]?\s+-c\s+['\"]import\s+socket",
      "severity": "critical", "confidence": 0.95, "dual_use": False,
      "desc": "Python reverse shell", "mitre": "T1059.006"},
     # ── Living-off-the-land (LOLBin) patterns ─────────────────────────────────
-    {"pattern": r"(?i)/dev/shm/",
+    {"id": "X-PROC-DEVSHM",
+     "layer": "execution", "data_point": "processes", "weight": 0.88,
+     "pattern": r"(?i)/dev/shm/",
      "severity": "critical", "confidence": 0.95, "dual_use": False,
      "desc": "Process running from /dev/shm (memory-only evasion)", "mitre": "T1036.005"},
-    {"pattern": r"(?i)/tmp/[a-z0-9_.\-]{6,30}$",
+    {"id": "X-PROC-TMP-RAND",
+     "layer": "execution", "data_point": "processes", "weight": 0.50,
+     "pattern": r"(?i)/tmp/[a-z0-9_.\-]{6,30}$",
      "severity": "medium", "confidence": 0.60, "dual_use": False,
      "desc": "Process from /tmp with random-looking name", "mitre": "T1036"},
-    {"pattern": r"(?i)osascript\s+(-e\s+['\"].*do\s+shell|.*javascript)",
+    {"id": "X-PROC-OSASCRIPT",
+     "layer": "execution", "data_point": "processes", "weight": 0.72,
+     "pattern": r"(?i)osascript\s+(-e\s+['\"].*do\s+shell|.*javascript)",
      "severity": "high", "confidence": 0.82, "dual_use": False,
      "desc": "AppleScript executing shell command or JavaScript (T1059.002)", "mitre": "T1059.002"},
-    {"pattern": r"(?i)launchctl\s+(submit|load)\s+.*(/tmp/|/var/tmp/|/dev/shm/)",
+    {"id": "X-PROC-LAUNCHCTL-TMP",
+     "layer": "execution", "data_point": "processes", "weight": 0.88,
+     "pattern": r"(?i)launchctl\s+(submit|load)\s+.*(/tmp/|/var/tmp/|/dev/shm/)",
      "severity": "critical", "confidence": 0.95, "dual_use": False,
      "desc": "launchctl loading service from temp/memory path", "mitre": "T1543.004"},
-    {"pattern": r"(?i)(perl|ruby)\s+-e\s+['\"].*exec\s*\(",
+    {"id": "X-PROC-PERL-RUBY-EXEC",
+     "layer": "execution", "data_point": "processes", "weight": 0.70,
+     "pattern": r"(?i)(perl|ruby)\s+-e\s+['\"].*exec\s*\(",
      "severity": "high", "confidence": 0.80, "dual_use": False,
      "desc": "Perl/Ruby one-liner process execution", "mitre": "T1059"},
     # ── Keylogging / exfiltration ─────────────────────────────────────────────
-    {"pattern": r"(?i)(keylogger|keystroke|pynput|pynput\.keyboard|evdev.*grab)",
+    {"id": "X-PROC-KEYLOGGER",
+     "layer": "execution", "data_point": "processes", "weight": 0.82,
+     "pattern": r"(?i)(keylogger|keystroke|pynput|pynput\.keyboard|evdev.*grab)",
      "severity": "critical", "confidence": 0.90, "dual_use": False,
      "desc": "Keylogger library or process", "mitre": "T1056.001"},
-    {"pattern": r"(?i)(dnscat|iodine|dns2tcp|dnscrypt.*tunnel)",
+    {"id": "X-PROC-DNS-TUNNEL",
+     "layer": "execution", "data_point": "processes", "weight": 0.82,
+     "pattern": r"(?i)(dnscat|iodine|dns2tcp|dnscrypt.*tunnel)",
      "severity": "high", "confidence": 0.90, "dual_use": False,
      "desc": "DNS tunnelling tool (C2/exfil via DNS)", "mitre": "T1071.004"},
 ]
@@ -326,3 +382,117 @@ def get_tactic(technique: str) -> str:
 
 def severity_to_score(severity: str) -> float:
     return SEVERITY_SCORE.get(severity.lower(), 0.5)
+
+
+# ── 7 stand-alone high-confidence rules ──────────────────────────────────────
+# These promote to findings at confidence ≥ 0.95 even without cross-layer
+# corroboration because they are individually catastrophic.
+
+STANDALONE_RULES: list[dict] = [
+    {
+        "id":          "S-APP-MALHASH",
+        "layer":       "surface",
+        "data_point":  "apps",
+        "severity":    "critical",
+        "weight":      0.90,
+        "stand_alone": True,
+        "desc":        "Application binary hash matches known-malware database",
+        "mitre":       "T1204.002",
+        "match": lambda item: bool(item.get("malware_hash_hit") or item.get("threat_hash_match")),
+    },
+    {
+        "id":          "S-CFG-IAM-WILDCARD",
+        "layer":       "surface",
+        "data_point":  "configs",
+        "severity":    "critical",
+        "weight":      0.88,
+        "stand_alone": True,
+        "desc":        "IAM policy grants wildcard (*:*) access to privileged actions",
+        "mitre":       "T1098",
+        "match": lambda item: (
+            "*:*" in (item.get("content") or "")
+            and any(k in (item.get("path") or "").lower()
+                    for k in ("iam", "policy", "role", "permission"))
+        ),
+    },
+    {
+        "id":          "E-PORT-DB-EXTERNAL",
+        "layer":       "exposure",
+        "data_point":  "ports",
+        "severity":    "critical",
+        "weight":      0.85,
+        "stand_alone": True,
+        "desc":        "Database port (MySQL/Postgres/MongoDB/Redis/ES) bound to all interfaces",
+        "mitre":       "T1190",
+        "match": lambda item: (
+            int(item.get("port", 0) or 0) in {3306, 5432, 27017, 6379, 9200, 5984, 1521}
+            and item.get("bind_addr", item.get("addr", "")) in ("0.0.0.0", "::")
+        ),
+    },
+    {
+        "id":          "X-PROC-HOLLOWING",
+        "layer":       "execution",
+        "data_point":  "processes",
+        "severity":    "critical",
+        "weight":      0.95,
+        "stand_alone": True,
+        "desc":        "Process hollowing — in-memory image hash differs from on-disk binary",
+        "mitre":       "T1055.012",
+        "match": lambda item: (
+            item.get("image_disk_sha256")
+            and item.get("image_mem_sha256")
+            and item["image_disk_sha256"] != item["image_mem_sha256"]
+        ),
+    },
+    {
+        "id":          "X-PROC-HIDDEN",
+        "layer":       "execution",
+        "data_point":  "processes",
+        "severity":    "critical",
+        "weight":      0.93,
+        "stand_alone": True,
+        "desc":        "Kernel PID list includes process absent from userspace enumeration (rootkit indicator)",
+        "mitre":       "T1014",
+        "match": lambda item: bool(item.get("kernel_only") or item.get("hidden_process")),
+    },
+    {
+        "id":          "X-AR-IFEO-HIJACK",
+        "layer":       "execution",
+        "data_point":  "autoruns",
+        "severity":    "critical",
+        "weight":      0.92,
+        "stand_alone": True,
+        "desc":        "Image File Execution Options Debugger set to non-approved binary (IFEO hijack)",
+        "mitre":       "T1546.012",
+        "match": lambda item: (
+            "ifeo" in (item.get("path") or item.get("label") or "").lower()
+            or item.get("ifeo_hijack")
+        ),
+    },
+    {
+        "id":          "X-AR-WINLOGON-SHELL",
+        "layer":       "execution",
+        "data_point":  "autoruns",
+        "severity":    "critical",
+        "weight":      0.92,
+        "stand_alone": True,
+        "desc":        "Winlogon Shell value set to non-standard binary (credential harvesting)",
+        "mitre":       "T1547.004",
+        "match": lambda item: (
+            "winlogon" in (item.get("path") or item.get("key") or "").lower()
+            and item.get("program", "") not in ("explorer.exe", "", None)
+        ),
+    },
+]
+
+
+def all_rules_by_data_point() -> dict[str, list[dict]]:
+    """Group every rule (existing + stand-alone) by data_point for the engine dispatcher."""
+    from collections import defaultdict
+    out: dict[str, list] = defaultdict(list)
+    for rule_list in (PROCESS_RULES, STANDALONE_RULES):
+        for r in rule_list:
+            dp = r.get("data_point", "")
+            if dp:
+                out[dp].append(r)
+    return dict(out)

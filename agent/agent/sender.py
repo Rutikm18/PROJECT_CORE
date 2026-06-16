@@ -24,8 +24,12 @@ log = logging.getLogger("agent.sender")
 
 # How many bytes the spool file may grow to before we drop oldest lines (~50 MB)
 _SPOOL_MAX_BYTES = 50 * 1024 * 1024
-# How often (seconds) to retry spool when manager is unreachable
-_SPOOL_RETRY_INTERVAL = 30
+# Offline reprobe backoff: probe quickly right after a drop (the manager is
+# often back within a second or two), then back off to the ceiling so a long
+# outage doesn't hammer the network. Was a flat 30 s, which added up to 30 s of
+# recovery latency on every transient blip.
+_SPOOL_RETRY_MIN = 2
+_SPOOL_RETRY_MAX = 30
 # Connectivity probe timeout (seconds)
 _PROBE_TIMEOUT = 5
 # Consecutive 401s from an "online" manager before triggering re-enrollment
@@ -108,6 +112,7 @@ class Sender:
         self._stop      = threading.Event()
         self._ctx       = self._build_ssl_ctx()
         self._online    = False   # tracks last known manager state
+        self._last_contact_ts = 0.0   # epoch of last confirmed manager contact
 
         # Disk spool — persists payloads when manager is unreachable.
         # NOTE: never derive this from __file__; PyInstaller bundles the module
@@ -163,6 +168,32 @@ class Sender:
     def stop(self):
         self._stop.set()
 
+    def spool_envelope(self, envelope: dict) -> None:
+        """Persist one envelope straight to the disk spool.
+
+        Wired to the Orchestrator as its overflow sink: when the in-memory queue
+        is full, the evicted envelope lands here instead of being dropped, and is
+        replayed once the backlog drains. Thread-safe via DiskSpool's lock.
+        """
+        self._spool.write(envelope)
+
+    def link_state(self) -> dict:
+        """Snapshot of manager connectivity, for the agent_health heartbeat.
+
+        Lets the dashboard show per-agent link health: whether the agent last
+        reached the manager, how much telemetry is buffered to disk while
+        offline, and whether the key is being rejected. `last_contact_ts` is 0
+        until the first successful contact; `seconds_since_contact` is None then.
+        """
+        last = self._last_contact_ts
+        return {
+            "manager_online":        self._online,
+            "spool_bytes":           self._spool.size(),
+            "auth_failures":         self._auth_fail_count,
+            "last_contact_ts":       int(last) if last else 0,
+            "seconds_since_contact": int(time.time() - last) if last else None,
+        }
+
     # ── Connectivity probe ────────────────────────────────────────────────────
 
     def _probe(self) -> bool:
@@ -181,13 +212,17 @@ class Sender:
 
     def _drain_loop(self):
         spool_check = 0.0
+        probe_delay = _SPOOL_RETRY_MIN
         while not self._stop.is_set():
-            # Periodically retry spool when we know we're offline
+            # Reprobe when offline, with fast-first backoff (2s → 30s) so a
+            # transient blip recovers in ~2s instead of waiting a flat 30s.
             now = time.time()
-            if not self._online and (now - spool_check) >= _SPOOL_RETRY_INTERVAL:
+            if not self._online and (now - spool_check) >= probe_delay:
                 spool_check = now
                 if self._probe():
+                    probe_delay = _SPOOL_RETRY_MIN          # reset for next outage
                     self._online = True
+                    self._last_contact_ts = time.time()
                     if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
                         log.warning(
                             "Manager back online after %d auth failures — "
@@ -208,8 +243,9 @@ class Sender:
                         for env in spooled:
                             self.queue.put_nowait(env)
                 else:
-                    log.debug("Manager still unreachable — spool has %d bytes",
-                              self._spool.size())
+                    probe_delay = min(probe_delay * 2, _SPOOL_RETRY_MAX)
+                    log.debug("Manager still unreachable — spool has %d bytes, "
+                              "next probe in %ds", self._spool.size(), probe_delay)
 
             try:
                 envelope = self.queue.get(timeout=1)
@@ -227,6 +263,9 @@ class Sender:
                 log.warning("Spooling %s to disk", envelope.get("section"))
                 self._spool.write(envelope)
                 self._online = False
+                # Just went offline — reprobe quickly (fast-first backoff).
+                probe_delay = _SPOOL_RETRY_MIN
+                spool_check = 0.0
                 # If auth failures crossed the threshold and manager is reachable,
                 # the key is invalid — trigger re-enrollment and clear bad spool.
                 if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
@@ -291,6 +330,7 @@ class Sender:
                         if not self._online:
                             log.info("Manager connection restored")
                         self._online = True
+                        self._last_contact_ts = time.time()
                         self._auth_fail_count = 0
                         log.debug("Sent %s → 200", section)
                         return True

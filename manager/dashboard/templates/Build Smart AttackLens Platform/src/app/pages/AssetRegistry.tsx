@@ -56,6 +56,15 @@ interface Asset {
   battery_charging: boolean | null;
   battery_condition: string;
   battery_cycles: number | null;
+  // Manager-link health from the agent_health heartbeat (null = older agent).
+  link: {
+    status: "healthy" | "degraded" | "auth_failed";
+    manager_online: boolean;
+    spool_bytes: number;
+    auth_failures: number;
+    last_contact_ts: number;
+    seconds_since_contact: number | null;
+  } | null;
 }
 
 interface TopoNode {
@@ -162,6 +171,36 @@ function TierBadge({ tier }: { tier: string }) {
   return (
     <span className={cn("px-2 py-0.5 text-[10px] font-bold rounded-full border capitalize tracking-wide", cfg.bg, cfg.text, cfg.border)}>
       {tier}
+    </span>
+  );
+}
+
+// Per-agent manager-link health. Surfaces the agent's own view of the link
+// (does it reach the manager, is telemetry spooling to disk, is the key being
+// rejected) — distinct from `status`, which is the manager's last-seen view.
+function LinkBadge({ link }: { link: Asset["link"] }) {
+  if (!link) return null;
+  const cfg = {
+    healthy:     { label: "Link OK",       dot: "#16a34a", text: "text-green-300", border: "border-green-400/30", bg: "bg-green-500/10" },
+    degraded:    { label: "Link degraded", dot: "#d97706", text: "text-amber-300", border: "border-amber-400/30", bg: "bg-amber-500/10" },
+    auth_failed: { label: "Auth failing",  dot: "#dc2626", text: "text-red-300",   border: "border-red-400/30",   bg: "bg-red-500/10" },
+  }[link.status] ?? { label: link.status, dot: "#9ca3af", text: "text-gray-300", border: "border-white/10", bg: "bg-white/10" };
+
+  const detail = [
+    link.seconds_since_contact == null
+      ? "never reached manager"
+      : `last contact ${link.seconds_since_contact}s ago`,
+    link.spool_bytes > 0 ? `${(link.spool_bytes / 1024).toFixed(0)} KB spooled offline` : null,
+    link.auth_failures > 0 ? `${link.auth_failures} auth failure(s)` : null,
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <span
+      title={detail}
+      className={cn("inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border", cfg.bg, cfg.text, cfg.border)}
+    >
+      <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: cfg.dot }} />
+      {cfg.label}
     </span>
   );
 }
@@ -342,6 +381,7 @@ function AssetDetailModal({ asset, onClose }: { asset: Asset; onClose: () => voi
                   {statusCfg.label}
                 </span>
                 <TierBadge tier={asset.asset_tier} />
+                <LinkBadge link={asset.link} />
                 {asset.os && (
                   <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/10 text-gray-300 text-[11px] font-medium border border-white/10">
                     {asset.os} {asset.arch}

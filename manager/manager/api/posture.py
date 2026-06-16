@@ -18,7 +18,9 @@ CIS Controls mapped to real agent data fields:
   SIP, Gatekeeper, FileVault, Firewall, XProtect, Secure Boot,
   Auto Update, Screensaver lock + timeout, SSH password auth,
   SSH root login, Remote Login (SSH), Screen Sharing, Remote Management,
-  Suspicious shell configs, Lockdown Mode.
+  Suspicious shell configs, Lockdown Mode, Audit subsystem, Password policy,
+  Guest account, Automatic login, Automatic update install, Network time,
+  File/printer sharing.
 """
 from __future__ import annotations
 
@@ -163,6 +165,68 @@ def _dev_tools(sec, _s, _c):
     return "pass", v
 
 
+# ── CIS expansion checks ──────────────────────────────────────────────────────
+
+def _audit_enabled(sec, _s, _c):
+    v = sec.get("audit_enabled")
+    if v is None:           return "unknown", _NA
+    if v is True:
+        flags = sec.get("audit_flags")
+        return "pass", f"auditd active{f' (flags: {flags})' if flags else ''}"
+    return "fail", "audit subsystem not running"
+
+
+def _password_policy(sec, _s, _c):
+    configured = sec.get("pw_policy_configured")
+    if configured is None:  return "unknown", _NA
+    if not configured:      return "fail", "no password policy configured"
+    n = sec.get("pw_min_length")
+    if n is None:           return "warn", "policy set, minimum length unknown"
+    if n >= 8:              return "pass", f"min length {n}"
+    return "fail", f"min length {n} (<8)"
+
+
+def _guest_account(sec, _s, _c):
+    v = sec.get("guest_account")
+    if v is None:           return "unknown", _NA
+    return ("fail" if v is True else "pass"), ("enabled" if v else "disabled")
+
+
+def _auto_login(sec, _s, _c):
+    v = sec.get("auto_login_user")
+    if v is None:           return "unknown", _NA
+    if v == "":             return "pass", "disabled"
+    return "fail", f"auto-login enabled for {v!r}"
+
+
+def _auto_update_install(sec, _s, _c):
+    v = sec.get("auto_update_install")
+    if v is None:           return "unknown", _NA
+    crit = sec.get("critical_update_install")
+    if v is True:
+        return "pass", f"install on{'' if crit is not False else ' (critical: off)'}"
+    return "fail", "macOS updates not auto-installed"
+
+
+def _network_time(sec, _s, _c):
+    v = sec.get("network_time")
+    if v is None:           return "unknown", _NA
+    if v is True:
+        srv = sec.get("time_server")
+        return "pass", f"on{f' ({srv})' if srv else ''}"
+    return "fail", "network time sync off"
+
+
+def _sharing_services(sec, _s, _c):
+    fs = sec.get("file_sharing")
+    ps = sec.get("printer_sharing")
+    if fs is None and ps is None:   return "unknown", _NA
+    on = [n for n, v in (("file", fs), ("printer", ps)) if v is True]
+    if on:
+        return "fail", f"{', '.join(on)} sharing enabled"
+    return "pass", "file & printer sharing off"
+
+
 # Master check registry
 _CHECKS = [
     # id, name, cis_control, severity, mitre, remediation, fn
@@ -245,6 +309,42 @@ _CHECKS = [
      "T1203",
      "Enable for high-risk users: System Settings → Privacy & Security → Lockdown Mode. Limits attack surface significantly.",
      _lockdown_mode),
+
+    # ── CIS expansion ──────────────────────────────────────────────────────
+    ("AUD",  "Audit Subsystem Enabled",            8, "high",
+     "T1562.008",
+     "Enable BSM auditing: `sudo launchctl enable system/com.apple.auditd` and ensure /etc/security/audit_control has active flags (e.g. `lo,aa`).",
+     _audit_enabled),
+
+    ("PWP",  "Password Policy (min length ≥8)",    5, "high",
+     "T1110",
+     "Set an account policy: `pwpolicy -setglobalpolicy \"minChars=8\"` (or enforce via MDM). Prevents weak/short passwords.",
+     _password_policy),
+
+    ("GST",  "Guest Account Disabled",             5, "medium",
+     "T1078",
+     "System Settings → Users & Groups → Guest User → Off (or `sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false`).",
+     _guest_account),
+
+    ("ALI",  "Automatic Login Disabled",           5, "high",
+     "T1078",
+     "System Settings → Lock Screen → Automatic login → Off. Auto-login bypasses the login password entirely.",
+     _auto_login),
+
+    ("AUI",  "Automatic Update Installation",      7, "high",
+     "T1195",
+     "System Settings → General → Software Update → enable 'Install macOS updates' and 'Install Security Responses'.",
+     _auto_update_install),
+
+    ("NTP",  "Network Time Synchronisation",       8, "medium",
+     "T1070.006",
+     "Enable: `sudo systemsetup -setusingnetworktime on`. Accurate time is required for trustworthy audit logs and certificate validation.",
+     _network_time),
+
+    ("SHR",  "File / Printer Sharing Disabled",    4, "medium",
+     "T1135",
+     "System Settings → General → Sharing → turn off File Sharing and Printer Sharing unless explicitly required.",
+     _sharing_services),
 ]
 
 # CIS Control groups — maps control number to label
@@ -253,6 +353,7 @@ _CIS_GROUPS = {
     4:  "Secure Configuration",
     5:  "Account Management",
     7:  "Vulnerability Management",
+    8:  "Audit Log Management",
     10: "Malware Defenses",
     12: "Network Infrastructure",
 }
@@ -394,15 +495,13 @@ def make_posture_router(db: "Database", intel_db: "IntelDB") -> APIRouter:
         if not agent:
             raise HTTPException(404, "Agent not found")
 
-        sec_map, sysctl_map, cfg_map = await asyncio.gather(
-            db.get_latest_section_per_agent("security"),
-            db.get_latest_section_per_agent("sysctl"),
-            db.get_latest_section_per_agent("configs"),
-        )
+        # Single-agent fetch: one query for this agent's three posture sections,
+        # instead of three whole-fleet scans we'd immediately index down to one.
+        sections = await db.get_latest_sections(agent_id, ["security", "sysctl", "configs"])
 
-        security = sec_map.get(agent_id, {})
-        sysctl   = sysctl_map.get(agent_id, [])
-        configs  = cfg_map.get(agent_id, [])
+        security = sections.get("security", {})
+        sysctl   = sections.get("sysctl", [])
+        configs  = sections.get("configs", [])
 
         if not isinstance(sysctl, list):  sysctl = []
         if not isinstance(configs, list): configs = []

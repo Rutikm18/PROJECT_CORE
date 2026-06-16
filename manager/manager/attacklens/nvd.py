@@ -6,6 +6,15 @@ Results are cached in intel.db for 24 hours to respect rate limits.
 
 API reference: https://nvd.nist.gov/developers/vulnerabilities
 Rate limit (no key): 5 requests / 30 seconds.
+
+Accuracy notes:
+  • NVD keywordSearch is fuzzy — versionStart/versionEnd query params are only
+    honoured with virtualMatchString (CPE). For keyword searches we post-filter
+    using CPE version ranges from each CVE's configurations block.
+  • Minimum keyword length is enforced to suppress absurd matches (e.g. "go"
+    matching every Golang CVE).
+  • _parse_cve now extracts references and per-CPE version ranges so downstream
+    intel enrichment (KEV/exploit/version filtering) works.
 """
 from __future__ import annotations
 
@@ -18,6 +27,12 @@ from typing import Optional
 
 import aiohttp
 
+try:
+    from packaging.version import InvalidVersion, Version
+except Exception:  # pragma: no cover — packaging is a stdlib-adjacent dep
+    Version = None         # type: ignore[assignment]
+    InvalidVersion = Exception  # type: ignore[assignment]
+
 log = logging.getLogger("manager.threat.nvd")
 
 NVD_API_URL    = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -26,6 +41,13 @@ REQUEST_DELAY  = 7.0          # seconds between NVD requests (rate limit)
 MAX_RESULTS    = 10           # max CVEs per package lookup
 SYNC_PAGE_SIZE = 200          # bounded page size for continuous modified sync
 TIMEOUT        = aiohttp.ClientTimeout(total=20)
+
+# Suppress lookups for absurdly short / common keywords that produce mostly noise
+MIN_KEYWORD_LEN = 4
+COMMON_NOISY_KEYWORDS = frozenset({
+    "git", "go", "vi", "lib", "ssh", "tls", "ssl", "core", "util", "base",
+    "test", "demo", "data", "main", "tool", "node", "html",
+})
 
 # CVSS → severity mapping
 def cvss_to_severity(score: Optional[float]) -> str:
@@ -41,6 +63,106 @@ def cvss_to_severity(score: Optional[float]) -> str:
 def _pkg_keyword(name: str, version: str = "") -> str:
     kw = re.sub(r"[^a-zA-Z0-9\.\-_]", " ", name).strip()
     return kw
+
+
+def _parse_version(v: str):
+    """Best-effort version parse; returns None on garbage so callers can skip filtering."""
+    if not v or v in ("*", "-", "any"):
+        return None
+    try:
+        return Version(v) if Version else None
+    except InvalidVersion:
+        # Fallback: take leading numeric.dotted prefix
+        m = re.match(r"\d+(?:\.\d+){0,3}", v)
+        if not m:
+            return None
+        try:
+            return Version(m.group(0)) if Version else None
+        except InvalidVersion:
+            return None
+
+
+def _versions_equal(a: str, b: str) -> bool:
+    """
+    Equality that is stricter than _parse_version for CPE exact-match comparisons.
+    Handles vendor suffixes like OpenSSL's 1.0.1f / 1.0.1g that strip to the same
+    numeric prefix but are distinct releases.
+    """
+    if not a or not b:
+        return False
+    if a.strip().lower() == b.strip().lower():
+        return True
+    pa, pb = _parse_version(a), _parse_version(b)
+    if pa is None or pb is None:
+        return False
+    if pa != pb:
+        return False
+    # Numeric prefix matches — require the trailing suffixes match too
+    suf_a = re.sub(r"^\d+(?:\.\d+){0,3}", "", a).strip().lower()
+    suf_b = re.sub(r"^\d+(?:\.\d+){0,3}", "", b).strip().lower()
+    return suf_a == suf_b
+
+
+def cve_affects_version(cve: dict, installed_version: str) -> bool:
+    """
+    Decide whether `cve` applies to the installed version using its CPE matches.
+
+    Returns True if ANY cpe_match's range covers the installed version. If the
+    CVE has no usable version range data, we conservatively return True
+    (preserves existing behaviour for old cached entries).
+    """
+    if not installed_version:
+        return True
+    inst = _parse_version(installed_version)
+    if inst is None:
+        return True
+
+    matches = cve.get("affected_cpe_matches") or []
+    if not matches:
+        return True
+
+    saw_range = False
+    for m in matches:
+        if not m.get("vulnerable", True):
+            continue
+        criteria   = m.get("criteria", "")
+        # CPE format: cpe:2.3:part:vendor:product:version:...
+        cpe_parts  = criteria.split(":")
+        cpe_ver    = cpe_parts[5] if len(cpe_parts) > 5 else "*"
+        v_start_i  = m.get("versionStartIncluding")
+        v_start_e  = m.get("versionStartExcluding")
+        v_end_i    = m.get("versionEndIncluding")
+        v_end_e    = m.get("versionEndExcluding")
+
+        if not any([v_start_i, v_start_e, v_end_i, v_end_e, cpe_ver not in ("*", "-")]):
+            continue
+        saw_range = True
+
+        # Exact-version CPE entry: only matches if equal.
+        if cpe_ver not in ("*", "-") and not any([v_start_i, v_start_e, v_end_i, v_end_e]):
+            if _versions_equal(cpe_ver, installed_version):
+                return True
+            continue
+
+        ok = True
+        for bound, op in (
+            (v_start_i, "ge"), (v_start_e, "gt"),
+            (v_end_i,   "le"), (v_end_e,   "lt"),
+        ):
+            if not bound:
+                continue
+            b = _parse_version(bound)
+            if b is None:
+                continue
+            if op == "ge" and not (inst >= b): ok = False
+            if op == "gt" and not (inst >  b): ok = False
+            if op == "le" and not (inst <= b): ok = False
+            if op == "lt" and not (inst <  b): ok = False
+        if ok:
+            return True
+
+    # If every match had a range and none covered us, the CVE doesn't apply.
+    return not saw_range
 
 
 def _nvd_dt(dt: datetime) -> str:
@@ -107,6 +229,12 @@ class CVELookup:
     # ── NVD API calls ─────────────────────────────────────────────────────────
 
     async def _fetch_nvd(self, package: str, version: str) -> list[dict]:
+        # Suppress noisy keywords that produce mostly false positives
+        kw_norm = package.lower().strip()
+        if len(kw_norm) < MIN_KEYWORD_LEN or kw_norm in COMMON_NOISY_KEYWORDS:
+            log.debug("Skipping NVD lookup for short/noisy keyword: %r", package)
+            return []
+
         global _last_nvd_call
         async with _nvd_lock:
             # Rate limiting: wait if we called too recently
@@ -116,12 +244,13 @@ class CVELookup:
 
             keyword = _pkg_keyword(package, version)
             params: dict = {
-                "keywordSearch": keyword,
-                "resultsPerPage": MAX_RESULTS,
+                "keywordSearch":     keyword,
+                "keywordExactMatch": "",   # presence-only flag → exact substring match
+                "resultsPerPage":    MAX_RESULTS,
             }
-            if version:
-                params["versionStart"] = version
-                params["versionStartType"] = "including"
+            # versionStart/versionEnd are only honoured with virtualMatchString
+            # (CPE-based). For keyword searches we post-filter using
+            # cve_affects_version() below.
 
             try:
                 async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
@@ -138,9 +267,15 @@ class CVELookup:
                 results = []
                 for vuln in data.get("vulnerabilities", []):
                     parsed = self._parse_cve(vuln.get("cve", {}))
-                    if parsed:
-                        results.append(parsed)
-                        await self._db.upsert_cve(parsed)
+                    if not parsed:
+                        continue
+                    # Post-filter by installed version using CPE version ranges
+                    if version and not cve_affects_version(parsed, version):
+                        log.debug("NVD: %s does not affect %s %s — dropping",
+                                  parsed["cve_id"], package, version)
+                        continue
+                    results.append(parsed)
+                    await self._db.upsert_cve(parsed)
                 return results
 
             except Exception as exc:
@@ -242,25 +377,60 @@ class CVELookup:
                 if d.get("lang") == "en" and d.get("value", "").startswith("CWE-"):
                     cwes.append(d["value"])
 
-        # CPE affected
-        cpe_list: list[str] = []
+        # CPE affected — preserve version ranges so callers can filter by installed version.
+        cpe_list:    list[str] = []
+        cpe_matches: list[dict] = []
         for cfg in cve.get("configurations", []):
             for node in cfg.get("nodes", []):
                 for cpe_match in node.get("cpeMatch", []):
-                    if cpe_match.get("vulnerable"):
-                        cpe_list.append(cpe_match.get("criteria", ""))
+                    if not cpe_match.get("vulnerable"):
+                        continue
+                    crit = cpe_match.get("criteria", "")
+                    if crit:
+                        cpe_list.append(crit)
+                    cpe_matches.append({
+                        "criteria":              crit,
+                        "vulnerable":            cpe_match.get("vulnerable", True),
+                        "versionStartIncluding": cpe_match.get("versionStartIncluding"),
+                        "versionStartExcluding": cpe_match.get("versionStartExcluding"),
+                        "versionEndIncluding":   cpe_match.get("versionEndIncluding"),
+                        "versionEndExcluding":   cpe_match.get("versionEndExcluding"),
+                    })
+
+        # References — needed for exploit-availability heuristics downstream.
+        refs:        list[str] = []
+        ref_tags:    set[str]  = set()
+        for ref in cve.get("references", []):
+            url = ref.get("url", "")
+            if url:
+                refs.append(url)
+            for t in ref.get("tags", []) or []:
+                ref_tags.add(t)
+
+        ref_blob = " ".join(refs).lower() + " " + desc.lower()
+        exploit_available = bool(
+            "Exploit" in ref_tags
+            or "exploit-db" in ref_blob
+            or "metasploit" in ref_blob
+            or "proof-of-concept" in ref_blob
+            or "poc" in ref_blob
+        )
 
         published = cve.get("published", "")
         modified  = cve.get("lastModified", "")
 
         return {
-            "cve_id":       cve_id,
-            "description":  desc,
-            "cvss_score":   cvss_score,
-            "cvss_vector":  cvss_vector,
-            "severity":     severity,
-            "cwe_ids":      cwes,
-            "published_at": published,
-            "modified_at":  modified,
-            "affected_cpe": cpe_list[:20],  # cap to avoid huge blobs
+            "cve_id":               cve_id,
+            "description":          desc,
+            "cvss_score":           cvss_score,
+            "cvss_vector":          cvss_vector,
+            "severity":             severity,
+            "cwe_ids":              cwes,
+            "published_at":         published,
+            "modified_at":          modified,
+            "affected_cpe":         cpe_list[:20],
+            "affected_cpe_matches": cpe_matches[:20],
+            "references":           refs[:20],
+            "reference_tags":       sorted(ref_tags),
+            "exploit_available":    exploit_available,
         }

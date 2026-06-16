@@ -54,12 +54,43 @@ def is_running(label: str = _AGENT_LABEL) -> bool:
     return r.returncode == 0 and '"PID"' in r.stdout
 
 
+def _plist_for(label: str) -> str:
+    return _WATCHDOG_PLIST if label == _WATCHDOG_LABEL else _AGENT_PLIST
+
+
+def _bootstrap(label: str) -> bool:
+    """
+    Load a daemon into the running system domain using the modern launchctl
+    API (macOS 10.10+).  `enable` clears any prior `disable` override so the
+    daemon actually starts; `bootstrap system` loads + (with RunAtLoad) starts
+    it.  Falls back to the deprecated `load -w` on very old macOS.
+    """
+    plist = _plist_for(label)
+    _lctl("enable", f"system/{label}")              # clear any disable override
+    r = _lctl("bootstrap", "system", plist)
+    if r.returncode == 0:
+        return True
+    # Already bootstrapped → just kick it.
+    if "already" in (r.stderr or "").lower():
+        return _lctl("kickstart", "-k", f"system/{label}").returncode == 0
+    # macOS 10.9 and earlier
+    return _lctl("load", "-w", plist).returncode == 0
+
+
+def _bootout(label: str) -> bool:
+    """Unload a daemon from the system domain (modern API, legacy fallback)."""
+    r = _lctl("bootout", f"system/{label}")
+    if r.returncode == 0:
+        return True
+    return _lctl("unload", "-w", _plist_for(label)).returncode == 0
+
+
 def start(label: str = _AGENT_LABEL) -> bool:
+    # If already loaded, kickstart restarts it; otherwise bootstrap loads it.
     r = _lctl("kickstart", f"system/{label}")
     if r.returncode != 0:
-        # macOS 10.x compatibility
-        r = _lctl("load", "-w", _AGENT_PLIST)
-    return r.returncode == 0
+        return _bootstrap(label)
+    return True
 
 
 def stop(label: str = _AGENT_LABEL) -> bool:
@@ -202,13 +233,15 @@ def install_plist(
     if which in ("agent", "both"):
         xml = _agent_plist_xml(config_path, agent_bin, log_dir)
         _write_plist(_AGENT_PLIST, xml)
-        _lctl("load", "-w", _AGENT_PLIST)
+        _bootout(_AGENT_LABEL)          # idempotent: drop any stale instance first
+        _bootstrap(_AGENT_LABEL)
         log.info("LaunchDaemon loaded: %s", _AGENT_LABEL)
 
     if which in ("watchdog", "both"):
         xml = _watchdog_plist_xml(config_path, watchdog_bin, log_dir)
         _write_plist(_WATCHDOG_PLIST, xml)
-        _lctl("load", "-w", _WATCHDOG_PLIST)
+        _bootout(_WATCHDOG_LABEL)
+        _bootstrap(_WATCHDOG_LABEL)
         log.info("LaunchDaemon loaded: %s", _WATCHDOG_LABEL)
 
 
@@ -221,7 +254,7 @@ def uninstall_plist(which: str = "both") -> None:
         pairs.append((_AGENT_LABEL, _AGENT_PLIST))
 
     for label, path in pairs:
-        _lctl("unload", "-w", path)
+        _bootout(label)
         if os.path.exists(path):
             os.unlink(path)
             log.info("Removed plist: %s", path)

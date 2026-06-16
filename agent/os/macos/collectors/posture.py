@@ -43,6 +43,19 @@ class SecurityCollector(BaseCollector):
             # ── Screensaver / session lock ────────────────────────────────
             "screensaver_lock":      self._screensaver_lock(),      # require pw on wake?
             "screensaver_idle_sec":  self._screensaver_idle_sec(),
+            # ── CIS expansion: audit / accounts / updates / time / sharing ─
+            "audit_enabled":         self._audit_enabled(),         # CIS §3 / Ctrl 8
+            "audit_flags":           self._audit_flags(),
+            "pw_policy_configured":  self._pw_policy_configured(),  # CIS §5 / Ctrl 5
+            "pw_min_length":         self._pw_min_length(),
+            "guest_account":         self._guest_account(),         # CIS §5 / Ctrl 5
+            "auto_login_user":       self._auto_login_user(),
+            "auto_update_install":   self._auto_update_install(),   # CIS §7 / Ctrl 7
+            "critical_update_install": self._critical_update_install(),
+            "network_time":          self._network_time(),          # CIS §6 / Ctrl 8
+            "time_server":           self._time_server(),
+            "file_sharing":          self._file_sharing(),          # CIS §2 / Ctrl 4
+            "printer_sharing":       self._printer_sharing(),
             # ── AV / EDR ─────────────────────────────────────────────────
             "av_installed":          None,
             "av_product":            None,
@@ -205,6 +218,148 @@ class SecurityCollector(BaseCollector):
         # Lockdown Mode (macOS 13+): launchctl environment key
         out = _run(["launchctl", "getenv", "com.apple.security.lockdown"])
         return True if "1" in out else (False if out else None)
+
+    # ── CIS expansion helpers ─────────────────────────────────────────────────
+
+    def _svc_loaded(self, label: str) -> bool | None:
+        """Whether a launchd system service is loaded.
+
+        `launchctl list <label>` echoes a plist containing the label when the
+        service is loaded, and writes 'Could not find service' to stderr when it
+        is not.  Returns None only when neither signal is present (can't tell) —
+        never guesses 'disabled', so we don't mask an enabled sharing service.
+        """
+        out = _run(["launchctl", "list", label])
+        if label in out:
+            return True
+        err = _run(["launchctl", "list", label], stderr=True)
+        if "could not find" in err.lower() or "no such" in err.lower():
+            return False
+        return None
+
+    def _defaults_bool(self, domain: str, key: str) -> bool | None:
+        out = _run(["defaults", "read", domain, key]).strip()
+        if out == "1":
+            return True
+        if out == "0":
+            return False
+        return None
+
+    def _audit_enabled(self) -> bool | None:
+        """BSM audit subsystem (auditd) active?  CIS logging control."""
+        loaded = self._svc_loaded("com.apple.auditd")
+        if loaded:
+            return True
+        # Fallback: presence of a configured audit_control with active flags.
+        try:
+            with open("/etc/security/audit_control") as f:
+                for line in f:
+                    if line.strip().startswith("flags:") and line.split(":", 1)[1].strip():
+                        return True
+        except OSError:
+            return loaded   # None or False from the service probe
+        return loaded
+
+    def _audit_flags(self) -> str | None:
+        try:
+            with open("/etc/security/audit_control") as f:
+                for line in f:
+                    if line.strip().startswith("flags:"):
+                        return line.split(":", 1)[1].strip() or None
+        except OSError:
+            pass
+        return None
+
+    def _pw_policy_configured(self) -> bool | None:
+        """Whether a global password-content policy is set (length/age/lockout)."""
+        out = _run(["pwpolicy", "-getaccountpolicies"])
+        if not out:
+            return None
+        low = out.lower()
+        if "no accountpolicies" in low:
+            return False
+        if "policycontent" in low or "policyattribute" in low or "minimumlength" in low:
+            return True
+        return False
+
+    def _pw_min_length(self) -> int | None:
+        out = _run(["pwpolicy", "-getaccountpolicies"])
+        if not out:
+            return None
+        # Global policy expresses minimum length as `minimumLength` (plist int)
+        # or inside a content regex like `.{N,}` / `{N,}`.
+        m = re.search(r"minimumLength\D{0,40}?(\d+)", out, re.IGNORECASE | re.DOTALL)
+        if not m:
+            m = re.search(r"\{(\d+),\}", out)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+        return None
+
+    def _guest_account(self) -> bool | None:
+        return self._defaults_bool(
+            "/Library/Preferences/com.apple.loginwindow", "GuestEnabled"
+        )
+
+    def _auto_login_user(self) -> str | None:
+        """Configured automatic-login user, or '' when auto-login is off."""
+        out = _run(["defaults", "read",
+                    "/Library/Preferences/com.apple.loginwindow",
+                    "autoLoginUser"]).strip()
+        if not out or "does not exist" in out.lower():
+            return ""          # explicitly: no auto-login configured (good)
+        return out
+
+    def _auto_update_install(self) -> bool | None:
+        return self._defaults_bool(
+            "/Library/Preferences/com.apple.SoftwareUpdate",
+            "AutomaticallyInstallMacOSUpdates",
+        )
+
+    def _critical_update_install(self) -> bool | None:
+        return self._defaults_bool(
+            "/Library/Preferences/com.apple.SoftwareUpdate",
+            "CriticalUpdateInstall",
+        )
+
+    @staticmethod
+    def _needs_admin(out: str) -> bool:
+        # systemsetup prints this when not run as root; the agent daemon runs as
+        # root so this only trips in unprivileged test/dev contexts.
+        return "administrator access" in out.lower()
+
+    def _network_time(self) -> bool | None:
+        out = _run(["systemsetup", "-getusingnetworktime"])
+        if self._needs_admin(out):
+            return None
+        low = out.lower()
+        if "on" in low:
+            return True
+        if "off" in low:
+            return False
+        return None
+
+    def _time_server(self) -> str | None:
+        out = _run(["systemsetup", "-getnetworktimeserver"])
+        if self._needs_admin(out):
+            return None
+        # "Network Time Server: time.apple.com"
+        if ":" in out:
+            return out.split(":", 1)[1].strip() or None
+        return out.strip() or None
+
+    def _file_sharing(self) -> bool | None:
+        """SMB file sharing service."""
+        return self._svc_loaded("com.apple.smbd")
+
+    def _printer_sharing(self) -> bool | None:
+        out = _run(["cupsctl"])
+        for line in out.splitlines():
+            if "_share_printers" in line:
+                return line.strip().endswith("=1")
+        return None
 
 
 class SysctlCollector(BaseCollector):

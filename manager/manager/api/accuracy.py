@@ -165,6 +165,16 @@ def make_accuracy_router(intel_db: "IntelDB") -> APIRouter:
         )
         return _check_correlation_integrity(correlations, findings)
 
+    # ── Confidence engine precision ────────────────────────────────────────────
+    @router.get("/confidence")
+    async def confidence_metrics():
+        """
+        Engine-wide and per-rule confidence calibration from the feedback loop.
+        Returns precision_by_rule[], precision_overall, rejected_by_gate[].
+        Only populated after analysts have disposed at least some findings.
+        """
+        return await intel_db.compute_confidence_metrics()
+
     return router
 
 

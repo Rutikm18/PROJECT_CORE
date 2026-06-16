@@ -521,24 +521,53 @@ def _norm_containers(raw: Any) -> list:
 def _norm_security(raw: Any) -> dict:
     if not isinstance(raw, dict):
         return raw
+    # auto_login_user: "" means "no auto-login configured" (a PASS signal), which
+    # is distinct from None ("unknown"). _s_opt would collapse "" → None, so keep
+    # the string as-is and only coerce non-strings to None.
+    _al = raw.get("auto_login_user")
     return {
-        # macOS-specific
-        "sip":          _s_opt(raw.get("sip")),
-        "gatekeeper":   _s_opt(raw.get("gatekeeper")),
-        "filevault":    _s_opt(raw.get("filevault")),
-        "firewall":     _s_opt(raw.get("firewall")),
-        "xprotect":     _s_opt(raw.get("xprotect")),
-        "secure_boot":  _s_opt(raw.get("secure_boot")),
-        "lockdown_mode": _b_opt(raw.get("lockdown_mode")),
-        # Windows-specific (always None on macOS)
+        # ── macOS core controls ───────────────────────────────────────────
+        "sip":             _s_opt(raw.get("sip")),
+        "gatekeeper":      _s_opt(raw.get("gatekeeper")),
+        "filevault":       _s_opt(raw.get("filevault")),
+        "firewall":        _s_opt(raw.get("firewall")),
+        # NOTE: manager scorer reads `xprotect_version` (the rich collector's
+        # key), not the legacy `xprotect`. Emit the canonical name.
+        "xprotect_version": _s_opt(raw.get("xprotect_version", raw.get("xprotect"))),
+        "secure_boot":     _s_opt(raw.get("secure_boot")),
+        "dev_tools":       _s_opt(raw.get("dev_tools", raw.get("dev_tools_security"))),
+        "lockdown_mode":   _b_opt(raw.get("lockdown_mode")),
+        # ── SSH / remote access ───────────────────────────────────────────
+        "remote_login":          _b_opt(raw.get("remote_login")),
+        "remote_management":     _b_opt(raw.get("remote_management")),
+        "screen_sharing":        _b_opt(raw.get("screen_sharing")),
+        "ssh_password_auth":     _s_opt(raw.get("ssh_password_auth")),
+        "ssh_permit_root_login": _s_opt(raw.get("ssh_permit_root_login")),
+        # ── Session lock ──────────────────────────────────────────────────
+        "screensaver_lock":     _b_opt(raw.get("screensaver_lock")),
+        "screensaver_idle_sec": _i_opt(raw.get("screensaver_idle_sec")),
+        # ── CIS expansion: audit / accounts / updates / time / sharing ─────
+        "audit_enabled":           _b_opt(raw.get("audit_enabled")),
+        "audit_flags":             _s_opt(raw.get("audit_flags")),
+        "pw_policy_configured":    _b_opt(raw.get("pw_policy_configured")),
+        "pw_min_length":           _i_opt(raw.get("pw_min_length")),
+        "guest_account":           _b_opt(raw.get("guest_account")),
+        "auto_login_user":         _al if isinstance(_al, str) else None,
+        "auto_update_install":     _b_opt(raw.get("auto_update_install")),
+        "critical_update_install": _b_opt(raw.get("critical_update_install")),
+        "network_time":            _b_opt(raw.get("network_time")),
+        "time_server":             _s_opt(raw.get("time_server")),
+        "file_sharing":            _b_opt(raw.get("file_sharing")),
+        "printer_sharing":         _b_opt(raw.get("printer_sharing")),
+        # ── Windows-specific (always None on macOS) ───────────────────────
         "uac":          None,
         "bitlocker":    None,
         "defender":     None,
-        # Linux-specific (always None on macOS)
+        # ── Linux-specific (always None on macOS) ─────────────────────────
         "selinux":      None,
         "apparmor":     None,
         "ufw":          None,
-        # Cross-platform
+        # ── Cross-platform ────────────────────────────────────────────────
         "av_installed": _b_opt(raw.get("av_installed")),
         "av_product":   _s_opt(raw.get("av_product")),
         "os_patched":   _b_opt(raw.get("os_patched")),

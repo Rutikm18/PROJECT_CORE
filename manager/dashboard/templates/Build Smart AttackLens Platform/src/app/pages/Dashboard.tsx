@@ -400,9 +400,9 @@ export default function SecurityDashboard() {
               <BarChart3 className="w-5 h-5 text-orange-500" />
             </div>
             <div>
-              <h1 className="text-base font-bold text-gray-900">Security Dashboard</h1>
+              <h1 className="text-base font-bold text-gray-900">Agentic Exposure Management</h1>
               <p className="text-xs text-gray-500 mt-0.5">
-                Real-time posture · finding analytics · CIS compliance · threat intelligence overview
+                Autonomous exposure discovery · prioritisation · remediation across your entire attack surface
               </p>
             </div>
           </div>

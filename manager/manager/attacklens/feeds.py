@@ -43,6 +43,15 @@ THREATFOX_URL        = "https://threatfox-api.abuse.ch/api/v1/"
 SPAMHAUS_DROP_URL    = "https://www.spamhaus.org/drop/drop.txt"
 SPAMHAUS_EDROP_URL   = "https://www.spamhaus.org/drop/edrop.txt"
 CISA_KEV_URL         = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+# Ordered KEV sources, tried in sequence until one returns a valid catalog.
+# Primary is the official CISA feed; the cisagov/kev-data GitHub mirror is a
+# continuously-updated fallback used when cisa.gov rate-limits / blocks / times
+# out. Both expose the identical {"vulnerabilities":[...]} schema. (label, url)
+KEV_SOURCES = [
+    ("cisa.gov",                 CISA_KEV_URL),
+    ("github:cisagov/kev-data",  "https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json"),
+    ("github:cisagov/kev-data",  "https://raw.githubusercontent.com/cisagov/kev-data/main/known_exploited_vulnerabilities.json"),
+]
 RANSOMWARE_GROUPS_URL = "https://api.ransomware.live/groups"
 RANSOMWARE_VICTIMS_URL = "https://api.ransomware.live/recentvictims"
 HN_NEW_STORIES_URL   = "https://hacker-news.firebaseio.com/v0/newstories.json"
@@ -116,6 +125,8 @@ class FeedManager:
         self._domain_set:  set[str]       = set()
         self._domain_meta: dict[str, dict] = {}
         self._kev_set:   set[str]        = set()   # CISA KEV CVE IDs
+        self._kev_source:    str | None  = None     # which source last succeeded
+        self._kev_synced_at: float       = 0.0      # epoch of last successful KEV load
         self._actor_meta: dict[str, dict] = {}      # threat actors by lowercase name
         self._news_cache: list[dict]     = []       # recent security news
         self._spamhaus_cidrs: list[ipaddress.IPv4Network] = []
@@ -166,6 +177,8 @@ class FeedManager:
             "total_ips":       len(self._ip_set),
             "total_domains":   len(self._domain_set),
             "kev_cves":        len(self._kev_set),
+            "kev_source":      self._kev_source,
+            "kev_age_sec":     int(time.time() - self._kev_synced_at) if self._kev_synced_at else None,
             "threat_actors":   len(self._actor_meta),
             "spamhaus_cidrs":  len(self._spamhaus_cidrs),
             "news_items":      len(self._news_cache),
@@ -507,27 +520,53 @@ class FeedManager:
         return count
 
     async def _fetch_cisa_kev(self) -> int:
-        """CISA Known Exploited Vulnerabilities catalog."""
-        try:
-            async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
-                async with s.get(CISA_KEV_URL) as r:
-                    if r.status != 200:
-                        log.warning("CISA KEV returned %d", r.status)
-                        return 0
-                    j = await r.json(content_type=None)
-            count = 0
-            for vuln in j.get("vulnerabilities", []):
-                cve_id = str(vuln.get("cveID", "") or "").upper().strip()
-                if not cve_id:
+        """CISA Known Exploited Vulnerabilities catalog.
+
+        Resilient multi-source load: tries the official CISA feed first, then the
+        cisagov/kev-data GitHub mirror(s). The first source that returns a valid,
+        non-empty catalog wins; the rest are skipped. On total failure the
+        in-memory set and DB cache from the previous successful load are kept
+        (we never wipe KEV state just because every upstream is briefly down).
+        """
+        last_exc: Exception | None = None
+        for label, url in KEV_SOURCES:
+            try:
+                async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
+                    async with s.get(url, headers={"User-Agent": "AttackLens/1.0"}) as r:
+                        if r.status != 200:
+                            log.warning("KEV source %s returned %d", label, r.status)
+                            continue
+                        j = await r.json(content_type=None)
+
+                vulns = j.get("vulnerabilities", []) if isinstance(j, dict) else []
+                if not vulns:
+                    log.warning("KEV source %s returned no vulnerabilities", label)
                     continue
-                self._kev_set.add(cve_id)
-                await self._db.upsert_cisa_kev(cve_id, vuln)
-                count += 1
-            log.info("CISA KEV: %d vulnerabilities loaded", count)
-            return count
-        except Exception as exc:
-            log.warning("CISA KEV feed error: %s", exc)
-            return 0
+
+                count = 0
+                for vuln in vulns:
+                    cve_id = str(vuln.get("cveID", "") or "").upper().strip()
+                    if not cve_id:
+                        continue
+                    self._kev_set.add(cve_id)
+                    await self._db.upsert_cisa_kev(cve_id, vuln)
+                    count += 1
+
+                if count:
+                    self._kev_source    = label
+                    self._kev_synced_at = time.time()
+                    log.info("CISA KEV: %d vulnerabilities loaded from %s", count, label)
+                    return count
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                log.warning("KEV source %s failed: %s — trying next", label, exc)
+                continue
+
+        log.error("All KEV sources failed (last error: %s) — keeping cached catalog (%d CVEs)",
+                  last_exc, len(self._kev_set))
+        return 0
 
     async def _fetch_ransomware_live(self) -> int:
         """ransomware.live — active groups and recent victims."""
