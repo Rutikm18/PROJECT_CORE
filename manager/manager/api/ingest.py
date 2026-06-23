@@ -67,10 +67,41 @@ _STRICT_PAYLOAD = os.environ.get(
 # signal instead of silent blanks. Bounded by the fixed field vocabulary.
 _SCHEMA_GAPS: Counter = Counter()
 
+# Per-stage ingest counters — turns "no data" into "data stops at stage X".
+# Stages: received → decrypt_ok/decrypt_failed → unenrolled → duplicate →
+# stored_raw → index_ok/index_failed → detection_dispatched → queued.
+_INGEST_STATS: Counter = Counter()
+_LAST_INGEST_ERROR: dict = {"stage": None, "error": None, "ts": None}
+
 
 def schema_gap_stats() -> dict:
     """Snapshot of payload-schema gaps seen since boot (field → count)."""
     return dict(_SCHEMA_GAPS)
+
+
+def ingest_stats() -> dict:
+    """Per-stage ingest counters since boot, for the health/diagnostics endpoint.
+
+    Lets an operator pinpoint where telemetry stops: if `received` climbs but
+    `stored_raw` doesn't, the failure is in decrypt/dedup/store; if `stored_raw`
+    climbs but `index_ok` doesn't, Deep Analysis (the SQLite index) is the gap;
+    if `queued` climbs but raw never lands, the queue workers aren't draining.
+    """
+    return {
+        "counters":   dict(_INGEST_STATS),
+        "last_error": dict(_LAST_INGEST_ERROR),
+        "schema_gaps": dict(_SCHEMA_GAPS),
+        "strict_payload": _STRICT_PAYLOAD,
+    }
+
+
+def _stat(stage: str, n: int = 1) -> None:
+    _INGEST_STATS[stage] += n
+
+
+def _note_error(stage: str, error: str) -> None:
+    _INGEST_STATS[f"{stage}_failed"] += 1
+    _LAST_INGEST_ERROR.update({"stage": stage, "error": str(error)[:300], "ts": time.time()})
 
 
 def _record_schema_gaps(agent_id: str, section: str, report: dict) -> None:
@@ -112,13 +143,35 @@ def make_ingest_router(
 
     router = APIRouter()
 
+    @router.get("/ingest/health")
+    async def ingest_health() -> dict:
+        """Per-stage ingest diagnostics — pinpoint where telemetry stops.
+
+        `mode` reflects whether queue mode is active (raw store + detection then
+        run in the workers, not here). If `received` grows but `stored_raw`
+        doesn't, the break is upstream of storage; if `queued` grows in queue
+        mode but you see no raw data, the workers aren't draining.
+        """
+        s = ingest_stats()
+        s["mode"] = "queue" if (producer is not None and getattr(producer, "ready", False)) else "sync"
+        # Surface the bounded detection executor's live throughput/backlog so an
+        # operator can see if detection (not ingest) is the bottleneck under load.
+        if engine is not None and hasattr(engine, "detection_stats"):
+            try:
+                s["detection"] = engine.detection_stats()
+            except Exception:
+                pass
+        return s
+
     @router.post("/ingest", response_model=IngestResponse)
     async def ingest(request: Request) -> IngestResponse:
 
+        _stat("received")
         # ── 1. Parse ──────────────────────────────────────────────────────────
         try:
             envelope = await request.json()
         except Exception:
+            _note_error("parse", "invalid JSON")
             raise HTTPException(400, "Invalid JSON body")
 
         # ── 2. Schema check ───────────────────────────────────────────────────
@@ -166,14 +219,25 @@ def make_ingest_router(
             try:
                 payload = decrypt(envelope, enc_key, mac_key)
             except ValueError as exc:
+                _note_error("decrypt", exc)
                 log.warning("Decrypt failed agent=%s: %s", raw_agent_id, exc)
                 raise HTTPException(401, "Verification failed")
 
-            # ── 8. Nonce dedup (DB-backed) ────────────────────────────────────
+            # ── 8. Nonce dedup (DB-backed, IDEMPOTENT) ────────────────────────
+            # The nonce is recorded only AFTER successful persistence (below), so
+            # a nonce we've already seen means the payload was fully stored once.
+            # We ACK it idempotently (200) instead of returning 401 — an
+            # at-least-once retry (e.g. the agent's 200 response was lost) must
+            # not be miscounted by the agent as an auth failure, which would
+            # trip the re-enrollment spiral and wipe its spool. A retry whose
+            # original persistence FAILED (503) was never recorded, so it falls
+            # through and is reprocessed here — no silent loss.
             nonce = envelope["nonce"]
-            accepted = await db.check_and_store_nonce(nonce, REPLAY_WINDOW_SECONDS)
-            if not accepted:
-                raise HTTPException(401, "Duplicate nonce — replay rejected")
+            if await db.nonce_seen(nonce):
+                _stat("duplicate")
+                log.debug("Idempotent duplicate agent=%s nonce=%s — already stored",
+                          raw_agent_id, nonce[:12])
+                return IngestResponse(status="duplicate", queued=False)
 
             # ── 8b. Payload-schema validation ─────────────────────────────────
             # The envelope was validated at step 2; the *payload* historically
@@ -222,6 +286,9 @@ def make_ingest_router(
                             data         = data,
                         )
                     )
+                    # Durably handed off → record nonce so retries are idempotent.
+                    await db.store_nonce(nonce, REPLAY_WINDOW_SECONDS)
+                    _stat("queued")
                     log.debug("Queued: agent=%s section=%s", agent_id, section)
                     return IngestResponse(status="queued", queued=True)
                 except Exception as exc:
@@ -261,22 +328,42 @@ def make_ingest_router(
                     detail="Storage error — agent should retry",
                 ) from exc
 
+            _stat("stored_raw")
+            # Persisted durably to the file store → NOW record the nonce, so any
+            # retry of this exact envelope is idempotently ack'd rather than
+            # reprocessed. (Stored after store.write, never before — a 503 above
+            # leaves the nonce unrecorded so the retry is reprocessed, not lost.)
+            await db.store_nonce(nonce, REPLAY_WINDOW_SECONDS)
+
             # Step 2: update SQLite index. Failure here is non-fatal for the
             # file-store record (already written above) but we log clearly so
             # operators can detect index drift.
             try:
                 await db.insert_payload(agent_id, section, int(float(collected)), data)
+                _stat("index_ok")
             except Exception as exc:
+                # NOTE: this is the SILENT failure that makes Deep Analysis empty —
+                # /api/v1/raw reads this SQLite index. Surfaced via the counter +
+                # last_error so it's no longer invisible. Still non-fatal (the file
+                # store has the record and the index can be rebuilt).
+                _note_error("index", exc)
                 log.error(
                     "DB index write failed agent=%s section=%s ts=%s: %s — "
-                    "file-store record exists but DB index is behind",
+                    "file-store record exists but DB index (Deep Analysis) is behind",
                     agent_id, section, collected, exc,
                 )
-                # Do NOT raise — file-store record is safe; index can be rebuilt.
 
-            # Step 3: run detection engine (non-blocking, never crashes ingest).
+            # Step 3: hand to the bounded detection executor (non-blocking,
+            # never crashes ingest). engine.enqueue() caps concurrent detection
+            # at a fixed worker pool instead of spawning an unbounded task per
+            # payload — keeps ingest latency flat and detection memory bounded
+            # under large data volumes. A saturated queue drops + counts (raw
+            # telemetry is already persisted above and is reprocessable).
             if engine is not None:
-                asyncio.create_task(engine.process(agent_id, section, data))
+                accepted = engine.enqueue(
+                    agent_id, section, data, collected_at=float(collected)
+                )
+                _stat("detection_dispatched" if accepted else "detection_dropped")
 
             # Step 4: push to live dashboard — totally optional; never crashes ingest.
             try:

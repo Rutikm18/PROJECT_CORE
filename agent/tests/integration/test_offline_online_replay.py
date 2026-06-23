@@ -124,6 +124,7 @@ def _make_sender(manager: FakeManager, spool_dir: str) -> tuple[Sender, queue.Qu
             "timeout_sec": 2,
             "retry_attempts": 1,   # fail fast when offline — straight to spool
             "retry_delay_sec": 0,
+            "max_send_rate": 100000,  # disable send pacing for this timing test
         },
         "paths": {"spool_dir": spool_dir},
     }

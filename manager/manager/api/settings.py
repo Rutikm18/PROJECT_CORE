@@ -55,11 +55,39 @@ DEFAULTS: dict[str, str] = {
     "notif_sla_breach":       "false",
     "notif_digest_daily":     "false",
     "notif_email_recipient":  "",
+    # Data retention: how long raw telemetry stays queryable, and what
+    # happens to it past that point. See manager/store.py (cold tier doubles
+    # as the archive when retention_action="archive") and server.py's
+    # _cleanup_store (reads these live, so a change here takes effect on the
+    # next hourly sweep with no restart).
+    "retention_period_months": "1",       # default: 1 month (current 30-day behavior)
+    "retention_action":        "delete",  # default: delete — "archive" keeps a
+                                          # compressed copy instead (see /retention)
 }
 
 REQUIRED_FIELDS   = {"org_name", "issue_date", "valid_until"}
 BOOLEAN_FIELDS    = {"notif_critical_email", "notif_sla_breach", "notif_digest_daily"}
 DATE_FIELDS       = {"issue_date", "valid_until"}
+
+# Allowed retention periods, in months → days (30 days/month, consistent with
+# the existing 30-day default this replaces). 12/24-month windows are flagged
+# "slow" — Deep Analysis queries scan a proportionally larger payloads table.
+RETENTION_PERIODS_MONTHS: tuple[int, ...] = (1, 3, 6, 12, 24)
+RETENTION_SLOW_FETCH_MONTHS: frozenset[int] = frozenset({12, 24})
+RETENTION_ACTIONS = ("delete", "archive")
+
+
+def retention_period_days(months_str: str) -> int:
+    """Convert a retention_period_months setting value to days. Falls back to
+    the 1-month default for an unset/invalid value rather than raising —
+    retention enforcement must never crash the cleanup job over a bad setting."""
+    try:
+        months = int(months_str)
+    except (TypeError, ValueError):
+        months = 1
+    if months not in RETENTION_PERIODS_MONTHS:
+        months = min(RETENTION_PERIODS_MONTHS, key=lambda m: abs(m - months))
+    return months * 30
 
 # ── Validation / Confidence Scoring keys ──────────────────────────────────────
 # All persisted in the same org_settings table. JSON-encoded keys hold maps.
@@ -228,6 +256,8 @@ class SettingsUpdate(BaseModel):
     notif_sla_breach:       Optional[str] = None
     notif_digest_daily:     Optional[str] = None
     notif_email_recipient:  Optional[str] = None
+    retention_period_months: Optional[str] = None
+    retention_action:        Optional[str] = None
 
     @field_validator("org_name")
     @classmethod
@@ -291,6 +321,31 @@ class SettingsUpdate(BaseModel):
         if low in ("0", "false", "no", "off"):
             return "false"
         raise ValueError(f"Boolean field expects true/false, got {v!r}")
+
+    @field_validator("retention_period_months")
+    @classmethod
+    def valid_retention_period(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        try:
+            months = int(v.strip())
+        except ValueError:
+            raise ValueError(f"retention_period_months must be an integer, got {v!r}")
+        if months not in RETENTION_PERIODS_MONTHS:
+            raise ValueError(
+                f"retention_period_months must be one of {RETENTION_PERIODS_MONTHS}, got {months}"
+            )
+        return str(months)
+
+    @field_validator("retention_action")
+    @classmethod
+    def valid_retention_action(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        action = v.strip().lower()
+        if action not in RETENTION_ACTIONS:
+            raise ValueError(f"retention_action must be one of {RETENTION_ACTIONS}, got {v!r}")
+        return action
 
     @model_validator(mode="after")
     def dates_ordered(self) -> "SettingsUpdate":
@@ -359,7 +414,10 @@ def _mask(value: str) -> str:
 
 # ── Router factory ────────────────────────────────────────────────────────────
 
-def make_settings_router(intel_db) -> APIRouter:
+def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
+    """store (TelemetryStore) and db (manager Database) are optional — only
+    needed for GET /retention's live size stats. Settings CRUD works without
+    them; the retention endpoint degrades to config-only if omitted."""
     router = APIRouter()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -478,6 +536,59 @@ def make_settings_router(intel_db) -> APIRouter:
             "roles":             ROLE_MATRIX,
             "permission_labels": PERMISSION_LABELS,
         }
+
+    # ── GET /retention ────────────────────────────────────────────────────────
+    @router.get("/retention")
+    async def get_retention():
+        """Current data-retention config + live size stats for the dashboard.
+
+        config.period_months / .action come straight from org_settings (same
+        store as every other setting — no new table). stats are computed live:
+        - live_payloads: row count + estimated bytes in manager.db's `payloads`
+          table — the table Deep Analysis (/api/v1/raw/*) actually queries.
+        - archive: only meaningful when action="archive" — size/location/file
+          count of the cold tier, which becomes the permanent archive once its
+          pruning is skipped (see store.py TelemetryStore.cleanup/archive_stats).
+        """
+        try:
+            raw = await _load()
+            months = int(raw.get("retention_period_months", "1"))
+            action = raw.get("retention_action", "delete")
+            config = {
+                "period_months": months,
+                "period_days":   retention_period_days(raw.get("retention_period_months", "1")),
+                "action":        action,
+                "slow_fetch_warning": months in RETENTION_SLOW_FETCH_MONTHS,
+                "available_periods": list(RETENTION_PERIODS_MONTHS),
+                "available_actions": list(RETENTION_ACTIONS),
+            }
+
+            stats: dict[str, Any] = {"live_payloads": None, "archive": None}
+            if db is not None:
+                try:
+                    async with db._pool.read() as conn:
+                        async with conn.execute(
+                            "SELECT COUNT(*) AS n, SUM(LENGTH(data)) AS approx_bytes "
+                            "FROM payloads"
+                        ) as cur:
+                            row = await cur.fetchone()
+                    if row:
+                        stats["live_payloads"] = {
+                            "row_count":    row["n"] or 0,
+                            "approx_bytes": row["approx_bytes"] or 0,
+                        }
+                except Exception as exc:
+                    log.debug("retention live_payloads stats failed: %s", exc)
+            if store is not None and action == "archive":
+                try:
+                    stats["archive"] = await store.archive_stats()
+                except Exception as exc:
+                    log.debug("retention archive_stats failed: %s", exc)
+
+            return {"config": config, "stats": stats}
+        except Exception as exc:
+            log.exception("get_retention failed")
+            raise HTTPException(500, f"Failed to load retention settings: {exc}")
 
     # ── GET /audit ────────────────────────────────────────────────────────────
     @router.get("/audit")

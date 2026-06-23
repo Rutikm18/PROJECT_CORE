@@ -131,15 +131,26 @@ class TestEnrollmentAndIngestPipeline:
                            json=make_envelope("integ-agent-004", new_key)
                            ).status_code == 200
 
-    def test_replay_attack_rejected(self, client):
+    def test_replay_attack_is_idempotent(self, client):
+        # Replay protection is now IDEMPOTENT, not a 401. The nonce is recorded
+        # only after the payload is durably stored, so a re-sent envelope is
+        # recognised BEFORE any storage/processing and ack'd with 200
+        # status="duplicate" — zero effect (not stored or processed twice).
+        # 200-not-401 matters because an at-least-once retry (a lost 200
+        # response) must not be miscounted by the agent as an auth failure
+        # (which would trip re-enrollment and wipe its spool). The attack still
+        # gains nothing; a legitimate retry is no longer punished.
         api_key = secrets.token_hex(32)
         enroll_agent(client, "integ-agent-005", api_key)
         env = make_envelope("integ-agent-005", api_key)
-        # First send — accepted
-        assert client.post("/api/v1/ingest", json=env).status_code == 200
-        # Same envelope again — rejected (duplicate nonce)
+        # First send — accepted + persisted.
+        first = client.post("/api/v1/ingest", json=env)
+        assert first.status_code == 200
+        assert first.json().get("status") == "ok"
+        # Same envelope again — idempotently acknowledged, not reprocessed.
         r = client.post("/api/v1/ingest", json=env)
-        assert r.status_code == 401
+        assert r.status_code == 200
+        assert r.json().get("status") == "duplicate"
 
     def test_stale_timestamp_rejected(self, client):
         api_key = secrets.token_hex(32)

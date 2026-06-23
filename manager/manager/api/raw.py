@@ -157,6 +157,100 @@ def make_raw_router(db: "Database") -> APIRouter:
             },
         }
 
+    # ── First-layer data checkpoint ─────────────────────────────────────────
+    # Every section a macOS agent is expected to report, and whether it feeds
+    # the detection engine (the input surface for the 14 detection modules).
+    _EXPECTED_SECTIONS: dict[str, bool] = {
+        # section: feeds_detection?
+        "metrics": False, "connections": True, "processes": True, "ports": True,
+        "network": True,  "arp": True,         "mounts": False,   "battery": False,
+        "openfiles": False, "services": True,  "users": True,     "hardware": False,
+        "containers": True, "storage": False,  "tasks": True,     "security": True,
+        "sysctl": True,   "configs": True,     "apps": True,      "packages": True,
+        "binaries": True, "sbom": True,
+    }
+
+    def _has_real_data(data) -> bool:
+        """True only if the section's latest payload carries actual telemetry —
+        not empty and not a collector-error ({"error": ...}) payload."""
+        if not data:
+            return False
+        if isinstance(data, dict):
+            if set(data.keys()) == {"error"}:
+                return False
+            return any(v not in (None, "", [], {}) for v in data.values())
+        if isinstance(data, (list, tuple)):
+            return len(data) > 0
+        return False
+
+    @router.get("/coverage")
+    async def coverage(
+        agent_id:  Optional[str] = Query(None, description="Agent to check; default = most recently active"),
+        stale_sec: int           = Query(7200, ge=1, description="A section older than this is 'stale'"),
+    ):
+        """First-layer checkpoint: for ONE agent, verify every expected section is
+        PRESENT, FRESH, and carrying REAL data (not empty / not an {error}
+        payload). `ok` is True only when every detection-feeding section passes —
+        i.e. the agent is actually delivering the data the 14 detection modules
+        need. Per-section `status` ∈ ok | stale | empty | missing pinpoints gaps.
+        """
+        if not agent_id:
+            agents = await db.get_all_agents()
+            if not agents:
+                return {"ok": False, "error": "no agents have reported yet",
+                        "agent_id": None, "sections": []}
+            agent_id = agents[0]["agent_id"]    # ordered by last_seen DESC
+
+        last_times = await db.get_section_last_times(agent_id)
+        now = int(time.time())
+
+        sections, missing, stale, empty = [], [], [], []
+        for sec, feeds in sorted(_EXPECTED_SECTIONS.items()):
+            last    = last_times.get(sec)
+            present = last is not None
+            age     = (now - int(last)) if present else None
+            has_data = None
+            status   = "missing"
+            if present:
+                try:
+                    rows = await db.query_section(agent_id, sec, limit=1)
+                    has_data = _has_real_data(rows[0]["data"]) if rows else False
+                except Exception:
+                    has_data = None
+                fresh = age is not None and age <= stale_sec
+                if not fresh:
+                    status = "stale"
+                elif has_data is False:
+                    status = "empty"
+                else:
+                    status = "ok"
+            if status == "missing":
+                missing.append(sec)
+            elif status == "stale":
+                stale.append(sec)
+            elif status == "empty":
+                empty.append(sec)
+            sections.append({
+                "section": sec, "feeds_detection": feeds, "present": present,
+                "last_collected_at": last, "age_sec": age,
+                "has_real_data": has_data, "status": status,
+            })
+
+        det_ok = all(s["status"] == "ok" for s in sections if s["feeds_detection"])
+        return {
+            "agent_id":       agent_id,
+            "checked_at":     now,
+            "stale_sec":      stale_sec,
+            "ok":             det_ok,                 # all detection-feeding sections good
+            "detection_ready": det_ok,
+            "expected":       len(_EXPECTED_SECTIONS),
+            "present":        sum(1 for s in sections if s["present"]),
+            "missing":        missing,
+            "stale":          stale,
+            "empty":          empty,
+            "sections":       sections,
+        }
+
     return router
 
 

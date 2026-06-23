@@ -38,14 +38,41 @@ _AGENT_ID     = "attacklens-agent"
 _AGENT_KEY    = secrets.token_hex(32)
 
 
+def _run(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 @pytest.fixture(scope="module")
 def app(tmp_path_factory):
-    os.environ["DATA_DIR"]          = str(tmp_path_factory.mktemp("attacklens_db"))
-    os.environ["ENROLLMENT_TOKENS"] = _ENROLL_TOKEN
-    os.environ["API_KEY"]           = _AGENT_KEY   # for WebSocket master token
+    # MANAGER_DATABASE_URL/INTEL_DATABASE_URL must be set to isolated,
+    # freshly CREATEd Postgres databases — without them, create_app() falls
+    # back to the default shared postgresql://.../manager + /intel databases
+    # (server.py), and every run of this file accumulates findings/baseline
+    # state for "attacklens-agent" FOREVER across every pytest invocation.
+    # That stale cross-run state was silently corrupting the "first
+    # observation" detection assertions below (confirmed: 6 leftover findings
+    # for attacklens-agent in the shared `intel` database from prior runs).
+    from manager.tests.conftest import _create_test_db, _drop_test_db
+    dsn_m, name_m = _run(_create_test_db())
+    dsn_i, name_i = _run(_create_test_db())
+
+    os.environ["DATA_DIR"]              = str(tmp_path_factory.mktemp("attacklens_db"))
+    os.environ["ENROLLMENT_TOKENS"]     = _ENROLL_TOKEN
+    os.environ["API_KEY"]               = _AGENT_KEY   # for WebSocket master token
+    os.environ["MANAGER_DATABASE_URL"]  = dsn_m
+    os.environ["INTEL_DATABASE_URL"]    = dsn_i
     os.environ.pop("MACOS_INTEL_DEV_BOOTSTRAP", None)
     from manager.manager.server import create_app
-    return create_app()
+    try:
+        yield create_app()
+    finally:
+        _run(_drop_test_db(name_m))
+        _run(_drop_test_db(name_i))
 
 
 @pytest.fixture(scope="module")
@@ -85,10 +112,23 @@ def _ingest(client, section: str, data: object) -> None:
     env["section"] = section
     r = client.post("/api/v1/ingest", json=env)
     assert r.status_code == 200, f"Ingest failed ({section}): {r.text}"
-    # Give AttackLensEngine's async tasks a moment to run inside the sync test client
-    # TestClient runs the app synchronously so asyncio.create_task fires on next
-    # I/O iteration — a tiny sleep is sufficient.
-    time.sleep(0.15)
+    # Detection runs on the bounded executor's worker pool (engine.py,
+    # engine.enqueue()) — a separate asyncio.Queue drained by background
+    # worker tasks, not synchronously inside this request. Under the full
+    # suite's load the queue can have a backlog from other tests sharing this
+    # module-scoped app/engine, so a fixed sleep can return before THIS
+    # payload's detection finishes. Poll /ingest/health's detection_stats
+    # (enqueued vs processed) until the queue has actually drained, instead
+    # of guessing a "big enough" delay.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        h = client.get("/api/v1/ingest/health").json()
+        d = h.get("detection") or {}
+        if d.get("processed", 0) >= d.get("enqueued", 0):
+            break
+        time.sleep(0.05)
+    else:
+        time.sleep(0.15)  # detection_stats unavailable — fall back to a sleep
 
 
 def _findings(client, **kwargs) -> list[dict]:
@@ -121,8 +161,18 @@ class TestIngestToJarvis:
             f"Expected xmrig finding, got: {[f['title'] for f in findings]}"
 
     def test_sip_disabled_creates_finding(self, client):
-        """SIP disabled → critical security posture finding."""
-        _ingest(client, "security", {"sip_enabled": False, "gatekeeper": True})
+        """SIP disabled → critical security posture finding.
+
+        Field names/types match the REAL collector + normalizer output
+        (agent/os/macos/collectors/posture.py via agent/os/macos/normalizer.py
+        _norm_security): sip/gatekeeper are strings ("enabled"/"disabled"),
+        never bools. The previous fixture used "sip_enabled": False (a key
+        that doesn't exist) — it happened to pass only because the old,
+        now-fixed engine._security() had the identical bug (wrong key, wrong
+        type), so the two bugs canceled out. No real agent has ever sent that
+        shape; this is what one actually sends.
+        """
+        _ingest(client, "security", {"sip": "disabled", "gatekeeper": "enabled"})
         findings = _findings(client, active_only="true", severity="critical")
         assert any("sip" in f["title"].lower() for f in findings), \
             f"Expected SIP finding, got: {[f['title'] for f in findings]}"

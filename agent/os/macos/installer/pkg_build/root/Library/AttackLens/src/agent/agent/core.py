@@ -11,6 +11,7 @@ Signal handling:
 """
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -40,20 +41,23 @@ from .circuit_breaker import CircuitBreakerRegistry
 
 # ── OS-aware path defaults ────────────────────────────────────────────────────
 if sys.platform == "darwin":
-    _DEFAULT_LOG_FILE  = "/Library/AttackLens/logs/agent.log"
-    _DEFAULT_SPOOL_DIR = "/Library/AttackLens/spool"
-    _DEFAULT_SECURITY  = "/Library/AttackLens/security"
-    _DEFAULT_CONFIG    = "/Library/AttackLens/agent.toml"
+    _DEFAULT_LOG_FILE    = "/Library/AttackLens/logs/agent.log"
+    _DEFAULT_SPOOL_DIR   = "/Library/AttackLens/spool"
+    _DEFAULT_SECURITY    = "/Library/AttackLens/security"
+    _DEFAULT_CONFIG      = "/Library/AttackLens/agent.toml"
+    _DEFAULT_STATUS_FILE = "/Library/AttackLens/health.json"
 elif sys.platform == "win32":
-    _DEFAULT_LOG_FILE  = r"C:\Program Files (x86)\AttackLens\logs\agent.log"
-    _DEFAULT_SPOOL_DIR = r"C:\Program Files (x86)\AttackLens\spool"
-    _DEFAULT_SECURITY  = r"C:\Program Files (x86)\AttackLens\security"
-    _DEFAULT_CONFIG    = r"C:\Program Files (x86)\AttackLens\config\agent.toml"
+    _DEFAULT_LOG_FILE    = r"C:\Program Files (x86)\AttackLens\logs\agent.log"
+    _DEFAULT_SPOOL_DIR   = r"C:\Program Files (x86)\AttackLens\spool"
+    _DEFAULT_SECURITY    = r"C:\Program Files (x86)\AttackLens\security"
+    _DEFAULT_CONFIG      = r"C:\Program Files (x86)\AttackLens\config\agent.toml"
+    _DEFAULT_STATUS_FILE = r"C:\Program Files (x86)\AttackLens\health.json"
 else:
-    _DEFAULT_LOG_FILE  = "/var/log/attacklens/agent.log"
-    _DEFAULT_SPOOL_DIR = "/var/lib/attacklens/spool"
-    _DEFAULT_SECURITY  = "/var/lib/attacklens/security"
-    _DEFAULT_CONFIG    = "/etc/attacklens/agent.toml"
+    _DEFAULT_LOG_FILE    = "/var/log/attacklens/agent.log"
+    _DEFAULT_SPOOL_DIR   = "/var/lib/attacklens/spool"
+    _DEFAULT_SECURITY    = "/var/lib/attacklens/security"
+    _DEFAULT_CONFIG      = "/etc/attacklens/agent.toml"
+    _DEFAULT_STATUS_FILE = "/var/lib/attacklens/health.json"
 
 # ── Built-in default collection schedule (used when [collection.sections] absent) ──
 _DEFAULT_SECTIONS: dict = {
@@ -124,6 +128,44 @@ _HOSTNAME  = socket.gethostname()
 _HEALTH_INTERVAL_SEC = 60
 _START_TIME          = time.time()
 
+# Hard wall-clock deadline for a single collector call. Without this, a
+# hung subprocess (a stuck system_profiler/mdfind call, a stalled read on a
+# slow disk) blocks its ThreadPoolExecutor worker FOREVER — the circuit
+# breaker never sees a failure (it only records when fn() returns, success or
+# exception; a hang returns neither), so the section's data freezes
+# permanently with zero operator visibility, and the worker pool slowly loses
+# a slot per hang until everything stops. Overridable per-section via
+# cfg["timeout_sec"], or globally via [collection] section_timeout_sec.
+_DEFAULT_SECTION_TIMEOUT_SEC = 25
+
+
+def _call_with_timeout(fn, timeout_sec: float):
+    """Run fn() with a hard deadline; raise TimeoutError if it's exceeded.
+
+    A plain function call can't be interrupted from the outside in Python, so
+    a genuinely hung fn() keeps running in a throwaway daemon thread past the
+    deadline — but THIS call returns to the caller immediately regardless.
+    A hang now costs one leaked daemon thread, never a permanently-stuck pool
+    worker: the orchestrator's bounded ThreadPoolExecutor slot is freed every
+    time, so one slow/hanging collector can no longer starve the others.
+    """
+    result: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker():
+        try:
+            result.put(("ok", fn()))
+        except Exception as exc:
+            result.put(("error", exc))
+
+    threading.Thread(target=_worker, daemon=True, name="collector-call").start()
+    try:
+        kind, value = result.get(timeout=timeout_sec)
+    except queue.Empty:
+        raise TimeoutError(f"did not complete within {timeout_sec}s — possible hang")
+    if kind == "error":
+        raise value
+    return value
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Orchestrator  (with circuit breakers + health heartbeat)
@@ -140,11 +182,15 @@ class Orchestrator:
     • Health heartbeat: synthetic agent_health payload every 60 s containing
       circuit-breaker snapshot, queue depth, and uptime.
     • Thread-pool execution: collectors run concurrently (one slot each).
+    • Per-collector timeout (25 s default): a hung collector can't hold its
+      pool slot forever or freeze that section's data permanently — it's
+      converted into a circuit-breaker failure and retried on schedule.
     • Graceful shutdown via _stop event.
     """
 
     def __init__(self, config: dict, enc_key: bytes, mac_key: bytes,
-                 send_queue: "queue.Queue"):
+                 send_queue: "queue.Queue", link_state=None, policy_state=None,
+                 overflow_sink=None):
         self.config     = config
         self.enc_key    = enc_key
         self.mac_key    = mac_key
@@ -156,25 +202,26 @@ class Orchestrator:
         self._last_health = 0.0
         self._executor  = None
         self._cbr       = CircuitBreakerRegistry(fail_threshold=3, cooldown_sec=60)
-
-        # Overflow spool: when the in-memory queue is saturated we write
-        # encrypted envelopes straight to disk rather than silently dropping them.
-        # The sender drains this same file when the manager comes back online.
-        from .sender import DiskSpool
-        if sys.platform == "darwin":
-            _default_spool = "/Library/AttackLens/spool"
-        elif sys.platform == "win32":
-            _default_spool = r"C:\Program Files (x86)\AttackLens\spool"
-        else:
-            _default_spool = "/var/lib/attacklens/spool"
-        _spool_dir = config.get("paths", {}).get("spool_dir", _default_spool)
-        self._overflow_spool = DiskSpool(os.path.join(_spool_dir, "unsent.ndjson"))
+        # Optional callable -> dict: manager connectivity snapshot from the
+        # Sender, surfaced in the agent_health heartbeat for dashboard link
+        # status. Kept as an attribute so it survives SIGHUP __init__ re-runs.
+        self.link_state = link_state
+        # Optional callable -> dict: ConfigEngine snapshot (accepted policy
+        # versions + response gate), surfaced in the heartbeat so the manager
+        # can see which signed policies each agent is actually running.
+        self.policy_state = policy_state
+        # Optional callable(envelope) -> None: where an evicted envelope goes
+        # when the in-memory queue is full. Wired to the Sender's disk spool so
+        # backpressure overflow is PERSISTED, never silently dropped. Survives
+        # SIGHUP re-init like the other providers above.
+        self.overflow_sink = overflow_sink
 
     def start(self):
         import concurrent.futures
         self._stop.clear()
         self._last_run    = {}
         self._last_health = 0.0
+        self._seed_phase()
         self._executor    = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(4, len(COLLECTORS)),
             thread_name_prefix="collector",
@@ -185,6 +232,29 @@ class Orchestrator:
         log.info("Orchestrator started — %d sections, circuit breakers active",
                  len(self._sections()))
         return t
+
+    # Spread first fires over a SMALL fixed window (seconds), not the section's
+    # full interval — otherwise a daily collector wouldn't fire for ~24h after
+    # startup. This de-bursts the startup stampede while keeping every section
+    # prompt (all fire within _STARTUP_STAGGER_SEC of boot).
+    _STARTUP_STAGGER_SEC = 30
+
+    def _seed_phase(self) -> None:
+        """Stagger each section's FIRST fire across a small startup window so
+        collectors don't all stampede on the same tick (CPU spike + manager
+        429s), while still firing every section promptly after boot. Phase is a
+        deterministic hash of the name (stable across restarts) but capped at
+        _STARTUP_STAGGER_SEC — never the full interval.
+        """
+        import hashlib
+        now = time.time()
+        for name, cfg in self._sections().items():
+            interval = max(1, cfg.get("interval_sec", 60))
+            stagger  = min(interval, self._STARTUP_STAGGER_SEC)
+            h = int(hashlib.sha256(name.encode()).hexdigest(), 16)
+            phase = h % stagger             # 0 .. stagger-1 seconds (≤ 30s)
+            # First fire lands at now+phase (prompt), then natural cadence.
+            self._last_run[name] = now - interval + phase
 
     def stop(self):
         self._stop.set()
@@ -199,25 +269,41 @@ class Orchestrator:
         return _DEFAULT_SECTIONS
 
     def _tick_loop(self):
+        # The orchestrator thread MUST NOT die — if it does, all collection
+        # stops silently. Every iteration is guarded so one unexpected error
+        # (bad config, executor hiccup) is logged and the loop continues.
         while not self._stop.is_set():
-            now = time.time()
+            try:
+                now = time.time()
 
-            # ── Health heartbeat ──────────────────────────────────────────────
-            if now - self._last_health >= _HEALTH_INTERVAL_SEC:
-                self._last_health = now
-                self._executor.submit(self._emit_health)  # type: ignore
+                # ── Health heartbeat ──────────────────────────────────────────
+                if now - self._last_health >= _HEALTH_INTERVAL_SEC:
+                    self._last_health = now
+                    self._executor.submit(self._emit_health)  # type: ignore
 
-            # ── Section scheduling ────────────────────────────────────────────
-            for name, cfg in self._sections().items():
-                if not cfg.get("enabled", True):
-                    continue
-                interval = cfg.get("interval_sec", 60)
-                if now - self._last_run.get(name, 0) >= interval:
-                    self._last_run[name] = now
-                    if self._cbr.allow(name):
-                        self._executor.submit(self._run_section, name, cfg)  # type: ignore
-                    else:
-                        log.debug("[%s] circuit open — skipping", name)
+                # ── Section scheduling ────────────────────────────────────────
+                for name, cfg in self._sections().items():
+                    try:
+                        if not cfg.get("enabled", True):
+                            continue
+                        interval = cfg.get("interval_sec", 60)
+                        # While a breaker is open, re-check on ITS cooldown
+                        # (60s default), not the section's own interval — a
+                        # 1-hour section that just failed must not be silently
+                        # held to a 1-hour retry cadence; the breaker's own
+                        # cooldown promise (probed again after 60s) wins.
+                        if self._cbr.state(name) != "CLOSED":
+                            interval = min(interval, self._cbr.cooldown_for(name))
+                        if now - self._last_run.get(name, 0) >= interval:
+                            self._last_run[name] = now
+                            if self._cbr.allow(name):
+                                self._executor.submit(self._run_section, name, cfg)  # type: ignore
+                            else:
+                                log.debug("[%s] circuit open — skipping", name)
+                    except Exception as exc:
+                        log.error("tick scheduling error for section %s: %s", name, exc)
+            except Exception as exc:
+                log.error("orchestrator tick loop error (continuing): %s", exc)
 
             self._stop.wait(timeout=self.tick)
 
@@ -225,8 +311,10 @@ class Orchestrator:
         fn = COLLECTORS.get(name)
         if not fn:
             return
+        timeout = cfg.get("timeout_sec") or self.config.get("collection", {}).get(
+            "section_timeout_sec", _DEFAULT_SECTION_TIMEOUT_SEC)
         try:
-            raw = fn()
+            raw = _call_with_timeout(fn, timeout)
             # Normalize raw output to canonical schema
             data = raw
             if _HAS_NORMALIZER:
@@ -237,6 +325,10 @@ class Orchestrator:
             self._cbr.success(name)
             log.debug("Collected %s: %s items", name,
                       len(data) if isinstance(data, (list, dict)) else "—")
+        except TimeoutError as exc:
+            self._cbr.failure(name, str(exc))
+            log.error("Collector %s timed out (limit=%ss) — %s", name, timeout, exc)
+            data = {"error": str(exc)}
         except Exception as exc:
             self._cbr.failure(name, str(exc))
             log.warning("Collector %s failed: %s", name, exc)
@@ -263,34 +355,105 @@ class Orchestrator:
             envelope = encrypt(payload, self.enc_key, self.mac_key,
                                self.agent_id, int(time.time()))
             envelope["section"] = section   # plaintext routing hint for manager
-            maxq = self.config["manager"].get("max_queue_size", 500)
-            if self.send_queue.qsize() >= maxq:
-                # Spool to disk instead of silently dropping — zero data loss
-                # during manager outages. The sender auto-drains the spool file
-                # when the manager comes back online.
-                try:
-                    self._overflow_spool.write(envelope)
-                    log.debug("Queue full — overflow-spooled %s to disk", section)
-                except Exception as spool_exc:
-                    log.warning("Queue full, spool also failed for %s: %s",
-                                section, spool_exc)
-                return
-            self.send_queue.put_nowait(envelope)
         except Exception as exc:
-            log.error("Encrypt/enqueue failed for %s: %s", section, exc)
+            log.error("Encrypt failed for %s — payload dropped: %s", section, exc)
+            return
+
+        maxq = self.config["manager"].get("max_queue_size", 500)
+        if self.send_queue.qsize() >= maxq:
+            # Queue is full — evict the oldest item to make room. Instead of
+            # DROPPING it (the historical silent-data-loss path), spill it to the
+            # Sender's disk spool so it is replayed once the backlog clears.
+            try:
+                evicted = self.send_queue.get_nowait()
+                if self.overflow_sink is not None:
+                    try:
+                        self.overflow_sink(evicted)
+                        log.warning(
+                            "Send queue full (max=%d) — spilled oldest section=%s "
+                            "to disk spool (backpressure). Check sender/network.",
+                            maxq, evicted.get("section", "unknown"),
+                        )
+                    except Exception as exc:
+                        log.error("Overflow spill failed section=%s: %s — dropped",
+                                  evicted.get("section", "unknown"), exc)
+                else:
+                    log.warning(
+                        "Send queue full (max=%d) — no overflow sink; dropped "
+                        "oldest section=%s.", maxq, evicted.get("section", "unknown"),
+                    )
+            except queue.Empty:
+                pass
+
+        try:
+            self.send_queue.put_nowait(envelope)
+        except queue.Full:
+            # Highly unlikely (we just evicted above) — spill rather than drop.
+            if self.overflow_sink is not None:
+                try:
+                    self.overflow_sink(envelope)
+                except Exception:
+                    log.error("Send queue full after eviction section=%s — dropped",
+                              section)
+            else:
+                log.error(
+                    "Send queue still full after eviction for section=%s — dropping",
+                    section,
+                )
 
     def _emit_health(self) -> None:
         """Emit a synthetic agent_health section with diagnostics."""
         health_data = {
-            "agent_id":    self.agent_id,
-            "hostname":    _HOSTNAME,
-            "os":          _OS_NAME,
-            "arch":        _ARCH,
-            "uptime_sec":  int(time.time() - _START_TIME),
-            "queue_depth": self.send_queue.qsize(),
-            "sections":    self._cbr.snapshot(),
+            "agent_id":     self.agent_id,
+            "hostname":     _HOSTNAME,
+            "os":           _OS_NAME,
+            "arch":         _ARCH,
+            "uptime_sec":   int(time.time() - _START_TIME),
+            "queue_depth":  self.send_queue.qsize(),
+            "sections":     self._cbr.snapshot(),
+            "generated_at": int(time.time()),
         }
+        # Manager link health (probe state / spool backlog / auth failures).
+        if self.link_state is not None:
+            try:
+                health_data["link"] = self.link_state()
+            except Exception as exc:
+                log.debug("link_state() failed: %s", exc)
+        # Signed-policy state: which verified policy versions are active and
+        # whether the active-response gate is open. Lets the manager confirm
+        # fleet-wide policy convergence and spot agents stuck on a stale policy.
+        if self.policy_state is not None:
+            try:
+                ps = self.policy_state()
+                health_data["policy_versions"] = ps.get("policy_versions", {})
+                health_data["response_enabled"] = ps.get("response_enabled", False)
+            except Exception as exc:
+                log.debug("policy_state() failed: %s", exc)
         self._enqueue("agent_health", health_data)
+        self._write_status_file(health_data)
+
+    def _write_status_file(self, health_data: dict) -> None:
+        """Mirror the heartbeat to a local JSON file for offline diagnosis.
+
+        The manager-bound heartbeat is useless for troubleshooting the exact
+        outage it would otherwise report (manager unreachable). This file lets
+        an operator run `attacklens-agent --status` (or just `cat` it) on the
+        box itself with no network round-trip. Skipped when no [paths] table
+        is configured (e.g. ad-hoc Orchestrator construction in tests) — only
+        a real agent run (which always sets `paths.security_dir`) writes here.
+        """
+        paths = self.config.get("paths")
+        if not paths:
+            return
+        path = paths.get("status_file", _DEFAULT_STATUS_FILE)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(health_data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            log.debug("status file write failed (%s): %s", path, exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -440,10 +603,49 @@ def _obtain_api_key(cfg: dict, config_path: str) -> str:
     return enroll(cfg)
 
 
+def _print_status(config_path: str) -> None:
+    """Print the last-written health snapshot and exit. No agent startup,
+    no network call — reads whatever the running agent last wrote to disk.
+    """
+    status_file = _DEFAULT_STATUS_FILE
+    try:
+        cfg = load_config(config_path)
+        status_file = cfg.get("paths", {}).get("status_file", _DEFAULT_STATUS_FILE)
+    except Exception:
+        pass   # fall back to the default path; config may not exist yet
+
+    try:
+        with open(status_file, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(json.dumps({
+            "error": "no status file yet — agent may not be running, or "
+                     "hasn't completed its first heartbeat (60s after start)",
+            "path": status_file,
+        }, indent=2))
+        sys.exit(1)
+    except Exception as exc:
+        print(json.dumps({"error": str(exc), "path": status_file}, indent=2))
+        sys.exit(1)
+
+    age = int(time.time()) - data.get("generated_at", 0)
+    data["_status_file_age_sec"] = age
+    if age > 180:
+        data["_warning"] = "stale — last heartbeat over 3 minutes ago, agent may be down"
+    print(json.dumps(data, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description="mac_intel agent")
     parser.add_argument("--config", default=_DEFAULT_CONFIG)
+    parser.add_argument("--status", action="store_true",
+                        help="Print the agent's last health snapshot as JSON and exit "
+                             "(no network call, reads the on-disk heartbeat mirror)")
     args = parser.parse_args()
+
+    if args.status:
+        _print_status(args.config)
+        return
 
     cfg = load_config(args.config)
     setup_logging(cfg)
@@ -501,10 +703,57 @@ def main():
 
     # Import sender here (avoids circular import)
     from .sender import Sender
-    sender = Sender(cfg, send_queue)
+    # Pass mac_key so the sender re-stamps transport freshness at send time —
+    # spooled data survives outages > the manager's replay window (no loss).
+    sender = Sender(cfg, send_queue, mac_key=mac_key)
     sender_thread = sender.start()
 
-    orch = Orchestrator(cfg, enc_key, mac_key, send_queue)
+    # ── Signed-policy control plane ───────────────────────────────────────────
+    # Replaces the static agent.toml-only posture for the policy-controlled
+    # sections (security/response/telemetry/compliance): the ConfigEngine merges
+    # baseline ◅ verified manager policies ◅ tighten-only overrides into one
+    # immutable RuntimeConfig, fails closed on the response gate, and refreshes
+    # cache-first/non-blocking. Construction must never abort agent startup.
+    config_engine = None
+    try:
+        from .config_engine import (ConfigEngine, HttpPolicyTransport,
+                                     PathProvider)
+        from .policy import TrustStore
+
+        _base = os.path.dirname(os.path.abspath(args.config))
+        _paths = PathProvider(base=_base)
+        _trust = TrustStore(keystore_dir=_paths.keystore_dir)
+        _transport = HttpPolicyTransport(
+            cfg["manager"]["url"],
+            agent_id=agent_id,
+            tls_verify=cfg["manager"].get("tls_verify", True),
+            timeout_sec=cfg["manager"].get("timeout_sec", 10),
+        )
+        _group_ids = cfg.get("agent", {}).get("group_ids", []) \
+            or cfg.get("policy", {}).get("group_ids", [])
+        config_engine = ConfigEngine(
+            paths=_paths, trust=_trust, transport=_transport,
+            agent_id=agent_id, group_ids=_group_ids,
+        )
+        config_engine.load()                 # cache-first, non-blocking
+        config_engine.start_background()     # refresh on a monotonic cadence + reconnect
+        rc = config_engine.current()
+        log.info("ConfigEngine ready — policy_versions=%s response_enabled=%s",
+                 dict(rc.policy_versions), rc.response_enabled)
+    except Exception as exc:
+        log.error("ConfigEngine init failed (%s) — running on baseline only", exc)
+
+    def _policy_state():
+        if config_engine is None:
+            return {"policy_versions": {}, "response_enabled": False}
+        rc = config_engine.current()
+        return {"policy_versions": dict(rc.policy_versions),
+                "response_enabled": rc.response_enabled}
+
+    orch = Orchestrator(cfg, enc_key, mac_key, send_queue,
+                        link_state=sender.link_state,
+                        policy_state=_policy_state,
+                        overflow_sink=sender.spool_envelope)
     orch_thread  = orch.start()
 
     # Re-enrollment callback: called by sender when persistent 401 detected.
@@ -525,6 +774,8 @@ def main():
             new_enc, new_mac = derive_keys(new_key)
             orch.enc_key = new_enc
             orch.mac_key = new_mac
+            # Keep the sender's re-stamp key in sync with the rotated key.
+            sender.set_mac_key(new_mac)
             # Drain in-memory queue: items encrypted with old key cannot be
             # decrypted by the manager after key rotation — drop them so the
             # sender doesn't loop on 401s from stale-key ciphertext.
@@ -551,6 +802,8 @@ def main():
         log.info("Shutting down (signal %d)", signum)
         orch.stop()
         sender.stop()
+        if config_engine is not None:
+            config_engine.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -563,10 +816,21 @@ def main():
             try:
                 cfg = load_config(args.config)
                 log.info("Config reloaded on SIGHUP")
+                # Re-pull verified policies on reload too (SIGHUP == reload_config).
+                if config_engine is not None:
+                    try:
+                        result = config_engine.refresh()
+                        log.info("Policy refresh on SIGHUP: %s", result.outcomes)
+                    except Exception as exc:
+                        log.error("Policy refresh on SIGHUP failed: %s", exc)
                 orch.stop()
                 # Use orch.enc_key/mac_key — not startup enc_key/mac_key — so
                 # any keys updated via re-enrollment are preserved across reloads.
-                orch.__init__(cfg, orch.enc_key, orch.mac_key, send_queue)
+                # Preserve link_state + policy_state providers across the re-init.
+                orch.__init__(cfg, orch.enc_key, orch.mac_key, send_queue,
+                              link_state=orch.link_state,
+                              policy_state=orch.policy_state,
+                              overflow_sink=orch.overflow_sink)
                 orch.start()
             except Exception as exc:
                 log.error("Config reload failed: %s", exc)

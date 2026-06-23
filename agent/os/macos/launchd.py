@@ -118,6 +118,12 @@ def _agent_plist_xml(
     agent_bin: str = _AGENT_BIN,
     log_dir: str = _LOG_DIR,
 ) -> str:
+    # agent_bin is the PyInstaller binary built from agent_entry.py, whose CLI
+    # is subcommand-based (run/start/stop/status/...) — "run" must be passed
+    # explicitly or argparse rejects "--config" as an invalid subcommand and
+    # the daemon exits immediately on every single launch attempt. Confirmed
+    # by direct reproduction: `attacklens-agent --config X` exits 2
+    # ("invalid choice"); `attacklens-agent run --config X` parses correctly.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -129,6 +135,7 @@ def _agent_plist_xml(
     <key>ProgramArguments</key>
     <array>
         <string>{agent_bin}</string>
+        <string>run</string>
         <string>--config</string>
         <string>{config_path}</string>
     </array>

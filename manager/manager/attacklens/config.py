@@ -14,6 +14,14 @@ ENGINE_CONFIG: dict = {
     # Gate: only promote cluster → finding when confidence ≥ this threshold.
     "confidence_threshold": 0.95,
 
+    # Route detection through the rich detections/ modules (verified ones in
+    # engine._DETECTION_MODULE_ROUTES) instead of the engine's inline analyzers.
+    # Per-section: a routed section uses its module(s); unrouted sections keep
+    # the inline analyzer. Default on — only verified-safe sections are routed.
+    "use_detection_modules": (
+        os.getenv("ATTACKLENS_USE_MODULES", "true").lower() == "true"
+    ),
+
     # How far back to look when pulling existing signals for clustering (seconds).
     "correlation_window_sec":              3600,      # 1 h (default rules)
     "correlation_window_sec_persistence": 86400,      # 24 h (persistence-class rules)
@@ -53,6 +61,50 @@ ENGINE_CONFIG: dict = {
 
     # How long to suppress duplicate findings for the same cluster (dedup gate G3)
     "active_finding_dedup_hours": 24,
+
+    # ── Auto-resolution of stale findings ─────────────────────────────────
+    # Resolve a finding when its evidence stops being observed, so old incidents
+    # (e.g. a removed package in Origin) don't linger forever.
+    #
+    # CRITICAL invariant: `auto_resolve_stale_sec` MUST exceed the longest
+    # per-rule alert-dedup window. Detection rules suppress re-emission within
+    # their dedup window (Origin = 24 h for packages/apps/SBOM), so a STILL
+    # PRESENT entity only refreshes its last_detected_at when that window
+    # expires. A cutoff below the dedup window would wrongly resolve live
+    # findings (the data-loss regression). Default 48 h is safely above the 24 h
+    # max dedup → live findings survive, genuinely-gone ones clear within ~2 days.
+    #
+    # To clear faster, the right move is to SHRINK the dedup windows (the
+    # finding UPDATE is idempotent and doesn't spam the timeline, so frequent
+    # re-confirmation is cheap) and then lower this cutoff — that decouples
+    # "presence" from "alert dedup", which is the proper long-term design.
+    "auto_resolve_enabled": (
+        os.getenv("ATTACKLENS_AUTO_RESOLVE", "true").lower() == "true"
+    ),
+    "auto_resolve_stale_sec": int(
+        os.getenv("ATTACKLENS_AUTO_RESOLVE_STALE_SEC", str(2 * 86400))
+    ),
+
+    # ── Stale-agent filtering ──────────────────────────────────────────────
+    # auto_resolve_stale_sec (above) only fires when the agent sends a FRESH
+    # payload that no longer contains a previously-seen item — it requires a
+    # live ingest event to trigger. If the agent stops reporting entirely
+    # (uninstalled, offline, dev/test identity abandoned), nothing ever
+    # triggers it and the finding stays is_active=1 forever — confirmed live:
+    # an agent silent for 16 days still had 794 "active" findings showing
+    # fleet-wide in Incidents / Attack Terrain pages.
+    #
+    # This is a DIFFERENT, complementary mechanism: a read-time exclusion
+    # (get_soc_findings/get_active_findings_global), not a write-time resolve.
+    # Deliberately not touching is_active/status — we don't know the
+    # underlying condition is gone, only that the agent stopped talking, and
+    # the moment it reports again the finding reappears with zero data loss.
+    # Only applied to fleet-wide queries (no explicit agent_id) — an analyst
+    # explicitly investigating one agent still sees its findings regardless
+    # of how stale that agent is.
+    "stale_agent_sec": int(
+        os.getenv("ATTACKLENS_STALE_AGENT_SEC", str(86400))
+    ),
 
     # ── AI precision layer (ai_validator.py) ──────────────────────────────
     # When True, after the 8 deterministic gates pass we run an LLM-backed

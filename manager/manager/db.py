@@ -1,28 +1,34 @@
 """
-manager/db.py — Async SQLite layer backed by SQLitePool.
+manager/db.py — Async Postgres layer backed by PgPool.
 
-All reads use the shared reader pool (concurrent).
-All writes use the single write connection (serialised, non-blocking for readers).
+Migrated from SQLite (SQLitePool) to Postgres (PgPool, manager/pg_pool.py) —
+PgPool is API-compatible (same ?-placeholder query strings, same
+read()/write() async-context-manager checkout), so this module's queries are
+largely unchanged. What DID change is the schema DDL below (AUTOINCREMENT →
+SERIAL, PRAGMAs removed — Postgres has no pragma concept and always enforces
+foreign keys) and `path` → `dsn` (a postgresql:// connection string instead
+of a file path).
 
-Nonce deduplication is now DB-backed so it survives manager restarts and is
-safe for future horizontal scaling behind a shared SQLite (NFS/tmpfs).
+All reads and writes go through one Postgres connection pool — unlike SQLite,
+Postgres handles concurrent writers natively, so there's no single-writer
+bottleneck to design around here.
+
+Nonce deduplication is DB-backed so it survives manager restarts and works
+correctly across multiple manager instances sharing this database (the
+horizontal-scaling case SQLite couldn't support).
 """
 
 import json
 import time
 import logging
-import aiosqlite
 
-from .pool import SQLitePool
+from .pg_pool import PgPool
 
 log = logging.getLogger("manager.db")
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 SCHEMA = """
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS agents (
     agent_id   TEXT PRIMARY KEY,
     name       TEXT DEFAULT '',
@@ -44,7 +50,7 @@ CREATE TABLE IF NOT EXISTS agent_keys (
 );
 
 CREATE TABLE IF NOT EXISTS payloads (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           BIGSERIAL PRIMARY KEY,
     agent_id     TEXT NOT NULL,
     section      TEXT NOT NULL,
     collected_at INTEGER NOT NULL,
@@ -61,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_payloads_section
     ON payloads(section, collected_at DESC);
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id              BIGSERIAL PRIMARY KEY,
     agent_id        TEXT NOT NULL,
     connected_at    INTEGER NOT NULL,
     disconnected_at INTEGER DEFAULT 0,
@@ -80,7 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_open
 -- Index on expires_at allows O(log n) cleanup of expired nonces.
 CREATE TABLE IF NOT EXISTS nonce_cache (
     nonce      TEXT PRIMARY KEY,
-    expires_at REAL NOT NULL
+    expires_at DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nonce_exp ON nonce_cache(expires_at);
 """
@@ -94,9 +100,10 @@ _MIGRATIONS = [
 
 
 class Database:
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self._pool = SQLitePool(path, readers=4)
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.path = dsn  # kept for any code/logs still reading .path
+        self._pool = PgPool(dsn)
 
     async def init(self) -> None:
         await self._pool.init()
@@ -104,11 +111,10 @@ class Database:
             await db.executescript(SCHEMA)
             await db.commit()
             for table, col, defn in _MIGRATIONS:
-                try:
-                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
-                    await db.commit()
-                except Exception:
-                    pass
+                # Postgres supports IF NOT EXISTS on ADD COLUMN directly —
+                # no try/except-swallow needed (that was a SQLite workaround).
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {defn}")
+                await db.commit()
 
     async def ping(self) -> bool:
         return await self._pool.ping()
@@ -132,8 +138,10 @@ class Database:
             # Probabilistic cleanup — avoids a DELETE scan on every hot-path call.
             if random.random() < 0.01:
                 await db.execute(
-                    "DELETE FROM nonce_cache WHERE rowid IN "
-                    "(SELECT rowid FROM nonce_cache WHERE expires_at < ? LIMIT 500)",
+                    # rowid is SQLite-only — nonce_cache's actual primary key
+                    # (nonce) is the bounded-batch-delete handle in Postgres.
+                    "DELETE FROM nonce_cache WHERE nonce IN "
+                    "(SELECT nonce FROM nonce_cache WHERE expires_at < ? LIMIT 500)",
                     (now,),
                 )
             try:
@@ -147,6 +155,35 @@ class Database:
                 # UNIQUE constraint violation → replay attack
                 await db.rollback()
                 return False
+
+    async def nonce_seen(self, nonce: str) -> bool:
+        """Read-only check: has this nonce already been recorded?
+
+        Used with `store_nonce` for idempotent, no-loss ingest: the nonce is
+        recorded ONLY after the payload is durably persisted, so a `True` here
+        means "already fully processed" (safe to ack idempotently), while a
+        retry of a request whose persistence FAILED (e.g. 503) is NOT seen and
+        gets reprocessed — no silent loss, no false "duplicate" 401.
+        """
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT 1 FROM nonce_cache WHERE nonce=? LIMIT 1", (nonce,)
+            ) as cur:
+                return await cur.fetchone() is not None
+
+    async def store_nonce(self, nonce: str, ttl: float) -> None:
+        """Record a nonce AFTER successful persistence (idempotent insert)."""
+        now = time.time()
+        async with self._pool.write() as db:
+            try:
+                await db.execute(
+                    "INSERT INTO nonce_cache(nonce, expires_at) VALUES(?, ?) "
+                    "ON CONFLICT (nonce) DO NOTHING",
+                    (nonce, now + ttl),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
 
     # ── Agent key management ──────────────────────────────────────────────────
 
@@ -194,7 +231,6 @@ class Database:
 
     async def get_key_meta(self, agent_id: str) -> dict | None:
         async with self._pool.read() as db:
-            db.row_factory = aiosqlite.Row
             async with db.execute(
                 """SELECT agent_id, enrolled_at, enrollment_ip,
                           expires_at, revoked, rotated_at, key_label
@@ -213,7 +249,6 @@ class Database:
 
     async def list_key_meta(self) -> list[dict]:
         async with self._pool.read() as db:
-            db.row_factory = aiosqlite.Row
             async with db.execute(
                 """SELECT a.agent_id, a.name, a.last_seen, a.last_ip,
                           k.enrolled_at, k.enrollment_ip, k.expires_at,
@@ -267,7 +302,6 @@ class Database:
     async def upsert_agent(self, agent_id: str, name: str, ip: str) -> None:
         now = int(time.time())
         async with self._pool.write() as db:
-            db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT last_seen FROM agents WHERE agent_id=?", (agent_id,)
             ) as cur:
@@ -338,7 +372,6 @@ class Database:
     async def get_agent_sessions(self, agent_id: str, limit: int = 5) -> list[dict]:
         await self.close_stale_agent_sessions()
         async with self._pool.read() as db:
-            db.row_factory = aiosqlite.Row
             async with db.execute("""
                 SELECT id, agent_id, connected_at, disconnected_at,
                        last_seen, last_ip, status, close_reason
@@ -359,27 +392,101 @@ class Database:
     async def insert_payload(
         self, agent_id: str, section: str, collected_at: int, data: dict
     ) -> None:
+        now = int(time.time())
+        blob = json.dumps(data, default=str)
         async with self._pool.write() as db:
-            await db.execute("""
-                INSERT INTO payloads(agent_id, section, collected_at, received_at, data)
-                VALUES(?,?,?,?,?)
-            """, (agent_id, section, collected_at, int(time.time()),
-                  json.dumps(data, default=str)))
+            try:
+                await db.execute("""
+                    INSERT INTO payloads(agent_id, section, collected_at, received_at, data)
+                    VALUES(?,?,?,?,?)
+                """, (agent_id, section, collected_at, now, blob))
+                await db.commit()
+            except Exception:
+                # Self-heal the FK to agents(agent_id). If the parent row is
+                # missing — registration race, agent row evicted via ON DELETE
+                # CASCADE, or an agent_id mismatch — a raw FOREIGN KEY failure
+                # would SILENTLY drop telemetry (Deep Analysis goes empty while
+                # ingest still returns 200). Raw data must never be lost to a
+                # missing parent: ensure a stub agent row, then retry once.
+                await db.rollback()
+                await db.execute(
+                    "INSERT INTO agents(agent_id, name, created_at, last_seen) "
+                    "VALUES(?,?,?,?) ON CONFLICT (agent_id) DO NOTHING",
+                    (agent_id, agent_id, now, now),
+                )
+                await db.execute("""
+                    INSERT INTO payloads(agent_id, section, collected_at, received_at, data)
+                    VALUES(?,?,?,?,?)
+                """, (agent_id, section, collected_at, now, blob))
+                await db.commit()
+
+    async def prune_payloads(self, cutoff_ts: int) -> int:
+        """Delete payload rows older than cutoff_ts. Returns rows deleted.
+
+        This is the table Deep Analysis (/api/v1/raw/*) actually queries — it
+        had NO retention at all before this: every raw telemetry row landed
+        here and stayed forever, growing unbounded. Deletes in bounded batches
+        so a multi-million-row backlog doesn't hold the write lock for one
+        giant transaction (this runs on the same hourly cadence as
+        TelemetryStore.cleanup() — see server.py's _cleanup_store).
+        """
+        deleted_total = 0
+        async with self._pool.write() as db:
+            while True:
+                cur = await db.execute(
+                    # rowid is SQLite-only — payloads has a real id (BIGSERIAL)
+                    # primary key in Postgres, used as the batch-delete handle.
+                    "DELETE FROM payloads WHERE id IN "
+                    "(SELECT id FROM payloads WHERE collected_at < ? LIMIT 5000)",
+                    (cutoff_ts,),
+                )
+                await db.commit()
+                n = cur.rowcount or 0
+                deleted_total += n
+                if n < 5000:
+                    break
+        return deleted_total
+
+    async def prune_agent_sessions(self, cutoff_ts: int) -> int:
+        """Delete CLOSED session rows older than cutoff_ts. Returns rows deleted.
+
+        Never deletes a session whose status is still 'connected' — an
+        in-progress session has no end time to judge age by, and deleting it
+        would corrupt the live connection-history view for an active agent.
+        """
+        async with self._pool.write() as db:
+            cur = await db.execute(
+                "DELETE FROM agent_sessions "
+                "WHERE status != 'connected' AND last_seen < ?",
+                (cutoff_ts,),
+            )
             await db.commit()
+            return cur.rowcount or 0
 
     async def get_all_agents(self) -> list:
         await self.close_stale_agent_sessions()
         async with self._pool.read() as db:
-            db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM agents ORDER BY last_seen DESC"
             ) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
+    async def get_live_agent_ids(self, stale_after_sec: int) -> list[str]:
+        """agent_ids that have reported within stale_after_sec — the basis for
+        excluding a gone-dark agent's stale findings from fleet-wide views
+        (intel.db is a separate database file; this lives here because
+        last_seen lives here, and the caller composes the result into an
+        `agent_id IN (...)` filter against intel.db's findings table)."""
+        cutoff = int(time.time()) - stale_after_sec
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT agent_id FROM agents WHERE last_seen >= ?", (cutoff,)
+            ) as cur:
+                return [r[0] for r in await cur.fetchall()]
+
     async def get_agent(self, agent_id: str) -> dict | None:
         await self.close_stale_agent_sessions()
         async with self._pool.read() as db:
-            db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM agents WHERE agent_id=?", (agent_id,)
             ) as cur:

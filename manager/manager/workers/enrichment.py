@@ -374,21 +374,30 @@ class EnrichmentWorker:
             return
         tags.append(tag)
         try:
-            await self._idb._conn.execute(  # type: ignore[attr-defined]
-                "UPDATE findings SET tags=? WHERE id=?",
-                (json.dumps(tags), finding.get("id")),
-            )
-            await self._idb._conn.commit()  # type: ignore[attr-defined]
+            # Must acquire IntelDB's own write lock before touching the shared
+            # connection directly — confirmed live: an enrichment-worker write
+            # racing an ingest/enroll write on the SAME asyncpg connection
+            # (Postgres connections, unlike aiosqlite, are not safe for
+            # concurrent interleaved commands) corrupted the connection's
+            # transaction state ("transaction is in error state" on the next
+            # unrelated commit, anywhere in the app).
+            async with self._idb._lock:
+                await self._idb._conn.execute(  # type: ignore[attr-defined]
+                    "UPDATE findings SET tags=? WHERE id=?",
+                    (json.dumps(tags), finding.get("id")),
+                )
+                await self._idb._conn.commit()  # type: ignore[attr-defined]
         except Exception as exc:
             log.debug("tag update failed for finding=%s: %s", finding.get("id"), exc)
 
     async def _update_severity(self, finding: dict, severity: str) -> None:
         try:
-            await self._idb._conn.execute(  # type: ignore[attr-defined]
-                "UPDATE findings SET severity=? WHERE id=?",
-                (severity, finding.get("id")),
-            )
-            await self._idb._conn.commit()  # type: ignore[attr-defined]
+            async with self._idb._lock:  # see _add_tag's comment above
+                await self._idb._conn.execute(  # type: ignore[attr-defined]
+                    "UPDATE findings SET severity=? WHERE id=?",
+                    (severity, finding.get("id")),
+                )
+                await self._idb._conn.commit()  # type: ignore[attr-defined]
             log.info(
                 "severity escalated to %s for finding=%s",
                 severity, finding.get("id"),

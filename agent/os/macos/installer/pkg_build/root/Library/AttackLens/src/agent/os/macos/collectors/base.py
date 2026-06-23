@@ -125,6 +125,36 @@ def _codesign_info(path: str) -> dict:
     return info
 
 
+def codesign_trust(path: str) -> bool | None:
+    """Security-grade signing verdict for a Mach-O binary at `path`.
+
+      True  → validly signed with a real authority chain (Apple / Developer ID
+              / Mac App Store)
+      False → unsigned, OR only ad-hoc signed (no authority)
+      None  → cannot be determined (path missing, codesign unavailable, error)
+
+    Why this is stricter than `"Identifier=" in output`: an ad-hoc signature
+    (`Signature=adhoc`) produces an Identifier but carries NO authority — and
+    ad-hoc / unsigned is exactly the shape most macOS malware ships in. Treating
+    "has an Identifier" as "trusted" would wave through precisely the binaries a
+    security agent exists to flag. Trust here requires a non-ad-hoc signature
+    AND at least one Authority in the chain.
+    """
+    out = _run(["codesign", "-dvvv", "--", path], timeout=8, stderr=True)
+    if not out:
+        return None
+    low = out.lower()
+    if "not signed at all" in low or "code object is not signed" in low:
+        return False
+    if "signature=adhoc" in low:
+        return False          # ad-hoc: identifier present, but no real authority
+    if any(line.startswith("Authority=") for line in out.splitlines()):
+        return True
+    if "identifier=" in low:
+        return False          # signed shell but no authority chain → untrusted
+    return None
+
+
 class BaseCollector(ABC):
     """
     Abstract base for all macOS ARM64 collectors.

@@ -9,6 +9,7 @@
     <array>
         <string>PYTHON3_PLACEHOLDER</string>
         <string>/Library/AttackLens/bin/run_agent.py</string>
+        <string>run</string>
         <string>--config</string>
         <string>/Library/AttackLens/agent.toml</string>
     </array>

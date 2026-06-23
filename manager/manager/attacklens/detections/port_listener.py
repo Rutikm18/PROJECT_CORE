@@ -66,6 +66,12 @@ HIGH_RISK_PORTS: frozenset[int] = frozenset({
 
 # Processes that are permitted to open wildcard (0.0.0.0 / ::) listeners.
 # This is the global fallback; per-agent approved baselines override it.
+#
+# ALL ENTRIES MUST BE lowercase: the agent's port collector emits process names
+# lowercased, and _is_approved_wildcard() compares against name.lower(). The
+# previous mixed-case entries (e.g. "mDNSResponder", "ControlCenter") therefore
+# NEVER matched — a latent bug that let stock-macOS daemons keep generating
+# wildcard-bind alerts. Verified against real agent data.
 APPROVED_WILDCARD_BIND_PROCS: frozenset[str] = frozenset({
     # Web / app servers
     "nginx", "apache", "apache2", "httpd", "lighttpd", "caddy", "traefik",
@@ -80,12 +86,54 @@ APPROVED_WILDCARD_BIND_PROCS: frozenset[str] = frozenset({
     # Java app servers
     "java",
     # Windows services
-    "System", "lsass.exe", "services.exe", "svchost.exe", "spoolsv.exe",
-    # macOS system
-    "launchd", "mDNSResponder", "configd",
+    "system", "lsass.exe", "services.exe", "svchost.exe", "spoolsv.exe",
+    # macOS system daemons that legitimately wildcard-bind. Without these,
+    # `wildcard_bind` fired CRITICAL on stock macOS — verified against real
+    # agent data, these processes alone produced ~16k false positives:
+    #   netbiosd          → SMB/NetBIOS name service on 137/138
+    #   rapportd          → Continuity / Handoff
+    #   sharingd          → AirDrop / screen & file sharing
+    #   mdnsresponder     → Bonjour (5353)
+    #   controlcenter     → AirPlay receiver
+    #   identityservicesd → iMessage / FaceTime relay
+    "launchd", "mdnsresponder", "mdnsresponderhelper", "configd",
+    "netbiosd", "rapportd", "sharingd", "identityservicesd", "remoted",
+    "apsd", "nehelper", "controlcenter", "airplayxpchelper", "rapport",
+    # Found by REMOVING the ephemeral-port blind spot below and replaying real
+    # agent data: these macOS daemons wildcard-bind on high/ephemeral ports
+    # doing normal OS work, not exposure. The fix is naming the specific
+    # process — not exempting a port range, which would have hidden a real
+    # backdoor choosing the same range on purpose.
+    #   airportd         → WiFi interface management
+    #   replicatord       → Continuity/Handoff state replication
+    #   symptomsd         → diagnostics/symptom framework
+    #   syslogd           → BSD syslog relay
+    #   wifip2pd          → WiFi Direct/AirDrop peer-to-peer
+    #   wifivelocityd     → WiFi performance telemetry
+    "airportd", "replicatord", "symptomsd", "syslogd",
+    "wifip2pd", "wifivelocityd",
 })
 
-# Processes considered "known services" — not flagged as unknown
+# Vendor/process-name PREFIXES whose subprocesses legitimately wildcard-bind.
+# Exact-name matching alone missed these — e.g. Docker's listener process is
+# `com.docker.backend`, not `dockerd`; macOS daemons are reverse-DNS named.
+APPROVED_WILDCARD_PREFIXES: tuple[str, ...] = (
+    "com.apple.",     # any first-party Apple daemon (reverse-DNS named)
+    "com.docker.",    # Docker Desktop proxy/backend processes
+    "com.microsoft.", # VS Code / Edge background services
+    "org.mozilla.",
+)
+
+# macOS app subprocesses follow the "<App> Helper [(role)]" convention
+# (Electron, Chromium, VS Code, Slack, …). They bind localhost/ephemeral ports
+# for IPC. Treated as approved for wildcard-bind specifically.
+APPROVED_WILDCARD_NAME_SUBSTRINGS: tuple[str, ...] = (
+    " helper",        # "Code Helper (Plugin)", "Google Chrome Helper", …
+)
+
+# Processes considered "known services" — not flagged as unknown.
+# Lowercase for the same reason as APPROVED_WILDCARD_BIND_PROCS — the agent
+# emits lowercased process names and detect_unknown_process matches by name.
 KNOWN_SERVICE_PROCS: frozenset[str] = frozenset(APPROVED_WILDCARD_BIND_PROCS) | frozenset({
     "python", "python3", "ruby", "node", "nodejs", "perl", "php",
     "gunicorn", "uvicorn", "puma", "unicorn", "thin", "passenger",
@@ -94,8 +142,7 @@ KNOWN_SERVICE_PROCS: frozenset[str] = frozenset(APPROVED_WILDCARD_BIND_PROCS) | 
     "zookeeper", "etcd", "consul", "vault",
     "syncthing", "tailscaled", "openvpn", "wireguard",
     "smbd", "nmbd", "winbindd",
-    "com.apple.WebKit.Networking", "com.apple.WebKit.WebContent",
-    "AirPlayXPCHelper", "sharingd",
+    "com.apple.webkit.networking", "com.apple.webkit.webcontent",
 })
 
 # Expected port ranges per process name.
@@ -247,9 +294,43 @@ def _is_approved_listener(port: int, proto: str, proc_name: str, bind_ip: str) -
 
 
 def _is_approved_wildcard(proc_name: str) -> bool:
+    """True if this process is allowed to bind a wildcard (0.0.0.0/::) listener.
+
+    Matches by, in order: per-agent baseline, exact name, vendor reverse-DNS
+    prefix (com.apple./com.docker./…), or the macOS "<App> Helper" subprocess
+    convention. Exact-name-only matching previously missed `com.docker.backend`
+    and editor/Electron helpers, which dominated the false-positive volume.
+    """
+    name = (proc_name or "").lower().strip()
+    if not name:
+        return False
     baseline = _load_baseline()
     extra = {p.lower() for p in baseline.get("approved_wildcard_procs", [])}
-    return proc_name.lower() in APPROVED_WILDCARD_BIND_PROCS or proc_name.lower() in extra
+    if name in APPROVED_WILDCARD_BIND_PROCS or name in extra:
+        return True
+    if name.startswith(APPROVED_WILDCARD_PREFIXES):
+        return True
+    if any(sub in name for sub in APPROVED_WILDCARD_NAME_SUBSTRINGS):
+        return True
+    return False
+
+
+# Port 0 is not a real, connectable network surface (you cannot dial "port
+# 0" as a client) — collectors emit it as a sentinel when no actual listening
+# port could be resolved. Excluded as a data-validity guard, not a coverage
+# decision.
+#
+# Earlier this rule ALSO blanket-exempted the whole ephemeral range
+# (>=49152), reasoning that high ports are "overwhelmingly transient IPC
+# churn". Replaying real agent data after removing that exemption surfaced
+# only legitimate macOS daemons (airportd, syslogd, wifip2pd, ...) — now
+# named explicitly in APPROVED_WILDCARD_BIND_PROCS above — not a return of
+# the false-positive volume. Keeping the port-range exemption would have
+# created exactly the blind spot a real backdoor could exploit on purpose:
+# detection must cover every port, and unapproved processes are now flagged
+# regardless of which port they choose.
+def _is_invalid_port(port: int) -> bool:
+    return port == 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEMETRY INGESTION — normalize across all platform formats
@@ -261,6 +342,24 @@ def _is_external(bind_ip: str) -> bool:
 
 def _is_wildcard(bind_ip: str) -> bool:
     return bind_ip in ("0.0.0.0", "::", "*", "")
+
+
+def _new_listener_severity(bind_ip: str) -> str:
+    """Risk-tier a genuinely new listener instead of blanket CRITICAL.
+
+    A new listener is noteworthy, but severity should track reachability. Known
+    C2 / high-risk ports are separately flagged CRITICAL by detect_high_risk_port,
+    so new_listener tiers by exposure to avoid critical-spamming every new
+    service (e.g. nginx on 443):
+      external / wildcard bind → high   (reachable off-host)
+      loopback bind            → low    (local only — low blast radius)
+      otherwise                → medium
+    """
+    if bind_ip in _LOOPBACK_ADDRS:
+        return "low"
+    if _is_external(bind_ip) or _is_wildcard(bind_ip):
+        return "high"
+    return "medium"
 
 
 _SS_RE = re.compile(
@@ -317,9 +416,16 @@ def ingest_listeners(section: str, data: Any) -> list[dict]:
         for item in data:
             if not isinstance(item, dict):
                 continue
-            # Try generic normalized format first
+            # Try generic normalized format first.
+            # "bind_addr" is the ACTUAL field both macOS and Windows PortsCollector
+            # emit (agent/os/macos/collectors/network.py, os/windows/collectors/
+            # network.py) — it was missing from this chain entirely, so every real
+            # agent listener fell through to the "0.0.0.0" default regardless of
+            # its true bind address. That fed detect_wildcard_bind() a false
+            # "world-accessible" verdict for every single listener, including ones
+            # bound to 127.0.0.1 only — a fleet-wide false-positive generator.
             bind_ip = str(
-                item.get("bind_ip") or item.get("bind_address") or
+                item.get("bind_addr") or item.get("bind_ip") or item.get("bind_address") or
                 item.get("local_address") or item.get("LocalAddress") or
                 item.get("address") or "0.0.0.0"
             )
@@ -496,6 +602,13 @@ async def detect_new_listener(
         except Exception:
             stored = {}
 
+    # First-run seeding: with no prior baseline we are seeing the host's
+    # EXISTING listeners for the first time — they are not "newly appeared".
+    # Record them as baseline and emit nothing; alert only on listeners that
+    # show up in LATER snapshots. Removes the enrollment FP storm where every
+    # listening service fired a CRITICAL new-listener alert.
+    first_run = not stored
+
     updated = dict(stored)
     for lst in listeners:
         port      = lst["port"]
@@ -522,6 +635,9 @@ async def detect_new_listener(
         updated[fp] = {"port": port, "proto": proto,
                        "process_name": proc_name, "bind_ip": bind_ip}
 
+        if first_run:
+            continue   # pre-existing listener at first observation — not new
+
         item_key = f"{port}:{lst['pid']}"
         if _should_suppress(agent_id, "new_listener", item_key,
                             port=port, pid=lst["pid"],
@@ -530,7 +646,7 @@ async def detect_new_listener(
 
         findings.append(_make_alert(
             agent_id=agent_id, hostname="",
-            severity="critical",
+            severity=_new_listener_severity(bind_ip),
             rule_id="new_listener",
             title=f"New unauthorized listener: {proc_name} on port {port}/{proto}",
             description=(
@@ -562,28 +678,52 @@ async def detect_new_listener(
 
 
 def detect_wildcard_bind(agent_id: str, listeners: list[dict]) -> list[dict]:
-    """CRITICAL — Process binds to 0.0.0.0 or :: and is not in approved list."""
+    """MEDIUM — A non-approved process exposes a *service* port to all interfaces,
+    on ANY port — including the high/ephemeral range. There is no port-based
+    exemption: a real backdoor can choose any port it likes, so detection must
+    cover all of them. See _is_invalid_port for the one narrow, data-validity
+    exception (port 0 — not a real connectable surface).
+
+    Wildcard binding alone is a weak exposure signal, not a confirmed compromise,
+    so it is MEDIUM (was CRITICAL — which, combined with no vendor-prefix
+    filtering and a since-removed blanket ephemeral-port exemption, made this
+    the single largest false-positive source in the system: ~16k critical
+    alerts on stock macOS/Docker/VS Code). The genuinely-dangerous variants are
+    escalated by dedicated rules:
+      - known-bad / RAT ports        → detect_high_risk_port (HIGH)
+      - unsigned / unknown binaries  → detect_unknown_process (HIGH)
+
+    Suppressed only for approved processes (system/vendor/dev helpers — see
+    APPROVED_WILDCARD_BIND_PROCS). The item_key is keyed on (process, port) —
+    NOT the volatile pid — so the same exposed service dedups across snapshots
+    instead of minting a new finding each cycle.
+    """
     findings: list[dict] = []
     for lst in listeners:
         if not _is_wildcard(lst["bind_ip"]):
             continue
         proc_name = lst["process_name"]
+        port      = lst["port"]
         if _is_approved_wildcard(proc_name):
             continue
-        item_key = f"{lst['port']}:{lst['pid']}"
+        if _is_invalid_port(port):
+            continue
+        # Stable dedup identity: process + port, never the churning pid. Keeps
+        # one finding per genuinely-exposed service across re-scans.
+        item_key = f"{proc_name or 'unknown'}:{port}"
         if _should_suppress(agent_id, "wildcard_bind", item_key,
-                            port=lst["port"], pid=lst["pid"],
+                            port=port, pid=lst["pid"],
                             proc_name=proc_name, proc_path=lst["process_path"]):
             continue
         findings.append(_make_alert(
             agent_id=agent_id, hostname="",
-            severity="critical",
+            severity="medium",
             rule_id="wildcard_bind",
-            title=f"Unauthorized wildcard listener: {proc_name} bound to {lst['bind_ip']}:{lst['port']}",
+            title=f"Service exposed on all interfaces: {proc_name} on {lst['bind_ip']}:{port}",
             description=(
-                f"Process '{proc_name}' (PID {lst['pid']}) is listening on {lst['bind_ip']}:{lst['port']}, "
-                "exposing the port to all network interfaces. "
-                "This process is not in the approved wildcard-bind list."
+                f"Process '{proc_name}' (PID {lst['pid']}) is listening on {lst['bind_ip']}:{port}, "
+                "exposing the port to every network interface rather than loopback only. "
+                "Review whether this service needs to be externally reachable."
             ),
             mitre_technique="T1571",
             evidence={
@@ -863,39 +1003,52 @@ if __name__ == "__main__":
 
         db = MockDB()
 
-        # ── 1. New listener: CRITICAL on first-seen port ──────────────────────
-        print("\nTest 1: New listener triggers CRITICAL")
+        # ── 1. New listener appearing AFTER baseline seeding → alert ──────────
+        # detect_new_listener seeds silently on the first (empty-baseline) scan
+        # and only alerts on listeners that appear in LATER snapshots — that's
+        # the enrollment-FP-storm fix. So prime the baseline, THEN introduce a
+        # genuinely-new listener. Severity is reachability-tiered (0.0.0.0 →
+        # high), not blanket critical.
+        print("\nTest 1: New listener (post-seed) triggers alert")
         fresh()
         db1 = MockDB()
-        lst = [make_listener(port=9999, pid=100, process_name="malware",
-                             bind_ip="0.0.0.0", process_signature_valid=False)]
+        seed = [make_listener(port=22, pid=1, process_name="sshd",
+                              bind_ip="0.0.0.0", process_signature_valid=True)]
+        await detect_new_listener("agentA", seed, db1)   # seed baseline (no alerts)
+        lst = seed + [make_listener(port=9999, pid=100, process_name="malware",
+                                    bind_ip="0.0.0.0", process_signature_valid=False)]
         findings = await detect_new_listener("agentA", lst, db1)
         check("1 finding", len(findings) == 1)
-        check("severity critical", findings[0]["severity"] == "critical")
+        check("severity high (wildcard exposure)", findings[0]["severity"] == "high")
         check("rule_id new_listener", findings[0]["rule_id"] == "new_listener")
 
         # ── 2. Known listener: no alert on repeat ────────────────────────────
-        print("\nTest 2: Same listener not re-alerted in dedup window")
+        print("\nTest 2: Same listener not re-alerted once in baseline")
         fresh()
         db2 = MockDB()
-        lst = [make_listener(port=7878, pid=200, process_name="backdoor",
-                             bind_ip="127.0.0.1")]
-        f1 = await detect_new_listener("agentB", lst, db2)
-        f2 = await detect_new_listener("agentB", lst, db2)
+        await detect_new_listener("agentB",
+            [make_listener(port=22, pid=1, process_name="sshd")], db2)  # seed
+        newl = [make_listener(port=22, pid=1, process_name="sshd"),
+                make_listener(port=7878, pid=200, process_name="backdoor",
+                              bind_ip="127.0.0.1")]
+        f1 = await detect_new_listener("agentB", newl, db2)   # 7878 is new → alert
+        f2 = await detect_new_listener("agentB", newl, db2)   # now baselined → none
         check("first scan: 1 finding", len(f1) == 1)
         check("second scan: suppressed", len(f2) == 0)
 
         # ── 3. Dedup reset on process identity change ─────────────────────────
-        print("\nTest 3: Dedup resets on process_name change")
+        print("\nTest 3: Re-alerts when a port's process identity changes")
         fresh()
         db3 = MockDB()
+        await detect_new_listener("agentC",
+            [make_listener(port=22, pid=1, process_name="sshd")], db3)  # seed
         lst_a = [make_listener(port=5555, pid=300, process_name="sshd",
                                bind_ip="10.0.0.1", process_signature_valid=True)]
         lst_b = [make_listener(port=5555, pid=300, process_name="malware",
                                bind_ip="10.0.0.1", process_signature_valid=False)]
-        await detect_new_listener("agentC", lst_a, db3)
+        await detect_new_listener("agentC", lst_a, db3)   # sshd:5555 new → alert + baselined
         _dedup_cache.clear()
-        f = await detect_new_listener("agentC", lst_b, db3)
+        f = await detect_new_listener("agentC", lst_b, db3)  # malware:5555 → different fp → new
         check("re-alerts after name change", len(f) == 1)
 
         # ── 4. Wildcard bind: approved process → no alert ────────────────────
@@ -906,18 +1059,53 @@ if __name__ == "__main__":
         findings = detect_wildcard_bind("agentD", lst)
         check("no findings for nginx", len(findings) == 0)
 
-        # ── 5. Wildcard bind: unknown process → CRITICAL ──────────────────────
-        print("\nTest 5: Unknown wildcard bind → CRITICAL")
+        # ── 5. Wildcard bind: unknown process on a service port → MEDIUM ──────
+        print("\nTest 5: Unknown wildcard bind → MEDIUM")
         fresh()
         lst = [make_listener(port=8888, pid=20, process_name="mystery_app",
                              bind_ip="0.0.0.0")]
         findings = detect_wildcard_bind("agentE", lst)
         check("1 finding", len(findings) == 1)
-        check("severity critical", findings[0]["severity"] == "critical")
+        check("severity medium", findings[0]["severity"] == "medium")
         check("bind_ip in evidence", findings[0]["evidence"]["bind_ip"] == "0.0.0.0")
 
-        # ── 6. Wildcard bind: IPv6 :: → CRITICAL ────────────────────────────
-        print("\nTest 6: IPv6 wildcard :: → CRITICAL")
+        # ── 5b. Wildcard bind: unapproved process on a HIGH/ephemeral port still
+        #        fires — no port-based blind spot. Only port 0 (not a real
+        #        connectable surface) is exempt.
+        print("\nTest 5b: Unapproved process on ephemeral port still fires")
+        fresh()
+        lst = [make_listener(port=53782, pid=21, process_name="mystery_app",
+                             bind_ip="0.0.0.0")]
+        findings = detect_wildcard_bind("agentE2", lst)
+        check("fires on ephemeral port", len(findings) == 1)
+
+        print("\nTest 5b2: Port 0 (no real port resolved) suppressed")
+        fresh()
+        lst = [make_listener(port=0, pid=22, process_name="mystery_app",
+                             bind_ip="0.0.0.0")]
+        check("no findings (invalid port)", len(detect_wildcard_bind("agentE2b", lst)) == 0)
+
+        # ── 5c. FP regression: real stock-macOS / dev processes suppressed ────
+        # These exact (process, port) pairs produced ~16k false positives on
+        # live agent data before the allowlist/prefix/helper fixes.
+        print("\nTest 5c: Known system/dev wildcard binders suppressed")
+        for proc, port in [("netbiosd", 137), ("netbiosd", 138),
+                            ("com.docker.backend", 6443),
+                            ("com.docker.backend", 8080),
+                            ("Code Helper (Plugin)", 18620),
+                            ("com.apple.WebKit.Networking", 443),
+                            # Found by removing the ephemeral-port exemption
+                            # and replaying real data — see APPROVED_WILDCARD_
+                            # BIND_PROCS for why each is legitimate.
+                            ("airportd", 0), ("replicatord", 59995),
+                            ("symptomsd", 52138), ("syslogd", 50194),
+                            ("wifip2pd", 0), ("wifivelocityd", 0)]:
+            fresh()
+            lst = [make_listener(port=port, pid=22, process_name=proc, bind_ip="0.0.0.0")]
+            check(f"suppressed: {proc}:{port}", len(detect_wildcard_bind("agentE3", lst)) == 0)
+
+        # ── 6. Wildcard bind: IPv6 :: service port → fires ──────────────────
+        print("\nTest 6: IPv6 wildcard :: on service port")
         fresh()
         lst = [make_listener(port=7777, pid=30, process_name="unknown_srv",
                              bind_ip="::")]
@@ -1062,7 +1250,17 @@ if __name__ == "__main__":
              "process_path": "/tmp/strange", "parent_pid": 1,
              "cmdline": "/tmp/strange -l", "interface": "eth0"},
         ]
-        findings = await analyze("agentR", "ports", raw, db20, hostname="host-r")
+        # First scan seeds the new-listener baseline with a benign pre-existing
+        # listener (no new_listener alert yet); the genuinely-new strange_proc
+        # then appears in the second snapshot and fires new_listener, alongside
+        # the exposure rules (wildcard/high-risk/unknown).
+        seed_raw = [{"port": 5000, "bind_ip": "127.0.0.1", "process_name": "seedproc",
+                     "pid": 1, "proto": "tcp", "process_signature_valid": True,
+                     "process_path": "/usr/bin/seedproc", "parent_pid": 1,
+                     "cmdline": "seedproc", "interface": "lo0"}]
+        await analyze("agentR", "ports", seed_raw, db20, hostname="host-r")
+        _dedup_cache.clear()
+        findings = await analyze("agentR", "ports", seed_raw + raw, db20, hostname="host-r")
         rule_ids = {f["rule_id"] for f in findings}
         check("new_listener fired", "new_listener" in rule_ids)
         check("wildcard_bind fired", "wildcard_bind" in rule_ids)

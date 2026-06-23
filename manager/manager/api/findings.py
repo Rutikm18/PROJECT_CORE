@@ -62,8 +62,21 @@ class BulkAction(BaseModel):
 
 # ── Router factory ────────────────────────────────────────────────────────────
 
-def make_findings_router(intel_db) -> APIRouter:
+def make_findings_router(intel_db, db=None) -> APIRouter:
     router = APIRouter()
+
+    async def _live_agent_ids():
+        """agent_ids that haven't gone stale — see detection.py's identical
+        helper for the full rationale. None (db not provided) degrades to
+        unfiltered rather than breaking."""
+        if db is None:
+            return None
+        try:
+            from ..attacklens.config import ENGINE_CONFIG
+            return await db.get_live_agent_ids(ENGINE_CONFIG.get("stale_agent_sec", 86400))
+        except Exception as exc:
+            log.warning("Live-agent lookup failed, showing unfiltered: %s", exc)
+            return None
 
     # ── Dashboard stats ───────────────────────────────────────────────────────
     @router.get("/dashboard")
@@ -74,7 +87,7 @@ def make_findings_router(intel_db) -> APIRouter:
           daily_trend (7 days), sla_compliance.
         """
         try:
-            return await intel_db.get_dashboard_stats()
+            return await intel_db.get_dashboard_stats(live_agent_ids=await _live_agent_ids())
         except Exception as exc:
             log.exception("dashboard_stats failed")
             raise HTTPException(500, f"Failed to load dashboard stats: {exc}")
@@ -195,6 +208,7 @@ def make_findings_router(intel_db) -> APIRouter:
                 limit=limit,
                 offset=offset,
                 min_precision=min_precision_sql,
+                live_agent_ids=await _live_agent_ids(),
             )
         except Exception as exc:
             log.exception("list_findings failed")

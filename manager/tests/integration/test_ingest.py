@@ -25,13 +25,38 @@ _AGENT_ID     = "test-agent"
 _AGENT_KEY    = secrets.token_hex(32)
 
 
+def _run(coro):
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 @pytest.fixture(scope="module")
 def app(tmp_path_factory):
-    os.environ["DATA_DIR"]          = str(tmp_path_factory.mktemp("db"))
-    os.environ["ENROLLMENT_TOKENS"] = _ENROLL_TOKEN
+    # Without MANAGER_DATABASE_URL/INTEL_DATABASE_URL, create_app() falls back
+    # to the default shared postgresql://.../manager + /intel databases
+    # (server.py) — every run of this file would then accumulate "test-agent"
+    # state across every pytest invocation, forever. Isolated per-run
+    # databases instead (see test_attacklens_pipeline.py for the same fix).
+    from manager.tests.conftest import _create_test_db, _drop_test_db
+    dsn_m, name_m = _run(_create_test_db())
+    dsn_i, name_i = _run(_create_test_db())
+
+    os.environ["DATA_DIR"]             = str(tmp_path_factory.mktemp("db"))
+    os.environ["ENROLLMENT_TOKENS"]    = _ENROLL_TOKEN
+    os.environ["MANAGER_DATABASE_URL"] = dsn_m
+    os.environ["INTEL_DATABASE_URL"]   = dsn_i
     os.environ.pop("API_KEY", None)
     from manager.manager.server import create_app
-    return create_app()
+    try:
+        yield create_app()
+    finally:
+        _run(_drop_test_db(name_m))
+        _run(_drop_test_db(name_i))
 
 
 @pytest.fixture(scope="module")

@@ -33,7 +33,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db        import Database
-from .store     import TelemetryStore
+from .pg_pool   import _redact_dsn
+from .store     import TelemetryStore, RAW_TELEMETRY_RETENTION_DAYS
 from .ws_hub    import WebSocketHub
 from .indexer   import IntelDB
 from .attacklens  import AttackLensEngine
@@ -88,9 +89,22 @@ def create_app() -> FastAPI:
     data_dir = os.environ.get("DATA_DIR", os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "data"
     ))
-    db_path    = os.path.join(data_dir, "manager.db")
-    intel_path = os.path.join(data_dir, "intel.db")
     os.makedirs(data_dir, exist_ok=True)
+    # TelemetryStore (raw telemetry NDJSON+gzip files) stays on local disk
+    # under DATA_DIR — only manager.db/intel.db moved to Postgres.
+    #
+    # DATABASE_URL is the base connection string (no database name) shared by
+    # both logical databases — matches docker-compose.postgres.yml, which
+    # creates "manager" and "intel" as two separate databases on one Postgres
+    # instance (mirrors the old two-separate-SQLite-files isolation: neither
+    # was ever queryable against the other, same here). Override either
+    # individually via MANAGER_DATABASE_URL/INTEL_DATABASE_URL if they ever
+    # need to live on different hosts.
+    database_url = os.environ.get(
+        "DATABASE_URL", "postgresql://attacklens:attacklens@localhost:5432"
+    ).rstrip("/")
+    db_path    = os.environ.get("MANAGER_DATABASE_URL", f"{database_url}/manager")
+    intel_path = os.environ.get("INTEL_DATABASE_URL",   f"{database_url}/intel")
 
     rabbitmq_url = os.environ.get("RABBITMQ_URL", "").strip()
     threat_intel_url = os.environ.get("THREAT_INTEL_URL", "").strip().rstrip("/")
@@ -152,15 +166,66 @@ def create_app() -> FastAPI:
     # but is no longer used for deduplication logic.
     nonce_cache: dict[str, float] = {}
 
+    async def _retention_settings() -> tuple[int, str]:
+        """Read the LIVE Settings → Data Retention config (org_settings table)
+        each cycle, so a change in the UI takes effect on the next hourly sweep
+        with no restart. Falls back to the RAW_TELEMETRY_RETENTION_DAYS env
+        default (delete mode) if settings are unreadable for any reason —
+        retention enforcement must degrade safely, never crash the job."""
+        try:
+            from .api.settings import retention_period_days
+            row_months = await intel_db._fetchone(
+                "SELECT value FROM org_settings WHERE key='retention_period_months'", ()
+            )
+            row_action = await intel_db._fetchone(
+                "SELECT value FROM org_settings WHERE key='retention_action'", ()
+            )
+            months_val = row_months["value"] if row_months else "1"
+            action     = row_action["value"] if row_action else "delete"
+            return retention_period_days(months_val), action
+        except Exception as exc:
+            log.debug("Retention settings unreadable, using default: %s", exc)
+            return RAW_TELEMETRY_RETENTION_DAYS, "delete"
+
     async def _cleanup_store():
-        """Hourly file-store cleanup job."""
+        """Hourly retention sweep — file-tier archive AND the manager.db rows
+        Deep Analysis actually queries, on the SAME cutoff (Settings → Data
+        Retention, default 1 month / delete — see api/settings.py). Before
+        this, `payloads` and `agent_sessions` had no retention at all and grew
+        unbounded forever."""
         while True:
             await asyncio.sleep(3600)
+            retention_days, action = await _retention_settings()
+            archive_mode = (action == "archive")
             try:
-                stats = await store.cleanup()
-                log.info("Store cleanup: %s", stats)
+                stats = await store.cleanup(
+                    cold_retention_sec=retention_days * 86400,
+                    prune_cold=not archive_mode,
+                )
+                log.info("Store cleanup (action=%s): %s", action, stats)
             except Exception as exc:
                 log.warning("Store cleanup error: %s", exc)
+            try:
+                cutoff = int(time.time()) - retention_days * 86400
+                n_payloads = await db.prune_payloads(cutoff)
+                n_sessions = await db.prune_agent_sessions(cutoff)
+                if n_payloads or n_sessions:
+                    log.info("Retention prune (>%dd, action=%s): payloads=%d agent_sessions=%d",
+                             retention_days, action, n_payloads, n_sessions)
+            except Exception as exc:
+                log.warning("Payload/session retention prune error: %s", exc)
+            try:
+                # intel.db bound to the SAME retention window — only the
+                # historical backlog (resolved findings, closed correlations,
+                # timeline events); a currently-active finding is never
+                # removed regardless of age. Unconditional on delete/archive
+                # mode — that toggle governs raw telemetry, not findings.
+                cutoff = time.time() - retention_days * 86400
+                idb_deleted = await intel_db.prune_inactive(cutoff)
+                if any(idb_deleted.values()):
+                    log.info("intel.db retention prune (>%dd): %s", retention_days, idb_deleted)
+            except Exception as exc:
+                log.warning("intel.db retention prune error: %s", exc)
 
     async def _expire_chunks():
         """Periodic chunk-tracker expiry — prevents unbounded memory growth."""
@@ -256,7 +321,7 @@ def create_app() -> FastAPI:
         await _nvd_sync.start()
 
         log.info("Manager started. DB=%s  Intel=%s  Data=%s",
-                 db_path, intel_path, data_dir)
+                 _redact_dsn(db_path), _redact_dsn(intel_path), data_dir)
         log.info("Enrollment mode: %s",
                  "OPEN (no token required)" if open_enrollment else
                  f"TOKEN ({len(enrollment_tokens)} token(s) configured)")
@@ -319,15 +384,15 @@ def create_app() -> FastAPI:
     enroll_router      = make_enroll_router(db, enrollment_tokens, open_enrollment)
     attacklens_router  = make_attacklens_router(intel_db, engine)
     keys_router      = make_keys_router(db, admin_token)
-    findings_router  = make_findings_router(intel_db)
+    findings_router  = make_findings_router(intel_db, db)
     threat_router    = make_threat_router(intel_db, central_url=threat_intel_url)
 
     raw_router    = make_raw_router(db)
     assets_router  = make_assets_router(db, intel_db)
     posture_router    = make_posture_router(db, intel_db)
-    detection_router  = make_detection_router(intel_db)
+    detection_router  = make_detection_router(intel_db, db)
     accuracy_router   = make_accuracy_router(intel_db)
-    settings_router   = make_settings_router(intel_db)
+    settings_router   = make_settings_router(intel_db, store, db)
     allowlist_router  = make_allowlist_router(intel_db)
 
     app.include_router(ingest_router,       prefix="/api/v1")

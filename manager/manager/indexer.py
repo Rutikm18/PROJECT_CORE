@@ -22,29 +22,30 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
-from .pool import SQLitePool
+from .pg_pool import PgPool
 
 log = logging.getLogger("manager.indexer")
 
-_SCHEMA = """
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+# Reserved pseudo-agent under which fleet-wide / global-threat correlations are
+# stored (correlations table is keyed UNIQUE(agent_id, rule_id)). A real agent
+# can never collide with this — agent ids are hardware-derived (mac-/win-/host-).
+FLEET_AGENT_ID = "__fleet__"
 
+_SCHEMA = """
 -- ── Findings ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS findings (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                BIGSERIAL PRIMARY KEY,
     external_id       TEXT    NOT NULL DEFAULT '',
     agent_id          TEXT    NOT NULL,
     category          TEXT    NOT NULL,
     item_key          TEXT    NOT NULL,
     fingerprint       TEXT    NOT NULL,
     severity          TEXT    NOT NULL DEFAULT 'info',
-    score             REAL    NOT NULL DEFAULT 0,
+    score             DOUBLE PRECISION    NOT NULL DEFAULT 0,
     title             TEXT    NOT NULL DEFAULT '',
     description       TEXT,
     evidence          TEXT,
@@ -52,30 +53,30 @@ CREATE TABLE IF NOT EXISTS findings (
     source            TEXT,
     rule_id           TEXT,
     cve_ids           TEXT,
-    cvss_score        REAL,
+    cvss_score        DOUBLE PRECISION,
     cvss_vector       TEXT,
-    composite_score   REAL    NOT NULL DEFAULT 0,
-    epss_score        REAL    NOT NULL DEFAULT 0,
+    composite_score   DOUBLE PRECISION    NOT NULL DEFAULT 0,
+    epss_score        DOUBLE PRECISION    NOT NULL DEFAULT 0,
     kev               INTEGER NOT NULL DEFAULT 0,
     exploit_available INTEGER NOT NULL DEFAULT 0,
     exploit_sources   TEXT    NOT NULL DEFAULT '[]',
     asset_tier        TEXT    NOT NULL DEFAULT '',
-    asset_importance  REAL    NOT NULL DEFAULT 0,
+    asset_importance  DOUBLE PRECISION    NOT NULL DEFAULT 0,
     priority_reason   TEXT    NOT NULL DEFAULT '',
     action_plan       TEXT    NOT NULL DEFAULT '[]',
     mitre_technique   TEXT,
     mitre_tactic      TEXT,
-    first_detected_at REAL    NOT NULL,
-    last_detected_at  REAL    NOT NULL,
+    first_detected_at DOUBLE PRECISION    NOT NULL,
+    last_detected_at  DOUBLE PRECISION    NOT NULL,
     scan_count        INTEGER NOT NULL DEFAULT 1,
     is_active         INTEGER NOT NULL DEFAULT 1,
-    resolved_at       REAL,
+    resolved_at       DOUBLE PRECISION,
     tags              TEXT,
     -- SOC workflow columns (were migrations; now canonical schema for fresh DBs)
     status            TEXT    NOT NULL DEFAULT 'new',
     assignee          TEXT    NOT NULL DEFAULT '',
-    sla_due           REAL    NOT NULL DEFAULT 0,
-    closed_at         REAL,
+    sla_due           DOUBLE PRECISION    NOT NULL DEFAULT 0,
+    closed_at         DOUBLE PRECISION,
     priority          INTEGER NOT NULL DEFAULT 0,
     analyst_notes     TEXT    NOT NULL DEFAULT '',
     ai_analysed       INTEGER NOT NULL DEFAULT 0,
@@ -83,12 +84,12 @@ CREATE TABLE IF NOT EXISTS findings (
     news_refs         TEXT    NOT NULL DEFAULT '[]',
     -- Detection Confidence Engine (canonical for fresh DBs)
     signal_cluster_id INTEGER,
-    confidence        REAL,
+    confidence        DOUBLE PRECISION,
     validation_gates_passed TEXT NOT NULL DEFAULT '[]',
     layers_involved   TEXT    NOT NULL DEFAULT '[]',
     host_class        TEXT    NOT NULL DEFAULT '',
     -- AI Precision Validation (canonical for fresh DBs)
-    precision_score   REAL    NOT NULL DEFAULT 0.0,
+    precision_score   DOUBLE PRECISION    NOT NULL DEFAULT 0.0,
     precision_factors TEXT    NOT NULL DEFAULT '{}',
     ai_verdict        TEXT    NOT NULL DEFAULT '{}',
     ai_validation_used INTEGER NOT NULL DEFAULT 0,
@@ -102,26 +103,38 @@ CREATE INDEX IF NOT EXISTS idx_find_ts      ON findings(last_detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_find_score   ON findings(score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_composite ON findings(composite_score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_cat     ON findings(agent_id, category);
+-- Every Attack Terrain page (processes/network/persistence/packages/ports)
+-- queries category + is_active with NO agent_id filter (fleet-wide view) —
+-- idx_find_cat can't help there (its leading column is agent_id). Confirmed
+-- live against an 18k-row findings table: this turned an 839ms full-index
+-- SCAN into a 2ms SEARCH. idx_find_agent's leading-agent_id limitation is the
+-- same gap for severity-only fleet-wide filters, so it gets the matching index.
+CREATE INDEX IF NOT EXISTS idx_find_active_cat_score ON findings(is_active, category, composite_score DESC);
+CREATE INDEX IF NOT EXISTS idx_find_active_sev_score ON findings(is_active, severity, composite_score DESC);
+-- get_dashboard_stats() — the very first page most users hit. Confirmed live
+-- (18.4k-row findings table): top_agents' "GROUP BY agent_id" forced a full
+-- temp B-TREE scan over every active row (136ms); the 7-day trend loop ran
+-- 7 unindexed full-table scans on first_detected_at (22ms each, ~157ms
+-- total). Together these two gaps accounted for ~290ms of the page's 305ms
+-- total. With these indexes: top_agents 136ms→10ms, trend loop 157ms→1ms.
+CREATE INDEX IF NOT EXISTS idx_find_active_agent     ON findings(is_active, agent_id);
+CREATE INDEX IF NOT EXISTS idx_find_first_detected   ON findings(first_detected_at);
 
--- ── FTS5 for full-text search ─────────────────────────────────────────────
-CREATE VIRTUAL TABLE IF NOT EXISTS findings_fts USING fts5(
-    title, description, evidence, tags, cve_ids,
-    content=findings, content_rowid=id
-);
-CREATE TRIGGER IF NOT EXISTS findings_ai AFTER INSERT ON findings BEGIN
-    INSERT INTO findings_fts(rowid,title,description,evidence,tags,cve_ids)
-    VALUES(new.id,new.title,new.description,new.evidence,new.tags,new.cve_ids);
-END;
-CREATE TRIGGER IF NOT EXISTS findings_ad AFTER DELETE ON findings BEGIN
-    INSERT INTO findings_fts(findings_fts,rowid,title,description,evidence,tags,cve_ids)
-    VALUES('delete',old.id,old.title,old.description,old.evidence,old.tags,old.cve_ids);
-END;
-CREATE TRIGGER IF NOT EXISTS findings_au AFTER UPDATE ON findings BEGIN
-    INSERT INTO findings_fts(findings_fts,rowid,title,description,evidence,tags,cve_ids)
-    VALUES('delete',old.id,old.title,old.description,old.evidence,old.tags,old.cve_ids);
-    INSERT INTO findings_fts(rowid,title,description,evidence,tags,cve_ids)
-    VALUES(new.id,new.title,new.description,new.evidence,new.tags,new.cve_ids);
-END;
+-- ── Full-text search ──────────────────────────────────────────────────────
+-- SQLite's FTS5 needed a separate virtual table + 3 triggers to mirror data
+-- into a shadow index on every insert/update/delete. Postgres can compute the
+-- search vector AS PART OF THE ROW ITSELF via a GENERATED STORED column —
+-- no shadow table, no triggers, always in sync by construction. A GIN index
+-- on that column gives the same sub-millisecond search.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS search_vector tsvector
+    GENERATED ALWAYS AS (
+        to_tsvector('english',
+            coalesce(title,'') || ' ' || coalesce(description,'') || ' ' ||
+            coalesce(evidence,'') || ' ' || coalesce(tags,'') || ' ' ||
+            coalesce(cve_ids,'')
+        )
+    ) STORED;
+CREATE INDEX IF NOT EXISTS idx_findings_search ON findings USING GIN(search_vector);
 
 -- ── IOC cache ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ioc_cache (
@@ -132,8 +145,8 @@ CREATE TABLE IF NOT EXISTS ioc_cache (
     confidence INTEGER DEFAULT 50,
     description TEXT,
     tags       TEXT,
-    cached_at  REAL NOT NULL,
-    expires_at REAL NOT NULL,
+    cached_at  DOUBLE PRECISION NOT NULL,
+    expires_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY(ioc_type, ioc_value, source)
 );
 CREATE INDEX IF NOT EXISTS idx_ioc_val  ON ioc_cache(ioc_type, ioc_value);
@@ -143,33 +156,33 @@ CREATE INDEX IF NOT EXISTS idx_ioc_exp  ON ioc_cache(expires_at);
 CREATE TABLE IF NOT EXISTS cve_cache (
     cache_key     TEXT PRIMARY KEY,
     data_json     TEXT NOT NULL,
-    cached_at     REAL NOT NULL,
-    expires_at    REAL NOT NULL
+    cached_at     DOUBLE PRECISION NOT NULL,
+    expires_at    DOUBLE PRECISION NOT NULL
 );
 CREATE TABLE IF NOT EXISTS cve_entries (
     cve_id        TEXT PRIMARY KEY,
     description   TEXT,
-    cvss_score    REAL,
+    cvss_score    DOUBLE PRECISION,
     cvss_vector   TEXT,
     severity      TEXT,
     cwe_ids       TEXT,
     published_at  TEXT,
     modified_at   TEXT,
     affected_cpe  TEXT,
-    cached_at     REAL NOT NULL
+    cached_at     DOUBLE PRECISION NOT NULL
 );
 
 -- ── Behavioral baseline ───────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS behavior_baseline (
     agent_id      TEXT NOT NULL,
     metric        TEXT NOT NULL,
-    mean          REAL DEFAULT 0,
-    m2            REAL DEFAULT 0,
-    stddev        REAL DEFAULT 0,
-    min_val       REAL,
-    max_val       REAL,
+    mean          DOUBLE PRECISION DEFAULT 0,
+    m2            DOUBLE PRECISION DEFAULT 0,
+    stddev        DOUBLE PRECISION DEFAULT 0,
+    min_val       DOUBLE PRECISION,
+    max_val       DOUBLE PRECISION,
     sample_count  INTEGER DEFAULT 0,
-    updated_at    REAL NOT NULL,
+    updated_at    DOUBLE PRECISION NOT NULL,
     PRIMARY KEY(agent_id, metric)
 );
 
@@ -179,17 +192,17 @@ CREATE TABLE IF NOT EXISTS entity_state (
     category    TEXT NOT NULL,
     entity_key  TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
-    seen_at     REAL NOT NULL,
+    seen_at     DOUBLE PRECISION NOT NULL,
     PRIMARY KEY(agent_id, category, entity_key)
 );
 
 -- ── Correlation chains ───────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS correlations (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id              BIGSERIAL PRIMARY KEY,
     agent_id        TEXT    NOT NULL,
     rule_id         TEXT    NOT NULL,
     severity        TEXT    NOT NULL DEFAULT 'high',
-    score           REAL    NOT NULL DEFAULT 0,
+    score           DOUBLE PRECISION    NOT NULL DEFAULT 0,
     confidence      INTEGER NOT NULL DEFAULT 0,
     title           TEXT    NOT NULL DEFAULT '',
     description     TEXT,
@@ -202,8 +215,8 @@ CREATE TABLE IF NOT EXISTS correlations (
     likely_next_steps TEXT,
     signals         TEXT,
     signal_count    INTEGER DEFAULT 0,
-    first_detected  REAL    NOT NULL,
-    last_detected   REAL    NOT NULL,
+    first_detected  DOUBLE PRECISION    NOT NULL,
+    last_detected   DOUBLE PRECISION    NOT NULL,
     is_active       INTEGER NOT NULL DEFAULT 1,
     UNIQUE(agent_id, rule_id)
 );
@@ -211,7 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_corr_agent ON correlations(agent_id, is_active, s
 
 -- ── Change timeline ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS change_timeline (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          BIGSERIAL PRIMARY KEY,
     agent_id    TEXT    NOT NULL,
     category    TEXT    NOT NULL,
     change_type TEXT    NOT NULL,
@@ -219,7 +232,7 @@ CREATE TABLE IF NOT EXISTS change_timeline (
     title       TEXT,
     item_data   TEXT,
     prev_data   TEXT,
-    detected_at REAL    NOT NULL
+    detected_at DOUBLE PRECISION    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tl_agent ON change_timeline(agent_id, detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tl_cat   ON change_timeline(agent_id, category, detected_at DESC);
@@ -227,7 +240,7 @@ CREATE INDEX IF NOT EXISTS idx_tl_cat   ON change_timeline(agent_id, category, d
 -- ── SOC workflow: analyst activity log ───────────────────────────────────
 -- Records every analyst action on a finding (status change, assignment, etc.)
 CREATE TABLE IF NOT EXISTS soc_activity (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          BIGSERIAL PRIMARY KEY,
     finding_id  INTEGER NOT NULL,
     agent_id    TEXT    NOT NULL,
     action      TEXT    NOT NULL,   -- 'created','status_change','assigned','commented','escalated','resolved','false_positive','accepted_risk'
@@ -235,36 +248,36 @@ CREATE TABLE IF NOT EXISTS soc_activity (
     old_value   TEXT    DEFAULT '',
     new_value   TEXT    DEFAULT '',
     detail      TEXT    DEFAULT '',
-    created_at  REAL    NOT NULL
+    created_at  DOUBLE PRECISION    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_act_finding ON soc_activity(finding_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_act_agent   ON soc_activity(agent_id,   created_at DESC);
 
 -- ── SOC workflow: analyst comments ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS soc_comments (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          BIGSERIAL PRIMARY KEY,
     finding_id  INTEGER NOT NULL,
     agent_id    TEXT    NOT NULL,
     analyst     TEXT    NOT NULL DEFAULT 'analyst',
     comment     TEXT    NOT NULL,
-    created_at  REAL    NOT NULL
+    created_at  DOUBLE PRECISION    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cmt_finding ON soc_comments(finding_id, created_at DESC);
 
 -- ── SOC workflow: durable action / remediation plan items ─────────────────
 CREATE TABLE IF NOT EXISTS soc_actions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          BIGSERIAL PRIMARY KEY,
     finding_id  INTEGER NOT NULL,
     agent_id    TEXT    NOT NULL,
     action_type TEXT    NOT NULL DEFAULT 'remediate',
     title       TEXT    NOT NULL DEFAULT '',
     status      TEXT    NOT NULL DEFAULT 'open',
     owner       TEXT    NOT NULL DEFAULT '',
-    due_at      REAL    DEFAULT 0,
+    due_at      DOUBLE PRECISION    DEFAULT 0,
     detail      TEXT    DEFAULT '',
     created_by  TEXT    NOT NULL DEFAULT 'system',
-    created_at  REAL    NOT NULL,
-    updated_at  REAL    NOT NULL
+    created_at  DOUBLE PRECISION    NOT NULL,
+    updated_at  DOUBLE PRECISION    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_action_finding ON soc_actions(finding_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_action_agent   ON soc_actions(agent_id, status, created_at DESC);
@@ -272,8 +285,8 @@ CREATE INDEX IF NOT EXISTS idx_action_agent   ON soc_actions(agent_id, status, c
 -- ── Threat intel feed health ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS feed_health (
     source        TEXT PRIMARY KEY,
-    last_attempt  REAL NOT NULL DEFAULT 0,
-    last_success  REAL NOT NULL DEFAULT 0,
+    last_attempt  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_success  DOUBLE PRECISION NOT NULL DEFAULT 0,
     last_error    TEXT NOT NULL DEFAULT '',
     error_count   INTEGER NOT NULL DEFAULT 0,
     entry_count   INTEGER NOT NULL DEFAULT 0,
@@ -286,7 +299,7 @@ CREATE TABLE IF NOT EXISTS feed_health (
 CREATE TABLE IF NOT EXISTS nvd_cve_local (
     cve_id        TEXT PRIMARY KEY,
     description   TEXT NOT NULL DEFAULT '',
-    cvss_score    REAL,
+    cvss_score    DOUBLE PRECISION,
     cvss_vector   TEXT NOT NULL DEFAULT '',
     severity      TEXT NOT NULL DEFAULT 'info',
     cwe_ids       TEXT NOT NULL DEFAULT '[]',
@@ -294,30 +307,16 @@ CREATE TABLE IF NOT EXISTS nvd_cve_local (
     pkg_keywords  TEXT NOT NULL DEFAULT '',
     published_at  TEXT NOT NULL DEFAULT '',
     modified_at   TEXT NOT NULL DEFAULT '',
-    synced_at     REAL NOT NULL DEFAULT 0
+    synced_at     DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_nvd_score ON nvd_cve_local(cvss_score DESC);
 CREATE INDEX IF NOT EXISTS idx_nvd_mod   ON nvd_cve_local(modified_at DESC);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS nvd_cve_fts USING fts5(
-    cve_id UNINDEXED,
-    pkg_keywords,
-    content='nvd_cve_local', content_rowid=rowid
-);
-CREATE TRIGGER IF NOT EXISTS nvd_ai AFTER INSERT ON nvd_cve_local BEGIN
-    INSERT INTO nvd_cve_fts(rowid, cve_id, pkg_keywords)
-    VALUES(new.rowid, new.cve_id, new.pkg_keywords);
-END;
-CREATE TRIGGER IF NOT EXISTS nvd_ad AFTER DELETE ON nvd_cve_local BEGIN
-    INSERT INTO nvd_cve_fts(nvd_cve_fts, rowid, cve_id, pkg_keywords)
-    VALUES('delete', old.rowid, old.cve_id, old.pkg_keywords);
-END;
-CREATE TRIGGER IF NOT EXISTS nvd_au AFTER UPDATE ON nvd_cve_local BEGIN
-    INSERT INTO nvd_cve_fts(nvd_cve_fts, rowid, cve_id, pkg_keywords)
-    VALUES('delete', old.rowid, old.cve_id, old.pkg_keywords);
-    INSERT INTO nvd_cve_fts(rowid, cve_id, pkg_keywords)
-    VALUES(new.rowid, new.cve_id, new.pkg_keywords);
-END;
+-- Same GENERATED-column approach as findings.search_vector above — replaces
+-- the FTS5 virtual table + 3 triggers entirely.
+ALTER TABLE nvd_cve_local ADD COLUMN IF NOT EXISTS search_vector tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(pkg_keywords,''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_nvd_search ON nvd_cve_local USING GIN(search_vector);
 
 -- ── NVD sync state (key/value for sync timestamps) ───────────────────────
 CREATE TABLE IF NOT EXISTS nvd_sync_state (
@@ -331,19 +330,19 @@ CREATE TABLE IF NOT EXISTS nvd_sync_state (
 CREATE TABLE IF NOT EXISTS org_settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL DEFAULT '',
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
 -- ── Settings audit log ─────────────────────────────────────────────────────
 -- Immutable record of every settings change: who changed what, from/to, when.
 CREATE TABLE IF NOT EXISTS settings_audit (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         BIGSERIAL PRIMARY KEY,
     key        TEXT NOT NULL,
     old_value  TEXT NOT NULL DEFAULT '',
     new_value  TEXT NOT NULL DEFAULT '',
     actor      TEXT NOT NULL DEFAULT 'system',
     ip         TEXT NOT NULL DEFAULT '',
-    changed_at REAL NOT NULL DEFAULT 0
+    changed_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_audit_key ON settings_audit(key, changed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_ts  ON settings_audit(changed_at DESC);
@@ -358,23 +357,23 @@ CREATE TABLE IF NOT EXISTS cisa_kev (
     short_desc      TEXT NOT NULL DEFAULT '',
     required_action TEXT NOT NULL DEFAULT '',
     due_date        TEXT NOT NULL DEFAULT '',
-    cached_at       REAL NOT NULL
+    cached_at       DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_kev_date ON cisa_kev(date_added DESC);
 
 -- ── EPSS scores ───────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS epss_scores (
     cve_id      TEXT PRIMARY KEY,
-    epss        REAL NOT NULL DEFAULT 0,
-    percentile  REAL NOT NULL DEFAULT 0,
+    epss        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    percentile  DOUBLE PRECISION NOT NULL DEFAULT 0,
     model_date  TEXT NOT NULL DEFAULT '',
-    cached_at   REAL NOT NULL
+    cached_at   DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_epss_score ON epss_scores(epss DESC);
 
 -- ── Threat actors (ransomware.live, ThreatFox, etc.) ──────────────────────
 CREATE TABLE IF NOT EXISTS threat_actors (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          BIGSERIAL PRIMARY KEY,
     name        TEXT NOT NULL,
     aliases     TEXT NOT NULL DEFAULT '[]',
     description TEXT NOT NULL DEFAULT '',
@@ -384,14 +383,14 @@ CREATE TABLE IF NOT EXISTS threat_actors (
     source      TEXT NOT NULL DEFAULT 'ransomware.live',
     first_seen  TEXT NOT NULL DEFAULT '',
     last_active TEXT NOT NULL DEFAULT '',
-    cached_at   REAL NOT NULL,
+    cached_at   DOUBLE PRECISION NOT NULL,
     UNIQUE(name, source)
 );
 CREATE INDEX IF NOT EXISTS idx_actors_active ON threat_actors(active, cached_at DESC);
 
 -- ── Security news feed (HackerNews, security blogs) ──────────────────────
 CREATE TABLE IF NOT EXISTS security_news (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           BIGSERIAL PRIMARY KEY,
     source       TEXT NOT NULL,
     external_id  TEXT NOT NULL DEFAULT '',
     title        TEXT NOT NULL,
@@ -400,8 +399,8 @@ CREATE TABLE IF NOT EXISTS security_news (
     keywords     TEXT NOT NULL DEFAULT '[]',
     cve_refs     TEXT NOT NULL DEFAULT '[]',
     severity     TEXT NOT NULL DEFAULT 'info',
-    published_at REAL NOT NULL DEFAULT 0,
-    cached_at    REAL NOT NULL,
+    published_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cached_at    DOUBLE PRECISION NOT NULL,
     UNIQUE(source, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_news_pub ON security_news(published_at DESC);
@@ -417,14 +416,14 @@ CREATE TABLE IF NOT EXISTS ai_analysis (
     ioc_matches     TEXT NOT NULL DEFAULT '[]',
     news_context    TEXT NOT NULL DEFAULT '[]',
     actor_context   TEXT NOT NULL DEFAULT '[]',
-    confidence      REAL NOT NULL DEFAULT 0,
+    confidence      DOUBLE PRECISION NOT NULL DEFAULT 0,
     tokens_used     INTEGER NOT NULL DEFAULT 0,
-    generated_at    REAL NOT NULL
+    generated_at    DOUBLE PRECISION NOT NULL
 );
 
 -- ── AI-generated remediation plans ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS remediation_plans (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           BIGSERIAL PRIMARY KEY,
     finding_id   INTEGER NOT NULL,
     agent_id     TEXT NOT NULL,
     os_type      TEXT NOT NULL DEFAULT 'macos',
@@ -435,7 +434,7 @@ CREATE TABLE IF NOT EXISTS remediation_plans (
     risk_level   TEXT NOT NULL DEFAULT 'low',
     verification TEXT NOT NULL DEFAULT '[]',
     long_term    TEXT NOT NULL DEFAULT '[]',
-    generated_at REAL NOT NULL,
+    generated_at DOUBLE PRECISION NOT NULL,
     UNIQUE(finding_id, os_type)
 );
 CREATE INDEX IF NOT EXISTS idx_remed_finding ON remediation_plans(finding_id);
@@ -450,30 +449,30 @@ CREATE TABLE IF NOT EXISTS asset_registry (
     arch        TEXT NOT NULL DEFAULT '',
     asset_tier  TEXT NOT NULL DEFAULT 'standard',
     asset_group TEXT NOT NULL DEFAULT '',
-    importance  REAL NOT NULL DEFAULT 0.3,
+    importance  DOUBLE PRECISION NOT NULL DEFAULT 0.3,
     owner       TEXT NOT NULL DEFAULT '',
     department  TEXT NOT NULL DEFAULT '',
     tags        TEXT NOT NULL DEFAULT '[]',
-    first_seen  REAL NOT NULL DEFAULT 0,
-    last_seen   REAL NOT NULL DEFAULT 0
+    first_seen  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_seen   DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
 -- ── Org groups for priority weighting ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS org_groups (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            BIGSERIAL PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,
     description   TEXT NOT NULL DEFAULT '',
-    importance    REAL NOT NULL DEFAULT 0.5,
+    importance    DOUBLE PRECISION NOT NULL DEFAULT 0.5,
     member_agents TEXT NOT NULL DEFAULT '[]',
-    created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL
+    created_at    DOUBLE PRECISION NOT NULL,
+    updated_at    DOUBLE PRECISION NOT NULL
 );
 
 -- ── Detection Confidence Engine tables ───────────────────────────────────
 
 -- Raw signals emitted by rules before clustering / validation
 CREATE TABLE IF NOT EXISTS signals (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    id               BIGSERIAL PRIMARY KEY,
     rule_id          TEXT NOT NULL,
     layer            TEXT NOT NULL CHECK (layer IN ('surface','exposure','execution')),
     data_point       TEXT NOT NULL,
@@ -481,10 +480,10 @@ CREATE TABLE IF NOT EXISTS signals (
     agent_id         TEXT NOT NULL,
     severity_hint    TEXT NOT NULL DEFAULT 'medium',
     evidence         TEXT NOT NULL DEFAULT '{}',
-    weight           REAL NOT NULL DEFAULT 0.5,
-    strength         REAL NOT NULL DEFAULT 0.5,
-    detected_at      REAL NOT NULL,
-    created_at       REAL NOT NULL,
+    weight           DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    strength         DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    detected_at      DOUBLE PRECISION NOT NULL,
+    created_at       DOUBLE PRECISION NOT NULL,
     cluster_id       INTEGER,          -- set after cluster is persisted
     validation_status TEXT,            -- 'promoted' | 'rejected_G<n>' | 'low_confidence'
     rejection_reason  TEXT
@@ -495,28 +494,28 @@ CREATE INDEX IF NOT EXISTS idx_signals_cluster ON signals(cluster_id);
 
 -- Persisted signal clusters (one row per cluster)
 CREATE TABLE IF NOT EXISTS signal_clusters (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id              BIGSERIAL PRIMARY KEY,
     agent_id        TEXT NOT NULL,
     entity_key      TEXT NOT NULL,
     layers_covered  TEXT NOT NULL DEFAULT '[]',   -- JSON array
-    confidence      REAL,
+    confidence      DOUBLE PRECISION,
     validation_status TEXT,
     rejection_reason  TEXT,
     finding_id      INTEGER,                       -- FK to findings (if promoted)
-    created_at      REAL NOT NULL
+    created_at      DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_clusters_agent ON signal_clusters(agent_id, created_at DESC);
 
 -- Table-backed allowlist (complements static attacklens/allowlist.py lists)
 CREATE TABLE IF NOT EXISTS detection_allowlist (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         BIGSERIAL PRIMARY KEY,
     rule_id    TEXT,        -- NULL = all rules
     entity_key TEXT,        -- NULL = all entities
     agent_id   TEXT,        -- NULL = all agents
     reason     TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL DEFAULT 'system',
-    created_at REAL NOT NULL,
-    expires_at REAL          -- NULL = never expires
+    created_at DOUBLE PRECISION NOT NULL,
+    expires_at DOUBLE PRECISION          -- NULL = never expires
 );
 CREATE INDEX IF NOT EXISTS idx_allowlist_lookup
     ON detection_allowlist(rule_id, entity_key, agent_id);
@@ -529,21 +528,21 @@ CREATE TABLE IF NOT EXISTS rule_fp_stats (
     tp_count      INTEGER DEFAULT 0,
     fp_count      INTEGER DEFAULT 0,
     accepted_risk INTEGER DEFAULT 0,
-    updated_at    REAL,
+    updated_at    DOUBLE PRECISION,
     PRIMARY KEY (rule_id, host_class, window_start)
 );
 
 -- Auto-generated allowlist suggestions for engineer review
 CREATE TABLE IF NOT EXISTS allowlist_suggestions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           BIGSERIAL PRIMARY KEY,
     rule_id      TEXT NOT NULL,
     entity_key   TEXT NOT NULL,
     fp_count     INTEGER NOT NULL DEFAULT 0,
-    last_fp_at   REAL,
-    suggested_at REAL NOT NULL,
+    last_fp_at   DOUBLE PRECISION,
+    suggested_at DOUBLE PRECISION NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',    -- 'pending'|'approved'|'rejected'
     reviewed_by  TEXT,
-    reviewed_at  REAL,
+    reviewed_at  DOUBLE PRECISION,
     UNIQUE(rule_id, entity_key)
 );
 """
@@ -565,17 +564,17 @@ _SOC_MIGRATIONS = [
     ("findings",     "external_id",       "TEXT    DEFAULT ''"),
     ("findings",     "status",        "TEXT    DEFAULT 'new'"),
     ("findings",     "assignee",      "TEXT    DEFAULT ''"),
-    ("findings",     "sla_due",       "REAL    DEFAULT 0"),
-    ("findings",     "closed_at",     "REAL    DEFAULT NULL"),
+    ("findings",     "sla_due",       "DOUBLE PRECISION    DEFAULT 0"),
+    ("findings",     "closed_at",     "DOUBLE PRECISION    DEFAULT NULL"),
     ("findings",     "priority",      "INTEGER DEFAULT 0"),
     ("findings",     "analyst_notes", "TEXT    DEFAULT ''"),
-    ("findings",     "composite_score",   "REAL    DEFAULT 0"),
-    ("findings",     "epss_score",        "REAL    DEFAULT 0"),
+    ("findings",     "composite_score",   "DOUBLE PRECISION    DEFAULT 0"),
+    ("findings",     "epss_score",        "DOUBLE PRECISION    DEFAULT 0"),
     ("findings",     "kev",               "INTEGER DEFAULT 0"),
     ("findings",     "exploit_available", "INTEGER DEFAULT 0"),
     ("findings",     "exploit_sources",   "TEXT    DEFAULT '[]'"),
     ("findings",     "asset_tier",        "TEXT    DEFAULT ''"),
-    ("findings",     "asset_importance",  "REAL    DEFAULT 0"),
+    ("findings",     "asset_importance",  "DOUBLE PRECISION    DEFAULT 0"),
     ("findings",     "priority_reason",   "TEXT    DEFAULT ''"),
     ("findings",     "action_plan",       "TEXT    DEFAULT '[]'"),
     ("correlations",  "attack_path",       "TEXT    DEFAULT '[]'"),
@@ -589,12 +588,12 @@ _SOC_MIGRATIONS = [
     ("findings", "news_refs",          "TEXT    DEFAULT '[]'"),
     # Detection Confidence Engine columns (added on existing findings rows)
     ("findings", "signal_cluster_id",       "INTEGER"),
-    ("findings", "confidence",              "REAL"),
+    ("findings", "confidence",              "DOUBLE PRECISION"),
     ("findings", "validation_gates_passed", "TEXT    DEFAULT '[]'"),
     ("findings", "layers_involved",         "TEXT    DEFAULT '[]'"),
     ("findings", "host_class",              "TEXT    DEFAULT ''"),
     # AI Precision Validation columns
-    ("findings", "precision_score",         "REAL    DEFAULT 0.0"),
+    ("findings", "precision_score",         "DOUBLE PRECISION    DEFAULT 0.0"),
     ("findings", "precision_factors",       "TEXT    DEFAULT '{}'"),
     ("findings", "ai_verdict",              "TEXT    DEFAULT '{}'"),
     ("findings", "ai_validation_used",      "INTEGER DEFAULT 0"),
@@ -604,25 +603,32 @@ _SOC_MIGRATIONS = [
 
 class IntelDB:
     """
-    Async SQLite wrapper for the intel database.
+    Async Postgres wrapper for the intel database (migrated from SQLite —
+    see manager/pg_pool.py for the compatibility layer that kept query call
+    sites largely unchanged).
 
-    Uses SQLitePool: reader connections for all SELECT queries (concurrent),
-    the write connection for all INSERT/UPDATE/DELETE (serialised via pool lock).
-    self._conn is aliased to the pool's write connection for backwards
-    compatibility with all existing write methods — no logic changes needed.
+    Postgres handles concurrent writers natively, so unlike the old
+    SQLitePool there's no single-writer bottleneck here — read() and write()
+    both draw from one connection pool. self._conn is aliased to a write
+    checkout for backwards compatibility with all existing write methods.
     """
 
-    def __init__(self, path: str) -> None:
-        self._path = path
-        self._pool: Optional[SQLitePool] = None
-        self._conn: Optional[aiosqlite.Connection] = None
+    def __init__(self, dsn: str) -> None:
+        self._path = dsn  # kept as _path for any code/logs still reading it
+        self._dsn = dsn
+        self._pool: Optional[PgPool] = None
+        self._conn = None
         self._lock = asyncio.Lock()  # kept for write-serialisation within Python
 
     async def init(self) -> None:
-        self._pool = SQLitePool(self._path, readers=3)
+        self._pool = PgPool(self._dsn, readers=3)
         await self._pool.init()
-        # Alias write connection for all existing write code (zero changes needed)
-        self._conn = self._pool._write_conn  # type: ignore[attr-defined]
+        # Alias a long-lived write connection for all existing write code
+        # (zero call-site changes needed). Postgres can hold one connection
+        # open indefinitely without blocking other writers, unlike SQLite's
+        # single-writer model this used to compensate for.
+        self._conn_ctx = self._pool.write()
+        self._conn = await self._conn_ctx.__aenter__()
 
         # 1. Migrations first: add columns that exist in _SOC_MIGRATIONS but may
         #    be absent on old databases.  Must run before executescript because
@@ -630,6 +636,12 @@ class IntelDB:
         #    (e.g. idx_find_composite on composite_score).  Errors are silently
         #    ignored — the column already exists, or the table doesn't exist yet
         #    (fresh DB) and will be created by executescript below.
+        #
+        #    Postgres-specific: unlike SQLite, ANY failed statement poisons the
+        #    rest of the current transaction (InFailedSQLTransactionError) until
+        #    a rollback — so swallowing the Python exception alone isn't enough;
+        #    the transaction itself must be rolled back too, or every subsequent
+        #    statement (the remaining migrations, then executescript) fails.
         for table, col, defn in _SOC_MIGRATIONS:
             try:
                 await self._conn.execute(
@@ -637,7 +649,7 @@ class IntelDB:
                 )
                 await self._conn.commit()
             except Exception:
-                pass  # column already exists — no-op
+                await self._conn.rollback()  # reset the poisoned transaction
 
         # 2. Backfill external_id before creating the UNIQUE INDEX on it.
         #    On existing DBs all rows may have external_id=''; giving each a
@@ -656,7 +668,7 @@ class IntelDB:
             if rows:
                 await self._conn.commit()
         except Exception:
-            pass  # findings table doesn't exist yet on a fresh DB — skip
+            await self._conn.rollback()  # findings table doesn't exist yet on a fresh DB
 
         # 3. Create all tables + indexes (idempotent CREATE IF NOT EXISTS).
         #    Migrations and backfill above ensure existing data is clean before
@@ -668,6 +680,11 @@ class IntelDB:
 
     async def close(self) -> None:
         if self._pool:
+            # Release the long-held write checkout BEFORE closing the pool —
+            # asyncpg.Pool.close() waits for all checked-out connections to be
+            # released first, so skipping this would hang forever.
+            if getattr(self, "_conn_ctx", None) is not None:
+                await self._conn_ctx.__aexit__(None, None, None)
             await self._pool.close()
             self._conn = None
 
@@ -840,15 +857,63 @@ class IntelDB:
         )
         return [dict(r) for r in rows]
 
+    async def get_active_findings_global(
+        self,
+        *,
+        categories: list[str] | None = None,
+        since: float | None = None,
+        limit: int = 5000,
+        live_agent_ids: list[str] | None = None,
+    ) -> list[dict]:
+        """Active findings across ALL agents — the input to fleet-wide / global
+        correlation. The per-agent get_findings() can never see a campaign that
+        spans hosts (distributed C2, worm propagation, supply-chain outbreak);
+        this is the cross-host read that makes that visible.
+
+        Bounded by LIMIT and (optionally) a recency cutoff + category filter so a
+        large fleet doesn't pull the whole table. Excludes the synthetic
+        __fleet__ pseudo-agent so fleet correlations never recurse on themselves.
+
+        `live_agent_ids`: when given, also excludes findings whose source agent
+        has gone stale — a campaign rule with min_hosts=3 should mean 3
+        CURRENTLY-reporting hosts, not 2 live ones plus a third that went dark
+        weeks ago. Without this, a stale agent's lingering findings can be the
+        deciding vote in a fleet-wide false positive.
+        """
+        parts = ["is_active=1", "agent_id != ?"]
+        args: list = [FLEET_AGENT_ID]
+        if categories:
+            placeholders = ",".join("?" for _ in categories)
+            parts.append(f"category IN ({placeholders})")
+            args.extend(categories)
+        if since is not None:
+            parts.append("last_detected_at >= ?")
+            args.append(since)
+        if live_agent_ids is not None:
+            if not live_agent_ids:
+                return []
+            placeholders = ",".join("?" * len(live_agent_ids))
+            parts.append(f"agent_id IN ({placeholders})")
+            args.extend(live_agent_ids)
+        where = " AND ".join(parts)
+        rows = await self._fetchall(
+            f"SELECT * FROM findings WHERE {where} "
+            f"ORDER BY last_detected_at DESC LIMIT ?",
+            (*args, limit),
+        )
+        return [dict(r) for r in rows]
+
     async def search_findings(self, agent_id: str, query: str,
                               limit: int = 100) -> list[dict]:
-        """FTS5 full-text search."""
+        """Full-text search via Postgres tsvector/tsquery (was SQLite FTS5
+        MATCH against a separate virtual table + JOIN; now a direct predicate
+        against findings.search_vector, a GENERATED column — see _SCHEMA)."""
         rows = await self._fetchall(
-            "SELECT f.* FROM findings f "
-            "JOIN findings_fts fts ON f.id=fts.rowid "
-            "WHERE f.agent_id=? AND findings_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (agent_id, query, limit),
+            "SELECT * FROM findings "
+            "WHERE agent_id=? AND search_vector @@ websearch_to_tsquery('english', ?) "
+            "ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ?)) DESC "
+            "LIMIT ?",
+            (agent_id, query, query, limit),
         )
         return [dict(r) for r in rows]
 
@@ -915,6 +980,39 @@ class IntelDB:
                 )
             await self._conn.commit()
         return len(rows)
+
+    async def prune_inactive(self, cutoff_ts: float) -> dict:
+        """Bound intel.db to a retention window (Settings → Data Retention,
+        same cutoff as raw telemetry — see server.py's _cleanup_store).
+
+        Only removes the HISTORICAL backlog: resolved findings, closed
+        correlations, and timeline events older than cutoff. Never touches a
+        currently-active finding/correlation regardless of age — "active"
+        means it represents real, currently-true state, and deleting it
+        because it's old would be the exact data-loss-to-correlations
+        regression this engine is built to avoid. change_timeline is pure
+        audit history with no active/inactive concept, so it prunes
+        unconditionally by age.
+        """
+        deleted = {"findings": 0, "correlations": 0, "change_timeline": 0}
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM findings WHERE is_active=0 AND last_detected_at < ?",
+                (cutoff_ts,),
+            )
+            deleted["findings"] = cur.rowcount or 0
+            cur = await self._conn.execute(
+                "DELETE FROM correlations WHERE is_active=0 AND last_detected < ?",
+                (cutoff_ts,),
+            )
+            deleted["correlations"] = cur.rowcount or 0
+            cur = await self._conn.execute(
+                "DELETE FROM change_timeline WHERE detected_at < ?",
+                (cutoff_ts,),
+            )
+            deleted["change_timeline"] = cur.rowcount or 0
+            await self._conn.commit()
+        return deleted
 
     async def mark_resolved(self, agent_id: str, finding_id: int) -> None:
         ts = time.time()
@@ -1049,17 +1147,18 @@ class IntelDB:
     async def upsert_ioc(self, *, ioc_type, ioc_value, source,
                          severity, confidence, description,
                          expires_at: float) -> None:
-        await self._conn.execute("""
-            INSERT INTO ioc_cache
-            (ioc_type,ioc_value,source,severity,confidence,description,cached_at,expires_at)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(ioc_type,ioc_value,source) DO UPDATE SET
-            severity=excluded.severity, confidence=excluded.confidence,
-            description=excluded.description, cached_at=excluded.cached_at,
-            expires_at=excluded.expires_at
-        """, (ioc_type, ioc_value, source, severity, confidence,
-              description, time.time(), expires_at))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO ioc_cache
+                (ioc_type,ioc_value,source,severity,confidence,description,cached_at,expires_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(ioc_type,ioc_value,source) DO UPDATE SET
+                severity=excluded.severity, confidence=excluded.confidence,
+                description=excluded.description, cached_at=excluded.cached_at,
+                expires_at=excluded.expires_at
+            """, (ioc_type, ioc_value, source, severity, confidence,
+                  description, time.time(), expires_at))
+            await self._conn.commit()
 
     async def get_ioc(self, ioc_value: str, source: str) -> Optional[dict]:
         row = await self._fetchone(
@@ -1096,31 +1195,33 @@ class IntelDB:
         return json.loads(row["data_json"]) if row else None
 
     async def set_cve_cache(self, cache_key: str, data: list, ttl: int) -> None:
-        now = time.time()
-        await self._conn.execute("""
-            INSERT INTO cve_cache(cache_key,data_json,cached_at,expires_at)
-            VALUES(?,?,?,?)
-            ON CONFLICT(cache_key) DO UPDATE SET
-            data_json=excluded.data_json, cached_at=excluded.cached_at,
-            expires_at=excluded.expires_at
-        """, (cache_key, json.dumps(data), now, now + ttl))
-        await self._conn.commit()
+        async with self._lock:
+            now = time.time()
+            await self._conn.execute("""
+                INSERT INTO cve_cache(cache_key,data_json,cached_at,expires_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                data_json=excluded.data_json, cached_at=excluded.cached_at,
+                expires_at=excluded.expires_at
+            """, (cache_key, json.dumps(data), now, now + ttl))
+            await self._conn.commit()
 
     async def upsert_cve(self, cve: dict) -> None:
-        await self._conn.execute("""
-            INSERT INTO cve_entries
-            (cve_id,description,cvss_score,cvss_vector,severity,cwe_ids,
-             published_at,modified_at,affected_cpe,cached_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(cve_id) DO UPDATE SET
-            cvss_score=excluded.cvss_score,severity=excluded.severity,
-            description=excluded.description,cached_at=excluded.cached_at
-        """, (cve["cve_id"], cve.get("description",""),
-              cve.get("cvss_score"), cve.get("cvss_vector",""),
-              cve.get("severity",""), json.dumps(cve.get("cwe_ids",[])),
-              cve.get("published_at",""), cve.get("modified_at",""),
-              json.dumps(cve.get("affected_cpe",[])), time.time()))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO cve_entries
+                (cve_id,description,cvss_score,cvss_vector,severity,cwe_ids,
+                 published_at,modified_at,affected_cpe,cached_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(cve_id) DO UPDATE SET
+                cvss_score=excluded.cvss_score,severity=excluded.severity,
+                description=excluded.description,cached_at=excluded.cached_at
+            """, (cve["cve_id"], cve.get("description",""),
+                  cve.get("cvss_score"), cve.get("cvss_vector",""),
+                  cve.get("severity",""), json.dumps(cve.get("cwe_ids",[])),
+                  cve.get("published_at",""), cve.get("modified_at",""),
+                  json.dumps(cve.get("affected_cpe",[])), time.time()))
+            await self._conn.commit()
 
     async def get_cve_by_id(self, cve_id: str) -> Optional[dict]:
         row = await self._fetchone(
@@ -1200,17 +1301,18 @@ class IntelDB:
         return dict(row) if row else None
 
     async def upsert_baseline(self, agent_id: str, metric: str, data: dict) -> None:
-        await self._conn.execute("""
-            INSERT INTO behavior_baseline
-            (agent_id,metric,mean,m2,stddev,min_val,max_val,sample_count,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(agent_id,metric) DO UPDATE SET
-            mean=excluded.mean, m2=excluded.m2, stddev=excluded.stddev,
-            min_val=excluded.min_val, max_val=excluded.max_val,
-            sample_count=excluded.sample_count, updated_at=excluded.updated_at
-        """, (agent_id, metric, data["mean"], data["m2"], data["stddev"],
-              data["min_val"], data["max_val"], data["sample_count"], data["updated_at"]))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO behavior_baseline
+                (agent_id,metric,mean,m2,stddev,min_val,max_val,sample_count,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(agent_id,metric) DO UPDATE SET
+                mean=excluded.mean, m2=excluded.m2, stddev=excluded.stddev,
+                min_val=excluded.min_val, max_val=excluded.max_val,
+                sample_count=excluded.sample_count, updated_at=excluded.updated_at
+            """, (agent_id, metric, data["mean"], data["m2"], data["stddev"],
+                  data["min_val"], data["max_val"], data["sample_count"], data["updated_at"]))
+            await self._conn.commit()
 
     # ── Entity state ──────────────────────────────────────────────────────────
 
@@ -1225,13 +1327,14 @@ class IntelDB:
 
     async def set_entity_state(self, agent_id: str, category: str,
                                entity_key: str, fingerprint: str, ts: float) -> None:
-        await self._conn.execute("""
-            INSERT INTO entity_state(agent_id,category,entity_key,fingerprint,seen_at)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(agent_id,category,entity_key) DO UPDATE SET
-            fingerprint=excluded.fingerprint, seen_at=excluded.seen_at
-        """, (agent_id, category, entity_key, fingerprint, ts))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO entity_state(agent_id,category,entity_key,fingerprint,seen_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(agent_id,category,entity_key) DO UPDATE SET
+                fingerprint=excluded.fingerprint, seen_at=excluded.seen_at
+            """, (agent_id, category, entity_key, fingerprint, ts))
+            await self._conn.commit()
 
     # ── SOC workflow ──────────────────────────────────────────────────────────
 
@@ -1249,12 +1352,22 @@ class IntelDB:
         offset: int = 0,
         sort_by: str = "score",
         min_precision: float | None = None,
+        live_agent_ids: list[str] | None = None,
     ) -> list[dict]:
         """Global findings list with full SOC filters.
 
         `min_precision` filters by the AI Precision Validator composite score
         (precision_score in [0,1]).  The Validated Findings page uses 0.9 to
         only show high-confidence findings.
+
+        `live_agent_ids`: when given AND no explicit `agent_id` was requested
+        AND `active_only` is True, restrict to these agent_ids — excludes
+        findings whose source agent has gone stale (hasn't reported within
+        config.py's stale_agent_sec) from fleet-wide views. An explicit
+        single-agent query is NEVER filtered this way — an analyst
+        investigating one agent should see its findings regardless of how
+        long it's been offline. None (the default) disables this entirely —
+        callers that haven't computed agent liveness get the old behavior.
 
         Each row is left-joined to asset_registry so the response carries the
         agent's OS as `agent_os` — the UI uses this to lock the remediation
@@ -1264,6 +1377,12 @@ class IntelDB:
         args: list = []
         if agent_id:
             parts.append("f.agent_id=?"); args.append(agent_id)
+        elif live_agent_ids is not None and active_only:
+            if not live_agent_ids:
+                return []   # no live agents at all — nothing to show
+            placeholders = ",".join("?" * len(live_agent_ids))
+            parts.append(f"f.agent_id IN ({placeholders})")
+            args.extend(live_agent_ids)
         if severity:
             parts.append("f.severity=?"); args.append(severity)
         if min_precision is not None:
@@ -1302,22 +1421,29 @@ class IntelDB:
         order = valid_sorts.get(sort_by, "f.score DESC")
 
         if search:
-            # Full-text search path
+            # Full-text search path, via Postgres tsvector/tsquery (was SQLite
+            # FTS5 MATCH against a separate virtual table + JOIN; now a direct
+            # predicate against findings.search_vector — see _SCHEMA). Also:
+            # previously also LEFT JOINed a subquery selecting `name FROM
+            # agents` — agents lives in manager.db, a SEPARATE database from
+            # this one (intel.db); there is no `agents` table here. That made
+            # every search query throw "no such table: agents" — confirmed by
+            # reproducing it directly against the live database. The resulting
+            # agent_name column was never read anywhere (not in _enrich, not in
+            # the frontend), so the fix is to drop it, matching the non-search
+            # branch below.
             rows = await self._fetchall(
                 f"SELECT f.*, "
                 f"       ar.os         AS agent_os, "
                 f"       ar.hostname   AS agent_hostname, "
-                f"       ar.os_version AS agent_os_version, "
-                f"       a.name        AS agent_name "
+                f"       ar.os_version AS agent_os_version "
                 f"FROM findings f "
-                f"JOIN findings_fts fts ON f.id=fts.rowid "
                 f"LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
-                f"LEFT JOIN (SELECT agent_id, name FROM (SELECT DISTINCT agent_id, "
-                f"(SELECT name FROM agents WHERE agents.agent_id=f2.agent_id LIMIT 1) AS name "
-                f"FROM findings f2) sub) a ON f.agent_id=a.agent_id "
-                f"{where} {'AND' if where else 'WHERE'} findings_fts MATCH ? "
-                f"ORDER BY rank LIMIT ? OFFSET ?",
-                (*args, search, limit, offset),
+                f"{where} {'AND' if where else 'WHERE'} "
+                f"f.search_vector @@ websearch_to_tsquery('english', ?) "
+                f"ORDER BY ts_rank(f.search_vector, websearch_to_tsquery('english', ?)) DESC "
+                f"LIMIT ? OFFSET ?",
+                (*args, search, search, limit, offset),
             )
         else:
             rows = await self._fetchall(
@@ -1538,13 +1664,35 @@ class IntelDB:
 
     # ── Dashboard & SLA analytics ─────────────────────────────────────────────
 
-    async def get_dashboard_stats(self) -> dict:
-        """Comprehensive stats for the SOC dashboard."""
+    async def get_dashboard_stats(self, live_agent_ids: list[str] | None = None) -> dict:
+        """Comprehensive stats for the SOC dashboard — the first page most
+        users hit, so its latency sets the tone for "the whole app feels slow".
+
+        `live_agent_ids`: same contract as get_soc_findings — when given,
+        excludes findings from agents that have gone stale (see config.py's
+        stale_agent_sec) from every count here. Without this, a dead agent's
+        lingering findings inflate total_active/critical/top_agents/etc. with
+        numbers that don't correspond to any currently-reporting machine —
+        confirmed live: a 16-day-silent agent contributed 794 of ~18.4k
+        "active" findings straight into these headline KPIs.
+        """
         now = time.time()
         today_start = now - (now % 86400)  # approximate
 
+        if live_agent_ids is not None and not live_agent_ids:
+            return {
+                "kpi": {}, "severity_dist": [], "status_dist": [], "category_dist": [],
+                "top_agents": [], "daily_trend": [], "sla_compliance": {},
+            }
+        agent_clause = ""
+        agent_args: tuple = ()
+        if live_agent_ids is not None:
+            placeholders = ",".join("?" * len(live_agent_ids))
+            agent_clause = f" AND agent_id IN ({placeholders})"
+            agent_args = tuple(live_agent_ids)
+
         # KPI row
-        kpi_row = await self._fetchone("""
+        kpi_row = await self._fetchone(f"""
             SELECT
                 SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END)                                          AS total_active,
                 SUM(CASE WHEN severity='critical' AND is_active=1 THEN 1 ELSE 0 END)                  AS critical,
@@ -1555,50 +1703,50 @@ class IntelDB:
                 SUM(CASE WHEN sla_due > 0 AND sla_due < ? AND is_active=1 THEN 1 ELSE 0 END)          AS sla_breached,
                 SUM(CASE WHEN closed_at >= ? THEN 1 ELSE 0 END)                                       AS resolved_today,
                 COUNT(DISTINCT CASE WHEN is_active=1 THEN agent_id END)                               AS agents_with_findings
-            FROM findings
-        """, (now, today_start))
+            FROM findings WHERE 1=1{agent_clause}
+        """, (now, today_start, *agent_args))
 
         # Severity distribution (all active)
         sev_rows = await self._fetchall(
-            "SELECT severity, COUNT(*) AS cnt FROM findings WHERE is_active=1 "
-            "GROUP BY severity", ()
+            f"SELECT severity, COUNT(*) AS cnt FROM findings WHERE is_active=1{agent_clause} "
+            "GROUP BY severity", agent_args
         )
 
         # Status distribution (all active)
         status_rows = await self._fetchall(
-            "SELECT status, COUNT(*) AS cnt FROM findings WHERE is_active=1 "
-            "GROUP BY status", ()
+            f"SELECT status, COUNT(*) AS cnt FROM findings WHERE is_active=1{agent_clause} "
+            "GROUP BY status", agent_args
         )
 
         # Category distribution
         cat_rows = await self._fetchall(
-            "SELECT category, COUNT(*) AS cnt FROM findings WHERE is_active=1 "
-            "GROUP BY category ORDER BY cnt DESC LIMIT 10", ()
+            f"SELECT category, COUNT(*) AS cnt FROM findings WHERE is_active=1{agent_clause} "
+            "GROUP BY category ORDER BY cnt DESC LIMIT 10", agent_args
         )
 
         # Top 5 agents by active finding count
-        agent_rows = await self._fetchall("""
+        agent_rows = await self._fetchall(f"""
             SELECT f.agent_id,
                    COUNT(*) AS total,
                    SUM(CASE WHEN f.severity='critical' THEN 1 ELSE 0 END) AS critical,
                    SUM(CASE WHEN f.severity='high'     THEN 1 ELSE 0 END) AS high
-            FROM findings f WHERE f.is_active=1
+            FROM findings f WHERE f.is_active=1{agent_clause}
             GROUP BY f.agent_id ORDER BY total DESC LIMIT 5
-        """, ())
+        """, agent_args)
 
         # 7-day trend (approximate using last_detected_at)
         trend = []
         for i in range(6, -1, -1):
             day_start = now - (i + 1) * 86400
             day_end   = now - i * 86400
-            day_row = await self._fetchone("""
+            day_row = await self._fetchone(f"""
                 SELECT
                     SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical,
                     SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) AS high,
                     SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) AS medium,
                     SUM(CASE WHEN severity='low'      THEN 1 ELSE 0 END) AS low
-                FROM findings WHERE first_detected_at >= ? AND first_detected_at < ?
-            """, (day_start, day_end))
+                FROM findings WHERE first_detected_at >= ? AND first_detected_at < ?{agent_clause}
+            """, (day_start, day_end, *agent_args))
             import datetime
             date_str = datetime.datetime.utcfromtimestamp(day_end).strftime("%m/%d")
             trend.append({
@@ -1612,13 +1760,13 @@ class IntelDB:
         # SLA compliance by severity
         sla_compliance: dict = {}
         for sev in ("critical", "high", "medium", "low"):
-            row = await self._fetchone("""
+            row = await self._fetchone(f"""
                 SELECT
                     COUNT(*) AS total,
                     SUM(CASE WHEN sla_due=0 OR sla_due >= ? THEN 1 ELSE 0 END) AS on_time,
                     SUM(CASE WHEN sla_due > 0 AND sla_due < ?  THEN 1 ELSE 0 END) AS breached
-                FROM findings WHERE severity=? AND is_active=1
-            """, (now, now, sev))
+                FROM findings WHERE severity=? AND is_active=1{agent_clause}
+            """, (now, now, sev, *agent_args))
             if row:
                 sla_compliance[sev] = {
                     "total":   row["total"]   or 0,
@@ -1657,7 +1805,7 @@ class IntelDB:
         cutoff = time.time() - months * 30 * 86400
         rows = await self._fetchall("""
             SELECT
-                strftime('%Y-%m', datetime(first_detected_at, 'unixepoch')) AS month,
+                to_char(to_timestamp(first_detected_at), 'YYYY-MM') AS month,
                 SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical,
                 SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) AS high,
                 SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) AS medium,
@@ -1690,14 +1838,30 @@ class IntelDB:
     # ── NVD local mirror ──────────────────────────────────────────────────────
 
     async def upsert_nvd_bulk(self, cves: list[dict]) -> int:
-        """Batch upsert CVEs into local NVD mirror. Returns count written."""
+        """Batch upsert CVEs into local NVD mirror. Returns count written.
+
+        Was SQLite named-parameter binding (`:cve_id` + executemany(sql, dicts))
+        — sqlite3/aiosqlite support binding directly from a list of dicts.
+        asyncpg's executemany requires POSITIONAL ($1,$2,... here written as ?,
+        translated by PgPool) placeholders and a list of tuples, so each dict is
+        converted to a tuple in the exact column order below before binding.
+        """
         async with self._lock:
+            rows = [
+                (
+                    c.get("cve_id", ""), c.get("description", ""), c.get("cvss_score"),
+                    c.get("cvss_vector", ""), c.get("severity", "info"),
+                    c.get("cwe_ids", "[]"), c.get("cpe_uris", "[]"),
+                    c.get("pkg_keywords", ""), c.get("published_at", ""),
+                    c.get("modified_at", ""), c.get("synced_at", 0),
+                )
+                for c in cves
+            ]
             await self._conn.executemany("""
                 INSERT INTO nvd_cve_local
                 (cve_id, description, cvss_score, cvss_vector, severity,
                  cwe_ids, cpe_uris, pkg_keywords, published_at, modified_at, synced_at)
-                VALUES (:cve_id, :description, :cvss_score, :cvss_vector, :severity,
-                        :cwe_ids, :cpe_uris, :pkg_keywords, :published_at, :modified_at, :synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cve_id) DO UPDATE SET
                     description  = excluded.description,
                     cvss_score   = excluded.cvss_score,
@@ -1708,21 +1872,29 @@ class IntelDB:
                     pkg_keywords = excluded.pkg_keywords,
                     modified_at  = excluded.modified_at,
                     synced_at    = excluded.synced_at
-            """, cves)
+            """, rows)
             await self._conn.commit()
         return len(cves)
 
     async def search_nvd_local(self, keyword: str, limit: int = 20) -> list[dict]:
-        """FTS5 prefix search on local NVD mirror, ordered by CVSS score."""
-        fts_term = keyword.strip() + "*"
+        """Prefix search on local NVD mirror, ordered by CVSS score. Postgres
+        to_tsquery's `:*` prefix operator replaces SQLite FTS5's `term*`
+        syntax (was a JOIN against a separate nvd_cve_fts virtual table; now a
+        direct predicate against nvd_cve_local.search_vector — see _SCHEMA)."""
+        # to_tsquery is strict about its input grammar (unlike
+        # websearch_to_tsquery) — reduce to a single safe lexeme before
+        # appending the prefix operator, to avoid a syntax error on punctuation.
+        safe_term = re.sub(r"[^\w]", "", keyword.strip())
+        if not safe_term:
+            return []
+        fts_term = safe_term + ":*"
         try:
             rows = await self._fetchall("""
-                SELECT n.cve_id, n.description, n.cvss_score, n.cvss_vector,
-                       n.severity, n.cwe_ids, n.cpe_uris, n.published_at, n.modified_at
-                FROM nvd_cve_fts f
-                JOIN nvd_cve_local n ON n.rowid = f.rowid
-                WHERE nvd_cve_fts MATCH ?
-                ORDER BY COALESCE(n.cvss_score, 0) DESC
+                SELECT cve_id, description, cvss_score, cvss_vector,
+                       severity, cwe_ids, cpe_uris, published_at, modified_at
+                FROM nvd_cve_local
+                WHERE search_vector @@ to_tsquery('english', ?)
+                ORDER BY COALESCE(cvss_score, 0) DESC
                 LIMIT ?
             """, (fts_term, limit))
             return [dict(r) for r in rows]
@@ -1744,11 +1916,12 @@ class IntelDB:
         return row["value"] if row else None
 
     async def set_nvd_state(self, key: str, value: str) -> None:
-        await self._conn.execute("""
-            INSERT INTO nvd_sync_state(key, value) VALUES(?,?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """, (key, value))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO nvd_sync_state(key, value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """, (key, value))
+            await self._conn.commit()
 
     async def get_nvd_stats(self) -> dict:
         total  = await self._fetchone("SELECT COUNT(*) AS n FROM nvd_cve_local", ())
@@ -1779,29 +1952,30 @@ class IntelDB:
         On failure: increments error_count, updates last_error.
         """
         now = time.time()
-        if success:
-            await self._conn.execute("""
-                INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
-                VALUES(?,?,?,  '',      0,          ?,          'ok')
-                ON CONFLICT(source) DO UPDATE SET
-                    last_attempt=excluded.last_attempt,
-                    last_success=excluded.last_success,
-                    last_error='',
-                    error_count=0,
-                    entry_count=excluded.entry_count,
-                    status='ok'
-            """, (source, now, now, entry_count))
-        else:
-            await self._conn.execute("""
-                INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
-                VALUES(?,?,           0,           ?,        1,           0,         'error')
-                ON CONFLICT(source) DO UPDATE SET
-                    last_attempt=excluded.last_attempt,
-                    last_error=excluded.last_error,
-                    error_count=error_count+1,
-                    status=CASE WHEN error_count+1 >= 3 THEN 'error' ELSE 'degraded' END
-            """, (source, now, error[:200]))
-        await self._conn.commit()
+        async with self._lock:
+            if success:
+                await self._conn.execute("""
+                    INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
+                    VALUES(?,?,?,  '',      0,          ?,          'ok')
+                    ON CONFLICT(source) DO UPDATE SET
+                        last_attempt=excluded.last_attempt,
+                        last_success=excluded.last_success,
+                        last_error='',
+                        error_count=0,
+                        entry_count=excluded.entry_count,
+                        status='ok'
+                """, (source, now, now, entry_count))
+            else:
+                await self._conn.execute("""
+                    INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
+                    VALUES(?,?,           0,           ?,        1,           0,         'error')
+                    ON CONFLICT(source) DO UPDATE SET
+                        last_attempt=excluded.last_attempt,
+                        last_error=excluded.last_error,
+                        error_count=error_count+1,
+                        status=CASE WHEN error_count+1 >= 3 THEN 'error' ELSE 'degraded' END
+                """, (source, now, error[:200]))
+            await self._conn.commit()
 
     async def get_all_feed_health(self) -> list[dict]:
         """Return health record for every known feed source."""
@@ -1813,21 +1987,22 @@ class IntelDB:
     # ── CISA KEV ──────────────────────────────────────────────────────────────
 
     async def upsert_cisa_kev(self, cve_id: str, data: dict) -> None:
-        now = time.time()
-        await self._conn.execute("""
-            INSERT INTO cisa_kev
-            (cve_id,vendor,product,vuln_name,date_added,short_desc,required_action,due_date,cached_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(cve_id) DO UPDATE SET
-                vendor=excluded.vendor, product=excluded.product,
-                vuln_name=excluded.vuln_name, date_added=excluded.date_added,
-                short_desc=excluded.short_desc, required_action=excluded.required_action,
-                due_date=excluded.due_date, cached_at=excluded.cached_at
-        """, (cve_id, data.get("vendorProject",""), data.get("product",""),
-              data.get("vulnerabilityName",""), data.get("dateAdded",""),
-              data.get("shortDescription",""), data.get("requiredAction",""),
-              data.get("dueDate",""), now))
-        await self._conn.commit()
+        async with self._lock:
+            now = time.time()
+            await self._conn.execute("""
+                INSERT INTO cisa_kev
+                (cve_id,vendor,product,vuln_name,date_added,short_desc,required_action,due_date,cached_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(cve_id) DO UPDATE SET
+                    vendor=excluded.vendor, product=excluded.product,
+                    vuln_name=excluded.vuln_name, date_added=excluded.date_added,
+                    short_desc=excluded.short_desc, required_action=excluded.required_action,
+                    due_date=excluded.due_date, cached_at=excluded.cached_at
+            """, (cve_id, data.get("vendorProject",""), data.get("product",""),
+                  data.get("vulnerabilityName",""), data.get("dateAdded",""),
+                  data.get("shortDescription",""), data.get("requiredAction",""),
+                  data.get("dueDate",""), now))
+            await self._conn.commit()
 
     async def is_kev(self, cve_id: str) -> bool:
         row = await self._fetchone("SELECT 1 FROM cisa_kev WHERE cve_id=?", (cve_id,))
@@ -1845,14 +2020,15 @@ class IntelDB:
     # ── EPSS scores ───────────────────────────────────────────────────────────
 
     async def upsert_epss(self, cve_id: str, epss: float, percentile: float, model_date: str = "") -> None:
-        await self._conn.execute("""
-            INSERT INTO epss_scores(cve_id,epss,percentile,model_date,cached_at)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(cve_id) DO UPDATE SET
-                epss=excluded.epss, percentile=excluded.percentile,
-                model_date=excluded.model_date, cached_at=excluded.cached_at
-        """, (cve_id, epss, percentile, model_date, time.time()))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO epss_scores(cve_id,epss,percentile,model_date,cached_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(cve_id) DO UPDATE SET
+                    epss=excluded.epss, percentile=excluded.percentile,
+                    model_date=excluded.model_date, cached_at=excluded.cached_at
+            """, (cve_id, epss, percentile, model_date, time.time()))
+            await self._conn.commit()
 
     async def get_epss(self, cve_id: str) -> Optional[dict]:
         row = await self._fetchone("SELECT * FROM epss_scores WHERE cve_id=?", (cve_id,))
@@ -1870,21 +2046,22 @@ class IntelDB:
     # ── Threat actors ─────────────────────────────────────────────────────────
 
     async def upsert_threat_actor(self, name: str, source: str, data: dict) -> None:
-        now = time.time()
-        await self._conn.execute("""
-            INSERT INTO threat_actors
-            (name,aliases,description,active,countries,ttps,source,first_seen,last_active,cached_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(name,source) DO UPDATE SET
-                aliases=excluded.aliases, description=excluded.description,
-                active=excluded.active, countries=excluded.countries,
-                ttps=excluded.ttps, first_seen=excluded.first_seen,
-                last_active=excluded.last_active, cached_at=excluded.cached_at
-        """, (name, json.dumps(data.get("aliases",[])), data.get("description",""),
-              1 if data.get("active", True) else 0,
-              json.dumps(data.get("countries",[])), json.dumps(data.get("ttps",[])),
-              source, data.get("first_seen",""), data.get("last_active",""), now))
-        await self._conn.commit()
+        async with self._lock:
+            now = time.time()
+            await self._conn.execute("""
+                INSERT INTO threat_actors
+                (name,aliases,description,active,countries,ttps,source,first_seen,last_active,cached_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(name,source) DO UPDATE SET
+                    aliases=excluded.aliases, description=excluded.description,
+                    active=excluded.active, countries=excluded.countries,
+                    ttps=excluded.ttps, first_seen=excluded.first_seen,
+                    last_active=excluded.last_active, cached_at=excluded.cached_at
+            """, (name, json.dumps(data.get("aliases",[])), data.get("description",""),
+                  1 if data.get("active", True) else 0,
+                  json.dumps(data.get("countries",[])), json.dumps(data.get("ttps",[])),
+                  source, data.get("first_seen",""), data.get("last_active",""), now))
+            await self._conn.commit()
 
     async def get_threat_actors(self, active_only: bool = True, limit: int = 100) -> list[dict]:
         rows = await self._fetchall(
@@ -1899,19 +2076,20 @@ class IntelDB:
     # ── Security news ─────────────────────────────────────────────────────────
 
     async def upsert_news(self, source: str, external_id: str, data: dict) -> None:
-        await self._conn.execute("""
-            INSERT INTO security_news
-            (source,external_id,title,url,summary,keywords,cve_refs,severity,published_at,cached_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(source,external_id) DO UPDATE SET
-                title=excluded.title, summary=excluded.summary,
-                keywords=excluded.keywords, cve_refs=excluded.cve_refs,
-                cached_at=excluded.cached_at
-        """, (source, external_id, data.get("title",""), data.get("url",""),
-              data.get("summary",""), json.dumps(data.get("keywords",[])),
-              json.dumps(data.get("cve_refs",[])), data.get("severity","info"),
-              data.get("published_at", time.time()), time.time()))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO security_news
+                (source,external_id,title,url,summary,keywords,cve_refs,severity,published_at,cached_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(source,external_id) DO UPDATE SET
+                    title=excluded.title, summary=excluded.summary,
+                    keywords=excluded.keywords, cve_refs=excluded.cve_refs,
+                    cached_at=excluded.cached_at
+            """, (source, external_id, data.get("title",""), data.get("url",""),
+                  data.get("summary",""), json.dumps(data.get("keywords",[])),
+                  json.dumps(data.get("cve_refs",[])), data.get("severity","info"),
+                  data.get("published_at", time.time()), time.time()))
+            await self._conn.commit()
 
     async def get_recent_news(self, hours: int = 48, limit: int = 50) -> list[dict]:
         cutoff = time.time() - hours * 3600
@@ -1934,26 +2112,27 @@ class IntelDB:
     # ── AI analysis ───────────────────────────────────────────────────────────
 
     async def upsert_ai_analysis(self, finding_id: int, data: dict) -> None:
-        await self._conn.execute("""
-            INSERT INTO ai_analysis
-            (finding_id,model,analysis,threat_context,risk_factors,ioc_matches,
-             news_context,actor_context,confidence,tokens_used,generated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(finding_id) DO UPDATE SET
-                model=excluded.model, analysis=excluded.analysis,
-                threat_context=excluded.threat_context, risk_factors=excluded.risk_factors,
-                ioc_matches=excluded.ioc_matches, news_context=excluded.news_context,
-                actor_context=excluded.actor_context, confidence=excluded.confidence,
-                tokens_used=excluded.tokens_used, generated_at=excluded.generated_at
-        """, (finding_id, data.get("model","claude-sonnet-4-6"),
-              data.get("analysis",""), data.get("threat_context",""),
-              json.dumps(data.get("risk_factors",[])), json.dumps(data.get("ioc_matches",[])),
-              json.dumps(data.get("news_context",[])), json.dumps(data.get("actor_context",[])),
-              float(data.get("confidence",0)), int(data.get("tokens_used",0)),
-              time.time()))
-        await self._conn.execute(
-            "UPDATE findings SET ai_analysed=1 WHERE id=?", (finding_id,))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO ai_analysis
+                (finding_id,model,analysis,threat_context,risk_factors,ioc_matches,
+                 news_context,actor_context,confidence,tokens_used,generated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(finding_id) DO UPDATE SET
+                    model=excluded.model, analysis=excluded.analysis,
+                    threat_context=excluded.threat_context, risk_factors=excluded.risk_factors,
+                    ioc_matches=excluded.ioc_matches, news_context=excluded.news_context,
+                    actor_context=excluded.actor_context, confidence=excluded.confidence,
+                    tokens_used=excluded.tokens_used, generated_at=excluded.generated_at
+            """, (finding_id, data.get("model","claude-sonnet-4-6"),
+                  data.get("analysis",""), data.get("threat_context",""),
+                  json.dumps(data.get("risk_factors",[])), json.dumps(data.get("ioc_matches",[])),
+                  json.dumps(data.get("news_context",[])), json.dumps(data.get("actor_context",[])),
+                  float(data.get("confidence",0)), int(data.get("tokens_used",0)),
+                  time.time()))
+            await self._conn.execute(
+                "UPDATE findings SET ai_analysed=1 WHERE id=?", (finding_id,))
+            await self._conn.commit()
 
     async def get_ai_analysis(self, finding_id: int) -> Optional[dict]:
         row = await self._fetchone("SELECT * FROM ai_analysis WHERE finding_id=?", (finding_id,))
@@ -1963,22 +2142,23 @@ class IntelDB:
 
     async def upsert_remediation_plan(self, finding_id: int, agent_id: str,
                                       os_type: str, data: dict) -> None:
-        await self._conn.execute("""
-            INSERT INTO remediation_plans
-            (finding_id,agent_id,os_type,model,steps,summary,effort,risk_level,
-             verification,long_term,generated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(finding_id,os_type) DO UPDATE SET
-                model=excluded.model, steps=excluded.steps, summary=excluded.summary,
-                effort=excluded.effort, risk_level=excluded.risk_level,
-                verification=excluded.verification, long_term=excluded.long_term,
-                generated_at=excluded.generated_at
-        """, (finding_id, agent_id, os_type, data.get("model","claude-sonnet-4-6"),
-              json.dumps(data.get("steps",[])), data.get("summary",""),
-              data.get("effort","medium"), data.get("risk_level","low"),
-              json.dumps(data.get("verification",[])), json.dumps(data.get("long_term",[])),
-              time.time()))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO remediation_plans
+                (finding_id,agent_id,os_type,model,steps,summary,effort,risk_level,
+                 verification,long_term,generated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(finding_id,os_type) DO UPDATE SET
+                    model=excluded.model, steps=excluded.steps, summary=excluded.summary,
+                    effort=excluded.effort, risk_level=excluded.risk_level,
+                    verification=excluded.verification, long_term=excluded.long_term,
+                    generated_at=excluded.generated_at
+            """, (finding_id, agent_id, os_type, data.get("model","claude-sonnet-4-6"),
+                  json.dumps(data.get("steps",[])), data.get("summary",""),
+                  data.get("effort","medium"), data.get("risk_level","low"),
+                  json.dumps(data.get("verification",[])), json.dumps(data.get("long_term",[])),
+                  time.time()))
+            await self._conn.commit()
 
     async def get_remediation_plan(self, finding_id: int,
                                    os_type: str = "macos") -> Optional[dict]:
@@ -2004,28 +2184,29 @@ class IntelDB:
     # ── Asset registry ────────────────────────────────────────────────────────
 
     async def upsert_asset(self, agent_id: str, data: dict) -> None:
-        now = time.time()
-        await self._conn.execute("""
-            INSERT INTO asset_registry
-            (agent_id,hostname,os,os_version,arch,asset_tier,asset_group,
-             importance,owner,department,tags,first_seen,last_seen)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(agent_id) DO UPDATE SET
-                hostname=excluded.hostname, os=excluded.os,
-                os_version=excluded.os_version, arch=excluded.arch,
-                asset_tier=COALESCE(NULLIF(excluded.asset_tier,''), asset_tier),
-                asset_group=COALESCE(NULLIF(excluded.asset_group,''), asset_group),
-                importance=COALESCE(CASE WHEN excluded.importance>0 THEN excluded.importance END, importance),
-                owner=COALESCE(NULLIF(excluded.owner,''), owner),
-                department=COALESCE(NULLIF(excluded.department,''), department),
-                tags=excluded.tags, last_seen=excluded.last_seen
-        """, (agent_id, data.get("hostname",""), data.get("os",""),
-              data.get("os_version",""), data.get("arch",""),
-              data.get("asset_tier","standard"), data.get("asset_group",""),
-              float(data.get("importance", 0.3)), data.get("owner",""),
-              data.get("department",""), json.dumps(data.get("tags",[])),
-              now, now))
-        await self._conn.commit()
+        async with self._lock:
+            now = time.time()
+            await self._conn.execute("""
+                INSERT INTO asset_registry
+                (agent_id,hostname,os,os_version,arch,asset_tier,asset_group,
+                 importance,owner,department,tags,first_seen,last_seen)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    hostname=excluded.hostname, os=excluded.os,
+                    os_version=excluded.os_version, arch=excluded.arch,
+                    asset_tier=COALESCE(NULLIF(excluded.asset_tier,''), asset_tier),
+                    asset_group=COALESCE(NULLIF(excluded.asset_group,''), asset_group),
+                    importance=COALESCE(CASE WHEN excluded.importance>0 THEN excluded.importance END, importance),
+                    owner=COALESCE(NULLIF(excluded.owner,''), owner),
+                    department=COALESCE(NULLIF(excluded.department,''), department),
+                    tags=excluded.tags, last_seen=excluded.last_seen
+            """, (agent_id, data.get("hostname",""), data.get("os",""),
+                  data.get("os_version",""), data.get("arch",""),
+                  data.get("asset_tier","standard"), data.get("asset_group",""),
+                  float(data.get("importance", 0.3)), data.get("owner",""),
+                  data.get("department",""), json.dumps(data.get("tags",[])),
+                  now, now))
+            await self._conn.commit()
 
     async def get_asset(self, agent_id: str) -> Optional[dict]:
         row = await self._fetchone("SELECT * FROM asset_registry WHERE agent_id=?", (agent_id,))
@@ -2046,27 +2227,29 @@ class IntelDB:
 
     async def update_asset_tier(self, agent_id: str, tier: str, importance: float,
                                 group: str = "", owner: str = "") -> None:
-        await self._conn.execute("""
-            UPDATE asset_registry SET asset_tier=?, importance=?,
-            asset_group=COALESCE(NULLIF(?,''),(SELECT asset_group FROM asset_registry WHERE agent_id=?)),
-            owner=COALESCE(NULLIF(?,''),(SELECT owner FROM asset_registry WHERE agent_id=?))
-            WHERE agent_id=?
-        """, (tier, importance, group, agent_id, owner, agent_id, agent_id))
-        await self._conn.commit()
+        async with self._lock:
+            await self._conn.execute("""
+                UPDATE asset_registry SET asset_tier=?, importance=?,
+                asset_group=COALESCE(NULLIF(?,''),(SELECT asset_group FROM asset_registry WHERE agent_id=?)),
+                owner=COALESCE(NULLIF(?,''),(SELECT owner FROM asset_registry WHERE agent_id=?))
+                WHERE agent_id=?
+            """, (tier, importance, group, agent_id, owner, agent_id, agent_id))
+            await self._conn.commit()
 
     # ── Org groups ────────────────────────────────────────────────────────────
 
     async def upsert_org_group(self, name: str, data: dict) -> None:
-        now = time.time()
-        await self._conn.execute("""
-            INSERT INTO org_groups(name,description,importance,member_agents,created_at,updated_at)
-            VALUES(?,?,?,?,?,?)
-            ON CONFLICT(name) DO UPDATE SET
-                description=excluded.description, importance=excluded.importance,
-                member_agents=excluded.member_agents, updated_at=excluded.updated_at
-        """, (name, data.get("description",""), float(data.get("importance",0.5)),
-              json.dumps(data.get("member_agents",[])), now, now))
-        await self._conn.commit()
+        async with self._lock:
+            now = time.time()
+            await self._conn.execute("""
+                INSERT INTO org_groups(name,description,importance,member_agents,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(name) DO UPDATE SET
+                    description=excluded.description, importance=excluded.importance,
+                    member_agents=excluded.member_agents, updated_at=excluded.updated_at
+            """, (name, data.get("description",""), float(data.get("importance",0.5)),
+                  json.dumps(data.get("member_agents",[])), now, now))
+            await self._conn.commit()
 
     async def list_org_groups(self) -> list[dict]:
         rows = await self._fetchall("SELECT * FROM org_groups ORDER BY importance DESC", ())
@@ -2085,17 +2268,24 @@ class IntelDB:
             await self._conn.commit()
 
     async def upsert_signal(self, sig) -> int:
-        """Persist a Signal to the signals table; return its rowid."""
+        """Persist a Signal to the signals table; return its new id.
+
+        cur.lastrowid was an aiosqlite/sqlite3-only Cursor attribute — Postgres
+        has no equivalent concept (no per-connection "last generated id"), so
+        the idiomatic fix is INSERT ... RETURNING id, read directly from the
+        result row instead.
+        """
         async with self._lock:
             cur = await self._conn.execute(
                 "INSERT INTO signals "
                 "(rule_id, layer, data_point, entity_key, agent_id, severity_hint, "
                 "evidence, weight, strength, detected_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 sig.to_db_row(),
             )
+            row = await cur.fetchone()
             await self._conn.commit()
-            return cur.lastrowid
+            return row["id"]
 
     async def get_recent_signals(self, agent_id: str, since: float) -> list[dict]:
         rows = await self._fetchall(
@@ -2110,7 +2300,7 @@ class IntelDB:
             cur = await self._conn.execute(
                 "INSERT INTO signal_clusters "
                 "(agent_id, entity_key, layers_covered, confidence, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?) RETURNING id",
                 (
                     cluster.agent_id,
                     cluster.entity_key,
@@ -2119,7 +2309,8 @@ class IntelDB:
                     time.time(),
                 ),
             )
-            cluster_id = cur.lastrowid
+            row = await cur.fetchone()
+            cluster_id = row["id"]
             # Link all signals to this cluster
             for sig in cluster.signals:
                 if sig.id:
@@ -2431,94 +2622,95 @@ class IntelDB:
         updated = 0
         scanned = 0
         score_hist = {"00-49": 0, "50-69": 0, "70-84": 0, "85-89": 0, "90-100": 0}
-        for r in rows:
-            scanned += 1
-            f = dict(r)
-            if only_unscored and float(f.get("precision_score") or 0) > 0:
-                continue
+        async with self._lock:
+            for r in rows:
+                scanned += 1
+                f = dict(r)
+                if only_unscored and float(f.get("precision_score") or 0) > 0:
+                    continue
 
-            # Parse JSON columns so the evaluator sees structured input
-            for k, default in [("evidence", {}), ("cve_ids", []),
-                                ("ai_verdict", {})]:
-                v = f.get(k)
-                if isinstance(v, str):
-                    try:
-                        f[k] = json.loads(v) if v else default
-                    except json.JSONDecodeError:
-                        f[k] = default
+                # Parse JSON columns so the evaluator sees structured input
+                for k, default in [("evidence", {}), ("cve_ids", []),
+                                    ("ai_verdict", {})]:
+                    v = f.get(k)
+                    if isinstance(v, str):
+                        try:
+                            f[k] = json.loads(v) if v else default
+                        except json.JSONDecodeError:
+                            f[k] = default
 
-            # Build the same enriched context the engine's legacy path uses
-            ev = f.get("evidence") if isinstance(f.get("evidence"), dict) else {}
-            kev = bool(f.get("kev") or ev.get("kev")
-                       or (isinstance(ev.get("cve"), dict) and ev["cve"].get("kev")))
-            agent_id = f.get("agent_id", "")
+                # Build the same enriched context the engine's legacy path uses
+                ev = f.get("evidence") if isinstance(f.get("evidence"), dict) else {}
+                kev = bool(f.get("kev") or ev.get("kev")
+                           or (isinstance(ev.get("cve"), dict) and ev["cve"].get("kev")))
+                agent_id = f.get("agent_id", "")
 
-            # Cross-finding peek for package_running / port_open / paired-persistence
-            sibs = await self._fetchall(
-                "SELECT category, evidence FROM findings "
-                "WHERE agent_id=? AND is_active=1 AND id != ? LIMIT 100",
-                (agent_id, f["id"]),
-            )
-            package_running = False
-            port_open       = False
-            paired_persist  = False
-            controls_off    = 0
-            pkg_name = str(ev.get("name") or "").lower() if isinstance(ev, dict) else ""
-            for s in sibs:
-                cat = s["category"]
-                if cat == "port":
-                    port_open = True
-                if cat in ("service", "task"):
-                    paired_persist = True
-                if cat == "security":
-                    controls_off += 1
-                if cat == "process" and pkg_name:
-                    try:
-                        sev_ev = json.loads(s["evidence"] or "{}")
-                    except Exception:
-                        sev_ev = {}
-                    if pkg_name in str(sev_ev.get("process") or "").lower() \
-                       or pkg_name in str(sev_ev.get("path") or "").lower():
-                        package_running = True
+                # Cross-finding peek for package_running / port_open / paired-persistence
+                sibs = await self._fetchall(
+                    "SELECT category, evidence FROM findings "
+                    "WHERE agent_id=? AND is_active=1 AND id != ? LIMIT 100",
+                    (agent_id, f["id"]),
+                )
+                package_running = False
+                port_open       = False
+                paired_persist  = False
+                controls_off    = 0
+                pkg_name = str(ev.get("name") or "").lower() if isinstance(ev, dict) else ""
+                for s in sibs:
+                    cat = s["category"]
+                    if cat == "port":
+                        port_open = True
+                    if cat in ("service", "task"):
+                        paired_persist = True
+                    if cat == "security":
+                        controls_off += 1
+                    if cat == "process" and pkg_name:
+                        try:
+                            sev_ev = json.loads(s["evidence"] or "{}")
+                        except Exception:
+                            sev_ev = {}
+                        if pkg_name in str(sev_ev.get("process") or "").lower() \
+                           or pkg_name in str(sev_ev.get("path") or "").lower():
+                            package_running = True
 
-            enriched = {
-                "kev_hit":                kev,
-                "malicious_ip_hit":       bool(str(f.get("source", "")).startswith("feed:") or f.get("source") == "abuseipdb"),
-                "malicious_hash_hit":     bool(ev.get("malware_hash_hit") if isinstance(ev, dict) else False),
-                "epss_scores":            [float(f.get("epss_score") or 0)] if (f.get("epss_score") or 0) > 0 else [],
-                "asset_tier":             f.get("asset_tier") or "endpoint",
-                "host_class":             f.get("host_class") or "unknown",
-                "compensating_controls":  [],
-                "package_running":        package_running,
-                "port_open":              port_open,
-                "paired_with_persistence": paired_persist,
-                "cross_layer_match":      paired_persist,
-                "controls_disabled_count": controls_off,
-                "threat_intel_source_count": (1 if str(f.get("source","")).startswith("feed:") or f.get("source") == "abuseipdb" else 0) + (1 if kev else 0),
-            }
-            ai_dict = f.get("ai_verdict") if isinstance(f.get("ai_verdict"), dict) else None
+                enriched = {
+                    "kev_hit":                kev,
+                    "malicious_ip_hit":       bool(str(f.get("source", "")).startswith("feed:") or f.get("source") == "abuseipdb"),
+                    "malicious_hash_hit":     bool(ev.get("malware_hash_hit") if isinstance(ev, dict) else False),
+                    "epss_scores":            [float(f.get("epss_score") or 0)] if (f.get("epss_score") or 0) > 0 else [],
+                    "asset_tier":             f.get("asset_tier") or "endpoint",
+                    "host_class":             f.get("host_class") or "unknown",
+                    "compensating_controls":  [],
+                    "package_running":        package_running,
+                    "port_open":              port_open,
+                    "paired_with_persistence": paired_persist,
+                    "cross_layer_match":      paired_persist,
+                    "controls_disabled_count": controls_off,
+                    "threat_intel_source_count": (1 if str(f.get("source","")).startswith("feed:") or f.get("source") == "abuseipdb" else 0) + (1 if kev else 0),
+                }
+                ai_dict = f.get("ai_verdict") if isinstance(f.get("ai_verdict"), dict) else None
 
-            tv = evaluate_finding(f, enriched, ai_dict)
-            new_score = float(tv["score"])
+                tv = evaluate_finding(f, enriched, ai_dict)
+                new_score = float(tv["score"])
 
-            await self._conn.execute(
-                "UPDATE findings SET "
-                "   precision_score=?, "
-                "   terrain_validation=? "
-                "WHERE id=?",
-                (new_score, json.dumps(tv, default=str), f["id"]),
-            )
-            updated += 1
+                await self._conn.execute(
+                    "UPDATE findings SET "
+                    "   precision_score=?, "
+                    "   terrain_validation=? "
+                    "WHERE id=?",
+                    (new_score, json.dumps(tv, default=str), f["id"]),
+                )
+                updated += 1
 
-            # Histogram for the UI
-            p = int(new_score * 100)
-            if   p >= 90: score_hist["90-100"] += 1
-            elif p >= 85: score_hist["85-89"]  += 1
-            elif p >= 70: score_hist["70-84"]  += 1
-            elif p >= 50: score_hist["50-69"]  += 1
-            else:         score_hist["00-49"]  += 1
+                # Histogram for the UI
+                p = int(new_score * 100)
+                if   p >= 90: score_hist["90-100"] += 1
+                elif p >= 85: score_hist["85-89"]  += 1
+                elif p >= 70: score_hist["70-84"]  += 1
+                elif p >= 50: score_hist["50-69"]  += 1
+                else:         score_hist["00-49"]  += 1
 
-        await self._conn.commit()
+            await self._conn.commit()
         return {
             "scanned":   scanned,
             "updated":   updated,
@@ -2527,15 +2719,16 @@ class IntelDB:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    async def _fetchone(self, sql: str, args: tuple) -> Optional[aiosqlite.Row]:
-        """Concurrent read — uses a pool reader connection."""
+    async def _fetchone(self, sql: str, args: tuple) -> Optional[Any]:
+        """Concurrent read — uses a pool reader connection. Returns an
+        asyncpg.Record (positional + key access, like the old aiosqlite.Row)."""
         if self._pool is None:
             raise RuntimeError("IntelDB not initialised")
         async with self._pool.read() as conn:
             async with conn.execute(sql, args) as cur:
                 return await cur.fetchone()
 
-    async def _fetchall(self, sql: str, args: tuple) -> list[aiosqlite.Row]:
+    async def _fetchall(self, sql: str, args: tuple) -> list[Any]:
         """Concurrent read — uses a pool reader connection."""
         if self._pool is None:
             raise RuntimeError("IntelDB not initialised")
@@ -2592,6 +2785,9 @@ def _json_value(v: Any, default: Any) -> Any:
 
 
 def _shape_finding(d: dict) -> dict:
+    # search_vector is a Postgres GENERATED column (replaces SQLite's FTS5
+    # shadow table) — internal-only, never part of the API response shape.
+    d.pop("search_vector", None)
     d["external_id"] = d.get("external_id") or _external_id(d["id"])
     d["display_id"] = d["external_id"]
     d["kev"] = bool(d.get("kev"))

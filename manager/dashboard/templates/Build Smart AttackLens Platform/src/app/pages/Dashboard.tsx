@@ -24,6 +24,7 @@ import {
   Radio, Users, Server, Lock,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 
 // ── API endpoints ─────────────────────────────────────────────────────────────
 
@@ -848,51 +849,56 @@ export default function SecurityDashboard() {
         </Card>
       </div>
 
-      {/* ── Row 6: CIS compliance heatmap ──────────────────────────────────── */}
-      <Card>
-        <CardHeader title="CIS Benchmark Compliance Heatmap" icon={<Lock className="w-4 h-4" />}
-          color="text-orange-500"
-          right={
-            <div className="flex items-center gap-3 text-[9px]">
-              {[["#22c55e","≥90% Pass"],["#f59e0b","60–89%"],["#ef4444","<60%"],["#d1d5db","No data"]].map(([c,l]) => (
-                <span key={l} className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded" style={{ background: c }} />{l}</span>
-              ))}
+      {/* ── Row 6: CIS compliance heatmap ── hidden until the CIS Compliance
+            page itself ships (CIS_COMPLIANCE_LIVE in featureFlags.ts) — both
+            flip together so this never shows data for a feature that isn't
+            built yet. ──────────────────────────────────────────────────── */}
+      {CIS_COMPLIANCE_LIVE && (
+        <Card>
+          <CardHeader title="CIS Benchmark Compliance Heatmap" icon={<Lock className="w-4 h-4" />}
+            color="text-orange-500"
+            right={
+              <div className="flex items-center gap-3 text-[9px]">
+                {[["#22c55e","≥90% Pass"],["#f59e0b","60–89%"],["#ef4444","<60%"],["#d1d5db","No data"]].map(([c,l]) => (
+                  <span key={l} className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded" style={{ background: c }} />{l}</span>
+                ))}
+              </div>
+            }
+          />
+          <div className="p-4">
+            <div className="grid grid-cols-6 gap-2">
+              {[
+                { id: 3,  label: "Data Protection",   agents },
+                { id: 4,  label: "Secure Config",      agents },
+                { id: 5,  label: "Account Mgmt",       agents },
+                { id: 7,  label: "Vuln Management",    agents },
+                { id: 10, label: "Malware Defenses",   agents },
+                { id: 12, label: "Network Mgmt",       agents },
+              ].map(({ id, label }) => {
+                // approximate per-control rate from agent data
+                const pct = cisPassRate; // use overall as proxy; real data would be from groups
+                const color = pct >= 90 ? "#22c55e" : pct >= 60 ? "#f59e0b" : pct >= 30 ? "#ef4444" : "#d1d5db";
+                const bg    = pct >= 90 ? "bg-green-50 border-green-200" : pct >= 60 ? "bg-amber-50 border-amber-200" : pct >= 30 ? "bg-red-50 border-red-200" : "bg-gray-50 border-gray-200";
+                return (
+                  <div key={id} className={cn("rounded-xl border p-3 text-center al-bounce-in", bg)}>
+                    <div className="w-7 h-7 rounded-lg flex items-center justify-center mx-auto mb-2 text-white text-[10px] font-black" style={{ background: color }}>
+                      {id}
+                    </div>
+                    <div className="text-[9px] font-bold text-gray-700 leading-tight mb-1">{label}</div>
+                    <div className="text-[14px] font-black" style={{ color }}>{pct}%</div>
+                    <div className="h-1.5 bg-white/60 rounded-full overflow-hidden mt-1.5">
+                      <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color, transition: "width 1.2s ease" }} />
+                    </div>
+                    <div className={cn("text-[8px] font-bold mt-1", pct >= 90 ? "text-green-600" : pct >= 60 ? "text-amber-600" : "text-red-600")}>
+                      {pct >= 90 ? "PASS" : pct >= 60 ? "PARTIAL" : "FAIL"}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-          }
-        />
-        <div className="p-4">
-          <div className="grid grid-cols-6 gap-2">
-            {[
-              { id: 3,  label: "Data Protection",   agents },
-              { id: 4,  label: "Secure Config",      agents },
-              { id: 5,  label: "Account Mgmt",       agents },
-              { id: 7,  label: "Vuln Management",    agents },
-              { id: 10, label: "Malware Defenses",   agents },
-              { id: 12, label: "Network Mgmt",       agents },
-            ].map(({ id, label }) => {
-              // approximate per-control rate from agent data
-              const pct = cisPassRate; // use overall as proxy; real data would be from groups
-              const color = pct >= 90 ? "#22c55e" : pct >= 60 ? "#f59e0b" : pct >= 30 ? "#ef4444" : "#d1d5db";
-              const bg    = pct >= 90 ? "bg-green-50 border-green-200" : pct >= 60 ? "bg-amber-50 border-amber-200" : pct >= 30 ? "bg-red-50 border-red-200" : "bg-gray-50 border-gray-200";
-              return (
-                <div key={id} className={cn("rounded-xl border p-3 text-center al-bounce-in", bg)}>
-                  <div className="w-7 h-7 rounded-lg flex items-center justify-center mx-auto mb-2 text-white text-[10px] font-black" style={{ background: color }}>
-                    {id}
-                  </div>
-                  <div className="text-[9px] font-bold text-gray-700 leading-tight mb-1">{label}</div>
-                  <div className="text-[14px] font-black" style={{ color }}>{pct}%</div>
-                  <div className="h-1.5 bg-white/60 rounded-full overflow-hidden mt-1.5">
-                    <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color, transition: "width 1.2s ease" }} />
-                  </div>
-                  <div className={cn("text-[8px] font-bold mt-1", pct >= 90 ? "text-green-600" : pct >= 60 ? "text-amber-600" : "text-red-600")}>
-                    {pct >= 90 ? "PASS" : pct >= 60 ? "PARTIAL" : "FAIL"}
-                  </div>
-                </div>
-              );
-            })}
           </div>
-        </div>
-      </Card>
+        </Card>
+      )}
 
     </div>
   );

@@ -125,8 +125,22 @@ _IMPACT: dict[str, str] = {
 }
 
 
-def make_detection_router(intel_db: "IntelDB") -> APIRouter:
+def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
     router = APIRouter()
+
+    async def _live_agent_ids() -> Optional[list[str]]:
+        """agent_ids that haven't gone stale (config.py: stale_agent_sec).
+        None when db wasn't provided — callers degrade to unfiltered (old
+        behavior) rather than break. See get_soc_findings's live_agent_ids
+        docstring for why this never affects an explicit single-agent query."""
+        if db is None:
+            return None
+        try:
+            from ..attacklens.config import ENGINE_CONFIG
+            return await db.get_live_agent_ids(ENGINE_CONFIG.get("stale_agent_sec", 86400))
+        except Exception as exc:
+            log.warning("Live-agent lookup failed, showing unfiltered: %s", exc)
+            return None
 
     # ── Summary counts ─────────────────────────────────────────────────────────
     @router.get("/summary")
@@ -135,15 +149,29 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
         Active finding counts per category and severity.
         Used for sidebar badges and dashboard KPIs.
         """
+        live_ids = None if agent_id else await _live_agent_ids()
         try:
-            rows = await intel_db._fetchall(
-                "SELECT category, severity, COUNT(*) AS cnt "
-                "FROM findings "
-                "WHERE is_active=1 "
-                + ("AND agent_id=? " if agent_id else "")
-                + "GROUP BY category, severity",
-                ((agent_id,) if agent_id else ()),
-            )
+            if live_ids is not None:
+                if not live_ids:
+                    rows = []
+                else:
+                    placeholders = ",".join("?" * len(live_ids))
+                    rows = await intel_db._fetchall(
+                        "SELECT category, severity, COUNT(*) AS cnt "
+                        "FROM findings "
+                        f"WHERE is_active=1 AND agent_id IN ({placeholders}) "
+                        "GROUP BY category, severity",
+                        tuple(live_ids),
+                    )
+            else:
+                rows = await intel_db._fetchall(
+                    "SELECT category, severity, COUNT(*) AS cnt "
+                    "FROM findings "
+                    "WHERE is_active=1 "
+                    + ("AND agent_id=? " if agent_id else "")
+                    + "GROUP BY category, severity",
+                    ((agent_id,) if agent_id else ()),
+                )
         except Exception:
             rows = []
 
@@ -161,6 +189,25 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
             "by_category": cats,
             "totals":       totals,
             "grand_total":  sum(totals.values()),
+        }
+
+    # ── Fleet-wide / global-threat campaigns ───────────────────────────────────
+    @router.get("/fleet")
+    async def fleet_campaigns():
+        """Cross-host campaigns (distributed C2, malware propagation, supply-chain
+        outbreak, mass posture collapse, coordinated recon …). These are emitted
+        by the FleetCorrelator and stored under the reserved __fleet__ pseudo-agent
+        — they represent threats that span multiple hosts and are invisible to the
+        per-agent correlation view."""
+        try:
+            from ..indexer import FLEET_AGENT_ID
+            from ..attacklens.fleet_correlator import build_fleet_summary
+            campaigns = await intel_db.get_correlations(FLEET_AGENT_ID)
+        except Exception:
+            campaigns = []
+        return {
+            "summary":   build_fleet_summary(campaigns),
+            "campaigns": campaigns,
         }
 
     # ── Package CVE findings ───────────────────────────────────────────────────
@@ -187,6 +234,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
             sort_by=sort_by,
             limit=limit,
             offset=offset,
+            live_agent_ids=await _live_agent_ids(),
         )
         return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
 
@@ -206,6 +254,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
             sort_by="composite_score",
             limit=limit,
             offset=offset,
+            live_agent_ids=await _live_agent_ids(),
         )
         return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
 
@@ -224,6 +273,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
         """
         persistence_cats = [sub_type] if sub_type else ["service", "task", "config", "binary"]
         all_rows = []
+        live_ids = await _live_agent_ids()
         # Fetch each category concurrently
         results = await asyncio.gather(*[
             intel_db.get_soc_findings(
@@ -234,6 +284,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
                 sort_by="composite_score",
                 limit=limit,
                 offset=0,
+                live_agent_ids=live_ids,
             )
             for cat in persistence_cats
         ])
@@ -275,6 +326,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
         wanted_cats = (
             [sub_type] if sub_type in _VECTOR_CATEGORIES else _VECTOR_CATEGORIES
         )
+        live_ids = await _live_agent_ids()
 
         results = await asyncio.gather(*[
             intel_db.get_soc_findings(
@@ -286,6 +338,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
                 # Pull enough per category to give the merge headroom before paging.
                 limit=limit + offset,
                 offset=0,
+                live_agent_ids=live_ids,
             )
             for cat in wanted_cats
         ], return_exceptions=True)
@@ -329,16 +382,19 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
     ):
+        live_ids = await _live_agent_ids()
         results = await asyncio.gather(
             intel_db.get_soc_findings(
                 agent_id=agent_id, category="process",
                 severity=severity, active_only=True,
                 sort_by="composite_score", limit=limit, offset=0,
+                live_agent_ids=live_ids,
             ),
             intel_db.get_soc_findings(
                 agent_id=agent_id, category="app",
                 severity=severity, active_only=True,
                 sort_by="composite_score", limit=limit, offset=0,
+                live_agent_ids=live_ids,
             ),
         )
         all_rows = sorted(
@@ -362,11 +418,14 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
         limit:     int           = Query(200, ge=1, le=1000),
         offset:    int           = Query(0, ge=0),
         validated_only: bool     = Query(
-            True,
-            description="Apply the configured Settings → Validation thresholds "
-                        "(per-agent → per-terrain → global) so the All Incidents "
-                        "queue shows only findings whose precision ≥ threshold. "
-                        "Pass false to see every active finding.",
+            False,
+            description="Opt-in: apply the configured Settings → Validation "
+                        "thresholds (per-agent → per-terrain → global) to show only "
+                        "findings whose precision ≥ threshold. Default False — "
+                        "All Incidents shows EVERY active incident; the threshold-"
+                        "filtered subset is the separate Validated Findings view. "
+                        "Defaulting True hid everything in shadow mode (precision "
+                        "scores below the bar), which read as 'no data'.",
         ),
     ):
         # When validated_only is on, resolve the per-agent → per-terrain → global
@@ -405,6 +464,7 @@ def make_detection_router(intel_db: "IntelDB") -> APIRouter:
             limit=limit,
             offset=offset,
             min_precision=min_precision_sql,
+            live_agent_ids=await _live_agent_ids(),
         )
 
         below = 0
@@ -464,6 +524,16 @@ def _enrich(f: dict) -> dict:
                 f[field] = json.loads(v)
             except Exception:
                 f[field] = default
+
+    # Lift raw-payload provenance to top-level fields so the UI/analyst can
+    # verify the incident against Deep Analysis:
+    #   GET /api/v1/raw/query?agent_id=<source_agent_id>&section=<source_section>
+    # and locate the payload at <source_collected_at>.
+    _src = f.get("evidence", {}).get("_source") if isinstance(f.get("evidence"), dict) else None
+    if isinstance(_src, dict):
+        f["source_section"]      = _src.get("section")
+        f["source_collected_at"] = _src.get("collected_at")
+        f["source_agent_id"]     = _src.get("agent_id") or f.get("agent_id")
 
     cat = f.get("category", "")
     source = f.get("source", "") or f.get("rule_id", "")

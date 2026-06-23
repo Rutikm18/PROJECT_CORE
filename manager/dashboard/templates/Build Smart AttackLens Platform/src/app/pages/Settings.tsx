@@ -11,7 +11,7 @@ import {
   Building2, MapPin, Mail, Calendar, ShieldCheck, Settings2,
   Bell, RefreshCw, Save, AlertTriangle, CheckCircle2, Info,
   Clock, Users, Lock, Unlock, Globe, RotateCcw, ChevronRight,
-  Brain, Target, Trash2, Plus,
+  Brain, Target, Trash2, Plus, Database, Archive, FolderOpen,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -55,7 +55,7 @@ interface RoleEntry {
   color:       string;
 }
 
-type TabId = "org" | "license" | "roles" | "platform" | "validation";
+type TabId = "org" | "license" | "roles" | "platform" | "validation" | "retention";
 
 const EMPTY: OrgSettings = {
   org_name: "", org_description: "", org_location: "", contact_email: "",
@@ -227,6 +227,7 @@ export default function Settings() {
     { id: "roles",      label: "Role Access",   icon: Users      },
     { id: "platform",   label: "Platform",      icon: Settings2  },
     { id: "validation", label: "Validation",    icon: Brain      },
+    { id: "retention",  label: "Data Retention", icon: Database  },
   ];
 
   return (
@@ -734,6 +735,13 @@ export default function Settings() {
       {tab === "validation" && (
         <ValidationSettingsPanel />
       )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          TAB: Data Retention
+      ══════════════════════════════════════════════════════════════════════ */}
+      {tab === "retention" && (
+        <RetentionSettingsPanel />
+      )}
     </div>
   );
 }
@@ -1117,6 +1125,239 @@ function ValidationSettingsPanel() {
           the first match in this priority order — <strong>per-agent override</strong> →
           <strong> per-terrain override</strong> → <strong>global threshold</strong>. Changes apply within ~30s
           (settings cache); cluster rejections show the effective threshold in the engine log.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Data Retention panel ─────────────────────────────────────────────────────
+// How long raw telemetry stays queryable, and what happens to it once that
+// window elapses. Period changes are persisted via the main /api/v1/settings
+// PUT (same org_settings store as every other field); the dedicated
+// /retention GET below also returns live size stats so the dashboard can
+// show actual data volume rather than just the configured policy.
+
+const RETENTION_API = "/api/v1/settings";
+
+interface RetentionConfig {
+  period_months:       number;
+  period_days:         number;
+  action:              "delete" | "archive";
+  slow_fetch_warning:  boolean;
+  available_periods:   number[];
+  available_actions:   string[];
+}
+interface RetentionStats {
+  live_payloads: { row_count: number; approx_bytes: number } | null;
+  archive: { path: string; file_count: number; total_bytes: number;
+             oldest_file_ts: number | null; newest_file_ts: number | null } | null;
+}
+
+const RETENTION_PERIOD_LABELS: Record<number, string> = {
+  1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year", 24: "2 years",
+};
+
+function formatBytes(n: number | null | undefined): string {
+  if (n == null || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function RetentionSettingsPanel() {
+  const [config,  setConfig]  = useState<RetentionConfig | null>(null);
+  const [stats,   setStats]   = useState<RetentionStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(false);
+  const [saved,   setSaved]   = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch(`${RETENTION_API}/retention`);
+      if (!r.ok) throw new Error(`${r.status}`);
+      const d = await r.json();
+      setConfig(d.config);
+      setStats(d.stats);
+      setError(null);
+    } catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (periodMonths: number, action: "delete" | "archive") => {
+    setSaving(true); setSaved(false);
+    try {
+      const r = await fetch(RETENTION_API, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          retention_period_months: String(periodMonths),
+          retention_action: action,
+        }),
+      });
+      if (!r.ok) throw new Error(`${r.status}`);
+      await load();
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+      setError(null);
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  if (loading || !config) {
+    return (
+      <div className="bg-white border border-[--gray-200] rounded-2xl p-8 text-center text-[11px] text-[--gray-400]">
+        <RefreshCw className="w-4 h-4 animate-spin inline mr-2" />Loading retention settings…
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-2 gap-4">
+
+      {/* ── Retention period ─────────────────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
+        <SectionLabel icon={Clock}>Retention Period</SectionLabel>
+        <p className="text-[10px] text-[--gray-500] leading-relaxed">
+          How long raw telemetry stays in the live, queryable store before the action below applies.
+          Default is 1 month.
+        </p>
+
+        <Field label="Keep data for" hint="default: 1 month">
+          <select
+            value={config.period_months}
+            onChange={e => save(Number(e.target.value), config.action)}
+            disabled={saving}
+            className={selectCls}
+          >
+            {config.available_periods.map(m => (
+              <option key={m} value={m}>{RETENTION_PERIOD_LABELS[m] ?? `${m} months`}</option>
+            ))}
+          </select>
+        </Field>
+
+        {config.slow_fetch_warning && (
+          <div className="flex items-start gap-2 px-3 py-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[10px] text-amber-800 leading-relaxed">
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+            <div>
+              <strong>Slower fetches at this window.</strong> 1- and 2-year retention keep a much larger
+              dataset live — Deep Analysis and raw-telemetry queries over the full window will take
+              noticeably longer to return.
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          {error && <span className="text-[10px] text-red-600">{error}</span>}
+          {saved && <span className="text-[10px] text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" />Saved</span>}
+        </div>
+      </div>
+
+      {/* ── Past-retention action ────────────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
+        <SectionLabel icon={Trash2}>When Data Ages Out</SectionLabel>
+        <p className="text-[10px] text-[--gray-500] leading-relaxed">
+          What happens to telemetry once it's older than the retention period above. Default is Delete.
+        </p>
+
+        <div className="space-y-2">
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => save(config.period_months, "delete")}
+            className={cn(
+              "w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all",
+              config.action === "delete"
+                ? "border-purple-300 bg-purple-50/40"
+                : "border-[--gray-200] hover:border-[--gray-300]"
+            )}
+          >
+            <Trash2 className={cn("w-4 h-4 flex-shrink-0 mt-0.5", config.action === "delete" ? "text-purple-600" : "text-[--gray-400]")} />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-[12px] font-bold text-[--gray-800]">Delete</span>
+                <span className="px-1.5 py-0.5 bg-[--gray-100] text-[--gray-500] rounded text-[8px] font-bold uppercase tracking-wide">default</span>
+                {config.action === "delete" && (
+                  <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[8px] font-bold uppercase tracking-wide">active</span>
+                )}
+              </div>
+              <div className="text-[10px] text-[--gray-500] mt-0.5">
+                Telemetry is permanently removed once it ages past the retention period. Lowest storage cost.
+              </div>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => save(config.period_months, "archive")}
+            className={cn(
+              "w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all",
+              config.action === "archive"
+                ? "border-purple-300 bg-purple-50/40"
+                : "border-[--gray-200] hover:border-[--gray-300]"
+            )}
+          >
+            <Archive className={cn("w-4 h-4 flex-shrink-0 mt-0.5", config.action === "archive" ? "text-purple-600" : "text-[--gray-400]")} />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-[12px] font-bold text-[--gray-800]">Compress &amp; Store</span>
+                {config.action === "archive" && (
+                  <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[8px] font-bold uppercase tracking-wide">active</span>
+                )}
+              </div>
+              <div className="text-[10px] text-[--gray-500] mt-0.5">
+                Aged-out telemetry is kept indefinitely as compressed NDJSON+gzip files on disk instead of
+                being deleted — see the location below.
+              </div>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      {/* ── Live data size ───────────────────────────────────────────────── */}
+      <div className="col-span-2 bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-3">
+        <SectionLabel icon={Database}>Current Data Size</SectionLabel>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="rounded-xl border border-[--gray-100] bg-[--gray-25] p-3.5">
+            <div className="text-[9px] font-semibold text-[--gray-400] uppercase tracking-wide">Live (queryable)</div>
+            <div className="text-[18px] font-black text-[--gray-800] mt-1">
+              {formatBytes(stats?.live_payloads?.approx_bytes)}
+            </div>
+            <div className="text-[10px] text-[--gray-400] mt-0.5">
+              {(stats?.live_payloads?.row_count ?? 0).toLocaleString()} telemetry rows
+            </div>
+          </div>
+
+          <div className={cn(
+            "rounded-xl border p-3.5",
+            config.action === "archive" ? "border-[--gray-100] bg-[--gray-25]" : "border-[--gray-100] bg-[--gray-25] opacity-50"
+          )}>
+            <div className="text-[9px] font-semibold text-[--gray-400] uppercase tracking-wide">Archived (compressed)</div>
+            {config.action === "archive" && stats?.archive ? (
+              <>
+                <div className="text-[18px] font-black text-[--gray-800] mt-1">
+                  {formatBytes(stats.archive.total_bytes)}
+                </div>
+                <div className="text-[10px] text-[--gray-400] mt-0.5">
+                  {stats.archive.file_count.toLocaleString()} compressed files
+                </div>
+                <div className="flex items-center gap-1.5 mt-2 pt-2 border-t border-[--gray-100]">
+                  <FolderOpen className="w-3 h-3 text-[--gray-400] flex-shrink-0" />
+                  <code className="text-[9px] font-mono text-[--gray-500] truncate">{stats.archive.path}</code>
+                </div>
+              </>
+            ) : (
+              <div className="text-[11px] text-[--gray-400] mt-1">
+                Not in use — switch to "Compress &amp; Store" to keep aged-out data instead of deleting it.
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

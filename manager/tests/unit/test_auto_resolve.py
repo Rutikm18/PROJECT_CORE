@@ -11,39 +11,16 @@ These tests pin the fix:
     cutoff), and leaves fresh findings, other categories, and other agents alone.
   • _is_live_snapshot() refuses to treat an empty/errored section as a snapshot,
     so "data missed" never mass-resolves real incidents.
+
+Uses pg_intel_dsn (conftest.py) — a freshly CREATEd, then DROPped, real
+Postgres database per test.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 
 from manager.manager.attacklens.engine import _is_live_snapshot
 from manager.manager.indexer import IntelDB
-
-
-def _run_with_db(tmp_path, body):
-    """Run `body(idb)` against a fresh file-backed IntelDB, always closing it.
-
-    A file path (not ':memory:') is required — IntelDB opens a multi-connection
-    SQLitePool, and each ':memory:' connection would be a separate empty DB.
-    """
-    async def _wrapped():
-        idb = IntelDB(str(tmp_path / "intel.db"))
-        await idb.init()
-        try:
-            await body(idb)
-        finally:
-            await idb.close()
-    # Use a dedicated loop (not asyncio.run, which closes the global loop) and
-    # restore a fresh current loop afterward, so other tests that still use the
-    # deprecated asyncio.get_event_loop().run_until_complete(...) aren't left
-    # with a closed loop.
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(_wrapped())
-    finally:
-        loop.close()
-        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 async def _seed(idb, agent, category, item_key, last_seen):
@@ -62,8 +39,9 @@ async def _state(idb, agent):
     return {r["item_key"]: (r["is_active"], r["status"]) for r in rows}
 
 
-def test_auto_resolve_resolves_only_absent_in_category(tmp_path):
-    async def body(idb):
+async def test_auto_resolve_resolves_only_absent_in_category(pg_intel_dsn):
+    idb = IntelDB(pg_intel_dsn); await idb.init()
+    try:
         now = time.time()
         await _seed(idb, "a1", "port", "port:9999", now - 3600)   # stale → resolve
         await _seed(idb, "a1", "port", "port:443",  now)          # fresh → keep
@@ -83,15 +61,17 @@ def test_auto_resolve_resolves_only_absent_in_category(tmp_path):
 
         # Idempotent: nothing left to resolve.
         assert await idb.auto_resolve_absent("a1", ["port"], cutoff_ts=now - 1.0) == 0
+    finally:
+        await idb.close()
 
-    _run_with_db(tmp_path, body)
 
-
-def test_empty_categories_is_noop(tmp_path):
-    async def body(idb):
+async def test_empty_categories_is_noop(pg_intel_dsn):
+    idb = IntelDB(pg_intel_dsn); await idb.init()
+    try:
         await _seed(idb, "a1", "port", "p", time.time() - 3600)
         assert await idb.auto_resolve_absent("a1", [], cutoff_ts=time.time()) == 0
-    _run_with_db(tmp_path, body)
+    finally:
+        await idb.close()
 
 
 def test_is_live_snapshot_guards_against_missed_data():

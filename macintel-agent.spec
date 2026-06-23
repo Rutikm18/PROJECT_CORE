@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['agent/os/macos/launchd.py'],
+    ['agent/agent/core.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['agent.os.macos.collectors', 'agent.os.macos.normalizer', 'agent.os.macos.keystore', 'agent.os.macos.launchd', 'agent.agent.enrollment', 'agent.agent.crypto', 'agent.agent.sender', 'psutil', 'keyring'],
+    hiddenimports=['agent.agent.collectors', 'agent.agent.normalizer', 'agent.agent.enrollment', 'agent.agent.keystore'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

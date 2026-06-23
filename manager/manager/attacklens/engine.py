@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Optional
@@ -46,7 +47,9 @@ from .behavioral  import BehavioralAnalyzer
 from .feeds       import FeedManager
 from .nvd         import CVELookup
 from .correlator  import CorrelationEngine
+from .fleet_correlator import FleetCorrelator
 from .signals     import Signal, layer_for
+from .detections  import analyze_port_listener, analyze_user_account
 from .clustering  import cluster_signals
 from .confidence  import score_confidence
 from .validation  import validate_cluster
@@ -62,20 +65,105 @@ from ..threat.scoring import score_matrix
 
 log = logging.getLogger("manager.attacklens.engine")
 
+# Minimum gap between fleet-wide correlation sweeps. Per-agent correlation runs
+# frequently (every few payloads per host); the fleet sweep reads findings across
+# ALL hosts, so it's throttled to avoid redundant full-fleet scans under load.
+_FLEET_MIN_INTERVAL_SEC = 120
+
+# ── Bounded detection executor (throughput control for large data volumes) ────
+# Ingest hands each payload to a bounded queue drained by a fixed worker pool,
+# instead of spawning an unbounded asyncio.create_task per payload. Two reasons:
+#   1. Backpressure / memory: under a burst (many agents × many sections), an
+#      unbounded create_task fan-out piles thousands of in-flight process()
+#      coroutines into memory at once.
+#   2. Write-lock fairness: every process() ultimately serializes on IntelDB's
+#      single write connection. Capping concurrency to DETECTION_WORKERS keeps a
+#      stable, shallow queue at that lock instead of a thundering herd that makes
+#      every writer slower. Fewer, steadier writers drain FASTER overall.
+# Ingest itself never blocks on detection — enqueue() is a non-blocking put, so
+# ingest latency stays flat regardless of detection backlog.
+_DETECTION_WORKERS   = int(os.getenv("ATTACKLENS_DETECTION_WORKERS", "4"))
+_DETECTION_QUEUE_MAX = int(os.getenv("ATTACKLENS_DETECTION_QUEUE_MAX", "2000"))
+
 # Sections that report the agent's CURRENT live inventory every cycle. For these,
 # absence of an entity in a fresh, valid snapshot means it's genuinely gone, so
 # its incident should auto-resolve. Event/streaming or ambiguous-state sections
 # (posture, config, sysctl, network, sbom, …) are intentionally excluded — we
 # never auto-resolve on those.
 _RECONCILE_SECTIONS: dict[str, tuple[str, ...]] = {
+    # Vector / Citadels — live runtime inventories
     "ports":       ("port",),
-    "packages":    ("package",),
-    "apps":        ("app",),
     "services":    ("service",),
     "processes":   ("process",),
     "connections": ("connection",),
     "users":       ("user",),
+    # Origin — supply-chain / config inventories (clears removed packages,
+    # uninstalled apps, fixed sysctl, dropped SBOM components)
+    "packages":    ("package",),
+    "apps":        ("app",),
+    "sbom":        ("sbom",),
+    "sysctl":      ("sysctl",),
 }
+
+
+# Sections routed to the rich detections/ modules (verified against real agent
+# data shapes AND locked by the accuracy harness). Unrouted sections keep the
+# engine's inline analyzer. GROW this map one module at a time — only after the
+# module is confirmed to fire on live telemetry (many modules guard on section
+# names that differ from what the agent sends, so a blind add emits nothing).
+_DETECTION_MODULE_ROUTES: dict[str, list] = {
+    "ports": [analyze_port_listener],
+    "users": [analyze_user_account],
+}
+
+# Map an agent section → the engine's finding `category` (keeps terrain mapping
+# and dedup consistent with the inline analyzers).
+_SECTION_CATEGORY: dict[str, str] = {
+    "ports": "port", "processes": "process", "connections": "connection",
+    "services": "service", "apps": "app", "packages": "package",
+    "network": "network", "users": "user", "tasks": "task",
+    "security": "security", "configs": "config", "binaries": "binary",
+    "sysctl": "sysctl", "sbom": "sbom", "arp": "arp", "containers": "container",
+}
+
+# Evidence keys that change every snapshot — excluded from the item_key hash so
+# dedup recognises the same entity across cycles.
+_VOLATILE_EVIDENCE_KEYS = frozenset({
+    "pid", "ppid", "timestamp", "timestamp_utc", "alert_id", "created_at", "detected_at",
+})
+_ITEM_KEY_FIELDS = ("item_key", "username", "cve_id", "package", "name",
+                    "port", "path", "binary", "process", "ip", "mac")
+
+
+def _derive_item_key(rule_id: str, evidence: dict) -> str:
+    """Stable dedup key for a module finding (modules don't emit item_key).
+    Prefer a natural identifier in the evidence; else hash the stable evidence
+    fields (excluding volatile ones like pid/timestamps that would break dedup)."""
+    for k in _ITEM_KEY_FIELDS:
+        v = evidence.get(k)
+        if v not in (None, "", [], {}):
+            return f"{rule_id}:{v}"
+    stable = {k: v for k, v in evidence.items() if k not in _VOLATILE_EVIDENCE_KEYS}
+    digest = hashlib.sha256(
+        json.dumps(stable, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+    return f"{rule_id}:{digest}"
+
+
+def _adapt_module_finding(f: dict, section: str) -> dict:
+    """Map a detections/ module's alert dict → the engine finding format that
+    upsert_finding / _dispatch_to_signals require (category, item_key, source,
+    score). Non-destructive — anything the module already set is preserved."""
+    ev   = f.get("evidence") or {}
+    rule = f.get("rule_id") or f.get("detection_module") or "detection"
+    f.setdefault("category", _SECTION_CATEGORY.get(section, f.get("detection_module") or section))
+    f.setdefault("item_key", _derive_item_key(rule, ev))
+    f.setdefault("source", rule)
+    f.setdefault("rule_id", rule)
+    if "score" not in f:
+        f["score"] = severity_to_score(f.get("severity", "info"))
+    f["evidence"] = ev
+    return f
 
 
 def _is_live_snapshot(data) -> bool:
@@ -118,6 +206,7 @@ class AttackLensEngine:
         self._nvd     = CVELookup(intel_db)
         self._behav   = BehavioralAnalyzer(intel_db)
         self._corr    = CorrelationEngine(intel_db)
+        self._fleet   = FleetCorrelator(intel_db, db)   # cross-host / global-threat layer
         # Optional AI analyst — used by the precision validator if set.
         # Server wiring assigns this after both objects are constructed.
         self._ai_analyst = ai_analyst
@@ -125,6 +214,15 @@ class AttackLensEngine:
         self._nvd_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         # Per-agent payload counter — run correlation every 3 payloads
         self._payload_count: dict[str, int] = {}
+
+        # Bounded detection executor (see module constants). The queue is created
+        # lazily in start() on the running loop; workers drain it concurrently up
+        # to _DETECTION_WORKERS. Counters give operators a live throughput view.
+        self._detect_queue: Optional[asyncio.Queue] = None
+        self._detect_workers: list[asyncio.Task] = []
+        self._detect_stats = {
+            "enqueued": 0, "processed": 0, "dropped_queue_full": 0, "errors": 0,
+        }
 
     def attach_ai_analyst(self, ai_analyst) -> None:
         """Late binding for the AI analyst (server constructs both lazily)."""
@@ -144,8 +242,118 @@ class AttackLensEngine:
         """Call once at startup. Feed scheduling is owned by ThreatIntelWorker."""
         await self._feeds.refresh()   # initial load from DB cache only (no network)
         asyncio.create_task(self._nvd_worker())
+        asyncio.create_task(self._fleet_worker())
+        # Bounded detection executor: create the queue on the running loop and
+        # spawn the fixed worker pool that drains it.
+        self._detect_queue = asyncio.Queue(maxsize=_DETECTION_QUEUE_MAX)
+        self._detect_workers = [
+            asyncio.create_task(self._detection_worker(i))
+            for i in range(_DETECTION_WORKERS)
+        ]
         self._ready = True
-        log.info("AttackLens engine started")
+        log.info("AttackLens engine started (detection workers=%d, queue_max=%d)",
+                 _DETECTION_WORKERS, _DETECTION_QUEUE_MAX)
+
+    def enqueue(self, agent_id: str, section: str, data: Any,
+                collected_at: float | None = None) -> bool:
+        """Hand a payload to the bounded detection executor. Non-blocking.
+
+        Returns True if accepted, False if dropped (queue saturated). Ingest
+        calls this instead of asyncio.create_task(process(...)) so that:
+          - ingest latency stays flat (a near-instant put_nowait), and
+          - concurrent process() work is capped at _DETECTION_WORKERS.
+
+        On saturation we DROP and count rather than block ingest or spawn an
+        unbounded task — the raw telemetry is already persisted by ingest, so a
+        dropped detection is recoverable (reprocessable) and never silent (the
+        dropped_queue_full counter + a warning surface it). Falls back to a
+        one-off task only if the executor isn't running yet (e.g. a direct
+        caller before start()), preserving old behavior for tests."""
+        if self._detect_queue is None:
+            # Executor not started (unit tests, pre-start) — preserve legacy
+            # fire-and-forget so nothing depends on start() ordering.
+            try:
+                asyncio.create_task(
+                    self.process(agent_id, section, data, collected_at=collected_at)
+                )
+            except RuntimeError:
+                pass  # no running loop (sync test context) — caller awaits process directly
+            return True
+        try:
+            self._detect_queue.put_nowait((agent_id, section, data, collected_at))
+            self._detect_stats["enqueued"] += 1
+            return True
+        except asyncio.QueueFull:
+            self._detect_stats["dropped_queue_full"] += 1
+            # Log sparsely — once per 100 drops — to avoid log floods under load.
+            if self._detect_stats["dropped_queue_full"] % 100 == 1:
+                log.warning(
+                    "Detection queue full (cap=%d) — dropped %d payload(s) so far; "
+                    "raw telemetry is still stored and reprocessable. Consider raising "
+                    "ATTACKLENS_DETECTION_WORKERS/QUEUE_MAX or enabling queue mode.",
+                    _DETECTION_QUEUE_MAX, self._detect_stats["dropped_queue_full"],
+                )
+            return False
+
+    async def _detection_worker(self, idx: int) -> None:
+        """Drains the detection queue, running process() one payload at a time.
+        N of these run concurrently, capping total in-flight detection at N."""
+        assert self._detect_queue is not None
+        while True:
+            try:
+                agent_id, section, data, collected_at = await self._detect_queue.get()
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self.process(agent_id, section, data, collected_at=collected_at)
+                self._detect_stats["processed"] += 1
+            except Exception as exc:
+                self._detect_stats["errors"] += 1
+                log.warning("detection worker %d error agent=%s section=%s: %s",
+                            idx, agent_id, section, exc)
+            finally:
+                self._detect_queue.task_done()
+
+    def detection_stats(self) -> dict:
+        """Live executor throughput + backlog, for the health/diagnostics page.
+        depth = payloads waiting; a depth pinned near queue_max means detection
+        is the bottleneck (raise workers, or switch to queue mode)."""
+        depth = self._detect_queue.qsize() if self._detect_queue is not None else 0
+        return {
+            **self._detect_stats,
+            "queue_depth":  depth,
+            "queue_max":    _DETECTION_QUEUE_MAX,
+            "workers":      _DETECTION_WORKERS,
+            "running":      bool(self._detect_workers),
+        }
+
+    async def _fleet_worker(self) -> None:
+        """Periodic cross-host / global-threat sweep. Fully decoupled from the
+        per-payload ingest path — a fleet campaign is inherently periodic, and
+        coupling it to per-agent correlation would add DB I/O to the hot path."""
+        while True:
+            try:
+                await asyncio.sleep(_FLEET_MIN_INTERVAL_SEC)
+                await self._run_fleet_correlations()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Fleet worker error: %s", exc)
+
+    @staticmethod
+    def _stamp_provenance(evidence: Any, agent_id: str, section: str,
+                          collected_at: float | None) -> None:
+        """Record where a finding's evidence came from in the RAW telemetry, so
+        every incident is verifiable against Deep Analysis (`/api/v1/raw/query?
+        agent_id=…&section=…`). Stamped onto the evidence dict (no schema change)
+        before the signal/finding is persisted; never overwrites an existing
+        stamp (the primary signal of a multi-section cluster keeps its own)."""
+        if isinstance(evidence, dict) and "_source" not in evidence:
+            evidence["_source"] = {
+                "agent_id":     agent_id,
+                "section":      section,
+                "collected_at": int(collected_at) if collected_at else None,
+            }
 
     async def process(
         self,
@@ -153,6 +361,7 @@ class AttackLensEngine:
         section: str,
         data: Any,
         skip_correlation: bool = False,
+        collected_at: float | None = None,
     ) -> None:
         """
         Entry point for every payload (or chunk).
@@ -168,10 +377,22 @@ class AttackLensEngine:
         # snapshot keep their older timestamp and get auto-resolved below.
         t0 = time.time()
         try:
+            prov_ts = collected_at if collected_at else t0
             # ── Stage 1: rule matching → signals ──────────────────────────────
-            signals = await self._dispatch_to_signals(agent_id, section, data)
+            # Dispatch ONCE per payload and reuse — the detections/ modules keep
+            # internal dedup state, so a second dispatch in the same payload
+            # would be suppressed (and the shadow-emit path would get nothing).
+            disp_findings = await self._dispatch(agent_id, section, data)
+            signals = await self._dispatch_to_signals(
+                agent_id, section, data, findings=disp_findings,
+            )
             beh_signals = await self._behav.analyze_as_signals(agent_id, section, data)
             signals.extend(beh_signals)
+
+            # Stamp raw-payload provenance onto every signal BEFORE persisting,
+            # so the finding it later produces is traceable to a Deep-Analysis row.
+            for sig in signals:
+                self._stamp_provenance(sig.evidence, agent_id, section, prov_ts)
 
             # Persist all signals (raw, before any filtering)
             for sig in signals:
@@ -187,12 +408,15 @@ class AttackLensEngine:
                 # precision score for each finding (without the LLM step) so
                 # the UI's AI Precision Validator panel has something honest
                 # to show instead of a misleading "0% / NO LLM VERDICT".
-                findings = await self._dispatch(agent_id, section, data)
+                findings = list(disp_findings)   # reuse the single dispatch above
                 beh_old  = await self._behav.analyze(agent_id, section, data)
                 findings.extend(beh_old)
                 ts = time.time()
                 for f in findings:
                     f["agent_id"] = agent_id
+                    # Provenance → verifiable against the raw payload in Deep Analysis.
+                    f["evidence"] = f.get("evidence") or {}
+                    self._stamp_provenance(f["evidence"], agent_id, section, prov_ts)
                     try:
                         await self._attach_legacy_precision(f)
                     except Exception as exc:
@@ -209,17 +433,21 @@ class AttackLensEngine:
             # removed packages and exited processes stop showing as active
             # incidents. Skipped for chunks (partial snapshot) and for
             # empty/errored data ("missed", not "gone") so we never mass-resolve.
-            if not skip_correlation:
+            if not skip_correlation and ENGINE_CONFIG.get("auto_resolve_enabled"):
                 recon_cats = _RECONCILE_SECTIONS.get(section)
                 if recon_cats and _is_live_snapshot(data):
+                    # Stale cutoff must exceed the longest alert-dedup window, or
+                    # a still-present-but-dedup'd finding (last_detected_at not
+                    # refreshed during its dedup window) would be wrongly resolved.
+                    stale_sec = float(ENGINE_CONFIG.get("auto_resolve_stale_sec", 7 * 86400))
                     try:
                         n = await self._idb.auto_resolve_absent(
-                            agent_id, list(recon_cats), t0 - 1.0, "evidence_cleared",
+                            agent_id, list(recon_cats), t0 - stale_sec, "evidence_stale",
                         )
                         if n:
                             log.info("auto-resolved %d stale %s incident(s) agent=%s "
-                                     "(evidence cleared from live snapshot)",
-                                     n, section, agent_id)
+                                     "(not re-confirmed in %.0fh)",
+                                     n, section, agent_id, stale_sec / 3600.0)
                     except Exception as exc:
                         log.debug("auto_resolve_absent failed agent=%s section=%s: %s",
                                   agent_id, section, exc)
@@ -233,9 +461,17 @@ class AttackLensEngine:
             log.warning("AttackLens.process error agent=%s section=%s: %s",
                         agent_id, section, exc)
 
-    async def _dispatch_to_signals(self, agent_id: str, section: str, data: Any) -> list[Signal]:
-        """Run rules and convert matches to Signal objects (does not emit findings)."""
-        findings = await self._dispatch(agent_id, section, data)
+    async def _dispatch_to_signals(self, agent_id: str, section: str, data: Any,
+                                   findings: list[dict] | None = None) -> list[Signal]:
+        """Run rules and convert matches to Signal objects (does not emit findings).
+
+        `findings` may be passed in to avoid re-running `_dispatch` — important
+        now that detection runs through the detections/ modules, which keep
+        INTERNAL dedup state: dispatching twice in one payload would suppress the
+        second call. process() dispatches once and shares the result here.
+        """
+        if findings is None:
+            findings = await self._dispatch(agent_id, section, data)
         signals: list[Signal] = []
         for f in findings:
             source = f.get("source") or f.get("rule_id") or "unknown"
@@ -788,6 +1024,24 @@ class AttackLensEngine:
         except Exception as exc:
             log.warning("Correlation error agent=%s: %s", agent_id, exc)
 
+    async def run_fleet_correlations(self) -> None:
+        """Public trigger for the cross-host sweep (e.g. a periodic scheduler)."""
+        asyncio.create_task(self._run_fleet_correlations())
+
+    async def _run_fleet_correlations(self) -> None:
+        """Evaluate fleet-wide / global-threat campaigns across all hosts and
+        persist them under the reserved __fleet__ pseudo-agent."""
+        try:
+            campaigns = await self._fleet.correlate()
+            ts = time.time()
+            for c in campaigns:
+                await self._idb.upsert_correlation(c, ts)
+            if campaigns:
+                log.info("Fleet correlation: %d cross-host campaign(s) active",
+                         len(campaigns))
+        except Exception as exc:
+            log.warning("Fleet correlation error: %s", exc)
+
     async def get_correlations(self, agent_id: str) -> list[dict]:
         """Return current correlations for an agent (called by API)."""
         try:
@@ -795,9 +1049,51 @@ class AttackLensEngine:
         except Exception:
             return []
 
+    async def get_fleet_correlations(self) -> list[dict]:
+        """Return current fleet-wide / global-threat campaigns (called by API)."""
+        try:
+            from ..indexer import FLEET_AGENT_ID
+            return await self._idb.get_correlations(FLEET_AGENT_ID)
+        except Exception:
+            return []
+
     # ── Dispatcher ────────────────────────────────────────────────────────────
 
     async def _dispatch(self, agent_id: str, section: str, data: Any) -> list[dict]:
+        # Route verified sections through the rich detections/ modules (which
+        # carry baselines, allowlists, MITRE mapping + the FP fixes); fall back
+        # to the inline analyzer for everything else. Each module's findings are
+        # adapted to the engine finding format. Opt out via use_detection_modules.
+        if ENGINE_CONFIG.get("use_detection_modules", True):
+            routes = _DETECTION_MODULE_ROUTES.get(section)
+            if routes:
+                # The engine is the single dedup authority: upsert_finding dedups
+                # by fingerprint and WANTS every observation to re-upsert (so
+                # scan_count + last_detected_at refresh, which auto-resolve relies
+                # on). The modules' INTERNAL in-memory alert-dedup would suppress
+                # that re-emission, so reset it per dispatch. (First-run seeding is
+                # DB-backed entity-state, not this cache, so the FP fix is intact.)
+                import sys as _sys
+                for analyze in routes:
+                    _m = _sys.modules.get(getattr(analyze, "__module__", ""))
+                    for _attr in ("_dedup_cache", "_rate_counter"):
+                        _c = getattr(_m, _attr, None)
+                        if isinstance(_c, dict):
+                            _c.clear()
+                mod_findings: list[dict] = []
+                for analyze in routes:
+                    try:
+                        res = await analyze(agent_id, section, data, self._idb, "")
+                    except Exception as exc:
+                        log.warning(
+                            "detection module %s failed agent=%s section=%s: %s",
+                            getattr(analyze, "__module__", "?"), agent_id, section, exc,
+                        )
+                        continue
+                    for f in (res or []):
+                        mod_findings.append(_adapt_module_finding(f, section))
+                return mod_findings
+
         fn = {
             "ports":       self._ports,
             "processes":   self._processes,
@@ -1195,34 +1491,63 @@ class AttackLensEngine:
         return findings
 
     async def _security(self, agent_id: str, data: dict) -> list[dict]:
+        # Field names + bad-value sets verified against the actual collector and
+        # normalizer output (agent/os/macos/collectors/posture.py and
+        # os/windows/collectors/posture.py via agent/os/macos/normalizer.py
+        # _norm_security — every field below is wrapped in _s_opt(), i.e. a
+        # STRING or None, never a bool):
+        #   sip/gatekeeper        -> "enabled" | "disabled" | None
+        #   filevault/firewall    -> "on"      | "off"      | None
+        # The previous version checked a key that doesn't exist ("sip_enabled" —
+        # the real key is "sip") and compared all four against the Python literal
+        # False. A str is never == a bool in Python, so is_bad was unconditionally
+        # False for every agent, on every platform, since this analyzer existed —
+        # the entire SIP/Gatekeeper/FileVault/Firewall posture check never fired.
         findings = []
         if not isinstance(data, dict):
             return findings
         checks = [
-            ("sip_enabled",      False,  "critical", "SIP disabled",      "System Integrity Protection is disabled — attacker can modify protected files.", "T1562.001"),
-            ("gatekeeper",       False,  "high",     "Gatekeeper disabled","Gatekeeper is off — unsigned apps can run without warning.", "T1553.001"),
-            ("filevault",        False,  "high",     "FileVault disabled", "Full-disk encryption is not enabled — data at risk if device lost.", "T1486"),
-            ("firewall",         False,  "medium",   "Firewall disabled",  "macOS application firewall is disabled.", "T1562.004"),
-            ("lockdown_mode",    True,   "info",     "Lockdown Mode active","Device is in Lockdown Mode (highest security posture).", ""),
+            ("sip",        {"disabled"}, "critical", "SIP disabled",
+             "System Integrity Protection is disabled — attacker can modify protected files.",
+             "T1562.001"),
+            ("gatekeeper", {"disabled"}, "high", "Gatekeeper disabled",
+             "Gatekeeper is off — unsigned apps can run without warning.",
+             "T1553.001"),
+            ("filevault",  {"off"}, "high", "FileVault disabled",
+             "Full-disk encryption is not enabled — data at risk if device lost.",
+             "T1486"),
+            ("firewall",   {"off"}, "medium", "Firewall disabled",
+             "Application firewall is disabled.",
+             "T1562.004"),
         ]
-        for key, good_val, severity, title, desc, mitre in checks:
+        for key, bad_values, severity, title, desc, mitre in checks:
             val = data.get(key)
             if val is None:
                 continue
-            is_bad = (val == good_val) if isinstance(good_val, bool) else False
-            if key == "lockdown_mode":
-                is_bad = False  # always info, not bad
-            if not is_bad and key != "lockdown_mode":
+            if str(val).strip().lower() not in bad_values:
                 continue
             findings.append(self._finding(
                 category="security", item_key=f"sec:{key}",
-                severity=severity if is_bad else "info",
-                score=severity_to_score(severity) if is_bad else 0.5,
-                title=title,
-                desc=desc,
+                severity=severity, score=severity_to_score(severity),
+                title=title, desc=desc,
                 evidence={key: val},
                 source="rule:security_posture",
                 mitre=mitre,
+                tags=["security", "posture"],
+            ))
+
+        # lockdown_mode is a genuine bool (macOS posture collector's
+        # _lockdown_mode()) — informational only, never raised as "bad".
+        lockdown = data.get("lockdown_mode")
+        if lockdown is True:
+            findings.append(self._finding(
+                category="security", item_key="sec:lockdown_mode",
+                severity="info", score=0.5,
+                title="Lockdown Mode active",
+                desc="Device is in Lockdown Mode (highest security posture).",
+                evidence={"lockdown_mode": lockdown},
+                source="rule:security_posture",
+                mitre="",
                 tags=["security", "posture"],
             ))
         return findings

@@ -1,0 +1,45 @@
+# =============================================================================
+#  docker-compose.postgres.yml — local/dev Postgres for manager.db + intel.db
+#
+#  Standalone on purpose: spins up just the database, fast, without the full
+#  production stack (caddy/rabbitmq/threat-intel) in docker-compose.yml.
+#
+#  START:
+#    docker compose -f docker-compose.postgres.yml up -d
+#
+#  CONNECT (matches manager's default env vars):
+#    manager.db → postgresql://attacklens:attacklens@localhost:5432/manager
+#    intel.db   → postgresql://attacklens:attacklens@localhost:5432/intel
+#
+#  TWO physical databases on one Postgres instance — not two schemas in one
+#  database — to faithfully mirror the original two-separate-SQLite-files
+#  architecture (manager.db, intel.db were never queryable against each
+#  other; same isolation here). This also means every existing unqualified
+#  table name (findings, agents, ...) needs ZERO renaming during migration.
+#  init/01-create-databases.sql creates the "intel" database (the default
+#  POSTGRES_DB covers "manager").
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: attacklens-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER:     "${POSTGRES_USER:-attacklens}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-attacklens}"
+      POSTGRES_DB:       "manager"
+    volumes:
+      - attacklens_pg_data:/var/lib/postgresql/data
+      - ./manager/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-attacklens}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  attacklens_pg_data:

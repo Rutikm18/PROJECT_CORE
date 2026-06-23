@@ -9,10 +9,21 @@
 Always start here:
 
 ```bash
-attacklens-service diagnose        # no sudo needed
-attacklens-service status          # no sudo needed
+attacklens-service diagnose        # quick: install + connectivity checklist
+attacklens-service status          # service state + recent log
+sudo attacklens-service doctor     # DEEP: decodes log messages, identifies a
+                                   # rogue server squatting the manager port (by
+                                   # PID), and flags the spool-storm trend
 sudo attacklens-service logs       # live log tail
 ```
+
+`doctor` is the deep self-diagnosis (added 2026-06-22): it runs
+`agent/os/macos/diagnostics.py`, which knows every agent log message and the
+common failure modes below, and prints a single **TOP BLOCKER** with the exact
+fix. A periodic **self-heal LaunchDaemon** (`com.attacklens.selfheal`, every
+5 min) runs the same checks automatically — it re-loads the agent if launchd
+dropped it, and escalates (never silently) when the agent is alive but can't
+deliver. State it writes: `/Library/AttackLens/health_diagnosis.json`.
 
 ---
 
@@ -68,8 +79,15 @@ On startup all collectors fire nearly simultaneously — ports (30 s), processes
 connections, metrics (60 s) all trigger at t=0, producing 4-6 POSTs inside one
 second. The manager's per-agent rate window was exhausted.
 
-**Note: HTTP 4xx responses are permanently dropped by the sender — they are NOT
-retried and NOT spooled to disk.** This means those telemetry payloads are lost.
+**Update — 429 is no longer dropped (verified against the current sender.py):**
+429 is treated as a *transient* failure, distinct from the other 4xx codes —
+it logs the warning above, then falls through to the same exponential-backoff
+retry loop as a network error. If all retries are exhausted, the payload is
+spooled to disk like any other failed send, not discarded. Only a genuine 4xx
+client error (malformed payload, schema rejection) is dropped as
+unrecoverable — that case is correct to drop, since retrying a bad payload
+forever would never succeed. If you still see payload loss on 429 specifically,
+that's a regression worth re-reporting with the exact agent version.
 
 **Fix A — space out collection intervals in `/Library/AttackLens/agent.toml`:**
 ```toml
@@ -153,6 +171,55 @@ docker ps                           # if containerized
 
 ---
 
+### Issue 3b — Manager "reachable" but `/health` returns 404 (rogue server on the manager port)
+
+**What you saw (from `attacklens-service diagnose`):**
+```
+✓  Manager reachable  127.0.0.1:8080      OK
+⚠  Manager /health HTTP                   404 (may be normal if endpoint differs)
+```
+…and the dashboard stays empty even though the agent is "running".
+
+**Root cause (found 2026-06-22):**
+The TCP port is open (so "reachable" passes), but the thing answering it is **not
+the manager**. The classic trigger: a stray `python -m http.server 8080` (often
+started to share the `.pkg` from `dist/`) binds **IPv4 `127.0.0.1:8080`**, while
+Docker's manager publishes on `*:8080`. When the agent connects to
+`127.0.0.1:8080`, the **IPv4 loopback bind wins**, so every telemetry POST hits
+the static file server and gets a 404. The agent's sender treats 404 (a 4xx
+client error) as unrecoverable and **drops the payload** — silent data loss, and
+nothing reaches the dashboard.
+
+Tell-tale signature:
+```bash
+curl -sI http://127.0.0.1:8080/health      # Server: SimpleHTTP/0.6 Python/3.13.7  ← NOT uvicorn
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+#   Python    27355 ... TCP 127.0.0.1:8080 (LISTEN)   ← rogue, shadows the manager (IPv4)
+#   com.docke 69558 ... TCP *:8080 (LISTEN)            ← the real manager forward
+```
+
+**Fix — kill the squatter (it's your own process; no sudo needed):**
+```bash
+kill 27355                                 # the non-Docker PID from lsof above
+curl -s http://127.0.0.1:8080/health       # must now return {"status":"ok",...}
+```
+The agent auto-recovers within seconds (the sender probes `/health`, sees it
+healthy, and resumes delivering). **Never run `python -m http.server` on the
+manager's port** — use a different port (e.g. 8000) to share files.
+
+`sudo attacklens-service doctor` detects this automatically and prints the exact
+offending PID + `kill` command (verdict: `rogue_server`). The self-heal daemon
+escalates it too, but deliberately does **not** auto-kill a process (it could be
+a server you started on purpose) — it surfaces the fix instead.
+
+Alternative if you can't free the port: point the agent at the manager's other
+front door (Caddy on port 80):
+```bash
+sudo attacklens-service set-manager http://127.0.0.1
+```
+
+---
+
 ### Issue 4 — `Send queue full — dropped oldest item`
 
 **What you saw:**
@@ -174,8 +241,15 @@ Timeline of what happened:
 With 20+ sections collecting every 30–120 seconds and the sender unable to drain
 them (manager offline), the queue saturates in ~3–5 minutes.
 
-**Dropped items are gone — they are NOT recoverable from the spool.**
-The spool only contains items that were successfully dequeued and written.
+**Update — overflow no longer drops data (verified against the current
+core.py):** when the in-memory queue is full, the Orchestrator now evicts the
+oldest item and hands it to the Sender's disk spool instead of discarding it
+(`overflow_sink` / `Sender.spool_envelope`) — it's replayed once the backlog
+drains, same as any other spooled payload. The log line changed accordingly:
+`"Send queue full (max=N) — spilled oldest section=X to disk spool"`. The
+"dropped oldest item" message below is from the historical, now-fixed bug —
+if you see that exact message, you're running an old agent build and should
+rebuild/reinstall, not just tune `max_queue_size`.
 
 **Fix A — increase queue size in `/Library/AttackLens/agent.toml`:**
 ```toml
@@ -208,6 +282,58 @@ straight to spool from the orchestrator thread.
 ls -lh /Library/AttackLens/spool/
 # If unsent.ndjson grows over 50 MB the spool auto-trims (drops oldest 10%)
 ```
+
+---
+
+### Issue 5b — Agent never starts after reboot, exit code 78 OR a silent restart loop
+
+**What you'd see:**
+```
+$ attacklens-service status
+Agent:         stopped  (last exit: 2)
+```
+or, watching `launchctl print system/com.attacklens.agent` across a few seconds,
+the PID changing every ~10s (ThrottleInterval) forever — KeepAlive restarting
+a process that exits immediately every single time.
+
+**Root cause (found 2026-06-19, fixed in this build):**
+The agent binary/`run_agent.py` is built around `agent_entry.py`, whose CLI is
+**subcommand-based** (`run`, `start`, `stop`, `status`, ...). Every plist
+generator in this tree (`launchd.py`, `install.sh`, `build_pkg.sh`,
+`attacklens-service`'s macOS-15+ auto-patcher) used to invoke it as:
+```
+<binary-or-run_agent.py> --config /Library/AttackLens/agent.toml
+```
+With no subcommand, argparse treats `--config` as having no matching
+subcommand and tries to parse the config path itself as the subcommand →
+`error: argument COMMAND: invalid choice: '/Library/AttackLens/agent.toml'`
+→ exit 2 → KeepAlive restarts it → exit 2 again, forever. The agent **never
+actually starts**, on first boot or after any reboot. This is the most
+severe possible failure of capability #1 (auto-launch persistence): launchd
+faithfully restarts the process every 10 seconds exactly as designed, while
+the agent itself never runs even once.
+
+Confirmed by direct reproduction:
+```bash
+python3 -c "
+import sys; sys.argv = ['attacklens-agent', '--config', '/x.toml']
+from agent.agent_entry import _parser
+_parser().parse_args()"
+# SystemExit(2): invalid choice: '/x.toml'
+```
+
+**Fix:** every plist generator now inserts the `run` subcommand:
+```
+<binary-or-run_agent.py> run --config /Library/AttackLens/agent.toml
+```
+`run_watchdog.py` is unaffected — it calls `watchdog.main()` directly, which
+uses a plain (non-subcommand) `argparse` and already accepted `--config`
+correctly.
+
+**If you're on an older install:** reinstall the `.pkg`, or manually patch the
+two plists at `/Library/LaunchDaemons/com.attacklens.agent.plist` (NOT the
+watchdog plist) to insert `<string>run</string>` before `<string>--config</string>`
+in `ProgramArguments`, then `sudo attacklens-service restart`.
 
 ---
 
@@ -289,8 +415,8 @@ agent.sender DEBUG Sent processes → 200
 
 | Log message | Severity | Meaning | Action needed |
 |---|---|---|---|
-| `Send queue full — dropped oldest item` | WARNING | Manager offline; in-memory queue saturated; data lost | Start manager; raise `max_queue_size` |
-| `Manager rejected (HTTP 429) section=X — dropping` | ERROR | Manager rate-limited this section; payload permanently lost | Space out collection intervals |
+| `Send queue full (max=N) — spilled oldest section=X to disk spool` | WARNING | Manager offline; in-memory queue saturated; oldest item spilled to spool, NOT lost | Start manager — spool auto-drains; raise `max_queue_size` to reduce spill frequency |
+| `HTTP 429 rate-limited ... (attempt N/3)` | WARNING | Manager rate-limited this send; treated as transient, retried with backoff, spooled if all retries fail | Space out collection intervals if persistent |
 | `Send failed (attempt N/3): Connection refused` | WARNING | Manager TCP port closed | Start manager |
 | `Spooling X to disk` | WARNING | Manager unreachable; data queued to disk spool | Start manager — spool auto-drains on reconnect |
 | `Manager back online — draining spool` | INFO | Manager recovered; spooled data replaying | Normal — no action |
@@ -301,6 +427,7 @@ agent.sender DEBUG Sent processes → 200
 | `[X] circuit open — skipping` | DEBUG | Section X failed 3× and is in cooldown | Auto-recovers after 60 s |
 | `Config reloaded on SIGHUP` | INFO | Hot reload succeeded | Normal |
 | `Enrollment failed (manager unreachable?)` | WARNING | Can't reach manager on first boot | Start manager first, then restart agent |
+| `error: argument COMMAND: invalid choice` (in `agent-stderr.log`, repeating every ~10s) | — | Plist invokes the binary without the `run` subcommand — agent never starts, ever (see Issue 5b) | Reinstall/rebuild — fixed in this build's plist generators |
 
 ---
 
@@ -434,7 +561,8 @@ sudo attacklens-service restart  # full restart
 | `attacklens-service config` | No | Print agent.toml |
 | `attacklens-service version` | No | Version + Python info |
 | `attacklens-service diagnose` | No | Full connectivity + install health check |
-| `sudo attacklens-service start` | Yes | Start agent + watchdog LaunchDaemons |
+| `sudo attacklens-service doctor` | No* | Deep diagnosis: decode logs, name a rogue server on the manager port (by PID), spool-storm trend (*sudo for full log access) |
+| `sudo attacklens-service start` | Yes | Start agent + watchdog + self-heal LaunchDaemons |
 | `sudo attacklens-service stop` | Yes | Stop agent + watchdog |
 | `sudo attacklens-service restart` | Yes | Stop then start |
 | `sudo attacklens-service reload` | Yes | SIGHUP — reload config with no restart |

@@ -12,6 +12,7 @@ agent/os/macos/collectors/system.py — System state collectors (2 min interval)
 from __future__ import annotations
 
 import json
+import os
 import re
 
 from .base import BaseCollector, CollectorResult, _run, _run_json, _sp_json
@@ -136,6 +137,19 @@ class ServicesCollector(BaseCollector):
     def collect(self) -> list:
         rows: list[dict] = []
 
+        # Real disabled-state, queried once. `enabled` used to be hard-coded
+        # True for every service — which means a disabled (e.g. operator- or
+        # malware-disabled security daemon) looked identical to a healthy one.
+        disabled = self._disabled_labels()
+
+        # `launchctl list` enumerates the domain of the calling process: the
+        # SYSTEM domain (daemons) when run as root — which is how the agent
+        # actually runs — or the caller's GUI domain (agents) otherwise. Derive
+        # the type from that fact instead of a label-prefix guess that classified
+        # ~every service as "daemon" because nearly all labels start with "com.".
+        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
+        svc_type = "daemon" if is_root else "agent"
+
         # launchctl list: tab-delimited pid | exit_code | label
         out = _run(["launchctl", "list"])
         for line in out.splitlines()[1:]:
@@ -153,13 +167,12 @@ class ServicesCollector(BaseCollector):
             except ValueError:
                 pass
 
-            # Classify: daemon (system-wide) vs agent (per-user)
-            svc_type = "daemon" if label.startswith(("com.apple.", "com.attacklens.", "com.")) else "agent"
-
             rows.append({
                 "name":      label,
                 "status":    "running" if pid is not None else "stopped",
-                "enabled":   True,
+                # None (not True) when the disabled list is unavailable — an
+                # honest "unknown" beats a confident wrong "enabled".
+                "enabled":   (label not in disabled) if disabled is not None else None,
                 "pid":       pid,
                 "exit_code": exit_code,
                 "type":      svc_type,
@@ -167,6 +180,27 @@ class ServicesCollector(BaseCollector):
             })
 
         return rows
+
+    @staticmethod
+    def _disabled_labels() -> "set[str] | None":
+        """Set of launchd labels marked disabled, or None if it can't be read.
+
+        Parses `launchctl print-disabled system`, whose lines look like
+        `"com.foo.bar" => disabled` (newer) or `"com.foo.bar" => true` (older).
+        """
+        out = _run(["launchctl", "print-disabled", "system"])
+        if not out:
+            return None
+        disabled: set[str] = set()
+        found = False
+        for line in out.splitlines():
+            m = re.search(r'"([^"]+)"\s*=>\s*(disabled|enabled|true|false)', line)
+            if not m:
+                continue
+            found = True
+            if m.group(2).lower() in ("disabled", "true"):
+                disabled.add(m.group(1))
+        return disabled if found else None
 
 
 class UsersCollector(BaseCollector):

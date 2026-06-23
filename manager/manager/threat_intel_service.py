@@ -18,6 +18,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .indexer import IntelDB
+from .pg_pool import _redact_dsn
 from .attacklens.feeds import FeedManager
 from .attacklens.nvd import CVELookup
 
@@ -111,7 +112,14 @@ def create_app() -> FastAPI:
     )
     data_dir = os.environ.get("THREAT_INTEL_DATA_DIR") or os.environ.get("DATA_DIR", default_data_dir)
     os.makedirs(data_dir, exist_ok=True)
-    db_path = os.environ.get("THREAT_INTEL_DB", os.path.join(data_dir, "intel.db"))
+    # This service's intel DB is intentionally a SEPARATE Postgres database
+    # from the per-manager-instance one in server.py (it's the centrally
+    # shared store described in the module docstring, not the same "intel"
+    # database) — own env var, own default database name.
+    database_url = os.environ.get(
+        "DATABASE_URL", "postgresql://attacklens:attacklens@localhost:5432"
+    ).rstrip("/")
+    db_path = os.environ.get("THREAT_INTEL_DATABASE_URL", f"{database_url}/threat_intel")
 
     app = FastAPI(
         title="AttackLens Central Threat Intel",
@@ -138,7 +146,7 @@ def create_app() -> FastAPI:
         await worker.start()
         app.state.intel_db = intel_db
         app.state.worker = worker
-        log.info("Threat intel service started DB=%s", db_path)
+        log.info("Threat intel service started DB=%s", _redact_dsn(db_path))
 
     @app.on_event("shutdown")
     async def shutdown() -> None:

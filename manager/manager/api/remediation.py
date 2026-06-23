@@ -69,10 +69,15 @@ def _notifier(request: Request):
 
 async def _load_finding(idb, finding_id: int) -> Optional[dict]:
     """Single-row finding loader used by remediation routes."""
-    async with idb._conn.execute(
-        "SELECT * FROM findings WHERE id=?", (finding_id,)
-    ) as cur:
-        row = await cur.fetchone()
+    # A pooled READ checkout, not the shared write connection (idb._conn) —
+    # that connection is only safe when serialized via idb._lock (asyncpg
+    # connections don't support concurrent interleaved commands), and a plain
+    # SELECT has no reason to contend with writers for it anyway.
+    async with idb._pool.read() as conn:
+        async with conn.execute(
+            "SELECT * FROM findings WHERE id=?", (finding_id,)
+        ) as cur:
+            row = await cur.fetchone()
     if not row:
         return None
     f = dict(row)
@@ -222,12 +227,13 @@ async def generate_remediation_plan(
     # Fetch finding
     rows = await idb.get_soc_findings(active_only=False, limit=1)
     finding = None
-    async with idb._conn.execute(
-        "SELECT * FROM findings WHERE id=?", (finding_id,)
-    ) as cur:
-        row = await cur.fetchone()
-        if row:
-            finding = dict(row)
+    async with idb._pool.read() as conn:  # see _load_finding's comment on why not idb._conn
+        async with conn.execute(
+            "SELECT * FROM findings WHERE id=?", (finding_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                finding = dict(row)
 
     if not finding:
         raise HTTPException(404, f"Finding {finding_id} not found.")
@@ -262,10 +268,11 @@ async def generate_ai_analysis(
     if not analyst or not analyst.enabled:
         raise HTTPException(503, "AI analyst not available. Set ANTHROPIC_API_KEY.")
 
-    async with idb._conn.execute(
-        "SELECT * FROM findings WHERE id=?", (finding_id,)
-    ) as cur:
-        row = await cur.fetchone()
+    async with idb._pool.read() as conn:  # see _load_finding's comment on why not idb._conn
+        async with conn.execute(
+            "SELECT * FROM findings WHERE id=?", (finding_id,)
+        ) as cur:
+            row = await cur.fetchone()
     if not row:
         raise HTTPException(404, f"Finding {finding_id} not found.")
     finding = dict(row)

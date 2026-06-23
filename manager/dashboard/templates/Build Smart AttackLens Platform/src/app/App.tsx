@@ -1,7 +1,10 @@
 import { useState, lazy, Suspense } from "react";
+import { ClipboardList } from "lucide-react";
 import { Sidebar, type PageId } from "./components/Sidebar";
 import { TopHeader } from "./components/TopHeader";
+import { ComingSoon } from "./components/ComingSoon";
 import { RBACProvider } from "./context/RBACContext";
+import { CIS_COMPLIANCE_LIVE } from "./featureFlags";
 
 // Dashboard is the landing page — keep it eager so first paint is instant.
 import SecurityDashboard from "./pages/Dashboard";
@@ -17,7 +20,7 @@ const VulnerabilitySurface = lazy(() => import("./pages/VulnerabilitySurface"));
 const PersistenceBackdoors = lazy(() => import("./pages/PersistenceBackdoors"));
 const IdentityAccess       = lazy(() => import("./pages/IdentityAccess"));
 const SecurityPosture      = lazy(() => import("./pages/SecurityPosture"));
-const CISCompliance        = lazy(() => import("./pages/CISCompliance"));
+const CISCompliance        = CIS_COMPLIANCE_LIVE ? lazy(() => import("./pages/CISCompliance")) : null;
 const ThreatIntelligence   = lazy(() => import("./pages/ThreatIntelligence"));
 const Timeline             = lazy(() => import("./pages/Timeline"));
 const AssetRegistry        = lazy(() => import("./pages/AssetRegistry"));
@@ -38,7 +41,14 @@ function PageRouter({ page }: { page: PageId }) {
     case "persistence":      return <PersistenceBackdoors />;
     case "identity":         return <IdentityAccess />;
     case "security-posture": return <SecurityPosture />;
-    case "compliance":       return <CISCompliance />;
+    case "compliance":
+      return CISCompliance ? <CISCompliance /> : (
+        <ComingSoon
+          icon={<ClipboardList className="w-6 h-6 text-[--gray-400]" />}
+          title="CIS Compliance"
+          description="CIS Benchmark compliance scoring for the Posture section is coming soon — this page will track macOS hardening checks against the CIS macOS Benchmark."
+        />
+      );
     case "threat-intel":     return <ThreatIntelligence />;
     case "timeline":         return <Timeline />;
     case "assets":           return <AssetRegistry />;

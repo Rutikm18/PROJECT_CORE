@@ -5,8 +5,8 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 
-# Async SQLite
-aiosqlite>=0.20.0
+# Async Postgres
+asyncpg>=0.29.0
 
 # Crypto — AES-256-GCM, HKDF (shared with agent)
 cryptography>=42.0.0

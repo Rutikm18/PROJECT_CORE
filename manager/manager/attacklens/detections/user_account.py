@@ -123,6 +123,70 @@ def _should_suppress(agent_id: str, rule_id: str, item: str,
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FALSE-POSITIVE CONTROL — risk tiering for new accounts
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Below this UID an account is a system/service account on both macOS (<500)
+# and Linux (<1000 covered by the nologin-shell check too). Installers create
+# these constantly — they are not "an attacker made an account".
+_SYSTEM_UID_MAX = 500
+
+
+def _to_int(v: Any, default: int = -1) -> int:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_system_account(user: dict) -> bool:
+    """A service/daemon account (installer-created): underscore-prefixed (macOS),
+    a non-login shell, or a system UID. These should never be a CRITICAL incident."""
+    name  = (user.get("username") or "")
+    shell = (user.get("shell") or "").strip()
+    uid   = _to_int(user.get("uid"))
+    if name.startswith("_"):
+        return True
+    if shell in NON_LOGIN_SHELLS or shell.endswith("nologin") or shell.endswith("false"):
+        return True
+    if 0 <= uid < _SYSTEM_UID_MAX:
+        return True
+    return False
+
+
+def _is_interactive(user: dict) -> bool:
+    shell = (user.get("shell") or "").strip()
+    if shell in INTERACTIVE_SHELLS:
+        return True
+    return bool(shell) and shell not in NON_LOGIN_SHELLS \
+        and not shell.endswith("nologin") and not shell.endswith("false")
+
+
+def _new_account_severity(user: dict) -> str:
+    """Risk-tier a genuinely new account instead of blanket CRITICAL.
+
+      critical → UID 0 clone, or a new privileged-group account with a login shell
+      high     → new interactive (login-shell) user account
+      info     → system/service account (installer noise — visible, not an incident)
+      medium   → anything else
+    """
+    uid    = _to_int(user.get("uid"))
+    groups = {str(g).lower() for g in (user.get("groups") or [])}
+    privileged  = bool(groups & {g.lower() for g in PRIVILEGED_GROUPS})
+    interactive = _is_interactive(user)
+
+    if uid == 0:
+        return "critical"
+    if privileged and interactive:
+        return "critical"
+    if _is_system_account(user):
+        return "info"
+    if interactive:
+        return "high"
+    return "medium"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TELEMETRY INGESTION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -304,6 +368,13 @@ async def detect_new_account(
         except Exception:
             baseline = {}
 
+    # First-run seeding: with no prior baseline we are seeing the host's
+    # EXISTING accounts for the first time. They are not "newly created", so we
+    # record the baseline and emit nothing — alerting only on accounts that
+    # appear in LATER snapshots. This removes the enrollment FP storm where
+    # every pre-existing account fired a CRITICAL new-account alert.
+    first_run = not baseline
+
     updated = dict(baseline)
     for user in users:
         uname = user["username"]
@@ -314,25 +385,37 @@ async def detect_new_account(
 
         if uname in baseline:
             continue
+        if first_run:
+            continue   # pre-existing account at first observation — not new
+
+        # Risk-tier instead of blanket CRITICAL: a new daemon/service account
+        # (installer noise) is INFO; a root/privileged interactive account is
+        # CRITICAL. This is the accuracy fix — severity tracks real risk.
+        sev = _new_account_severity(user)
 
         # No dedup window for new accounts — alert immediately every time
         if _should_suppress(agent_id, "new_account", uname, window=0):
             continue
 
+        _acct_kind = "service/daemon" if _is_system_account(user) else "interactive"
         findings.append(_make_alert(
             agent_id=agent_id, hostname="",
-            severity="critical", rule_id="new_account",
-            title=f"New user account created: {uname}",
+            severity=sev, rule_id="new_account",
+            title=f"New {_acct_kind} account: {uname}",
             description=(
-                f"User account '{uname}' (UID {user['uid']}) appeared and is not in the "
-                "approved account baseline. Attackers create accounts for persistence "
-                "and to maintain access after credential rotation."
+                f"User account '{uname}' (UID {user['uid']}, shell {user['shell'] or 'n/a'}) "
+                "appeared and is not in the approved account baseline. "
+                + ("Attackers create accounts for persistence and to maintain access "
+                   "after credential rotation."
+                   if sev in ("critical", "high")
+                   else "Service/daemon accounts are routinely created by software "
+                        "installers; surfaced for visibility, not as a high-risk incident.")
             ),
             mitre_technique="T1136.001",
             evidence={
                 "username": uname, "uid": user["uid"], "gid": user["gid"],
                 "shell": user["shell"], "home": user["home"],
-                "groups": user["groups"],
+                "groups": user["groups"], "account_class": _acct_kind,
             },
             raw_user=user["raw"],
         ))
@@ -393,9 +476,15 @@ def detect_hidden_user(agent_id: str, users: list[dict]) -> list[dict]:
             continue
         if not _HIDDEN_USER_RE.match(uname):
             continue
-        # macOS system accounts all start with _ — only flag if NOT a known pattern
-        # We flag all underscore-prefix accounts that aren't standard macOS ones.
-        # The approved-baseline check in detect_new_account handles whitelisting.
+        # macOS ships ~50 underscore-prefixed daemon accounts by Apple convention
+        # (system UID + nologin shell) — those are NOT hidden/suspicious and
+        # flagging them is a guaranteed FP on every Mac. Only flag: a name with
+        # NON-PRINTABLE characters (always an evasion signal), or an underscore/
+        # hidden name that is NOT a benign system account (i.e. has a real UID or
+        # an interactive login shell — someone hiding a usable account behind `_`).
+        has_nonprintable = bool(re.search(r"[^\x20-\x7e]", uname))
+        if not has_nonprintable and _is_system_account(user):
+            continue
         if _should_suppress(agent_id, "hidden_user", uname):
             continue
         reason = "underscore-prefix" if uname.startswith("_") else "non-printable characters"
@@ -425,8 +514,11 @@ def detect_service_with_shell(agent_id: str, users: list[dict]) -> list[dict]:
         uname = user["username"]
         uid   = user["uid"]
         shell = user["shell"]
-        # Only flag accounts in system UID range
-        is_system = (0 < uid < LINUX_SYSTEM_UID_MAX) or "system" in uname.lower()
+        # Only flag genuine SERVICE accounts (system UID range) with a login
+        # shell. macOS real users start at 501, so the old Linux <1000 threshold
+        # misclassified normal Mac users (e.g. uid 501) as service accounts —
+        # a systemic FP. Use the macOS system-UID boundary (<500).
+        is_system = (0 < _to_int(uid) < _SYSTEM_UID_MAX) or "system" in uname.lower()
         if not is_system:
             continue
         if shell not in INTERACTIVE_SHELLS:
@@ -509,38 +601,74 @@ async def detect_home_changed(
     return findings
 
 
-def detect_privgroup_added(agent_id: str, users: list[dict]) -> list[dict]:
-    """HIGH (→ CRITICAL for domain admin) — Account added to a privileged group."""
+async def detect_privgroup_added(agent_id: str, users: list[dict], db: Any) -> list[dict]:
+    """HIGH (→ CRITICAL for domain admin) — Account NEWLY added to a privileged group.
+
+    Baseline-seeded change detection: existing privileged memberships (root in
+    wheel, admins you already had) are recorded on first observation and NOT
+    alerted — only a membership that appears in a LATER snapshot fires. Without
+    this, root→wheel (entirely expected) fired on every single snapshot, a
+    guaranteed false positive on every host.
+    """
     findings: list[dict] = []
+
+    raw_state = await db.get_entity_state(agent_id, "user_account", "privgroup_baseline")
+    baseline: dict[str, list] = {}
+    if raw_state:
+        try:
+            baseline = json.loads(raw_state) if isinstance(raw_state, str) else raw_state
+        except Exception:
+            baseline = {}
+    first_run = not baseline
+
+    updated = dict(baseline)
     for user in users:
         uname  = user["username"]
         groups = {g.lower() for g in (user.get("groups") or [])}
-        priv   = groups & PRIVILEGED_GROUPS
+        priv   = sorted(groups & PRIVILEGED_GROUPS)
+        prev   = set(baseline.get(uname, []))
+        updated[uname] = priv
         if not priv:
             continue
-        is_domain_admin = bool({"domain admins", "enterprise admins", "schema admins"} & priv)
+        newly = [g for g in priv if g not in prev]
+        if not newly:
+            continue                      # membership already known — not "added"
+        if first_run:
+            continue                      # pre-existing membership at first observation
+
+        is_domain_admin = bool({"domain admins", "enterprise admins", "schema admins"} & set(newly))
         severity = "critical" if is_domain_admin else "high"
-        item_key = f"{uname}:{','.join(sorted(priv))}"
+        item_key = f"{uname}:{','.join(newly)}"
         if _should_suppress(agent_id, "privgroup_added", item_key):
             continue
         findings.append(_make_alert(
             agent_id=agent_id, hostname="",
             severity=severity, rule_id="privgroup_added",
-            title=f"Account in privileged group(s): {uname} → {', '.join(sorted(priv))}",
+            title=f"Account added to privileged group(s): {uname} → {', '.join(newly)}",
             description=(
-                f"Account '{uname}' is a member of privileged group(s): {', '.join(sorted(priv))}. "
+                f"Account '{uname}' was newly added to privileged group(s): {', '.join(newly)}. "
                 + ("DOMAIN ADMIN — full domain compromise risk. " if is_domain_admin else "")
-                + "Investigate whether this membership was authorized."
+                + "Investigate whether this membership change was authorized."
             ),
             mitre_technique="T1136.002" if is_domain_admin else "T1136.001",
             evidence={
                 "username":          uname,
-                "privileged_groups": sorted(priv),
+                "newly_added":       newly,
+                "privileged_groups": priv,
                 "all_groups":        sorted(user.get("groups", [])),
                 "uid":               user["uid"],
             },
             raw_user=user["raw"],
         ))
+
+    try:
+        await db.set_entity_state(
+            agent_id, "user_account", "privgroup_baseline",
+            updated, datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception as exc:
+        log.debug("privgroup baseline persist failed: %s", exc)
+
     return findings
 
 
@@ -645,7 +773,7 @@ async def analyze(
         f["affected_asset"] = hostname or agent_id
         findings.append(f)
 
-    for f in detect_privgroup_added(agent_id, users):
+    for f in await detect_privgroup_added(agent_id, users, db):
         f["affected_asset"] = hostname or agent_id
         findings.append(f)
 

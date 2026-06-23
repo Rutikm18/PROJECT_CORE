@@ -10,6 +10,7 @@ every envelope it is handed.  These tests pin down that contract:
   - empty / missing spool drains to []
   - a corrupt line is skipped without losing the good lines around it
   - oversize spool is trimmed oldest-first (bounded disk use, newest kept)
+  - every drop (trim or corrupt) is counted in stats() — data loss is never silent
 """
 from __future__ import annotations
 
@@ -64,6 +65,7 @@ def test_corrupt_line_is_skipped_good_lines_survive(tmp_path):
     drained = s.drain()
 
     assert drained == [{"seq": 1}, {"seq": 2}], "corrupt line dropped, good lines kept"
+    assert s.stats()["dropped_corrupt"] == 1, "the corrupt drop must be counted, not silent"
 
 
 def test_trim_drops_oldest_keeps_newest_when_oversize(tmp_path, monkeypatch):
@@ -84,3 +86,9 @@ def test_trim_drops_oldest_keeps_newest_when_oversize(tmp_path, monkeypatch):
     assert seqs[-1] == 99, "newest envelope must be retained after trim"
     assert seqs == sorted(seqs), "trim must not reorder surviving envelopes"
     assert s.size() == 0
+    assert s.stats()["dropped_trim"] > 0, "trim drops must be counted, not silent"
+
+
+def test_stats_start_at_zero(tmp_path):
+    s = _spool(tmp_path)
+    assert s.stats() == {"dropped_trim": 0, "dropped_corrupt": 0}

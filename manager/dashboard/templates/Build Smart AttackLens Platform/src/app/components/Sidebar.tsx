@@ -5,6 +5,7 @@ import {
   ClipboardList, LayoutDashboard, Activity,
   Settings, Server, Building2, MapPin, Layers,
 } from "lucide-react";
+import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 
 export type PageId =
   | "dashboard"
@@ -34,11 +35,14 @@ interface NavItem {
   badgePulse?: boolean;
   // which category keys map to this nav item (for grouping new-finding counts)
   catKeys?: string[];
+  // page is reachable (not disabled) but renders a "Coming Soon" placeholder
+  comingSoon?: boolean;
 }
 
 interface NavGroup {
   label: string;
   items: NavItem[];
+  comingSoon?: boolean;
 }
 
 // Category keyword → PageId mapping (mirrors ThreatQueue catKey logic)
@@ -91,8 +95,9 @@ const GROUPS: NavGroup[] = [
   },
   {
     label: "Posture",
+    comingSoon: !CIS_COMPLIANCE_LIVE,
     items: [
-      { id: "compliance",       label: "CIS Compliance",   icon: ClipboardList },
+      { id: "compliance",       label: "CIS Compliance",   icon: ClipboardList, comingSoon: !CIS_COMPLIANCE_LIVE },
     ],
   },
   {
@@ -347,6 +352,14 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                 >
                   {group.label}
                 </span>
+                {group.comingSoon && (
+                  <span
+                    className="px-1.5 py-[1px] text-[8px] font-bold uppercase tracking-wide rounded-full"
+                    style={{ background: "rgba(217,119,6,0.18)", color: "rgba(252,211,77,0.9)" }}
+                  >
+                    Soon
+                  </span>
+                )}
               </div>
 
               {/* Nav items */}
@@ -395,6 +408,16 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                         {item.label}
                       </span>
                     </div>
+
+                    {/* Coming-soon marker — page is still clickable, nothing live behind it yet */}
+                    {item.comingSoon && (
+                      <span
+                        className="flex-shrink-0 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide rounded-full"
+                        style={{ background: "rgba(217,119,6,0.18)", color: "rgba(252,211,77,0.9)" }}
+                      >
+                        Soon
+                      </span>
+                    )}
 
                     {/* Live badge — only shows count of NEW (unactioned) findings */}
                     {(() => {

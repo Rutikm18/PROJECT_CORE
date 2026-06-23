@@ -14,8 +14,8 @@ from manager.manager.db import Database
 
 
 @pytest.fixture
-async def db(tmp_path):
-    d = Database(str(tmp_path / "t.db"))
+async def db(pg_manager_dsn):
+    d = Database(pg_manager_dsn)
     await d.init()
     # Two agents, multiple sections, multiple revisions (newest = highest ts).
     await d.upsert_agent("a1", "host-a1", "10.0.0.1")

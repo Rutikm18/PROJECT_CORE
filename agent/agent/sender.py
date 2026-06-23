@@ -44,6 +44,12 @@ class DiskSpool:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
+        # Cumulative, process-lifetime counts of envelopes that never made it
+        # to the manager because they were discarded on-disk (size trim) or
+        # found unreadable on replay (corrupt line) — visibility into data
+        # loss that was previously silent past a log line.
+        self._dropped_trim = 0
+        self._dropped_corrupt = 0
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def write(self, envelope: dict) -> None:
@@ -69,6 +75,7 @@ class DiskSpool:
             except FileNotFoundError:
                 return []
         out = []
+        corrupt = 0
         for l in lines:
             l = l.strip()
             if not l:
@@ -76,7 +83,12 @@ class DiskSpool:
             try:
                 out.append(json.loads(l))
             except json.JSONDecodeError:
-                pass
+                corrupt += 1
+        if corrupt:
+            with self._lock:
+                self._dropped_corrupt += corrupt
+            log.warning("Spool drain: dropped %d corrupt line(s) (cumulative=%d)",
+                        corrupt, self._dropped_corrupt)
         return out
 
     def size(self) -> int:
@@ -84,6 +96,14 @@ class DiskSpool:
             return os.path.getsize(self.path)
         except FileNotFoundError:
             return 0
+
+    def stats(self) -> dict:
+        """Cumulative (process-lifetime) counts of envelopes dropped on disk."""
+        with self._lock:
+            return {
+                "dropped_trim":    self._dropped_trim,
+                "dropped_corrupt": self._dropped_corrupt,
+            }
 
     def _trim(self) -> None:
         """Drop the first 10 % of lines to make room (holding lock)."""
@@ -93,14 +113,20 @@ class DiskSpool:
             drop = max(1, len(lines) // 10)
             with open(self.path, "w", encoding="utf-8") as f:
                 f.writelines(lines[drop:])
-            log.warning("Spool trimmed: dropped %d oldest entries (was %d lines)",
-                        drop, len(lines))
+            self._dropped_trim += drop
+            log.warning("Spool trimmed: dropped %d oldest entries (was %d lines, "
+                        "cumulative dropped=%d)", drop, len(lines), self._dropped_trim)
         except Exception as exc:
             log.error("Spool trim failed: %s", exc)
 
 
 class Sender:
-    def __init__(self, config: dict, send_queue: queue.Queue):
+    def __init__(self, config: dict, send_queue: queue.Queue, mac_key: bytes | None = None):
+        # mac_key lets the sender RE-STAMP each envelope's transport timestamp +
+        # HMAC at actual send time, so data spooled during an outage is still
+        # within the manager's replay window on reconnect (no store-and-forward
+        # data loss). None → legacy behaviour (send the sealed envelope as-is).
+        self._mac_key   = mac_key
         self.mgr        = config["manager"]
         self.url        = self.mgr["url"].rstrip("/") + "/api/v1/ingest"
         self.probe_url  = self.mgr["url"].rstrip("/") + "/health"
@@ -127,6 +153,13 @@ class Sender:
         spool_dir = config.get("paths", {}).get("spool_dir", _default_spool)
         self._spool = DiskSpool(os.path.join(spool_dir, "unsent.ndjson"))
 
+        # Send pacing: cap outbound rate just below the manager's per-agent rate
+        # limit (10 req/s) so draining a large spool after an outage doesn't burst
+        # into 429s. At low volume the gap is already exceeded → no added latency.
+        _rate = float(self.mgr.get("max_send_rate", 8.0))
+        self._min_send_interval = 1.0 / _rate if _rate > 0 else 0.0
+        self._last_send_ts = 0.0
+
         # Auth-failure tracking: counts consecutive 401s to detect key invalidation
         self._auth_fail_count = 0
         # Optional callback — called when persistent auth failure detected.
@@ -139,16 +172,8 @@ class Sender:
         if self.mgr["url"].startswith("http://"):
             log.warning("Manager URL is plain HTTP — no TLS encryption")
             return None   # urllib handles plain HTTP without a context
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        if not self.tls_verify:
-            ctx.check_hostname = False
-            ctx.verify_mode    = ssl.CERT_NONE
-            log.warning("TLS verification disabled — dev/self-signed cert mode")
-        else:
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            ctx.load_default_certs()
-        return ctx
+        from .tls import build_client_ssl_context
+        return build_client_ssl_context(self.mgr["url"], self.tls_verify)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -168,6 +193,10 @@ class Sender:
     def stop(self):
         self._stop.set()
 
+    def set_mac_key(self, mac_key: bytes) -> None:
+        """Update the HMAC key after re-enrollment so re-stamping stays valid."""
+        self._mac_key = mac_key
+
     def spool_envelope(self, envelope: dict) -> None:
         """Persist one envelope straight to the disk spool.
 
@@ -186,9 +215,12 @@ class Sender:
         until the first successful contact; `seconds_since_contact` is None then.
         """
         last = self._last_contact_ts
+        spool_stats = self._spool.stats()
         return {
             "manager_online":        self._online,
             "spool_bytes":           self._spool.size(),
+            "spool_dropped_trim":    spool_stats["dropped_trim"],
+            "spool_dropped_corrupt": spool_stats["dropped_corrupt"],
             "auth_failures":         self._auth_fail_count,
             "last_contact_ts":       int(last) if last else 0,
             "seconds_since_contact": int(time.time() - last) if last else None,
@@ -216,36 +248,41 @@ class Sender:
         while not self._stop.is_set():
             # Reprobe when offline, with fast-first backoff (2s → 30s) so a
             # transient blip recovers in ~2s instead of waiting a flat 30s.
-            now = time.time()
-            if not self._online and (now - spool_check) >= probe_delay:
-                spool_check = now
-                if self._probe():
-                    probe_delay = _SPOOL_RETRY_MIN          # reset for next outage
-                    self._online = True
-                    self._last_contact_ts = time.time()
-                    if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
-                        log.warning(
-                            "Manager back online after %d auth failures — "
-                            "clearing spool and triggering re-enrollment",
-                            self._auth_fail_count,
-                        )
-                        self._auth_fail_count = 0
-                        self._spool.drain()   # stale encrypted data, discard
-                        if self.on_auth_error:
-                            threading.Thread(
-                                target=self.on_auth_error,
-                                daemon=True,
-                                name="re-enroll",
-                            ).start()
+            # Guarded: a probe/drain/spool error must never kill the sender
+            # thread (that would stop all delivery silently).
+            try:
+                now = time.time()
+                if not self._online and (now - spool_check) >= probe_delay:
+                    spool_check = now
+                    if self._probe():
+                        probe_delay = _SPOOL_RETRY_MIN          # reset for next outage
+                        self._online = True
+                        self._last_contact_ts = time.time()
+                        if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
+                            log.warning(
+                                "Manager back online after %d auth failures — "
+                                "clearing spool and triggering re-enrollment",
+                                self._auth_fail_count,
+                            )
+                            self._auth_fail_count = 0
+                            self._spool.drain()   # stale encrypted data, discard
+                            if self.on_auth_error:
+                                threading.Thread(
+                                    target=self.on_auth_error,
+                                    daemon=True,
+                                    name="re-enroll",
+                                ).start()
+                        else:
+                            log.info("Manager back online — draining spool")
+                            spooled = self._spool.drain()
+                            for env in spooled:
+                                self.queue.put_nowait(env)
                     else:
-                        log.info("Manager back online — draining spool")
-                        spooled = self._spool.drain()
-                        for env in spooled:
-                            self.queue.put_nowait(env)
-                else:
-                    probe_delay = min(probe_delay * 2, _SPOOL_RETRY_MAX)
-                    log.debug("Manager still unreachable — spool has %d bytes, "
-                              "next probe in %ds", self._spool.size(), probe_delay)
+                        probe_delay = min(probe_delay * 2, _SPOOL_RETRY_MAX)
+                        log.debug("Manager still unreachable — spool has %d bytes, "
+                                  "next probe in %ds", self._spool.size(), probe_delay)
+            except Exception as exc:
+                log.error("sender reprobe/drain error (continuing): %s", exc)
 
             try:
                 envelope = self.queue.get(timeout=1)
@@ -304,6 +341,28 @@ class Sender:
         503 (storage unavailable on manager) is retried and spooled — it means
         the data was not persisted and the agent must hold onto it.
         """
+        # Pace outbound sends under the manager's rate limit (avoids 429 storms
+        # when draining a large spool on reconnect). Interruptible by shutdown.
+        if self._min_send_interval > 0:
+            gap = time.time() - self._last_send_ts
+            if 0 < gap < self._min_send_interval:
+                self._stop.wait(self._min_send_interval - gap)
+        self._last_send_ts = time.time()
+
+        # Re-stamp transport freshness at SEND time so a spooled/buffered
+        # envelope (possibly hours old) lands inside the manager's replay window
+        # instead of being rejected as stale. Event time (collected_at) inside
+        # the ciphertext is unchanged.
+        if self._mac_key is not None:
+            try:
+                from .crypto import restamp_envelope
+                section_hint = envelope.get("section")
+                envelope = restamp_envelope(envelope, self._mac_key)
+                if section_hint is not None:
+                    envelope["section"] = section_hint   # preserve plaintext routing hint
+            except Exception as exc:
+                log.debug("restamp failed (sending as-is): %s", exc)
+
         body    = json.dumps(envelope).encode()
         delay   = self.retry_del
         section = envelope.get("section", "unknown")
@@ -326,13 +385,20 @@ class Sender:
                 if self._ctx is not None:
                     kwargs["context"] = self._ctx
                 with urllib.request.urlopen(req, **kwargs) as resp:
-                    if resp.status == 200:
+                    if 200 <= resp.status < 300:
+                        # Any 2xx is delivered: ingest.py's queue-mode path is
+                        # documented as "publish → return 202" even though it
+                        # currently replies 200 — checking the whole 2xx range
+                        # (not == 200) means a future fix to match that doc, or
+                        # any 201/204 from a proxy in front of the manager,
+                        # can't fall through to the generic "unexpected status"
+                        # branch below and get spooled/retried as if it failed.
                         if not self._online:
                             log.info("Manager connection restored")
                         self._online = True
                         self._last_contact_ts = time.time()
                         self._auth_fail_count = 0
-                        log.debug("Sent %s → 200", section)
+                        log.debug("Sent %s → %d", section, resp.status)
                         return True
                     elif resp.status == 401:
                         self._auth_fail_count += 1
@@ -374,6 +440,20 @@ class Sender:
             except urllib.error.HTTPError as exc:
                 body_text = self._read_error_body(exc)
                 if exc.code == 401:
+                    # Distinguish a replay/duplicate rejection from a real auth
+                    # failure. Replay-class 401s (stale timestamp, duplicate
+                    # nonce) do NOT mean the key is bad — counting them toward
+                    # re-enrollment would wrongly rotate the key and wipe the
+                    # spool. The manager now idempotently 200s true duplicates;
+                    # this is defense-in-depth for older managers.
+                    low = body_text.lower()
+                    if any(k in low for k in ("replay", "duplicate", "out of window")):
+                        log.info(
+                            "HTTP 401 replay/duplicate agent=%s section=%s — "
+                            "manager already has it; dropping (not an auth failure): %r",
+                            agent, section, body_text,
+                        )
+                        return True   # handled — do not spool, do not count as auth fail
                     self._auth_fail_count += 1
                     log.warning(
                         "HTTP 401 (count=%d) agent=%s section=%s — "

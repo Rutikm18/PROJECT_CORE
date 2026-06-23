@@ -18,6 +18,7 @@ import gzip
 import hmac
 import json
 import os
+import time
 import hashlib
 import base64
 from typing import Tuple
@@ -139,6 +140,32 @@ def decrypt(envelope: dict, enc_key: bytes, mac_key: bytes) -> dict:
 
     # 3. Decompress + parse
     return json.loads(gzip.decompress(compressed))
+
+
+def restamp_envelope(envelope: dict, mac_key: bytes) -> dict:
+    """Refresh ONLY the transport freshness of an already-sealed envelope.
+
+    Store-and-forward problem: the manager rejects any envelope whose
+    `timestamp` is outside its replay window (±5 min). An envelope sealed at
+    enqueue time and then spooled while the agent/manager is offline becomes
+    "stale" and is rejected on reconnect → silent data loss.
+
+    This re-stamps the envelope's transport `timestamp` and recomputes the HMAC
+    over it at ACTUAL send time, so a payload buffered for hours still delivers.
+    The encrypted body (`nonce`, `ct`) and the event's own `collected_at`
+    (inside the ciphertext) are untouched — event time stays accurate; only the
+    transport clock is refreshed. `mac_key` must match the key the body was
+    encrypted under (i.e. pre key-rotation).
+
+    Returns a new dict; the original (spooled) envelope is not mutated.
+    """
+    ts = int(time.time())
+    env = dict(envelope)
+    env["timestamp"] = ts
+    env["hmac"] = _compute_hmac(
+        mac_key, env["agent_id"], ts, env["nonce"], env["ct"],
+    )
+    return env
 
 
 # ── Internal ──────────────────────────────────────────────────────────────────

@@ -122,6 +122,18 @@ class CircuitBreakerRegistry:
         with self._lock:
             self._get(section).record_failure(reason)
 
+    def state(self, section: str) -> State:
+        """Non-mutating peek at a section's current state (unlike allow(),
+        which transitions OPEN→HALF as a side effect of checking)."""
+        with self._lock:
+            return self._get(section).state
+
+    def cooldown_for(self, section: str) -> int:
+        """This breaker's cooldown window — the fastest it should ever be
+        re-checked while open, regardless of the section's own interval."""
+        with self._lock:
+            return self._get(section).cooldown_sec
+
     def snapshot(self) -> dict:
         """Return a status snapshot (for the health section)."""
         with self._lock:

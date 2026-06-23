@@ -172,6 +172,11 @@ fi
 # ── LaunchDaemon plists ───────────────────────────────────────────────────────
 # ProgramArguments[0] = python3 binary (Mach-O) — required by macOS 15+/26.
 # No EnvironmentVariables block needed: bootstrap scripts handle sys.path.
+# run_agent.py calls agent_entry.main(), whose CLI is subcommand-based (run,
+# start, stop, status, ...) — "run" must be passed explicitly or argparse
+# rejects "--config" as an invalid subcommand and the daemon never starts.
+# run_watchdog.py calls watchdog.main() directly (plain --config, no
+# subcommands), so it needs no such argument.
 echo "  Writing LaunchDaemons..."
 
 cat > "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" <<PLIST
@@ -185,6 +190,7 @@ cat > "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" <<PLIST
     <array>
         <string>${PYTHON3}</string>
         <string>${INSTALL_DIR}/bin/run_agent.py</string>
+        <string>run</string>
         <string>--config</string>
         <string>${CONFIG_PATH}</string>
     </array>

@@ -11,8 +11,9 @@ from __future__ import annotations
 import re
 
 import logging
+import os
 import threading
-from .base import BaseCollector, CollectorResult, _run, _run_json
+from .base import BaseCollector, CollectorResult, _run, _run_json, _sp_json
 
 log = logging.getLogger(__name__)
 
@@ -188,11 +189,62 @@ class NetworkCollector(BaseCollector):
         return out.strip() or None
 
     def _wifi(self) -> dict:
-        # airport utility path on macOS
+        """Current Wi-Fi association details.
+
+        Apple REMOVED the `airport` CLI in macOS 15 (deprecated in 14); on 26 the
+        binary no longer exists, so the old code path returned {} on every modern
+        Mac — silently nulling every wifi_* field. The supported source is now
+        `system_profiler SPAirPortDataType`. We try it first and fall back to
+        `airport` only on older systems where it still exists.
+
+        Note: modern macOS no longer exposes the BSSID at all (privacy), and may
+        redact the SSID unless the calling process holds Location Services
+        consent — those nulls are an OS constraint, not a collection bug. RSSI,
+        channel, and PHY/security details remain available.
+        """
+        info = self._wifi_system_profiler()
+        if info:
+            return info
+        return self._wifi_airport_legacy()
+
+    def _wifi_system_profiler(self) -> dict:
+        sp = _sp_json("SPAirPortDataType", timeout=20)
+        if not sp:
+            return {}
+        info: dict = {}
+        for top in sp.get("SPAirPortDataType", []):
+            for iface in top.get("spairport_airport_interfaces", []):
+                cur = iface.get("spairport_current_network_information")
+                if not isinstance(cur, dict):
+                    continue
+                ssid = cur.get("_name")
+                if ssid:
+                    info["ssid"] = ssid
+                # "1 (2GHz, 20MHz)" → "1"
+                chan = cur.get("spairport_network_channel")
+                if isinstance(chan, str) and chan:
+                    info["channel"] = chan.split()[0]
+                # "-42 dBm / -87 dBm" → -42  (signal half of signal/noise)
+                sig = cur.get("spairport_signal_noise")
+                if isinstance(sig, str):
+                    m = re.search(r"(-?\d+)\s*dBm", sig)
+                    if m:
+                        try:
+                            info["rssi"] = int(m.group(1))
+                        except ValueError:
+                            pass
+                if info:        # found the associated interface — stop scanning
+                    return info
+        return info
+
+    def _wifi_airport_legacy(self) -> dict:
+        # Pre-macOS-15 only: the binary is absent on current systems.
         airport = (
             "/System/Library/PrivateFrameworks/Apple80211.framework"
             "/Versions/Current/Resources/airport"
         )
+        if not os.path.exists(airport):
+            return {}
         out = _run([airport, "-I"])
         info: dict = {}
         for line in out.splitlines():

@@ -184,24 +184,32 @@ _patch_plist_python3() {
   if [[ $needs_patch -eq 1 ]]; then
     echo "  Patching $(basename "$plist") for macOS 15+ (python3 direct launch)..."
     # Determine which bootstrap launcher to use
-    local run_py
+    local run_py is_watchdog
     if echo "$plist" | grep -q "watchdog"; then
       run_py="${BIN_DIR}/run_watchdog.py"
+      is_watchdog=1
     else
       run_py="${BIN_DIR}/run_agent.py"
+      is_watchdog=0
     fi
 
-    python3 - "$plist" "$PYTHON3" "$run_py" "$CONFIG_PATH" <<'PYEOF'
+    python3 - "$plist" "$PYTHON3" "$run_py" "$CONFIG_PATH" "$is_watchdog" <<'PYEOF'
 import sys, re
-plist_path, python3, run_py, config = sys.argv[1:5]
+plist_path, python3, run_py, config, is_watchdog = sys.argv[1:6]
 with open(plist_path) as f:
     content = f.read()
+# run_agent.py calls agent_entry.main(), a subcommand-based CLI — "run" must
+# be passed explicitly or argparse rejects "--config" as an invalid
+# subcommand and the daemon exits immediately on every launch.
+# run_watchdog.py calls watchdog.main() directly (plain --config, no
+# subcommands), so it gets no extra argument.
+extra_arg = "" if is_watchdog == "1" else "<string>run</string>\n        "
 new_args = (
     f"<key>ProgramArguments</key>\n"
     f"    <array>\n"
     f"        <string>{python3}</string>\n"
     f"        <string>{run_py}</string>\n"
-    f"        <string>--config</string>\n"
+    f"        {extra_arg}<string>--config</string>\n"
     f"        <string>{config}</string>\n"
     f"    </array>"
 )
@@ -509,8 +517,9 @@ do_diagnose() {
   manager_url=$(_cfg_get "url" "")
   if [[ -n "$manager_url" ]] && [[ "$manager_url" != *"YOUR_MANAGER"* ]]; then
     local host port
-    host=$(echo "$manager_url" | sed 's|https\?://||;s|[:/].*||')
-    port=$(echo "$manager_url" | grep -oE ':[0-9]+' | tr -d ':' | head -1 || echo "8080")
+    host=$(echo "$manager_url" | sed -E 's|https?://||;s|[:/].*||')
+    port=$(echo "$manager_url" | grep -oE ':[0-9]+' | tr -d ':' | head -1)
+    port="${port:-8080}"
     if nc -z -w4 "$host" "$port" 2>/dev/null; then
       _ok "Manager reachable  ${host}:${port}" "OK"
     else

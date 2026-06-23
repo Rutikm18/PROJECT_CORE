@@ -26,13 +26,13 @@ import logging
 import platform
 import secrets
 import socket
-import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
 
 from .keystore import store_key, load_key, delete_key
+from .tls import build_client_ssl_context
 
 log = logging.getLogger("agent.enrollment")
 
@@ -117,7 +117,17 @@ def enroll(cfg: dict) -> str:
     except Exception as exc:
         raise EnrollmentError(f"Manager enrollment request failed: {exc}") from exc
 
-    # Step 2 — extract the key from the manager's response
+    # Step 2 — extract the key from the manager's response.
+    # `response is None` is the "already enrolled, nothing changed" signal from
+    # a 409 with no key in the body — the existing keystore key is still valid.
+    # Return falsy so callers (e.g. core.py's re-enrollment handler) know NOT to
+    # derive new crypto keys or drain the send queue, instead of falling through
+    # to the fallback below and overwriting a valid key with one the manager
+    # never issued.
+    if response is None:
+        log.info("Enrollment skipped: already enrolled, existing key unchanged")
+        return ""
+
     api_key = response.get("api_key", "").strip()
     if not api_key or len(api_key) != 64:
         # Old manager that doesn't return a key — fall back to local generation
@@ -149,16 +159,13 @@ def enroll(cfg: dict) -> str:
 
 # ── Internal ──────────────────────────────────────────────────────────────────
 
-def _post_enroll(url: str, token: str, payload: dict, tls_verify: bool) -> dict:
-    """POST enrollment request and return the parsed JSON response body."""
-    if url.startswith("http://"):
-        ctx = None   # plain HTTP — no TLS context
-    else:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        if not tls_verify:
-            ctx.check_hostname = False
-            ctx.verify_mode    = ssl.CERT_NONE
+def _post_enroll(url: str, token: str, payload: dict, tls_verify: bool) -> dict | None:
+    """POST enrollment request and return the parsed JSON response body.
+
+    Returns None specifically for "409, already enrolled, no key in body" —
+    the keystore's existing key is still valid and nothing should change.
+    """
+    ctx = build_client_ssl_context(url, tls_verify)
 
     body    = json.dumps(payload).encode()
     headers = {
@@ -207,9 +214,14 @@ def _post_enroll(url: str, token: str, payload: dict, tls_verify: bool) -> dict:
                 return {"api_key": existing_key}
         except Exception:
             pass
-        # Manager didn't return a key; the key already in keystore is still valid.
+        # Manager didn't return a key — nothing changed; the key already in the
+        # keystore is still valid. None (not {}) is deliberate: {} would be
+        # indistinguishable from a v1 manager's 200-without-api_key response,
+        # which enroll() treats as "generate a fallback key" — exactly the wrong
+        # move here, since that would overwrite a valid key with one the
+        # manager has never issued.
         log.info("Agent already enrolled (HTTP 409) — keystore key still valid")
-        return {}
+        return None
     raise EnrollmentError(
         f"Manager returned HTTP {status}: {body_resp.decode(errors='replace')}"
     )

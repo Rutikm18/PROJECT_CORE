@@ -65,7 +65,7 @@ python3 -m PyInstaller \
     --hidden-import "agent.agent.keystore" \
     --hidden-import "tomllib" \
     --distpath "${BUILD_DIR}/bin" \
-    agent/agent/core.py
+    agent/agent_entry.py
 
 # ── Step 2: Build watchdog binary ─────────────────────────────────────────────
 echo "[2/5] Building attacklens-watchdog binary (PyInstaller)..."
@@ -97,9 +97,12 @@ chmod 755 "${PKG_ROOT}${INSTALL_DIR}/bin/attacklens-watchdog"
 cp "agent/config/agent.conf.example" "${PKG_ROOT}${CONFIG_DIR}/agent.conf.example"
 chmod 644 "${PKG_ROOT}${CONFIG_DIR}/agent.conf.example"
 
-# LaunchDaemon
+# LaunchDaemons (agent + watchdog are two independent daemons — both must
+# ship, or the watchdog's crash-loop protection silently doesn't exist)
 cp "agent/launchd/com.attacklens.agent.plist" "${PKG_ROOT}${LAUNCHDAEMON_DIR}/"
 chmod 644 "${PKG_ROOT}${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist"
+cp "agent/launchd/com.attacklens.watchdog.plist" "${PKG_ROOT}${LAUNCHDAEMON_DIR}/"
+chmod 644 "${PKG_ROOT}${LAUNCHDAEMON_DIR}/com.attacklens.watchdog.plist"
 
 # ── Step 4: Build .pkg ────────────────────────────────────────────────────────
 echo "[4/5] Building .pkg with pkgbuild..."

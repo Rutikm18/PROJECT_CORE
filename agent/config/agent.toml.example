@@ -30,6 +30,9 @@
 #  sudo attacklens-ctl reload   → SIGHUP (hot config reload, no restart)
 #  sudo attacklens-ctl logs     → tail live agent log
 #  sudo attacklens-ctl enroll   → force re-enrollment (clears stored key)
+#  attacklens-agent --status    → print last health heartbeat as JSON, no
+#                                  network call — works even when the manager
+#                                  is unreachable (reads health.json on disk)
 #
 #  SECURITY MODEL
 #  ─────────────────────────────────────────────────────────────────────────
@@ -94,6 +97,8 @@ data_dir     = "/Library/AttackLens/data"
 security_dir = "/Library/AttackLens/security"
 spool_dir    = "/Library/AttackLens/spool"
 pid_file     = "/Library/AttackLens/attacklens-agent.pid"
+status_file  = "/Library/AttackLens/health.json"   # local mirror of the agent_health
+                                                    # heartbeat — read by `attacklens-agent --status`
 
 [binaries]
 agent    = "/Library/AttackLens/bin/attacklens-agent"

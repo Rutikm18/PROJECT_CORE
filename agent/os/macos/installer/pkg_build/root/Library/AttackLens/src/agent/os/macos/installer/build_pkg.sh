@@ -156,6 +156,12 @@ echo "     Alias:     /usr/local/bin/attacklens → attacklens-service"
 # PYTHON3_PLACEHOLDER is replaced in postinstall after detecting the real binary.
 # ProgramArguments[0] MUST be a Mach-O binary — macOS 15+ (Sequoia/Tahoe)
 # blocks LaunchDaemons that launch shell scripts as their primary executable.
+#
+# run_agent.py calls agent_entry.main(), whose CLI is subcommand-based — the
+# "run" subcommand must be passed explicitly or argparse rejects "--config"
+# as an invalid subcommand and the daemon exits immediately on every launch.
+# run_watchdog.py calls watchdog.main() directly (plain --config, no
+# subcommands), so its plist below carries no such argument.
 echo "  [5/6] Writing LaunchDaemon plists..."
 
 cat > "${PKG_ROOT}${LDIR}/com.attacklens.agent.plist" <<PLIST
@@ -170,6 +176,7 @@ cat > "${PKG_ROOT}${LDIR}/com.attacklens.agent.plist" <<PLIST
     <array>
         <string>PYTHON3_PLACEHOLDER</string>
         <string>${BIN_DIR}/run_agent.py</string>
+        <string>run</string>
         <string>--config</string>
         <string>${CONFIG_PATH}</string>
     </array>

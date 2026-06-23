@@ -31,13 +31,28 @@ To add a new collector (takes ~5 minutes):
 """
 from __future__ import annotations
 
+import sys as _sys
+
 from .volatile  import MetricsCollector, ConnectionsCollector, ProcessesCollector
 from .network   import PortsCollector, NetworkCollector, ArpCollector, MountsCollector
 from .system    import (
     BatteryCollector, OpenFilesCollector, ServicesCollector,
     UsersCollector, HardwareCollector, ContainersCollector,
 )
-from .posture   import SecurityCollector, SysctlCollector, ConfigsCollector
+
+# Posture collectors are platform-dispatched (mirrors core.py's normalizer
+# dispatch). The generic .posture emits raw CLI strings and a thin field set;
+# the macOS variant emits the canonical schema the manager's CIS scorer expects
+# (sip="enabled", filevault="on", secure_boot, ssh/screensaver/sharing fields,
+# configs[].suspicious, …). Without this, every Mac scores F because the raw
+# strings never match the canonical values the checks compare against.
+if _sys.platform == "darwin":
+    from agent.os.macos.collectors.posture import (
+        SecurityCollector, SysctlCollector, ConfigsCollector,
+    )
+else:
+    from .posture import SecurityCollector, SysctlCollector, ConfigsCollector
+
 from .inventory import (
     StorageCollector, TasksCollector, AppsCollector,
     PackagesCollector, BinariesCollector, SbomCollector,
