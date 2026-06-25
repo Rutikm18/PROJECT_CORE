@@ -9,10 +9,21 @@
 Always start here:
 
 ```bash
-attacklens-service diagnose        # no sudo needed
-attacklens-service status          # no sudo needed
+attacklens-service diagnose        # quick: install + connectivity checklist
+attacklens-service status          # service state + recent log
+sudo attacklens-service doctor     # DEEP: decodes log messages, identifies a
+                                   # rogue server squatting the manager port (by
+                                   # PID), and flags the spool-storm trend
 sudo attacklens-service logs       # live log tail
 ```
+
+`doctor` is the deep self-diagnosis (added 2026-06-22): it runs
+`agent/os/macos/diagnostics.py`, which knows every agent log message and the
+common failure modes below, and prints a single **TOP BLOCKER** with the exact
+fix. A periodic **self-heal LaunchDaemon** (`com.attacklens.selfheal`, every
+5 min) runs the same checks automatically — it re-loads the agent if launchd
+dropped it, and escalates (never silently) when the agent is alive but can't
+deliver. State it writes: `/Library/AttackLens/health_diagnosis.json`.
 
 ---
 
@@ -156,6 +167,55 @@ cat /Library/AttackLens/agent.toml | grep url
 lsof -i :80 -i :8080 | grep LISTEN
 ps aux | grep -E "uvicorn|gunicorn|fastapi|python"
 docker ps                           # if containerized
+```
+
+---
+
+### Issue 3b — Manager "reachable" but `/health` returns 404 (rogue server on the manager port)
+
+**What you saw (from `attacklens-service diagnose`):**
+```
+✓  Manager reachable  127.0.0.1:8080      OK
+⚠  Manager /health HTTP                   404 (may be normal if endpoint differs)
+```
+…and the dashboard stays empty even though the agent is "running".
+
+**Root cause (found 2026-06-22):**
+The TCP port is open (so "reachable" passes), but the thing answering it is **not
+the manager**. The classic trigger: a stray `python -m http.server 8080` (often
+started to share the `.pkg` from `dist/`) binds **IPv4 `127.0.0.1:8080`**, while
+Docker's manager publishes on `*:8080`. When the agent connects to
+`127.0.0.1:8080`, the **IPv4 loopback bind wins**, so every telemetry POST hits
+the static file server and gets a 404. The agent's sender treats 404 (a 4xx
+client error) as unrecoverable and **drops the payload** — silent data loss, and
+nothing reaches the dashboard.
+
+Tell-tale signature:
+```bash
+curl -sI http://127.0.0.1:8080/health      # Server: SimpleHTTP/0.6 Python/3.13.7  ← NOT uvicorn
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+#   Python    27355 ... TCP 127.0.0.1:8080 (LISTEN)   ← rogue, shadows the manager (IPv4)
+#   com.docke 69558 ... TCP *:8080 (LISTEN)            ← the real manager forward
+```
+
+**Fix — kill the squatter (it's your own process; no sudo needed):**
+```bash
+kill 27355                                 # the non-Docker PID from lsof above
+curl -s http://127.0.0.1:8080/health       # must now return {"status":"ok",...}
+```
+The agent auto-recovers within seconds (the sender probes `/health`, sees it
+healthy, and resumes delivering). **Never run `python -m http.server` on the
+manager's port** — use a different port (e.g. 8000) to share files.
+
+`sudo attacklens-service doctor` detects this automatically and prints the exact
+offending PID + `kill` command (verdict: `rogue_server`). The self-heal daemon
+escalates it too, but deliberately does **not** auto-kill a process (it could be
+a server you started on purpose) — it surfaces the fix instead.
+
+Alternative if you can't free the port: point the agent at the manager's other
+front door (Caddy on port 80):
+```bash
+sudo attacklens-service set-manager http://127.0.0.1
 ```
 
 ---
@@ -501,7 +561,8 @@ sudo attacklens-service restart  # full restart
 | `attacklens-service config` | No | Print agent.toml |
 | `attacklens-service version` | No | Version + Python info |
 | `attacklens-service diagnose` | No | Full connectivity + install health check |
-| `sudo attacklens-service start` | Yes | Start agent + watchdog LaunchDaemons |
+| `sudo attacklens-service doctor` | No* | Deep diagnosis: decode logs, name a rogue server on the manager port (by PID), spool-storm trend (*sudo for full log access) |
+| `sudo attacklens-service start` | Yes | Start agent + watchdog + self-heal LaunchDaemons |
 | `sudo attacklens-service stop` | Yes | Stop agent + watchdog |
 | `sudo attacklens-service restart` | Yes | Stop then start |
 | `sudo attacklens-service reload` | Yes | SIGHUP — reload config with no restart |

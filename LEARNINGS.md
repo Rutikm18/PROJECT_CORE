@@ -56,6 +56,58 @@ A running glossary of concepts/patterns introduced into this project, with a sho
 **What:** A markdown file in `.claude/commands/` (project-only) or `~/.claude/commands/` (global) becomes invocable as `/<filename>` — its content is the instruction Claude follows when you run it.
 **Why:** This file's existence — `/learnings` is the command that keeps it updated going forward.
 
+## 2026-06-24
+
+### Config files that declare intent but are never loaded
+**What:** `.env` documented `ATTACKLENS_VALIDATION=true` etc., but nothing in the actual startup paths (`start.sh`, `scripts/run_manager.sh`, `docker-compose.yml`/`.ha.yml`) sourced `.env` or forwarded those specific vars into the process/container environment — so the file's values silently had zero effect regardless of deployment method.
+**Why:** Found while debugging why the precision-validation pipeline appeared "disabled by default" despite `.env` saying otherwise. Fixed by sourcing `.env` in both shell scripts and explicitly listing the 3 vars in both compose files' `environment:` blocks.
+
+### Dormant detection modules (built but never dispatched)
+**What:** 15 of 17 fully-built `detections/*.py` modules (each with a uniform `analyze(agent_id, section, data, db, hostname)` entry point and already re-exported from `detections/__init__.py`) were never added to `AttackLensEngine._DETECTION_MODULE_ROUTES` — only `port_listener` and `user_account` were wired in. Verified via `grep` showing zero imports outside each module's own file.
+**Why:** A module existing, tested, and exported is not the same as it running. Wired in the 4 with zero section-name overlap with existing inline analyzers (`sysctl_monitor`→"sysctl", `arp_spoofing`→"arp", `container_security`→"containers", `sbom_posture`→"sbom") after confirming each against the agent's real `COLLECTORS` section names — left 11 overlapping ones (same section as an existing inline analyzer) for a separate pass requiring side-by-side behavioral comparison first.
+
+### Single-signal confidence floors (cross_matrix.py CROSS_LAYER_PATTERNS)
+**What:** The deterministic confidence engine (`confidence.py`) multiplies weight × strength × layer/KEV/EPSS/TI/asset multipliers — a single-layer, non-CVE pattern match (e.g. a hardcoded malicious port, a UID-0 clone) mathematically can't clear the 0.95 promotion gate without cross-layer corroboration. `cross_matrix.py` already had a `matched_floor()` escape hatch for exactly this (used by 7 pre-existing `STANDALONE_RULES`), but it was never extended to the rule_ids the live detection modules actually emit.
+**Why:** Confirmed via a failing test (`test_malicious_port_creates_finding`, port 4444/Metasploit scored ~0.39 confidence) that turning on validation would silently suppress exactly the findings it's supposed to protect. Added floor entries for 7 hand-verified, individually-unambiguous rule_ids (`uid_zero_clone`, `hidden_user`, `sysctl_critical`, `arp:duplicate_ip_mapping`, `arp:gateway_mac_changed`, `cs:privileged_host_network`, `cs:exposed_mgmt_port`, `rule:security_posture`) — deliberately not a blanket floor per module, since e.g. `high_risk_port`'s underlying port list mixes genuine backdoors with common legitimate services (SSH/RDP).
+
+### Two independent gates both need the same floor
+**What:** The validation pipeline has two separate confidence calculations — `confidence.py`'s deterministic gate (threshold 0.95) and `ai_validator.py`'s weighted precision score (threshold 0.90, AI-optional) — and they don't share state. `ai_validator.py`'s docstring claimed to use "cross-layer floor from cross_matrix" but `_cross_layer_score()` never actually called it.
+**Why:** Fixing only the first gate left findings rejected at the second with `ti_corroboration=0.00`. Added a second deterministic-floor override in `ai_validator.py` mirroring the existing KEV-corroboration override, keyed on `cluster.confidence >= confidence_threshold` (i.e. "the first gate already vouched for this at the highest tier") rather than requiring multi-layer coverage, since a standalone floor's whole point is not needing that.
+
+### `setdefault` vs `or`-chains hide which field actually wins
+**What:** `_adapt_module_finding()` uses `f.setdefault("source", rule)`, which never overrides — but several modules' own `build_alert()` helpers (`arp_spoofing.py`, `container_security.py`) pre-set `"source"` to a generic module-level constant (e.g. `"rule:arp_spoofing"`) even when the more-specific `"rule_id"` field was already correctly set (e.g. `"arp:duplicate_ip_mapping"`). `_dispatch_to_signals`'s `f.get("source") or f.get("rule_id")` then picked the less-specific one every time.
+**Why:** This silently defeated the cross_matrix floors above for 2 of the 4 newly-wired modules — their specific rule_id was right there, just never reached. Fixed by flipping precedence to `f.get("rule_id") or f.get("source")` — safe because every module sets `rule_id` correctly, `source` is the less-trustworthy field.
+
+### Validation-pipeline findings silently lost their descriptive title and correct category
+**What:** `_emit_finding_from_cluster()` (the function that writes a promoted cluster to the `findings` table) used `f"[{rule_id}] {severity} detection"` as a fallback title (the real title lived on the original finding dict, not on the `Signal.evidence` it was checking) and used the raw section name (`"ports"`) as `category` instead of mapping it through `_SECTION_CATEGORY` (`"port"`) — silently mismatching every `/api/v1/detection/*` endpoint's category filter.
+**Why:** Found via a unit test (`test_ports_routed_through_module_end_to_end`) asserting `category == "port"` that failed only under validation mode despite the underlying detection logic being correct. Fixed by carrying `title`/`description` through `Signal.evidence` under reserved `_title`/`_description` keys (stripped before persistence) and by reusing `_SECTION_CATEGORY` in the promotion path.
+
+## 2026-06-25
+
+### Postgres service was missing from the production compose files
+**What:** The SQLite→Postgres migration updated the code (which reads `DATABASE_URL`, default `postgresql://...@localhost:5432`) but never updated `docker-compose.yml`/`.ha.yml`: neither declared a `postgres` service or set `DATABASE_URL`, and `docker-compose.yml` still carried a dead `THREAT_INTEL_DB=/app/data/intel.db` SQLite path. Inside a container `localhost:5432` resolves to the container itself → `ConnectionRefusedError [Errno 111]`, crash-looping `threat-intel` and blocking `manager` (which `depends_on` it healthy).
+**Why:** Containers reach each other by service name, never `localhost`. Added a `postgres` service on the shared `attacklens_internal`/`internal` network and `DATABASE_URL=...@postgres:5432` to both apps with a `depends_on: condition: service_healthy` gate. The standalone `docker-compose.postgres.yml` is dev-only (separate project/network) — not reachable from the app stack.
+
+### docker-compose.ha.yml `<<` merge cycle
+**What:** Each manager replica's `environment:` block did `<<: *manager-base`, merging the *whole* service anchor (build/depends_on/volumes/networks) back into a key of the same service → `cycle detected: node at path services.manager-1.environment references node at path services.manager-1`, so the file didn't parse at all.
+**Why:** A YAML merge-key target must be shape-appropriate for where it's merged. Split into a flat `x-manager-env` (env vars only, safe to merge inside `environment:`) and `x-manager-base` (full service template, merged at service level).
+
+### TelemetryIndex (raw-payload store) stayed on SQLite through the Postgres migration
+**What:** `index.py`'s `TelemetryIndex` (the hot/warm/cold raw-telemetry index behind `/api/v1/raw` / Deep Analysis) still uses `aiosqlite` — only `manager.db`/`intel.db` moved to Postgres. But `aiosqlite` had been dropped from `manager/requirements.txt`, so the freshly-built image crashed at import (`ModuleNotFoundError: No module named 'aiosqlite'`).
+**Why:** A partial migration leaves real residual deps. Re-added `aiosqlite>=0.20.0`. The raw index is deliberately not in Postgres (append-only blob store, different access pattern), so the dep is load-bearing, not vestigial.
+
+### IPv4/IPv6 split hides a port collision (agent ingest silently eaten)
+**What:** A stray `python -m http.server 8080 --bind 127.0.0.1` held **IPv4** `127.0.0.1:8080` while Docker's port-forward held the **IPv6** wildcard `*:8080`. The agent posts to `http://127.0.0.1:8080` (literal IPv4) → every payload hit the stray server → `501`, zero reached the manager. `curl localhost:8080/health` resolved to IPv6 → real manager → looked healthy, masking it.
+**Why:** When ingest counters are flat but health is green, check `lsof -nP -iTCP:<port> -sTCP:LISTEN` for a *non-Docker* listener and test IPv4 (`127.0.0.1`) vs IPv6 (`[::1]`) separately — Docker's wildcard forward only re-binds the freed IPv4 after the squatter dies (no container recreate needed here).
+
+### Strict validation vs. a benign host = empty dashboard (deferred to a later phase)
+**What:** With `ATTACKLENS_VALIDATION=true`, a healthy Mac's 539 signals produced 557 clusters all rejected `low_confidence` (single-layer findings can't clear the 0.95 gate, and `ANTHROPIC_API_KEY` was unset so the AI gate over-rejects), so `/api/v1/detection/*` returned nothing while raw/Deep-Analysis data was fully present.
+**Why:** Validation/precision-gating is a next-phase concern until the mechanism is fully integrated; set both flags to `false` in `.env` so the legacy emission path writes every detected finding straight to the dashboard (0→18 active for the live host). The calibration groundwork (floors, gate fixes) remains in place for when it's re-enabled.
+
+### Cumulative-subprocess hang froze the heavy macOS collectors
+**What:** `security`/`sysctl`/`packages`/`apps` each fan out into many sequential `_run()` shell-outs (security ≈20: `systemsetup`, `csrutil`, `spctl`, `pwpolicy`, `system_profiler`…; packages: `brew`/`gem`/`cargo`). Each call had its own per-command timeout, but the *sum* exceeded the orchestrator's 25 s per-section timeout, so the section timed out and the agent emitted `{"error":"…possible hang"}` as the section's data — visible verbatim on the dashboard — losing every field, not just the slow one. The agent's own `agent_health` circuit-breaker heartbeat (per-section `state`/`failures`/`last_result`) is what pinpointed it without root access to the agent logs.
+**Why:** Added a thread-local per-section *budget* in `collectors/base.py` (`set_run_budget`/`run_budget_remaining`): `_run()` caps each call to the time remaining and skips once spent, and the orchestrator arms it (section_timeout − 3 s margin) on each collector's worker thread. A heavy collector now degrades to PARTIAL data within budget (verified: SecurityCollector returns 13/38 fields under a 1 s budget) instead of hanging. Per-item loops (`apps`, `binaries`) poll `run_budget_remaining()` to stop early. Also stopped enqueueing the `{"error":…}` blob on hard timeout — it overwrote the last-good snapshot in the store; the failure is already carried by the circuit breaker / heartbeat. Deploy via `build_pkg.sh` (rsyncs repo `agent/` into the pkg) + reinstall.
+
 ---
 
 # Study Roadmap

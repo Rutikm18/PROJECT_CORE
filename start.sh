@@ -11,6 +11,15 @@
 set -e
 cd "$(dirname "$0")"
 
+# ── Load .env (ATTACKLENS_VALIDATION, SMTP, API keys, ...) ───────────────────
+# Previously declared in .env but never sourced anywhere — every var in it
+# silently had no effect on a manager started this way.
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+fi
+
 # ── Read enrollment token from agent.toml ─────────────────────────────────────
 if [ ! -f agent.toml ]; then
   echo ""

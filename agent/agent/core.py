@@ -118,6 +118,24 @@ else:
     except Exception:
         _HAS_NORMALIZER = False
 
+# Optional per-section subprocess budget (macOS collectors only). When present,
+# the orchestrator arms it on each collector's worker thread so a section that
+# fans out into many slow shell-outs (security, packages, …) degrades to
+# partial data within its timeout instead of hanging the whole section. No-op
+# on platforms whose collectors don't shell out through the budgeted _run().
+try:
+    from agent.os.macos.collectors.base import (
+        set_run_budget as _set_run_budget,
+        clear_run_budget as _clear_run_budget,
+    )
+except Exception:
+    _set_run_budget = _clear_run_budget = None
+
+# Headroom between the collector's self-imposed budget and the orchestrator's
+# hard section timeout, so partial data is gathered and returned BEFORE the
+# hard timeout would fire and discard it.
+_SECTION_BUDGET_MARGIN_SEC = 3.0
+
 # Cached at startup — never changes during the process lifetime
 _OS_NAME   = "macos" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else "windows")
 _OS_VER    = platform.mac_ver()[0] if sys.platform == "darwin" else platform.version()
@@ -152,10 +170,19 @@ def _call_with_timeout(fn, timeout_sec: float):
     result: queue.Queue = queue.Queue(maxsize=1)
 
     def _worker():
+        # Arm the subprocess budget on THIS worker thread (thread-local), so the
+        # collector's many _run() calls collectively stay under the section
+        # timeout and return partial data instead of overrunning it. Margin
+        # keeps the collector finishing before the hard timeout below fires.
+        if _set_run_budget is not None:
+            _set_run_budget(max(1.0, timeout_sec - _SECTION_BUDGET_MARGIN_SEC))
         try:
             result.put(("ok", fn()))
         except Exception as exc:
             result.put(("error", exc))
+        finally:
+            if _clear_run_budget is not None:
+                _clear_run_budget()
 
     threading.Thread(target=_worker, daemon=True, name="collector-call").start()
     try:
@@ -328,11 +355,17 @@ class Orchestrator:
         except TimeoutError as exc:
             self._cbr.failure(name, str(exc))
             log.error("Collector %s timed out (limit=%ss) — %s", name, timeout, exc)
-            data = {"error": str(exc)}
+            # Do NOT enqueue an {"error": …} blob: it would overwrite the last
+            # good snapshot for this section in the manager's store with an
+            # error placeholder (and pollute detection). The failure is already
+            # recorded on the circuit breaker and surfaced per-section in the
+            # agent_health heartbeat — that is the failure channel. Skip the
+            # send; the previous good data stays until a later cycle succeeds.
+            return
         except Exception as exc:
             self._cbr.failure(name, str(exc))
             log.warning("Collector %s failed: %s", name, exc)
-            data = {"error": str(exc)}
+            return
 
         if not cfg.get("send", True):
             return

@@ -190,6 +190,19 @@ async def validate_with_ai(
     if kev_corroborated and multi_layer and clean_rule:
         score = max(score, threshold)
 
+    # 4b. Same override for single-signal deterministic floors (cross_matrix.py
+    # CROSS_LAYER_PATTERNS) — e.g. a UID-0 clone or duplicate ARP mapping. These
+    # were individually hand-verified as "individually catastrophic" and don't
+    # need cross-layer corroboration to be trusted (that's the whole point of a
+    # standalone floor) — only the FP-history safety net still applies.
+    base_conf_for_floor = getattr(cluster, "confidence", None)
+    cross_matrix_floor_hit = (
+        base_conf_for_floor is not None
+        and base_conf_for_floor >= ENGINE_CONFIG["confidence_threshold"]
+    )
+    if cross_matrix_floor_hit and clean_rule:
+        score = max(score, threshold)
+
     # 5. Cluster confidence boundary — never promote anything the base
     #    confidence engine already considered fragile (< 0.6) even if the LLM
     #    is enthusiastic.

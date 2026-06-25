@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
+# ── Load .env (ATTACKLENS_VALIDATION, SMTP, API keys, ...) ───────────────────
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
+
 # Read API_KEY from agent.toml when set (same 64-hex as agent after enroll or dev paste)
 if [ -f agent.toml ]; then
     TOML_KEY=$(python3 -c "

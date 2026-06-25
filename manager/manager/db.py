@@ -484,6 +484,17 @@ class Database:
             ) as cur:
                 return [r[0] for r in await cur.fetchall()]
 
+    async def get_agent_last_seen(self, agent_id: str) -> float | None:
+        """Single-agent last_seen — for the validation pipeline's G1 liveness
+        gate (validation.py). Lighter than get_agent(): no stale-session
+        side effect, just the one column the gate needs."""
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT last_seen FROM agents WHERE agent_id=?", (agent_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return float(row["last_seen"]) if row and row["last_seen"] else None
+
     async def get_agent(self, agent_id: str) -> dict | None:
         await self.close_stale_agent_sessions()
         async with self._pool.read() as db:

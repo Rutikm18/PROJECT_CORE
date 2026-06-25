@@ -30,13 +30,19 @@ class ValidationResult:
     detail:      str | None = None
 
 
-async def validate_cluster(cluster, enriched: dict, idb, feeds) -> ValidationResult:
+async def validate_cluster(cluster, enriched: dict, idb, feeds, manager_db=None) -> ValidationResult:
     """
     Run all 8 gates.  Returns the first failure or a final passed=True result.
     Side-effect: G5 may mutate cluster.confidence.
+
+    `manager_db` is the manager.db.Database instance (agents/last_seen lives
+    there, not in intel.db) — used by G1. Optional for callers that only have
+    `idb`; G1 then falls back to idb's asset_registry (manually-curated CMDB
+    data, not auto-populated by ingest — only useful if assets were explicitly
+    registered via /api/v1/assets).
     """
     for gate_name, gate_fn in _GATES:
-        result = await gate_fn(cluster, enriched, idb, feeds)
+        result = await gate_fn(cluster, enriched, idb, feeds, manager_db)
         if not result.passed:
             result.failed_gate = gate_name
             return result
@@ -45,14 +51,17 @@ async def validate_cluster(cluster, enriched: dict, idb, feeds) -> ValidationRes
 
 # ── Individual gate implementations ──────────────────────────────────────────
 
-async def _g1_entity_exists(cluster, enriched: dict, idb, _feeds) -> ValidationResult:
+async def _g1_entity_exists(cluster, enriched: dict, idb, _feeds, manager_db) -> ValidationResult:
     """Agent must be reachable, OR the source is an authoritative external intel hit."""
     if (enriched.get("kev_hit")
             or enriched.get("malicious_hash_hit")
             or enriched.get("malicious_ip_hit")):
         return ValidationResult(True)
     try:
-        last_seen = await idb.get_agent_last_seen(cluster.agent_id)
+        if manager_db is not None:
+            last_seen = await manager_db.get_agent_last_seen(cluster.agent_id)
+        else:
+            last_seen = await idb.get_agent_last_seen(cluster.agent_id)
     except Exception:
         last_seen = None
     if not last_seen or time.time() - last_seen > 600:
@@ -63,7 +72,7 @@ async def _g1_entity_exists(cluster, enriched: dict, idb, _feeds) -> ValidationR
     return ValidationResult(True)
 
 
-async def _g2_not_allowlisted(cluster, _enriched: dict, idb, _feeds) -> ValidationResult:
+async def _g2_not_allowlisted(cluster, _enriched: dict, idb, _feeds, _manager_db) -> ValidationResult:
     """Check both the static FP suppression lists and the table-backed allowlist."""
     for sig in cluster.signals:
         try:
@@ -74,7 +83,7 @@ async def _g2_not_allowlisted(cluster, _enriched: dict, idb, _feeds) -> Validati
     return ValidationResult(True)
 
 
-async def _g3_not_duplicate(cluster, _enriched: dict, idb, _feeds) -> ValidationResult:
+async def _g3_not_duplicate(cluster, _enriched: dict, idb, _feeds, _manager_db) -> ValidationResult:
     """No active finding already exists for the same cluster entity within 24 h."""
     window = ENGINE_CONFIG["active_finding_dedup_hours"] * 3600
     try:
@@ -86,7 +95,7 @@ async def _g3_not_duplicate(cluster, _enriched: dict, idb, _feeds) -> Validation
     return ValidationResult(True)
 
 
-async def _g4_reachability(cluster, enriched: dict, _idb, _feeds) -> ValidationResult:
+async def _g4_reachability(cluster, enriched: dict, _idb, _feeds, _manager_db) -> ValidationResult:
     """
     Surface-only clusters need authoritative external confirmation. Cross-layer
     clusters always pass — exposure or execution evidence implies reachability.
@@ -95,6 +104,11 @@ async def _g4_reachability(cluster, enriched: dict, _idb, _feeds) -> ValidationR
       • KEV hit
       • Malicious hash hit
       • EPSS ≥ 0.7 (high probability of exploitation)
+      • A cross_matrix.py single-signal floor match (SIP/Gatekeeper disabled,
+        privileged+host-network container, kernel security param tampered, ...)
+        — these are direct observations of a violated control, not a
+        speculative "is this CVE reachable" claim, so the same external-
+        corroboration requirement doesn't apply.
     """
     if cluster.layers_covered != {"surface"}:
         return ValidationResult(True)
@@ -106,13 +120,17 @@ async def _g4_reachability(cluster, enriched: dict, _idb, _feeds) -> ValidationR
     if epss_scores and max(epss_scores) >= 0.7:
         return ValidationResult(True)
 
+    from .cross_matrix import matched_floor
+    if matched_floor(cluster) is not None:
+        return ValidationResult(True)
+
     return ValidationResult(
         False,
         detail="surface-only cluster without KEV/malicious-hash/high-EPSS confirmation",
     )
 
 
-async def _g5_compensating_controls(cluster, enriched: dict, _idb, _feeds) -> ValidationResult:
+async def _g5_compensating_controls(cluster, enriched: dict, _idb, _feeds, _manager_db) -> ValidationResult:
     """
     Reduce confidence by the compensating-controls penalty then re-check threshold.
     Mutates cluster.confidence — must run after scoring.
@@ -139,7 +157,7 @@ async def _g5_compensating_controls(cluster, enriched: dict, _idb, _feeds) -> Va
     return ValidationResult(True)
 
 
-async def _g6_recent_fp(cluster, enriched: dict, idb, _feeds) -> ValidationResult:
+async def _g6_recent_fp(cluster, enriched: dict, idb, _feeds, _manager_db) -> ValidationResult:
     """
     FP-prone rules need at least one *independent* corroborating signal
     (a second signal from a different rule_id).  KEV / malicious-hash hits
@@ -168,7 +186,7 @@ async def _g6_recent_fp(cluster, enriched: dict, idb, _feeds) -> ValidationResul
     return ValidationResult(True)
 
 
-async def _g7_quality_floor(cluster, _enriched: dict, _idb, _feeds) -> ValidationResult:
+async def _g7_quality_floor(cluster, _enriched: dict, _idb, _feeds, _manager_db) -> ValidationResult:
     """At least one signal must meet the minimum strength floor."""
     floor = ENGINE_CONFIG["quality_floor_strength"]
     strong = [s for s in cluster.signals if s.strength >= floor]
@@ -180,7 +198,7 @@ async def _g7_quality_floor(cluster, _enriched: dict, _idb, _feeds) -> Validatio
     return ValidationResult(True)
 
 
-async def _g8_time_consistent(cluster, _enriched: dict, _idb, _feeds) -> ValidationResult:
+async def _g8_time_consistent(cluster, _enriched: dict, _idb, _feeds, _manager_db) -> ValidationResult:
     """Signal timestamps must fit within the appropriate correlation window."""
     if not cluster.signals:
         return ValidationResult(False, detail="empty cluster")

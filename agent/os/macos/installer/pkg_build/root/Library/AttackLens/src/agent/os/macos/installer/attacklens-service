@@ -52,6 +52,8 @@ readonly SECURITY_DIR="${INSTALL_DIR}/security"
 readonly BIN_DIR="${INSTALL_DIR}/bin"
 readonly AGENT_PLIST="${LAUNCHDAEMON_DIR}/${AGENT_LABEL}.plist"
 readonly WATCHDOG_PLIST="${LAUNCHDAEMON_DIR}/${WATCHDOG_LABEL}.plist"
+readonly SELFHEAL_LABEL="com.attacklens.selfheal"
+readonly SELFHEAL_PLIST="${LAUNCHDAEMON_DIR}/${SELFHEAL_LABEL}.plist"
 readonly AGENT_LOG="${LOG_DIR}/agent.log"
 readonly STDOUT_LOG="${LOG_DIR}/agent-stdout.log"
 readonly STDERR_LOG="${LOG_DIR}/agent-stderr.log"
@@ -324,6 +326,16 @@ do_start() {
     echo "  NOTE: Watchdog did not start — agent will still run without it."
   fi
 
+  # Self-heal timer (optional, periodic). Non-critical: the agent runs without it.
+  if [[ -f "$SELFHEAL_PLIST" ]]; then
+    _patch_plist_python3 "$SELFHEAL_PLIST"
+    if _load_svc "$SELFHEAL_PLIST" "$SELFHEAL_LABEL"; then
+      echo "  Started: ${SELFHEAL_LABEL}"
+    else
+      echo "  NOTE: Self-heal timer did not start (non-critical)."
+    fi
+  fi
+
   sleep 3
   # Post-start check: if still exit 78, the plist python3 is probably a shell script
   local post_exit
@@ -351,6 +363,7 @@ do_start() {
 do_stop() {
   _need_root
   echo "  Stopping AttackLens..."
+  [[ -f "$SELFHEAL_PLIST" ]] && _unload_svc "$SELFHEAL_LABEL" "$SELFHEAL_PLIST"
   _unload_svc "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"
   _unload_svc "$AGENT_LABEL"    "$AGENT_PLIST"
   echo "  Stopped."
@@ -554,6 +567,19 @@ do_diagnose() {
   [[ $fail -eq 0 ]]
 }
 
+do_doctor() {
+  # Deep self-diagnosis: decodes recent log messages, detects the spool-storm
+  # backlog trend, and probes whether the configured manager URL is the REAL
+  # manager or a rogue/wrong server (the "404 on /health" case). Reads root-owned
+  # logs, so run with sudo for the full report; the manager probe works without.
+  if [[ -z "$PYTHON3" ]]; then
+    echo "  ERROR: python3 not found — cannot run deep diagnosis."
+    exit 1
+  fi
+  "$PYTHON3" -c "import sys; sys.path.insert(0, '${INSTALL_DIR}/src'); \
+from agent.os.macos.diagnostics import main; sys.exit(main())" "$@"
+}
+
 do_set_manager() {
   _need_root
   local target="${1:-}"
@@ -657,6 +683,8 @@ do_help() {
   echo "    config                   print agent.toml"
   echo "    version                  installed version + python"
   echo "    diagnose                 connectivity + install health check"
+  echo "    doctor                   deep diagnosis: decode logs, detect rogue"
+  echo "                             server on manager port, spool-storm trend"
   echo ""
   echo "  Root required:"
   echo "    start                    start agent + watchdog"
@@ -687,6 +715,7 @@ case "$CMD" in
   config)         do_config              ;;
   version)        do_version             ;;
   diagnose)       do_diagnose            ;;
+  doctor)         do_doctor              ;;
   set-manager)    do_set_manager "$@"    ;;
   enroll)         do_enroll              ;;
   update-config)  do_update_config       ;;

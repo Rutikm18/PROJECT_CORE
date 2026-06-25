@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
 import time
 
-from .base import BaseCollector, CollectorResult, _run, _run_json, _sp_json
+from .base import (
+    BaseCollector, CollectorResult, _run, _run_json, _sp_json,
+    run_budget_remaining, _MIN_RUN_SLICE_SEC,
+)
+
+log = logging.getLogger(__name__)
 
 try:
     import psutil as _psutil
@@ -174,6 +180,15 @@ class AppsCollector(BaseCollector):
                 if path in seen:
                     continue
                 seen.add(path)
+                # Each app costs two shell-outs (plutil + codesign). On a host
+                # with hundreds of apps that can exceed the section budget — stop
+                # early and return the partial inventory rather than letting the
+                # orchestrator hard-timeout and discard everything collected.
+                rem = run_budget_remaining()
+                if rem is not None and rem < _MIN_RUN_SLICE_SEC:
+                    log.debug("apps: section budget spent — returning %d of "
+                              "in-progress inventory", len(rows))
+                    return [r for r in rows if r.get("name")]
                 rows.append(self._app_info(path))
         return [r for r in rows if r.get("name")]
 
@@ -341,6 +356,14 @@ class BinariesCollector(BaseCollector):
                 for fname in os.listdir(d):
                     if len(rows) >= self._MAX_FILES:
                         break
+                    # SHA-256-ing up to 500 files is disk-bound, not subprocess-
+                    # bound, so the _run budget doesn't cover it — guard the loop
+                    # directly so a slow disk can't blow the section timeout.
+                    rem = run_budget_remaining()
+                    if rem is not None and rem < _MIN_RUN_SLICE_SEC:
+                        log.debug("binaries: section budget spent — returning "
+                                  "%d hashed so far", len(rows))
+                        return rows
                     path = os.path.join(d, fname)
                     try:
                         st = os.stat(path)

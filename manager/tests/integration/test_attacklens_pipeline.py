@@ -456,3 +456,39 @@ class TestHealth:
 
     def test_health_db_ok(self, client):
         assert client.get("/health").json()["db"] == "ok"
+
+
+# ══ Newly-wired net-new detection modules (sysctl, arp, containers, sbom) ════
+# These sections had NO inline analyzer before — confirms _DETECTION_MODULE_ROUTES
+# wiring actually fires end-to-end through ingest, not just via direct analyze() calls.
+class TestNewlyWiredModules:
+
+    def test_sysctl_dangerous_param_creates_finding(self, client):
+        _ingest(client, "sysctl", {"vm.cs_enforcement_disable": "1"})
+        findings = _findings(client, active_only="true")
+        titles = [f["title"] for f in findings]
+        assert any("cs_enforcement_disable" in t for t in titles), f"Expected sysctl finding, got: {titles}"
+
+    def test_arp_duplicate_mapping_creates_finding(self, client):
+        _ingest(client, "arp", {"entries": [
+            {"ip_address": "10.50.50.50", "mac_address": "aa:bb:cc:dd:ee:f1"},
+            {"ip_address": "10.50.50.50", "mac_address": "aa:bb:cc:dd:ee:f2"},
+        ]})
+        findings = _findings(client, active_only="true")
+        titles = [f["title"] for f in findings]
+        assert any("10.50.50.50" in t for t in titles), f"Expected ARP finding, got: {titles}"
+
+    def test_container_privileged_host_network_creates_finding(self, client):
+        _ingest(client, "containers", [{
+            "container_id": "deadbeef0001", "container_name": "sketchy-ctr",
+            "image": "alpine:latest", "privileged": True, "network_mode": "host",
+        }])
+        findings = _findings(client, active_only="true")
+        titles = [f["title"] for f in findings]
+        assert any("sketchy-ctr" in t for t in titles), f"Expected container finding, got: {titles}"
+
+    def test_sbom_license_conflict_creates_finding(self, client):
+        _ingest(client, "sbom", [{"name": "copyleft-pkg", "version": "2.0", "license": "GPL-3.0"}])
+        findings = _findings(client, active_only="true")
+        titles = [f["title"] for f in findings]
+        assert any("copyleft-pkg" in t for t in titles), f"Expected SBOM finding, got: {titles}"

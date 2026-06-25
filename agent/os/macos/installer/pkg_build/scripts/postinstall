@@ -87,7 +87,7 @@ chmod 700 "${SECURITY_DIR}"
 for cli in /usr/local/bin/attacklens-service /usr/local/bin/attacklens; do
     [[ -e "$cli" ]] && { chown root:wheel "$cli"; chmod 755 "$cli"; } || true
 done
-for f in com.attacklens.agent.plist com.attacklens.watchdog.plist; do
+for f in com.attacklens.agent.plist com.attacklens.watchdog.plist com.attacklens.selfheal.plist; do
     [[ -f "${LDIR}/${f}" ]] && chown root:wheel "${LDIR}/${f}" && chmod 644 "${LDIR}/${f}" || true
 done
 ok "Permissions"
@@ -132,7 +132,7 @@ ok "Prerequisites installed"
 
 # ── Step 6: Patch plists with real Mach-O python3 ────────────────────────────
 log "Patching LaunchDaemon plists..."
-for plist in "${LDIR}/com.attacklens.agent.plist" "${LDIR}/com.attacklens.watchdog.plist"; do
+for plist in "${LDIR}/com.attacklens.agent.plist" "${LDIR}/com.attacklens.watchdog.plist" "${LDIR}/com.attacklens.selfheal.plist"; do
     [[ -f "$plist" ]] || continue
     sed -i '' "s|PYTHON3_PLACEHOLDER|${PYTHON3}|g" "$plist"
     # Also replace any previously-set path that differs from detected Mach-O
@@ -165,13 +165,13 @@ else
 fi
 
 # ── Step 8: Validate plists ───────────────────────────────────────────────────
-for plist in "${LDIR}/com.attacklens.agent.plist" "${LDIR}/com.attacklens.watchdog.plist"; do
+for plist in "${LDIR}/com.attacklens.agent.plist" "${LDIR}/com.attacklens.watchdog.plist" "${LDIR}/com.attacklens.selfheal.plist"; do
     plutil -lint "$plist" >/dev/null 2>&1         && ok "Valid plist: $(basename "$plist")"         || warn "Plist syntax error: $(basename "$plist")"
 done
 
 # ── Step 9: Start services in SYSTEM domain (never gui/) ─────────────────────
 log "Starting LaunchDaemons..."
-for LABEL in com.attacklens.agent com.attacklens.watchdog; do
+for LABEL in com.attacklens.agent com.attacklens.watchdog com.attacklens.selfheal; do
     # Make sure not stuck in wrong domain from previous installs
     for uid in $(dscl . -list /Users UniqueID 2>/dev/null | awk '$2>499{print $2}'); do
         launchctl bootout "gui/${uid}/${LABEL}" 2>/dev/null || true
@@ -182,6 +182,8 @@ done
 launchctl bootstrap system "${LDIR}/com.attacklens.agent.plist" 2>/dev/null     && ok "Started: com.attacklens.agent"     || log "  com.attacklens.agent queued — run: sudo attacklens-service start"
 
 launchctl bootstrap system "${LDIR}/com.attacklens.watchdog.plist" 2>/dev/null     && ok "Started: com.attacklens.watchdog"     || log "  com.attacklens.watchdog queued (non-critical)"
+
+launchctl bootstrap system "${LDIR}/com.attacklens.selfheal.plist" 2>/dev/null     && ok "Started: com.attacklens.selfheal"     || log "  com.attacklens.selfheal queued (non-critical)"
 
 # ── Step 10: Verify & summary ─────────────────────────────────────────────────
 sleep 3

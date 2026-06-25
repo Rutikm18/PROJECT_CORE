@@ -12,8 +12,15 @@ completely invisible to the existing health heartbeat.
 
 This pins: a hanging collector (a) does not block _run_section past the
 timeout, (b) is recorded as a circuit-breaker failure (closing the blind
-spot), (c) still results in an enqueued payload so last_collected_at keeps
-advancing instead of freezing, and (d) a normal fast collector is unaffected.
+spot), (c) does NOT enqueue an {"error": …} blob as section data — that would
+overwrite the last good snapshot in the manager's store with an error
+placeholder (the failure is surfaced via the circuit breaker / agent_health
+heartbeat instead), and (d) a normal fast collector is unaffected.
+
+Note: with the per-section subprocess budget (base.set_run_budget), a slow
+collector now returns PARTIAL data within its timeout rather than hanging, so
+this hard-timeout-skip path is the rare backstop, not the common case — the
+common case keeps last_collected_at advancing with real (partial) data.
 """
 from __future__ import annotations
 
@@ -78,8 +85,11 @@ def test_hanging_collector_does_not_block_run_section(monkeypatch):
     elapsed = time.monotonic() - start
 
     assert elapsed < 2.0, "a hung collector must not block _run_section past its timeout"
-    assert captured["section"] == "hangy"
-    assert "error" in captured["data"], "a timeout must still enqueue a payload"
+    # A hard timeout must NOT enqueue an {"error": …} blob — that would replace
+    # the section's last good data in the store with an error placeholder. The
+    # failure is recorded on the circuit breaker (next test) instead, so the
+    # last good snapshot is preserved until a later cycle succeeds.
+    assert captured == {}, "a timeout must not enqueue an error-blob payload"
 
 
 def test_hanging_collector_is_recorded_as_a_circuit_breaker_failure(monkeypatch):
@@ -122,3 +132,54 @@ def test_per_section_timeout_overrides_global_default(monkeypatch):
     orch._run_section("slow_but_fine", {"send": True, "timeout_sec": 2})
 
     assert captured["data"] == "done", "must complete normally within its own longer timeout"
+
+
+# ── Per-section subprocess budget (the cumulative-hang fix) ───────────────────
+
+def test_run_budget_caps_and_then_skips_slow_subprocesses():
+    """A collector that fans out into many slow shell-outs (security: ~20 of
+    systemsetup/csrutil/pwpolicy/…; packages: brew/gem/cargo) used to blow its
+    section timeout cumulatively and emit {"error": …} instead of data. The
+    per-thread budget caps each _run() to the time remaining and skips once
+    spent, so the collector returns PARTIAL data within budget."""
+    from agent.os.macos.collectors.base import (
+        _run, set_run_budget, clear_run_budget, run_budget_remaining,
+    )
+    try:
+        # No budget armed → run_budget_remaining is None, command runs normally.
+        clear_run_budget()
+        assert run_budget_remaining() is None
+        assert _run(["echo", "hi"]).strip() == "hi"
+
+        # Arm a 1s budget; a 5s sleep is capped to ~1s, not 5s.
+        set_run_budget(1.0)
+        t = time.monotonic()
+        _run(["sleep", "5"])
+        capped = time.monotonic() - t
+        assert capped < 2.0, f"slow command should be capped to the budget, took {capped:.1f}s"
+
+        # Budget now spent → further commands are skipped instantly (empty).
+        assert run_budget_remaining() <= 0.5
+        t = time.monotonic()
+        out = _run(["echo", "should-skip"])
+        assert out == "" and (time.monotonic() - t) < 0.2, "spent budget must skip, not run"
+    finally:
+        clear_run_budget()
+
+
+def test_call_with_timeout_arms_the_budget_on_the_worker_thread():
+    """The orchestrator must arm the budget (timeout − margin) on the collector's
+    worker thread, so collectors self-limit below the hard section timeout."""
+    from agent.os.macos.collectors.base import run_budget_remaining
+
+    seen = {}
+
+    def collector():
+        seen["remaining"] = run_budget_remaining()
+        return {"ok": True}
+
+    out = _call_with_timeout(collector, timeout_sec=25)
+    assert out == {"ok": True}
+    # 25s timeout − 3s margin ⇒ ~22s budget visible inside the collector.
+    assert seen["remaining"] is not None, "budget must be armed inside the collector"
+    assert 18 < seen["remaining"] <= 22, f"expected ~22s budget, saw {seen['remaining']}"

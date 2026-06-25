@@ -482,8 +482,17 @@ def detect_hidden_user(agent_id: str, users: list[dict]) -> list[dict]:
         # NON-PRINTABLE characters (always an evasion signal), or an underscore/
         # hidden name that is NOT a benign system account (i.e. has a real UID or
         # an interactive login shell — someone hiding a usable account behind `_`).
+        #
+        # We must NOT defer to _is_system_account() for this suppression: that
+        # helper returns True for EVERY underscore-prefixed name (its first
+        # check), which would suppress the exact case this detector exists to
+        # catch and make the underscore branch dead code. A genuinely-benign
+        # Apple daemon is underscore-prefixed AND has both a system UID AND a
+        # non-login shell; suppress only when both hold.
         has_nonprintable = bool(re.search(r"[^\x20-\x7e]", uname))
-        if not has_nonprintable and _is_system_account(user):
+        uid_val = _to_int(user.get("uid"))
+        benign_daemon = (0 <= uid_val < _SYSTEM_UID_MAX) and not _is_interactive(user)
+        if not has_nonprintable and benign_daemon:
             continue
         if _should_suppress(agent_id, "hidden_user", uname):
             continue
@@ -832,11 +841,17 @@ if __name__ == "__main__":
     async def run_tests():
         global passed, failed
 
-        # ── 1. New account: first scan → CRITICAL ─────────────────────────────
-        print("\nTest 1: New account → CRITICAL")
+        # ── 1. New UID-0 account appears AFTER baseline → CRITICAL ────────────
+        # First-run seeding (the enrollment-FP fix) means the very first scan
+        # only records the baseline and emits nothing — a "new" account is one
+        # that appears in a LATER snapshot. So seed with an existing account,
+        # then introduce a UID-0 clone on the second scan.
+        print("\nTest 1: New UID-0 account after baseline → CRITICAL")
         fresh()
         db1 = MockDB()
-        users = [make_user(username="backdoor", uid=5000)]
+        await detect_new_account("agentA", [make_user(username="alice", uid=1000)], db1)
+        users = [make_user(username="alice", uid=1000),
+                 make_user(username="backdoor", uid=0, shell="/bin/bash")]
         findings = await detect_new_account("agentA", users, db1)
         check("1 finding", len(findings) == 1)
         check("severity critical", findings[0]["severity"] == "critical")
@@ -851,16 +866,20 @@ if __name__ == "__main__":
         findings = await detect_new_account("agentB", users, db2)
         check("no findings on second scan", len(findings) == 0)
 
-        # ── 3. New account: no dedup — fires again ────────────────────────────
-        print("\nTest 3: New account — no dedup window, fires each time it's new")
+        # ── 3. Account is "new" only after baseline is seeded ─────────────────
+        print("\nTest 3: New account fires once after baseline, then not again")
         fresh()
         db3 = MockDB()
-        # Each new scan with a brand-new username that was never in baseline fires
-        users = [make_user(username="newuser99", uid=6000)]
+        # First scan seeds the baseline (enrollment-FP fix) → emits nothing.
+        f0 = await detect_new_account("agentC", [make_user(username="alice", uid=1000)], db3)
+        # A brand-new username now appears → fires once.
+        users = [make_user(username="alice", uid=1000),
+                 make_user(username="newuser99", uid=6000)]
         f1 = await detect_new_account("agentC", users, db3)
-        # Same agent, same DB — now it IS in baseline → should not fire
+        # Same agent, same DB — now it IS in baseline → should not fire.
         f2 = await detect_new_account("agentC", users, db3)
-        check("first scan fires", len(f1) == 1)
+        check("first scan seeds baseline (no storm)", len(f0) == 0)
+        check("new account fires once", len(f1) == 1)
         check("second scan does not fire (already in baseline)", len(f2) == 0)
 
         # ── 4. UID 0 clone → CRITICAL ─────────────────────────────────────────
@@ -936,29 +955,38 @@ if __name__ == "__main__":
         findings = await detect_home_changed("agentL", [make_user(username="carol", home="/home/carol")], db12)
         check("no findings", len(findings) == 0)
 
-        # ── 13. Privileged group: sudo → HIGH ─────────────────────────────────
-        print("\nTest 13: User in sudo group → HIGH")
+        # ── 13. Privileged group: sudo ADDED after baseline → HIGH ────────────
+        # Baseline-seeded: a pre-existing membership is recorded silently on the
+        # first scan; only a membership that APPEARS in a later snapshot fires.
+        print("\nTest 13: User newly added to sudo group → HIGH")
         fresh()
+        db13 = MockDB()
+        await detect_privgroup_added("agentM",
+            [make_user(username="attacker", uid=2000, groups=["users"])], db13)
         users = [make_user(username="attacker", uid=2000, groups=["users", "sudo"])]
-        findings = detect_privgroup_added("agentM", users)
+        findings = await detect_privgroup_added("agentM", users, db13)
         check("1 finding", len(findings) == 1)
         check("severity high", findings[0]["severity"] == "high")
         check("sudo in evidence", "sudo" in findings[0]["evidence"]["privileged_groups"])
 
-        # ── 14. Domain Admins → CRITICAL ─────────────────────────────────────
-        print("\nTest 14: Domain Admins membership → CRITICAL")
+        # ── 14. Domain Admins ADDED after baseline → CRITICAL ─────────────────
+        print("\nTest 14: Domain Admins membership newly added → CRITICAL")
         fresh()
+        db14 = MockDB()
+        await detect_privgroup_added("agentN",
+            [make_user(username="compromised", uid=3000, groups=["domain users"])], db14)
         users = [make_user(username="compromised", uid=3000,
                            groups=["domain users", "domain admins"])]
-        findings = detect_privgroup_added("agentN", users)
+        findings = await detect_privgroup_added("agentN", users, db14)
         check("1 finding", len(findings) == 1)
         check("severity critical", findings[0]["severity"] == "critical")
 
         # ── 15. No privileged groups → no alert ──────────────────────────────
         print("\nTest 15: No privileged groups — no alert")
         fresh()
+        db15 = MockDB()
         users = [make_user(username="alice", groups=["users", "audio"])]
-        findings = detect_privgroup_added("agentO", users)
+        findings = await detect_privgroup_added("agentO", users, db15)
         check("no findings", len(findings) == 0)
 
         # ── 16. Shell changed: nologin → bash → MEDIUM ───────────────────────
@@ -1001,10 +1029,16 @@ if __name__ == "__main__":
         check("groups contain sudo", "sudo" in users[0]["groups"])
 
         # ── 20. Full analyze() pipeline ───────────────────────────────────────
+        # The baseline-seeded detectors (new_account, privgroup_added) only fire
+        # on a LATER snapshot, so seed with a benign account first, then deliver
+        # the backdoor. uid_zero_clone is stateless and fires on either pass.
         print("\nTest 20: Full analyze() pipeline")
         fresh()
         db20 = MockDB()
-        raw = [
+        seed = [{"username": "alice", "uid": 1000, "gid": 1000,
+                 "shell": "/bin/bash", "home": "/home/alice", "groups": ["users"]}]
+        await analyze("agentR", "users", seed, db20, hostname="host-r")
+        raw = seed + [
             {"username": "backdoor_user", "uid": 0, "gid": 0,
              "shell": "/bin/bash", "home": "/tmp/home",
              "groups": ["sudo", "wheel"]},

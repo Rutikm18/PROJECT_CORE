@@ -13,12 +13,59 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Union
 
 log = logging.getLogger(__name__)
 
 CollectorResult = Union[dict, list]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Per-section wall-clock budget (prevents cumulative-subprocess hangs)
+# ─────────────────────────────────────────────────────────────────────────────
+# A posture/inventory collector makes many sequential _run() calls (security
+# alone fires ~20: systemsetup, csrutil, spctl, pwpolicy, system_profiler …;
+# packages shells out to brew/gem/cargo). Each call has its own per-command
+# timeout, but the SUM can exceed the orchestrator's per-section timeout (25 s),
+# so the whole section times out and the agent emits {"error": "…hang"} INSTEAD
+# of data — losing every field, not just the slow one.
+#
+# The orchestrator sets a budget (section_timeout − margin) on the collector's
+# worker thread via set_run_budget(). Every _run() then caps its own timeout to
+# the time remaining and, once the budget is spent, returns "" immediately
+# instead of launching the subprocess. Net effect: a collector degrades to
+# PARTIAL data within its budget and always returns before the hard section
+# timeout — the slow/hung command is the only field lost, not the section.
+#
+# Thread-local because collectors run concurrently in the orchestrator's pool;
+# each section's worker thread carries its own independent deadline.
+_budget = threading.local()
+
+
+def set_run_budget(seconds: float | None) -> None:
+    """Arm a wall-clock budget for all _run() calls in the CURRENT thread.
+    Pass None (or call clear_run_budget) to disarm."""
+    _budget.deadline = (time.monotonic() + seconds) if seconds else None
+
+
+def clear_run_budget() -> None:
+    _budget.deadline = None
+
+
+def run_budget_remaining() -> float | None:
+    """Seconds left in this thread's budget, or None if no budget is armed.
+    Collectors with their own per-item loops (apps, binaries) can poll this to
+    stop early instead of iterating thousands of items with a spent budget."""
+    dl = getattr(_budget, "deadline", None)
+    return None if dl is None else dl - time.monotonic()
+
+
+# Below this many seconds remaining, don't bother launching another subprocess —
+# it can't reliably finish, and a sub-second timeout mostly just kills it anyway.
+_MIN_RUN_SLICE_SEC = 0.5
 
 
 _EXTENDED_ENV: dict | None = None
@@ -46,7 +93,19 @@ def _get_env() -> dict:
 
 
 def _run(cmd: list[str], timeout: int = 15, stderr: bool = False) -> str:
-    """Run a command, return stdout (or stderr when stderr=True) as str. Returns '' on any error."""
+    """Run a command, return stdout (or stderr when stderr=True) as str. Returns '' on any error.
+
+    Honours the thread's section budget (set_run_budget): the effective timeout
+    is capped to the time remaining, and once the budget is spent the command is
+    skipped entirely (returns '') so the collector finishes within its section
+    deadline with partial data rather than hanging the whole section.
+    """
+    remaining = run_budget_remaining()
+    if remaining is not None:
+        if remaining < _MIN_RUN_SLICE_SEC:
+            log.debug("Skipped (section budget spent): %s", " ".join(cmd))
+            return ""
+        timeout = min(timeout, remaining)
     try:
         r = subprocess.run(
             cmd,
@@ -61,7 +120,7 @@ def _run(cmd: list[str], timeout: int = 15, stderr: bool = False) -> str:
         log.debug("Command not found: %s", cmd[0])
         return ""
     except subprocess.TimeoutExpired:
-        log.warning("Timed out after %ds: %s", timeout, " ".join(cmd))
+        log.warning("Timed out after %.1fs: %s", timeout, " ".join(cmd))
         return ""
     except Exception as exc:
         log.debug("Command failed [%s]: %s", " ".join(cmd), exc)

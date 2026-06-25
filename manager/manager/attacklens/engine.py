@@ -49,7 +49,11 @@ from .nvd         import CVELookup
 from .correlator  import CorrelationEngine
 from .fleet_correlator import FleetCorrelator
 from .signals     import Signal, layer_for
-from .detections  import analyze_port_listener, analyze_user_account
+from .detections  import (
+    analyze_port_listener, analyze_user_account,
+    analyze_sysctl_monitor, analyze_arp_spoofing,
+    analyze_container_security, analyze_sbom_posture,
+)
 from .clustering  import cluster_signals
 from .confidence  import score_confidence
 from .validation  import validate_cluster
@@ -114,6 +118,18 @@ _RECONCILE_SECTIONS: dict[str, tuple[str, ...]] = {
 _DETECTION_MODULE_ROUTES: dict[str, list] = {
     "ports": [analyze_port_listener],
     "users": [analyze_user_account],
+    # Confirmed against agent/os/macos/collectors/__init__.py's COLLECTORS
+    # registry — each of these sections has NO inline analyzer today (not in
+    # AttackLensEngine._dispatch()'s `fn` map), so routing them here is purely
+    # additive. Module-internal section guards verified to match exactly:
+    #   sysctl_monitor.SYSCTL_SECTIONS    ⊇ {"sysctl"}
+    #   arp_spoofing.analyze()            guards on section == "arp"
+    #   container_security.analyze()      guards on section in {"containers", ...}
+    #   sbom_posture.SBOM_SECTIONS        ⊇ {"sbom"}
+    "sysctl":     [analyze_sysctl_monitor],
+    "arp":        [analyze_arp_spoofing],
+    "containers": [analyze_container_security],
+    "sbom":       [analyze_sbom_posture],
 }
 
 # Map an agent section → the engine's finding `category` (keeps terrain mapping
@@ -474,10 +490,22 @@ class AttackLensEngine:
             findings = await self._dispatch(agent_id, section, data)
         signals: list[Signal] = []
         for f in findings:
-            source = f.get("source") or f.get("rule_id") or "unknown"
+            # rule_id first: several detections/*.py build_alert() helpers
+            # (arp_spoofing, container_security, ...) default "source" to a
+            # generic module-level constant (e.g. "rule:arp_spoofing") even
+            # when "rule_id" carries the specific, correctly-set identifier
+            # (e.g. "arp:duplicate_ip_mapping") — `source or rule_id` would
+            # always pick the less-specific generic one. rule_id is reliably
+            # specific across every module; source is not.
+            source = f.get("rule_id") or f.get("source") or "unknown"
             rule   = _lookup_rule_by_source(source)
             layer  = rule.get("layer") if rule else layer_for(section)
-            weight = float(rule.get("weight", 0.65)) if rule else 0.65
+            if rule and "weight" in rule:
+                weight = float(rule["weight"])
+            elif "weight" in f:
+                weight = float(f["weight"])
+            else:
+                weight = 0.65
 
             # strength = how strong is the EVIDENCE itself, independent of severity.
             # Prefer the rule's own confidence; fall back to the finding's confidence
@@ -499,6 +527,17 @@ class AttackLensEngine:
                 strength = max(strength, 0.95)
 
             strength = max(0.0, min(1.0, strength))
+
+            # Carry the original finding's title/description into evidence
+            # under reserved keys so _emit_finding_from_cluster can recover them
+            # instead of synthesizing a generic "[rule_id] severity detection"
+            # placeholder — the specific title (e.g. detector-generated, naming
+            # the actual host/process/account) is otherwise discarded the moment
+            # a finding becomes a Signal for clustering.
+            if f.get("title") and "_title" not in ev:
+                ev["_title"] = f["title"]
+            if f.get("description") and "_description" not in ev:
+                ev["_description"] = f["description"]
 
             signals.append(Signal(
                 rule_id=source,
@@ -564,7 +603,7 @@ class AttackLensEngine:
                     await self._idb.record_cluster_rejection(cluster, "low_confidence")
                     continue
 
-                verdict = await validate_cluster(cluster, enriched, self._idb, self._feeds)
+                verdict = await validate_cluster(cluster, enriched, self._idb, self._feeds, self._db)
                 if not verdict.passed:
                     await self._idb.record_cluster_rejection(cluster, verdict.failed_gate or "unknown")
                     continue
@@ -937,14 +976,23 @@ class AttackLensEngine:
         primary = max(cluster.signals, key=lambda s: (s.weight, s.strength))
         sev     = primary.severity_hint
         layers  = sorted(cluster.layers_covered)
+        # Reserved keys carried via _dispatch_to_signals — recover then strip
+        # so they don't leak into the persisted evidence shown to analysts.
+        title       = primary.evidence.pop("_title", None)
+        description = primary.evidence.pop("_description", None)
         f: dict[str, Any] = {
             "agent_id":              cluster.agent_id,
-            "category":              primary.data_point,
+            # Map the raw section name (data_point, e.g. "ports") through the
+            # same _SECTION_CATEGORY taxonomy the legacy path and every
+            # dashboard /api/v1/detection/* endpoint filters on (e.g. "port",
+            # singular) — using data_point directly silently orphaned every
+            # validation-promoted finding from category-scoped queries.
+            "category":              _SECTION_CATEGORY.get(primary.data_point, primary.data_point),
             "item_key":              cluster.entity_key,
             "severity":              sev,
             "score":                 severity_to_score(sev),
-            "title":                 primary.evidence.get("title") or f"[{primary.rule_id}] {sev} detection",
-            "description":           primary.evidence.get("description") or primary.evidence.get("desc", ""),
+            "title":                 title or f"[{primary.rule_id}] {sev} detection",
+            "description":           description or primary.evidence.get("desc", ""),
             "evidence":              primary.evidence,
             "source":                primary.rule_id,
             "rule_id":               primary.rule_id,
@@ -1230,6 +1278,11 @@ class AttackLensEngine:
                             evidence={**item, "parent_name": parent_name, "ppid": ppid},
                             source="rule:process_lineage", mitre=lrule["mitre"],
                             tags=["process", "lineage", "high_confidence"],
+                            confidence=lrule.get("confidence"),
+                            # PARENT_CHILD_RULES has no explicit weight field — these
+                            # are individually diagnostic (office/browser spawning a
+                            # shell has no benign explanation), hence the high default.
+                            weight=0.90,
                         )
                         findings.append(f)
                         break
@@ -1246,6 +1299,8 @@ class AttackLensEngine:
                         desc=f"{rule['desc']} — PID {pid}: {cmd[:120]}",
                         evidence=item, source="rule:process_pattern",
                         mitre=rule["mitre"], tags=["process", "suspicious"],
+                        confidence=rule.get("confidence"),
+                        weight=rule.get("weight"),
                     )
                     # Apply dual-use allowlist adjustment
                     f = adjust_finding_for_allowlist(f, name=name, path=exe, cmd=cmd,
@@ -1266,6 +1321,10 @@ class AttackLensEngine:
                         desc=f"{orule['desc']} — PID {pid}: {cmd[:150]}",
                         evidence=item, source="rule:obfuscation",
                         mitre=orule["mitre"], tags=["process", "obfuscation"],
+                        confidence=orule.get("confidence"),
+                        # OBFUSCATION_RULES has no weight field — obfuscated/encoded
+                        # execution is itself the diagnostic signal, default high.
+                        weight=0.85,
                     )
                     findings.append(f)
                     break
@@ -1414,6 +1473,13 @@ class AttackLensEngine:
                         evidence=item, source="rule:risky_package",
                         mitre=rule["mitre"],
                         tags=["package", "tool", manager],
+                        # RISKY_PACKAGES has no per-entry confidence field (unlike
+                        # PROCESS_RULES) — only the critical-severity entries are
+                        # genuinely zero-legitimate-use (metasploit, mimikatz,
+                        # cobalt-strike, lazagne, empire, xmrig, ...); dual-use
+                        # tools (nmap, tcpdump, ngrok) stay at the generic default.
+                        confidence=0.95 if rule["severity"] == "critical" else None,
+                        weight=0.90 if rule["severity"] == "critical" else None,
                     )
                     # Apply dual-use downgrade for legitimate pentest/admin tools
                     f = adjust_finding_for_allowlist(f, name=name)
@@ -1534,6 +1600,11 @@ class AttackLensEngine:
                 source="rule:security_posture",
                 mitre=mitre,
                 tags=["security", "posture"],
+                # SIP/Gatekeeper/FileVault/Firewall disabled are direct
+                # observations of a violated control, not a speculative
+                # pattern match — same standalone-floor treatment as
+                # uid_zero_clone/sysctl_critical (see cross_matrix.py).
+                confidence=0.95, weight=0.90,
             ))
 
         # lockdown_mode is a genuine bool (macOS posture collector's
@@ -1734,8 +1805,9 @@ class AttackLensEngine:
                  score: float, title: str, desc: str, evidence: dict,
                  source: str, mitre: str = "", tags: list | None = None,
                  cve_ids: list | None = None, cvss_score: float | None = None,
-                 cvss_vector: str = "") -> dict:
-        return {
+                 cvss_vector: str = "", confidence: float | None = None,
+                 weight: float | None = None) -> dict:
+        f = {
             "category":        category,
             "item_key":        item_key,
             "severity":        severity,
@@ -1752,6 +1824,17 @@ class AttackLensEngine:
             "cvss_vector":     cvss_vector,
             "tags":            tags or [category, source],
         }
+        # Propagate the catalog rule's own per-entry confidence (rules.py sets
+        # this per pattern, e.g. X-PROC-CRYPTOMINER=0.97 vs X-PROC-MASSCAN=0.65)
+        # so _dispatch_to_signals doesn't fall back to the generic weight=0.65
+        # default — every PROCESS_RULES/OBFUSCATION_RULES/PARENT_CHILD_RULES
+        # match collapsed to the same generic "rule:process_pattern"-style
+        # source string, discarding the specific pattern's own confidence.
+        if confidence is not None:
+            f["confidence"] = confidence
+        if weight is not None:
+            f["weight"] = weight
+        return f
 
 
 def _fp(s: str) -> str:

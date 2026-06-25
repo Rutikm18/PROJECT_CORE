@@ -130,9 +130,21 @@ from agent.agent.watchdog import main
 main()
 PYBOOT
 
+# Self-heal one-shot: run periodically by the selfheal LaunchDaemon (StartInterval).
+# Ensures the agent is loaded after boot/crash AND detects the "agent alive but
+# delivering nothing" cases launchd KeepAlive can't see (manager unreachable,
+# rogue server on the port, wrong URL).
+cat > "${PKG_ROOT}${BIN_DIR}/run_selfheal.py" <<PYBOOT
+import sys
+sys.path.insert(0, '${SRC_DIR}')
+from agent.os.macos.self_heal import main
+sys.exit(main())
+PYBOOT
+
 chmod 644 \
     "${PKG_ROOT}${BIN_DIR}/run_agent.py" \
-    "${PKG_ROOT}${BIN_DIR}/run_watchdog.py"
+    "${PKG_ROOT}${BIN_DIR}/run_watchdog.py" \
+    "${PKG_ROOT}${BIN_DIR}/run_selfheal.py"
 
 # Bundle generate_config.sh + QUICKSTART.md
 cp  "${SCRIPT_DIR}/generate_config.sh" "${PKG_ROOT}${BIN_DIR}/generate_config.sh"
@@ -261,6 +273,52 @@ cat > "${PKG_ROOT}${LDIR}/com.attacklens.watchdog.plist" <<PLIST
 </plist>
 PLIST
 
+# Self-heal timer: runs run_selfheal.py every 5 min (and at boot). NOT KeepAlive
+# — it's a one-shot that exits each run; StartInterval re-runs it on a cadence.
+cat > "${PKG_ROOT}${LDIR}/com.attacklens.selfheal.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.attacklens.selfheal</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>PYTHON3_PLACEHOLDER</string>
+        <string>${BIN_DIR}/run_selfheal.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>MallocStackLogging</key>
+        <string>0</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+    <key>UserName</key>
+    <string>root</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/selfheal-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/selfheal-stderr.log</string>
+</dict>
+</plist>
+PLIST
+
 echo "     Done."
 
 # ── [6/6] Installer scripts ───────────────────────────────────────────────────
@@ -273,7 +331,7 @@ cat > "${PKG_SCRIPTS}/preinstall" <<'PREINST'
 set -uo pipefail
 LDIR="/Library/LaunchDaemons"
 for LABEL in \
-    com.attacklens.watchdog com.attacklens.agent \
+    com.attacklens.selfheal com.attacklens.watchdog com.attacklens.agent \
     com.macintel.watchdog   com.macintel.agent; do
     # Remove from system domain
     launchctl bootout "system/${LABEL}" 2>/dev/null || true
@@ -378,7 +436,7 @@ chmod 700 "\${SECURITY_DIR}"
 for cli in /usr/local/bin/attacklens-service /usr/local/bin/attacklens; do
     [[ -e "\$cli" ]] && { chown root:wheel "\$cli"; chmod 755 "\$cli"; } || true
 done
-for f in com.attacklens.agent.plist com.attacklens.watchdog.plist; do
+for f in com.attacklens.agent.plist com.attacklens.watchdog.plist com.attacklens.selfheal.plist; do
     [[ -f "\${LDIR}/\${f}" ]] && chown root:wheel "\${LDIR}/\${f}" && chmod 644 "\${LDIR}/\${f}" || true
 done
 ok "Permissions"
@@ -426,7 +484,7 @@ ok "Prerequisites installed"
 
 # ── Step 6: Patch plists with real Mach-O python3 ────────────────────────────
 log "Patching LaunchDaemon plists..."
-for plist in "\${LDIR}/com.attacklens.agent.plist" "\${LDIR}/com.attacklens.watchdog.plist"; do
+for plist in "\${LDIR}/com.attacklens.agent.plist" "\${LDIR}/com.attacklens.watchdog.plist" "\${LDIR}/com.attacklens.selfheal.plist"; do
     [[ -f "\$plist" ]] || continue
     sed -i '' "s|PYTHON3_PLACEHOLDER|\${PYTHON3}|g" "\$plist"
     # Also replace any previously-set path that differs from detected Mach-O
@@ -466,7 +524,7 @@ else
 fi
 
 # ── Step 8: Validate plists ───────────────────────────────────────────────────
-for plist in "\${LDIR}/com.attacklens.agent.plist" "\${LDIR}/com.attacklens.watchdog.plist"; do
+for plist in "\${LDIR}/com.attacklens.agent.plist" "\${LDIR}/com.attacklens.watchdog.plist" "\${LDIR}/com.attacklens.selfheal.plist"; do
     plutil -lint "\$plist" >/dev/null 2>&1 \
         && ok "Valid plist: \$(basename "\$plist")" \
         || warn "Plist syntax error: \$(basename "\$plist")"
@@ -474,7 +532,7 @@ done
 
 # ── Step 9: Start services in SYSTEM domain (never gui/) ─────────────────────
 log "Starting LaunchDaemons..."
-for LABEL in com.attacklens.agent com.attacklens.watchdog; do
+for LABEL in com.attacklens.agent com.attacklens.watchdog com.attacklens.selfheal; do
     # Make sure not stuck in wrong domain from previous installs
     for uid in \$(dscl . -list /Users UniqueID 2>/dev/null | awk '\$2>499{print \$2}'); do
         launchctl bootout "gui/\${uid}/\${LABEL}" 2>/dev/null || true
@@ -489,6 +547,10 @@ launchctl bootstrap system "\${LDIR}/com.attacklens.agent.plist" 2>/dev/null \
 launchctl bootstrap system "\${LDIR}/com.attacklens.watchdog.plist" 2>/dev/null \
     && ok "Started: com.attacklens.watchdog" \
     || log "  com.attacklens.watchdog queued (non-critical)"
+
+launchctl bootstrap system "\${LDIR}/com.attacklens.selfheal.plist" 2>/dev/null \
+    && ok "Started: com.attacklens.selfheal" \
+    || log "  com.attacklens.selfheal queued (non-critical)"
 
 # ── Step 10: Verify & summary ─────────────────────────────────────────────────
 sleep 3

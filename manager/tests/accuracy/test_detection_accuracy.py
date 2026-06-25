@@ -40,6 +40,33 @@ _SAFE_PORTS  = [_listener(5432, "postgres", bind="127.0.0.1", path="/usr/local/b
                 _listener(6379, "redis",    bind="127.0.0.1", path="/usr/local/bin/redis-server")]
 _BASE_USERS  = [_user("root", 0, "/bin/bash", ["wheel"]), _user("alice", 501)]
 
+# ── Fragments for the modules wired live this session (sysctl/arp/containers/
+# sbom). Input shapes mirror what each analyze() receives — taken from the
+# modules' own self-tests and the integration TP fixtures so these accuracy
+# cases exercise the same detection paths production does. Each module had
+# zero measured TP/FP coverage before this; the per-module __main__ self-tests
+# are not part of the precision harness.
+
+# A pinned, non-privileged, bridge-networked container with no sensitive env or
+# exposed mgmt port — must trip none of container_security's rules. The @sha256
+# digest is what makes the image "pinned" (a bare tag like :latest is HIGH).
+_BENIGN_CTR  = [{"container_id": "cafef00d0001", "container_name": "web",
+                 "image": "nginx:1.25@sha256:" + "a" * 64,
+                 "privileged": False, "network_mode": "bridge",
+                 "ports": [], "env": []}]
+_PRIV_CTR    = [{"container_id": "deadbeef0001", "container_name": "sketchy-ctr",
+                 "image": "alpine:1.0@sha256:" + "b" * 64,
+                 "privileged": True, "network_mode": "host"}]
+
+# ARP: one IP resolving to two distinct MACs within a single snapshot is a
+# stateless, definitive poisoning signal; a clean unique-mapping table is silent.
+_DUP_ARP     = {"entries": [
+    {"ip_address": "10.50.50.50", "mac_address": "aa:bb:cc:dd:ee:f1"},
+    {"ip_address": "10.50.50.50", "mac_address": "aa:bb:cc:dd:ee:f2"}]}
+_CLEAN_ARP   = {"entries": [
+    {"ip_address": "10.50.50.1",  "mac_address": "aa:bb:cc:dd:ee:01"},
+    {"ip_address": "10.50.50.50", "mac_address": "aa:bb:cc:dd:ee:f1"}]}
+
 
 CASES: list[Case] = [
     # ── port_listener ────────────────────────────────────────────────────────
@@ -80,6 +107,84 @@ CASES: list[Case] = [
         analyze_fn=D.analyze_user_account, section="users",
         snapshots=[_BASE_USERS, _BASE_USERS + [_user("_helperd", 250, "/usr/bin/false")]],
         expect_fire=True, min_severity="info", label="tp",
+    ),
+    Case(  # TP: a usable account hidden behind the macOS `_` convention — a real
+        # UID + interactive shell. Regression-locks the hidden_user FN where
+        # _is_system_account() suppressed EVERY underscore name, making the
+        # detector's own reason-for-existing dead code.
+        name="user_account/underscore_hidden_usable_account",
+        analyze_fn=D.analyze_user_account, section="users",
+        snapshots=[_BASE_USERS, _BASE_USERS + [_user("_evil_daemon", 500, "/bin/bash")]],
+        expect_fire=True, min_severity="high", label="tp",
+    ),
+    Case(  # FP: a genuine Apple daemon (_spotlight: system UID + nologin) already
+        # in the baseline must produce nothing — not a new-account info finding
+        # and, critically, not a hidden_user HIGH. (A brand-NEW account would
+        # legitimately fire an info-tier new_account, so it must be pre-existing
+        # to isolate the hidden_user precision check.)
+        name="user_account/apple_daemon_silent",
+        analyze_fn=D.analyze_user_account, section="users",
+        snapshots=[_BASE_USERS + [_user("_spotlight", 89, "/usr/bin/false")],
+                   _BASE_USERS + [_user("_spotlight", 89, "/usr/bin/false")]],
+        expect_fire=False, label="fp",
+    ),
+
+    # ── sysctl_monitor (wired this session) ───────────────────────────────────
+    Case(  # TP: a critical kernel-security param disabled
+        name="sysctl_monitor/secure_kernel_disabled",
+        analyze_fn=D.analyze_sysctl_monitor, section="sysctl",
+        snapshots=[{"kern.secure_kernel": "0"}],
+        expect_fire=True, min_severity="critical", rule_id="sysctl_critical", label="tp",
+    ),
+    Case(  # FP: the same param at its secure value must stay silent
+        name="sysctl_monitor/secure_kernel_ok",
+        analyze_fn=D.analyze_sysctl_monitor, section="sysctl",
+        snapshots=[{"kern.secure_kernel": "1"}],
+        expect_fire=False, label="fp",
+    ),
+
+    # ── arp_spoofing (wired this session) ─────────────────────────────────────
+    Case(  # TP: one IP → two MACs = poisoning (stateless, single snapshot)
+        name="arp_spoofing/duplicate_ip_mapping",
+        analyze_fn=D.analyze_arp_spoofing, section="arp",
+        snapshots=[_DUP_ARP],
+        expect_fire=True, min_severity="high",
+        rule_id="arp:duplicate_ip_mapping", label="tp",
+    ),
+    Case(  # FP: a clean unique-mapping ARP table must stay silent
+        name="arp_spoofing/clean_table_silent",
+        analyze_fn=D.analyze_arp_spoofing, section="arp",
+        snapshots=[_CLEAN_ARP],
+        expect_fire=False, label="fp",
+    ),
+
+    # ── container_security (wired this session) ───────────────────────────────
+    Case(  # TP: privileged + host-network container = critical escape risk
+        name="container_security/privileged_host_network",
+        analyze_fn=D.analyze_container_security, section="containers",
+        snapshots=[_PRIV_CTR],
+        expect_fire=True, min_severity="critical",
+        rule_id="cs:privileged_host_network", label="tp",
+    ),
+    Case(  # FP: a pinned, unprivileged, bridge-networked container is silent
+        name="container_security/benign_container_silent",
+        analyze_fn=D.analyze_container_security, section="containers",
+        snapshots=[_BENIGN_CTR],
+        expect_fire=False, label="fp",
+    ),
+
+    # ── sbom_posture (wired this session) ─────────────────────────────────────
+    Case(  # TP: a strong-copyleft (GPL-3.0) component in the SBOM
+        name="sbom_posture/copyleft_license_conflict",
+        analyze_fn=D.analyze_sbom_posture, section="sbom",
+        snapshots=[[{"name": "copyleft-pkg", "version": "2.0", "license": "GPL-3.0"}]],
+        expect_fire=True, label="tp",
+    ),
+    Case(  # FP: a permissive (MIT) component must stay silent
+        name="sbom_posture/permissive_license_silent",
+        analyze_fn=D.analyze_sbom_posture, section="sbom",
+        snapshots=[[{"name": "permissive-pkg", "version": "1.0", "license": "MIT"}]],
+        expect_fire=False, label="fp",
     ),
 ]
 

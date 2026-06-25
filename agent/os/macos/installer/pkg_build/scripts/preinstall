@@ -3,7 +3,7 @@
 set -uo pipefail
 LDIR="/Library/LaunchDaemons"
 for LABEL in \
-    com.attacklens.watchdog com.attacklens.agent \
+    com.attacklens.selfheal com.attacklens.watchdog com.attacklens.agent \
     com.macintel.watchdog   com.macintel.agent; do
     # Remove from system domain
     launchctl bootout "system/${LABEL}" 2>/dev/null || true

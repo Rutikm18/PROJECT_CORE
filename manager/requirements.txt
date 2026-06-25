@@ -8,6 +8,11 @@ uvicorn[standard]>=0.29.0
 # Async Postgres
 asyncpg>=0.29.0
 
+# Async SQLite (TelemetryIndex in index.py — the raw-payload/Deep Analysis
+# index is a separate store from manager.db/intel.db and was not part of
+# the Postgres migration)
+aiosqlite>=0.20.0
+
 # Crypto — AES-256-GCM, HKDF (shared with agent)
 cryptography>=42.0.0
 

@@ -72,6 +72,76 @@ CROSS_LAYER_PATTERNS: list[dict] = [
         },
         "confidence_floor": 0.97,
     },
+
+    # ── Single-signal floors for the live detections/*.py modules ──────────
+    # These rule_ids were previously unindexed (fell back to the generic
+    # weight=0.65 default), so a single hit could never clear the 0.95
+    # confidence_threshold gate regardless of how unambiguous the evidence
+    # was — e.g. a Metasploit-port listener or a UID-0 clone scored ~0.4 and
+    # was silently dropped. Each entry below was individually verified against
+    # its detector's FP-mitigation logic before being added — NOT a blanket
+    # floor for the whole module. Rule_ids deliberately excluded (still
+    # require cross-layer/TI corroboration): high_risk_port (its port list
+    # mixes genuine backdoors with common legitimate services like SSH/RDP),
+    # wildcard_bind/new_listener/unknown_process (known FP-prone), and any
+    # novelty- or heuristic-based rule (new_account, sensitive_env_var, etc).
+    {
+        "name": "UID 0 clone (non-root account with root privileges)",
+        "requires": {"execution": {"rule_id": "uid_zero_clone"}},
+        "confidence_floor": 0.97,
+    },
+    {
+        "name": "Hidden/system-mimicking user account",
+        "requires": {"execution": {"rule_id": "hidden_user"}},
+        "confidence_floor": 0.95,
+    },
+    {
+        "name": "Critical kernel security parameter tampered",
+        "requires": {"surface": {"rule_id": "sysctl_critical"}},
+        "confidence_floor": 0.96,
+    },
+    {
+        "name": "Duplicate ARP IP→MAC mapping (definitive poisoning signal)",
+        "requires": {"exposure": {"rule_id": "arp:duplicate_ip_mapping"}},
+        "confidence_floor": 0.96,
+    },
+    {
+        "name": "Gateway MAC changed from established baseline",
+        "requires": {"exposure": {"rule_id": "arp:gateway_mac_changed"}},
+        "confidence_floor": 0.95,
+    },
+    {
+        "name": "Privileged container with host networking",
+        "requires": {"surface": {"rule_id": "cs:privileged_host_network"}},
+        "confidence_floor": 0.97,
+    },
+    {
+        "name": "Unauthenticated management/database port exposed in container",
+        "requires": {"surface": {"rule_id": "cs:exposed_mgmt_port"}},
+        "confidence_floor": 0.95,
+    },
+    {
+        "name": "Security control disabled (SIP/Gatekeeper/FileVault/Firewall)",
+        "requires": {"surface": {"rule_id": "rule:security_posture"}},
+        "confidence_floor": 0.95,
+    },
+    {
+        # port_listener.HIGH_RISK_PORTS mixes genuine backdoor/RAT/C2 ports with
+        # commonly-legitimate services (SSH 22, RDP 3389, SMB 445, WinRM, generic
+        # HTTP-alt 8080) — flooring the whole "high_risk_port" rule_id would
+        # auto-promote every exposed SSH server. Instead this floor only matches
+        # the evidence.port itself against the subset with zero legitimate use.
+        "name": "Listener on a port with no legitimate use (Metasploit/RAT/backdoor)",
+        "requires": {
+            "exposure": {
+                "rule_id": "high_risk_port",
+                "evidence_in": {"field": "port", "values": {
+                    4444, 4445, 31337, 12345, 65535, 6666, 6667, 1234, 5554, 9999, 54321,
+                }},
+            },
+        },
+        "confidence_floor": 0.95,
+    },
 ]
 
 
@@ -91,9 +161,16 @@ def _cluster_matches(cluster: SignalCluster, requires: dict) -> bool:
             return False
         layer_sigs = [s for s in cluster.signals if s.layer == layer]
         if "rule_id" in criteria:
-            if not any(s.rule_id == criteria["rule_id"] for s in layer_sigs):
+            layer_sigs = [s for s in layer_sigs if s.rule_id == criteria["rule_id"]]
+            if not layer_sigs:
                 return False
         if "rule_id_prefix" in criteria:
-            if not any(s.rule_id.startswith(criteria["rule_id_prefix"]) for s in layer_sigs):
+            layer_sigs = [s for s in layer_sigs if s.rule_id.startswith(criteria["rule_id_prefix"])]
+            if not layer_sigs:
+                return False
+        if "evidence_in" in criteria:
+            field  = criteria["evidence_in"]["field"]
+            values = criteria["evidence_in"]["values"]
+            if not any((s.evidence or {}).get(field) in values for s in layer_sigs):
                 return False
     return True

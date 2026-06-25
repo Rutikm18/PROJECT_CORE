@@ -28,6 +28,27 @@
 
 services:
 
+  # ── Database (manager.db + intel.db + threat_intel.db, one Postgres) ───────
+  postgres:
+    image: postgres:16-alpine
+    container_name: attacklens-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     "${POSTGRES_USER:-attacklens}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-attacklens}"
+      POSTGRES_DB:       "manager"
+    volumes:
+      - attacklens_pg_data:/var/lib/postgresql/data
+      - ./manager/postgres-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - attacklens_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-attacklens}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
   # ── Message broker ───────────────────────────────────────────────────────────
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
@@ -115,12 +136,25 @@ services:
       BIND_PORT:               "8080"
       TLS_MODE:                "none"
 
+      # Postgres — base DSN shared by manager.db + intel.db (server.py appends
+      # /manager and /intel respectively; override via MANAGER_DATABASE_URL /
+      # INTEL_DATABASE_URL if they ever need to live on different hosts).
+      DATABASE_URL:            "postgresql://${POSTGRES_USER:-attacklens}:${POSTGRES_PASSWORD:-attacklens}@postgres:5432"
+
       # RabbitMQ — async ingest pipeline
       RABBITMQ_URL:            "amqp://${RABBITMQ_USER:-attacklens}:${RABBITMQ_PASS:-changeme}@rabbitmq:5672/"
 
       # Central threat-intel API. Manager still degrades gracefully if unavailable.
       THREAT_INTEL_URL:        "http://threat-intel:8090"
       MANAGER_EMBEDDED_THREAT_INTEL: "${MANAGER_EMBEDDED_THREAT_INTEL:-false}"
+
+      # ── AttackLens precision validation ─────────────────────────────────────
+      # Master switch for the cluster→signal validation pipeline (correlation +
+      # confidence scoring) before a finding is promoted to is_active=1.
+      ATTACKLENS_VALIDATION:            "${ATTACKLENS_VALIDATION:-true}"
+      # LLM precision verdict on top of the deterministic gates.
+      ATTACKLENS_AI_VALIDATION:         "${ATTACKLENS_AI_VALIDATION:-true}"
+      ATTACKLENS_AI_PRECISION_THRESHOLD: "${ATTACKLENS_AI_PRECISION_THRESHOLD:-0.90}"
 
       # ── AI analyst (Claude API) ─────────────────────────────────────────────
       ANTHROPIC_API_KEY:       "${ANTHROPIC_API_KEY:-}"
@@ -148,6 +182,8 @@ services:
       GREYNOISE_KEY:           "${GREYNOISE_KEY:-}"
 
     depends_on:
+      postgres:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
       threat-intel:
@@ -184,7 +220,11 @@ services:
       LOG_LEVEL:                    "${LOG_LEVEL:-info}"
       DATA_DIR:                     "/app/data"
       THREAT_INTEL_DATA_DIR:        "/app/data"
-      THREAT_INTEL_DB:              "/app/data/intel.db"
+      # Postgres — threat_intel_service.py defaults to localhost:5432 if unset,
+      # which inside a container resolves to itself, never the postgres
+      # service. (Removed THREAT_INTEL_DB=/app/data/intel.db here — a
+      # pre-Postgres-migration SQLite path the code no longer reads.)
+      DATABASE_URL:                 "postgresql://${POSTGRES_USER:-attacklens}:${POSTGRES_PASSWORD:-attacklens}@postgres:5432"
       CORS_ORIGINS:                 "${CORS_ORIGINS:-*}"
       THREAT_FEED_INTERVAL_SECONDS: "${THREAT_FEED_INTERVAL_SECONDS:-3600}"
       NVD_SYNC_INTERVAL_SECONDS:    "${NVD_SYNC_INTERVAL_SECONDS:-7200}"
@@ -193,6 +233,10 @@ services:
       ABUSEIPDB_KEY:                "${ABUSEIPDB_KEY:-}"
       OTX_KEY:                      "${OTX_KEY:-}"
       GREYNOISE_KEY:                "${GREYNOISE_KEY:-}"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     volumes:
       - ./data/threat-intel:/app/data
@@ -210,6 +254,7 @@ services:
 
 # ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
+  attacklens_pg_data: # Postgres data (manager + intel + threat_intel databases)
   caddy_data:    # Caddy ACME certificates + state (survives restarts)
   caddy_config:  # Caddy runtime config cache
   rabbitmq_data: # RabbitMQ message persistence
