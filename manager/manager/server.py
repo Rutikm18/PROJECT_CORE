@@ -43,6 +43,7 @@ from .pool        import AgentRateLimiter
 QueueProducer = None  # type: ignore[assignment]
 from .workers.telemetry   import TelemetryWorker
 from .workers.attacklens  import AttackLensWorker
+from .workers.dlq_replayer import DLQReplayer
 from .chunk_tracker       import ChunkTracker
 from .workers.intel       import ThreatIntelWorker
 from .workers.enrichment  import EnrichmentWorker
@@ -279,7 +280,13 @@ def create_app() -> FastAPI:
             asyncio.create_task(_al_worker.run())
             _tel_consumer = TelemetryConsumer(rabbitmq_url, db, store, hub, producer, engine)
             asyncio.create_task(_tel_consumer.run())
-            log.info("RabbitMQ: producer + workers + consumer started (url=%s)", rabbitmq_url)
+            # DLQ replayer: drains mac_intel.dead (previously unconsumed → a
+            # silent black hole for any nack'd telemetry/detection work) and
+            # replays to the origin queue with backoff, parking poison messages.
+            _dlq_replayer = DLQReplayer(rabbitmq_url)
+            app.state.dlq_replayer = _dlq_replayer
+            asyncio.create_task(_dlq_replayer.run())
+            log.info("RabbitMQ: producer + workers + consumer + DLQ replayer started (url=%s)", rabbitmq_url)
         else:
             log.info("RabbitMQ: not configured — sync pipeline active")
 

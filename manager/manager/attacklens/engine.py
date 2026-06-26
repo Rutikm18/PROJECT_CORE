@@ -228,8 +228,15 @@ class AttackLensEngine:
         self._ai_analyst = ai_analyst
         self._ready   = False
         self._nvd_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-        # Per-agent payload counter — run correlation every 3 payloads
-        self._payload_count: dict[str, int] = {}
+        # Real-time correlation coalescing (replaces the old "every 3rd payload"
+        # sampling, which let 2 of every 3 payloads — and any attack chain that
+        # landed in the gap — go uncorrelated). Every payload now requests a
+        # correlation pass, but we never run more than ONE per agent at a time:
+        # if a pass is already in flight for an agent, the new request just sets
+        # a "dirty" flag and the in-flight pass loops once more when it finishes.
+        # → correlate-on-every-event latency, with bounded (1 per agent) work.
+        self._correlate_inflight: set[str] = set()
+        self._correlate_dirty:    set[str] = set()
 
         # Bounded detection executor (see module constants). The queue is created
         # lazily in start() on the running loop; workers drain it concurrently up
@@ -469,10 +476,7 @@ class AttackLensEngine:
                                   agent_id, section, exc)
 
             if not skip_correlation:
-                count = self._payload_count.get(agent_id, 0) + 1
-                self._payload_count[agent_id] = count
-                if count % 3 == 0:
-                    asyncio.create_task(self._run_correlations(agent_id))
+                self._request_correlation(agent_id)
         except Exception as exc:
             log.warning("AttackLens.process error agent=%s section=%s: %s",
                         agent_id, section, exc)
@@ -1060,7 +1064,38 @@ class AttackLensEngine:
         Public trigger for cross-section correlation.
         Called by ChunkTracker when the last chunk of a chunk set completes.
         """
-        asyncio.create_task(self._run_correlations(agent_id))
+        self._request_correlation(agent_id)
+
+    def _request_correlation(self, agent_id: str) -> None:
+        """Request a correlation pass for an agent, coalescing concurrent
+        requests. At most one pass runs per agent at a time; requests that
+        arrive while a pass is in flight set a dirty flag so exactly one more
+        pass runs after it — every event gets correlated promptly without
+        spawning a pass per payload (which at volume would hammer the DB)."""
+        if agent_id in self._correlate_inflight:
+            self._correlate_dirty.add(agent_id)
+            return
+        self._correlate_inflight.add(agent_id)
+        try:
+            asyncio.create_task(self._correlation_loop(agent_id))
+        except RuntimeError:
+            # No running loop (sync/test context) — drop the inflight marker so
+            # a later call in a real loop can schedule.
+            self._correlate_inflight.discard(agent_id)
+
+    async def _correlation_loop(self, agent_id: str) -> None:
+        """Run correlation for an agent, then re-run once if more data arrived
+        while it was running (coalesced burst). Always clears its inflight
+        marker on exit so the agent can be scheduled again."""
+        try:
+            while True:
+                await self._run_correlations(agent_id)
+                if agent_id in self._correlate_dirty:
+                    self._correlate_dirty.discard(agent_id)
+                    continue   # data arrived mid-pass — fold it into one more run
+                break
+        finally:
+            self._correlate_inflight.discard(agent_id)
 
     async def _run_correlations(self, agent_id: str) -> None:
         """Evaluate cross-section correlation rules and store results."""

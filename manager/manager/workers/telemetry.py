@@ -121,20 +121,29 @@ class TelemetryWorker:
         os_name     = msg.get("os", "macos")
         hostname    = msg.get("hostname", "")
 
-        # 1. Three-tier file store
-        try:
-            await self._store.write(
-                agent_id=agent_id,
-                section=section,
-                ts=collected,
-                data=data,
-                os=os_name,
-                hostname=hostname,
-            )
-        except Exception as exc:
-            log.error("Store write failed agent=%s section=%s: %s", agent_id, section, exc)
+        # Step failure policy — the message is acked ONLY if both CRITICAL steps
+        # succeed; a critical failure re-raises so msg.process() nacks → DLQ,
+        # where the DLQ replayer retries it. Previously every step swallowed its
+        # exception and the message was acked regardless, so a failed store (lost
+        # provenance) or a failed detection fan-out (silently no detection, on a
+        # SECURITY tool) was invisible at-most-once loss. Best-effort steps
+        # (raw index, WS broadcast) stay non-fatal — the file store is the source
+        # of truth and the index is rebuildable.
+        #
+        #   CRITICAL : store.write (provenance) , publish_attacklens_work (detection)
+        #   BEST-EFFORT: insert_payload (Deep-Analysis index) , hub.broadcast (UI)
 
-        # 2. SQLite payload summary (section timestamps for dashboard)
+        # 1. Three-tier file store — CRITICAL (source of truth for provenance)
+        await self._store.write(
+            agent_id=agent_id,
+            section=section,
+            ts=collected,
+            data=data,
+            os=os_name,
+            hostname=hostname,
+        )
+
+        # 2. SQLite payload summary (section timestamps for dashboard) — best-effort
         try:
             await self._db.insert_payload(agent_id, section, int(collected), data)
         except Exception as exc:
@@ -152,27 +161,28 @@ class TelemetryWorker:
         except Exception as exc:
             log.debug("WS broadcast failed agent=%s: %s", agent_id, exc)
 
-        # 4. Fan-out to attacklens.work — chunk large list payloads
-        try:
-            chunks = chunk_split(data)
-            for chunk in chunks:
-                await self._producer.publish_attacklens_work(
-                    build_attacklens_msg(
-                        agent_id=agent_id,
-                        section=section,
-                        collected_at=collected,
-                        data=chunk.data,
-                        chunk_set_id=chunk.chunk_set_id,
-                        chunk_index=chunk.chunk_index,
-                        chunk_total=chunk.chunk_total,
-                    )
+        # 4. Fan-out to attacklens.work — CRITICAL (this IS the detection trigger).
+        # A failure here must NOT ack: losing it means the payload is stored but
+        # never analysed. Re-raise → nack → DLQ → replayer. Re-processing is safe:
+        # store.write is idempotent per (agent,section,ts) and detection dedups
+        # by fingerprint.
+        chunks = chunk_split(data)
+        for chunk in chunks:
+            await self._producer.publish_attacklens_work(
+                build_attacklens_msg(
+                    agent_id=agent_id,
+                    section=section,
+                    collected_at=collected,
+                    data=chunk.data,
+                    chunk_set_id=chunk.chunk_set_id,
+                    chunk_index=chunk.chunk_index,
+                    chunk_total=chunk.chunk_total,
                 )
-            if len(chunks) > 1:
-                log.info(
-                    "Chunked: agent=%s section=%s items=%d → %d chunks",
-                    agent_id, section, len(data), len(chunks),
-                )
-        except Exception as exc:
-            log.warning("Jarvis publish failed agent=%s section=%s: %s", agent_id, section, exc)
+            )
+        if len(chunks) > 1:
+            log.info(
+                "Chunked: agent=%s section=%s items=%d → %d chunks",
+                agent_id, section, len(data), len(chunks),
+            )
 
         log.debug("Telemetry processed: agent=%s section=%s", agent_id, section)
