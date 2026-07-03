@@ -219,6 +219,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         sort_by:  str           = Query("composite_score"),
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
+        validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
     ):
         """
         Package CVE findings — installed packages matched against NVD.
@@ -236,7 +237,8 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             offset=offset,
             live_agent_ids=await _live_agent_ids(),
         )
-        return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
+        rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
+        return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
 
     # ── Open port findings ─────────────────────────────────────────────────────
     @router.get("/ports")
@@ -245,6 +247,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         severity: Optional[str] = Query(None),
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
+        validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
     ):
         rows = await intel_db.get_soc_findings(
             agent_id=agent_id,
@@ -256,7 +259,8 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             offset=offset,
             live_agent_ids=await _live_agent_ids(),
         )
-        return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
+        rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
+        return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
 
     # ── Persistence findings (service + task + config + binary) ───────────────
     @router.get("/persistence")
@@ -266,6 +270,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         sub_type:  Optional[str] = Query(None, description="service|task|config|binary"),
         limit:     int           = Query(150, ge=1, le=500),
         offset:    int           = Query(0, ge=0),
+        validated_only: bool     = Query(False, description="Only findings with precision_score ≥ configured threshold"),
     ):
         """
         All persistence-related findings: launchd services, cron/launchd tasks,
@@ -274,7 +279,6 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         persistence_cats = [sub_type] if sub_type else ["service", "task", "config", "binary"]
         all_rows = []
         live_ids = await _live_agent_ids()
-        # Fetch each category concurrently
         results = await asyncio.gather(*[
             intel_db.get_soc_findings(
                 agent_id=agent_id,
@@ -290,67 +294,37 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         ])
         for batch in results:
             all_rows.extend(batch)
-
-        # Sort merged result by composite_score DESC
         all_rows.sort(key=lambda r: r.get("composite_score") or r.get("score") or 0, reverse=True)
         paged = all_rows[offset: offset + limit]
-        return {
-            "findings": [_enrich(r) for r in paged],
-            "count":    len(paged),
-            "total":    len(all_rows),
-            "offset":   offset,
-        }
+        paged, thr, below = await _apply_validated_filter(intel_db, paged, validated_only)
+        return _validated_body({"findings": [_enrich(r) for r in paged], "count": len(paged), "total": len(all_rows), "offset": offset}, validated_only, thr, below)
 
     # ── Network threat findings (the "Vector" panel) ───────────────────────────
     @router.get("/network")
     async def network(
         agent_id: Optional[str] = Query(None),
         severity: Optional[str] = Query(None),
-        sub_type: Optional[str] = Query(
-            None,
-            description="Restrict to one category: connection | network | port",
-        ),
+        sub_type: Optional[str] = Query(None, description="Restrict to one category: connection | network | port"),
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
+        validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
     ):
-        """
-        Aggregate every category that belongs to the dashboard's Vector panel:
-          • connection — outbound/inbound IOC matches (Feodo, URLhaus, AbuseIPDB)
-          • network    — behavioural interface changes, ARP-spoofing, covert
-                         channels, DNS tunnelling
-          • port       — risky open ports (no dedicated sidebar entry)
-
-        Each category is fetched concurrently and merged sorted by
-        composite_score so the Vector page sees one unified stream.
-        """
-        wanted_cats = (
-            [sub_type] if sub_type in _VECTOR_CATEGORIES else _VECTOR_CATEGORIES
-        )
+        """Aggregate every category that belongs to the dashboard's Vector panel."""
+        wanted_cats = [sub_type] if sub_type in _VECTOR_CATEGORIES else _VECTOR_CATEGORIES
         live_ids = await _live_agent_ids()
-
         results = await asyncio.gather(*[
             intel_db.get_soc_findings(
-                agent_id=agent_id,
-                category=cat,
-                severity=severity,
-                active_only=True,
-                sort_by="composite_score",
-                # Pull enough per category to give the merge headroom before paging.
-                limit=limit + offset,
-                offset=0,
-                live_agent_ids=live_ids,
-            )
-            for cat in wanted_cats
+                agent_id=agent_id, category=cat, severity=severity,
+                active_only=True, sort_by="composite_score",
+                limit=limit + offset, offset=0, live_agent_ids=live_ids,
+            ) for cat in wanted_cats
         ], return_exceptions=True)
-
         all_rows: list[dict] = []
         for batch in results:
             if isinstance(batch, Exception):
-                log.warning("Vector fetch failed for one sub-category: %s", batch)
+                log.warning("Vector fetch failed: %s", batch)
                 continue
             all_rows.extend(batch)
-
-        # De-duplicate by id (a finding could only be in one category, but be safe).
         seen: set = set()
         unique: list[dict] = []
         for r in all_rows:
@@ -360,19 +334,10 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             if fid is not None:
                 seen.add(fid)
             unique.append(r)
-
-        unique.sort(
-            key=lambda r: (r.get("composite_score") or r.get("score") or 0),
-            reverse=True,
-        )
+        unique.sort(key=lambda r: (r.get("composite_score") or r.get("score") or 0), reverse=True)
         paged = unique[offset: offset + limit]
-        return {
-            "findings":   [_enrich(r) for r in paged],
-            "count":      len(paged),
-            "total":      len(unique),
-            "offset":     offset,
-            "categories": wanted_cats,
-        }
+        paged, thr, below = await _apply_validated_filter(intel_db, paged, validated_only)
+        return _validated_body({"findings": [_enrich(r) for r in paged], "count": len(paged), "total": len(unique), "offset": offset, "categories": wanted_cats}, validated_only, thr, below)
 
     # ── Execution / process findings ───────────────────────────────────────────
     @router.get("/processes")
@@ -381,6 +346,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         severity: Optional[str] = Query(None),
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
+        validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
     ):
         live_ids = await _live_agent_ids()
         results = await asyncio.gather(
@@ -403,17 +369,24 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             reverse=True,
         )
         paged = all_rows[offset: offset + limit]
-        return {"findings": [_enrich(r) for r in paged], "count": len(paged), "offset": offset}
+        paged, thr, below = await _apply_validated_filter(intel_db, paged, validated_only)
+        return _validated_body({"findings": [_enrich(r) for r in paged], "count": len(paged), "offset": offset}, validated_only, thr, below)
 
     # ── All active findings ────────────────────────────────────────────────────
     @router.get("/all")
     async def all_findings(
         agent_id:  Optional[str] = Query(None),
+        terrain_id: Optional[str] = Query(None, description="citadels|vector|origin|identity|posture"),
         category:  Optional[str] = Query(None),
         severity:  Optional[str] = Query(None),
         status:    Optional[str] = Query(None),
         sla_only:  bool          = Query(False),
         search:    Optional[str] = Query(None),
+        id_search: Optional[str] = Query(
+            None, description="Direct ID lookup — prefix match on external_id "
+                              "(AL-F-NNNNNNNN). Uses UNIQUE index, O(log n). "
+                              "Overrides `search` when both are present."
+        ),
         sort_by:   str           = Query("composite_score"),
         limit:     int           = Query(200, ge=1, le=1000),
         offset:    int           = Query(0, ge=0),
@@ -428,74 +401,73 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
                         "scores below the bar), which read as 'no data'.",
         ),
     ):
-        # When validated_only is on, resolve the per-agent → per-terrain → global
-        # threshold from Settings → Validation and keep only findings whose
-        # precision_score clears it — the SAME bar the engine used to promote
-        # them, so the page stays consistent with the Validated Findings queue.
-        min_precision_sql: Optional[float] = None
-        global_threshold:  Optional[float] = None
-        if validated_only:
-            try:
-                from ..attacklens.ai_validator import _load_validation_settings
-                vs = await _load_validation_settings(intel_db)
-                global_threshold = float(vs.get("global", 0.90))
-                # SQL pre-filter at the LOWEST configured threshold so per-agent
-                # overrides set below the global aren't pre-dropped; the exact
-                # per-row bar is enforced in Python after fetch.
-                floors = [global_threshold]
-                floors.extend((vs.get("terrain") or {}).values())
-                floors.extend((vs.get("agent") or {}).values())
-                min_precision_sql = min(floors) if floors else global_threshold
-            except Exception as exc:
-                log.warning("detection/all validated_only settings load failed: %s "
-                            "— defaulting to 0.90 floor", exc)
-                min_precision_sql = 0.90
-                global_threshold = 0.90
+        # ── ID Search fast-path: direct indexed lookup ─────────────────────────
+        if id_search:
+            term = id_search.strip().upper()
+            if not term.startswith("AL-F-"):
+                term = "AL-F-" + term
+            rows = await intel_db.search_by_external_id(term, active_only=True, limit=limit)
+            return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": 0, "id_search": id_search}
 
         rows = await intel_db.get_soc_findings(
-            agent_id=agent_id,
-            category=category,
-            severity=severity,
-            status=status,
-            sla_breached=sla_only,
-            search=search,
-            active_only=True,
-            sort_by=sort_by,
-            limit=limit,
-            offset=offset,
-            min_precision=min_precision_sql,
+            agent_id=agent_id, terrain_id=terrain_id, category=category,
+            severity=severity, status=status, sla_breached=sla_only, search=search,
+            active_only=True, sort_by=sort_by, limit=limit, offset=offset,
             live_agent_ids=await _live_agent_ids(),
         )
-
-        below = 0
-        if validated_only and rows:
-            from ..attacklens.ai_validator import resolve_threshold
-            kept: list[dict] = []
-            for r in rows:
-                try:
-                    thr = await resolve_threshold(
-                        intel_db, r.get("agent_id", ""), r.get("category", ""),
-                    )
-                except Exception:
-                    thr = global_threshold or 0.90
-                r["effective_threshold"] = round(thr, 3)
-                if float(r.get("precision_score") or 0.0) >= thr:
-                    kept.append(r)
-                else:
-                    below += 1
-            rows = kept
-
-        body = {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}
-        if validated_only:
-            body["validated_only"]   = True
-            body["global_threshold"] = global_threshold
-            body["below_threshold"]  = below
-        return body
+        rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
+        return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
 
     return router
 
 
-# ── Enrichment ────────────────────────────────────────────────────────────────
+# ── Validated-only helper ──────────────────────────────────────────────────────
+
+async def _apply_validated_filter(intel_db, rows: list[dict], validated_only: bool) -> tuple[list[dict], float | None, int]:
+    """
+    When `validated_only` is True, load the configured thresholds from
+    Settings → Validation and keep only findings whose precision_score ≥
+    the per-agent → per-terrain → global threshold.
+
+    Returns (filtered_rows, global_threshold, below_count).
+    """
+    global_threshold: float | None = None
+    below = 0
+    if not validated_only or not rows:
+        return rows, global_threshold, below
+
+    try:
+        from ..attacklens.ai_validator import _load_validation_settings, resolve_threshold
+        vs = await _load_validation_settings(intel_db)
+        global_threshold = float(vs.get("global", 0.90))
+    except Exception as exc:
+        log.warning("validated_only settings load failed — defaulting to 0.90: %s", exc)
+        global_threshold = 0.90
+
+    kept: list[dict] = []
+    for r in rows:
+        try:
+            thr = await resolve_threshold(intel_db, r.get("agent_id", ""), r.get("category", ""))
+        except Exception:
+            thr = global_threshold or 0.90
+        r["effective_threshold"] = round(thr, 3)
+        row_score = float(r.get("precision_score") or 0.0)
+        r["is_validated"] = row_score >= thr
+        if row_score >= thr:
+            kept.append(r)
+        else:
+            below += 1
+    return kept, global_threshold, below
+
+
+def _validated_body(body: dict, validated_only: bool, global_threshold: float | None, below: int) -> dict:
+    """Attach validated-only metadata to the response body."""
+    if validated_only:
+        body["validated_only"] = True
+        body["global_threshold"] = global_threshold
+        body["below_threshold"] = below
+    return body
+
 
 def _enrich(f: dict) -> dict:
     """
@@ -544,10 +516,12 @@ def _enrich(f: dict) -> dict:
     f["impact"]    = _IMPACT.get(cat, "This finding may indicate a security risk. Review evidence and apply remediation.")
     f["cat_meta"]  = _CAT_META.get(cat, {"label": cat.title(), "icon": "alert", "group": "other"})
 
-    # SLA status
+    # SLA status — driven by the canonical terminal-status set.
+    from .. import finding_lifecycle as lc
     sla_due = f.get("sla_due") or 0
-    status  = f.get("status", "new")
-    if status in ("closed", "false_positive", "accepted_risk", "verified", "duplicate"):
+    status  = lc.normalize(f.get("status"))
+    f["status"] = status
+    if lc.is_terminal(status):
         f["sla_status"] = "closed"
     elif not sla_due:
         f["sla_status"] = "ok"
@@ -555,6 +529,34 @@ def _enrich(f: dict) -> dict:
         now = time.time()
         remaining = sla_due - now
         f["sla_status"] = "breached" if remaining < 0 else "warning" if remaining < 7200 else "ok"
+
+    # Stable identifiers + lifecycle, so every page (All Incidents, Attack
+    # Terrain Origin/Vector/Citadels) can show the unique id and render the
+    # correct triage action buttons for THIS finding's current state.
+    if not f.get("external_id") and f.get("id") is not None:
+        # Defensive: surface a deterministic display id even if the backfill
+        # hasn't stamped this row yet (the DB UNIQUE id is the source of truth).
+        f["external_id"] = f"AL-F-{int(f['id']):08d}"
+    f["is_terminal"]       = lc.is_terminal(status)
+    f["available_actions"] = lc.available_actions(status)
+
+    # Canonical attack-terrain bucket (origin/vector/citadels/identity/posture),
+    # the SINGLE source of truth so the same finding lands in the same terrain
+    # everywhere — All Incidents and the Attack Terrain sub-views agree, and the
+    # external_id is identical across them. Frontends must use this, not their
+    # own category→terrain guesses.
+    # Prefer the stored terrain_id (set by upsert_finding), fall back to
+    # runtime inference for legacy rows not yet backfilled.
+    terrain = f.get("terrain_id") or ""
+    if not terrain:
+        from ..attacklens.terrain_validators import terrain_for
+        terrain = terrain_for(f)
+    f["terrain"] = terrain
+    f["terrain_id"] = terrain
+
+    # Terrain source provenance — the detection source (rule|feed|nvd) that
+    # drove the terrain classification, surfaced in the UI as "via <source>".
+    f["terrain_source"] = f.get("terrain_source") or f.get("category", "")
 
     return f
 

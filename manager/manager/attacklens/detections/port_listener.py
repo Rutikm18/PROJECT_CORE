@@ -112,6 +112,19 @@ APPROVED_WILDCARD_BIND_PROCS: frozenset[str] = frozenset({
     #   wifivelocityd     → WiFi performance telemetry
     "airportd", "replicatord", "symptomsd", "syslogd",
     "wifip2pd", "wifivelocityd",
+    # Consumer browsers — bind ephemeral ports on 0.0.0.0 for IPC / Spotify Connect /
+    # browser remote-debugging. Not server exposure; suppress port noise for these.
+    # "zen" is a Firefox fork. "arc" / "brave" / "vivaldi" / "opera" are Chromium.
+    "zen", "arc", "brave", "vivaldi", "opera",
+    "firefox", "waterfox", "librewolf",
+    # Media & communication apps
+    "spotify", "vlc", "handbrake", "plexmediaplayer", "plexamp",
+    "discord", "slack", "zoom", "msteams", "teams", "webex",
+    "skype", "telegram", "signal", "whatsapp",
+    # Cloud storage daemons
+    "dropbox", "onedrive", "googledrivefs", "box",
+    # macOS built-in media apps (may bind ephemeral for AirPlay)
+    "music", "tv", "podcasts",
 })
 
 # Vendor/process-name PREFIXES whose subprocesses legitimately wildcard-bind.
@@ -154,7 +167,7 @@ PROCESS_PORT_MAP: dict[str, list[tuple[int, int]]] = {
     "apache2":      [(80, 80), (443, 443)],
     "httpd":        [(80, 80), (443, 443)],
     "postgres":     [(5432, 5432)],
-    "mysqld":       [(3306, 3306)],
+    "mysqld":       [(3306, 3306), (33060, 33060)],  # 33060 = MySQL X Protocol
     "mongod":       [(27017, 27019)],
     "redis-server": [(6379, 6379)],
     "memcached":    [(11211, 11211)],
@@ -706,6 +719,12 @@ def detect_wildcard_bind(agent_id: str, listeners: list[dict]) -> list[dict]:
         port      = lst["port"]
         if _is_approved_wildcard(proc_name):
             continue
+        # Empty process name = port scanner couldn't resolve the PID to a name.
+        # Without a name we can't evaluate risk — skip rather than false-alerting.
+        # The high-risk-port rule (which fires on port NUMBER alone) still covers
+        # genuinely-dangerous ports even when the process name is unknown.
+        if not proc_name:
+            continue
         if _is_invalid_port(port):
             continue
         # Stable dedup identity: process + port, never the churning pid. Keeps
@@ -747,6 +766,14 @@ def detect_high_risk_port(agent_id: str, listeners: list[dict]) -> list[dict]:
         if port not in HIGH_RISK_PORTS:
             continue
         if not _is_external(lst["bind_ip"]) and not _is_wildcard(lst["bind_ip"]):
+            continue
+        # Approved services (e.g. com.docker.backend exposing 8080 / 15672 for
+        # Docker Desktop's built-in HTTP/RabbitMQ) are not threats.
+        if _is_approved_wildcard(lst["process_name"]):
+            continue
+        # Empty name means the port scanner couldn't resolve the PID.
+        # Without an identity we can't assess risk — skip rather than false-alert.
+        if not lst["process_name"]:
             continue
         item_key = f"{port}:{lst['pid']}"
         if _should_suppress(agent_id, "high_risk_port", item_key,
@@ -877,6 +904,26 @@ def detect_duplicate_listener(agent_id: str, listeners: list[dict]) -> list[dict
             if pid not in seen_pids:
                 seen_pids[pid] = (proc_name, lst)
         if len(seen_pids) < 2:
+            continue
+
+        # If every process on this port is an approved service (or a browser
+        # helper IPC process), the "masquerading" interpretation doesn't apply.
+        # Also suppress when one of the entries has an empty process name and the
+        # other is an approved service — the empty name is a data-quality artifact
+        # from the port scanner failing to resolve the PID's process name (common
+        # for Docker Desktop's internal network namespace listeners).
+        all_approved = all(
+            not name or _is_approved_wildcard(name) or " helper" in name.lower()
+            for _, (name, _) in seen_pids.items()
+        )
+        any_approved = any(
+            _is_approved_wildcard(name)
+            for _, (name, _) in seen_pids.items()
+        )
+        # Suppress fully-approved sets OR sets where one process is approved and
+        # the other is unnamed (which is the same service seen twice under the OS).
+        has_unnamed = any(not name for _, (name, _) in seen_pids.items())
+        if all_approved or (any_approved and has_unnamed):
             continue
 
         pids = list(seen_pids.keys())

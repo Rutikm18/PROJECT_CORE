@@ -612,20 +612,23 @@ class BehavioralAnalyzer:
                       score: float, title: str, desc: str,
                       evidence: dict, source: str,
                       mitre: str = "", tags: list | None = None) -> dict:
+        _prec = {"critical": 0.70, "high": 0.62, "medium": 0.50,
+                 "low": 0.35, "info": 0.20}.get(severity.lower(), 0.50)
         return {
-            "category":      category,
-            "item_key":      item_key,
-            "severity":      severity,
-            "score":         score,
-            "title":         title,
-            "description":   desc,
-            "evidence":      evidence,
-            "source":        source,
+            "category":        category,
+            "item_key":        item_key,
+            "severity":        severity,
+            "score":           score,
+            "precision_score": _prec,
+            "title":           title,
+            "description":     desc,
+            "evidence":        evidence,
+            "source":          source,
             "mitre_technique": mitre,
-            "mitre_tactic":  "",
-            "cve_ids":       [],
-            "cvss_score":    None,
-            "tags":          tags or [source, category],
+            "mitre_tactic":    "",
+            "cve_ids":         [],
+            "cvss_score":      None,
+            "tags":            tags or [source, category],
         }
 
 

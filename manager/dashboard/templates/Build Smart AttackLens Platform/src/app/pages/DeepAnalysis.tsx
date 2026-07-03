@@ -7,11 +7,40 @@ import {
   Database, Search, RefreshCw, X, Clock, ChevronRight,
   ChevronDown, Cpu, Globe, Package, Activity, Users,
   Shield, HardDrive, Network, Terminal, FileText, Layers, Wifi,
-  Zap, Box, Server, BookOpen, Binary, List,
+  Zap, Box, Server, BookOpen, Binary, List, AlertTriangle,
+  Target, Radio, ExternalLink,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 const API = "/api/v1/raw";
+
+// ── Finding types for smart search ─────────────────────────────────────────────
+interface FindingResult {
+  id:                number;
+  external_id?:      string;
+  finding_uid?:      string;
+  terrain_id?:       string;
+  agent_id:          string;
+  category:          string;
+  severity:          string;
+  title:             string;
+  description?:      string;
+  composite_score?:  number;
+  kev:               boolean;
+  exploit_available: boolean;
+  mitre_technique?:  string;
+  mitre_tactic?:     string;
+  first_detected_at: number;
+  last_detected_at:  number;
+  precision_score?:  number;
+  confidence?:       number;
+  relevance:         number;
+  status:            string;
+  cve_ids?:          string[];
+  agent_os?:         string;
+  agent_hostname?:   string;
+  terrain?:          string;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface AgentInfo { agent_id: string; name: string; status: "online" | "stale" | "offline"; elapsed_s: number; }
@@ -442,6 +471,9 @@ export default function DeepAnalysis() {
   const [search,     setSearch]     = useState("");
   const [page,       setPage]       = useState(0);
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  // "all" = search across ALL telemetry sections (ignores selected section)
+  // "section" = scope search to the currently selected section only
+  const [searchScope, setSearchScope] = useState<"all" | "section">("all");
   const PAGE_SIZE = 100;
   const deb = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -453,15 +485,23 @@ export default function DeepAnalysis() {
 
   useEffect(() => { if (sections.length && !section) setSection(sections[0]); }, [sections.join(",")]);
 
+  // Build the raw telemetry query URL.
+  // When search is active, the section filter is dropped by default (all-sections
+  // search).  If the user toggles searchScope to "section", we scope the search
+  // to the current section only.
   const qUrl = useCallback(() => {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
-    if (section) p.set("section",  section);
+    // If we have a search query and scope is "all", drop the section filter
+    // so the backend searches across ALL telemetry sections.
+    if (section && !(search && searchScope === "all")) {
+      p.set("section",  section);
+    }
     p.set("window", window_);
     if (search) p.set("search", search);
     p.set("limit", String(PAGE_SIZE)); p.set("offset", String(page * PAGE_SIZE));
     return `${API}/query?${p}`;
-  }, [agentId, section, window_, search, page]);
+  }, [agentId, section, window_, search, searchScope, page]);
 
   const countUrl = useCallback((s: string) => {
     const p = new URLSearchParams();
@@ -470,12 +510,30 @@ export default function DeepAnalysis() {
     return `${API}/count?${p}`;
   }, [agentId, window_]);
 
+  // ── Smart Search (findings) ─────────────────────────────────────────────────
+  const smartSearchUrl = useCallback(() => {
+    if (!search || search.trim().length < 2) return null;
+    const p = new URLSearchParams();
+    p.set("q", search.trim());
+    if (agentId) p.set("agent_id", agentId);
+    p.set("limit", "25"); p.set("offset", "0");
+    return `/api/v1/soc/smart-search?${p}`;
+  }, [search, agentId]);
+
+  const { data: smartResult, loading: smartLoading, refetch: smartRefetch } = useFetch<{
+    findings: FindingResult[]; total: number;
+  }>(smartSearchUrl());
+
   const { data: result, loading, error, refetch } = useFetch<{ rows: PayloadRow[] }>(qUrl());
-  useEffect(() => { const t = setInterval(() => { refetch(); rfAgents(); }, 30_000); return () => clearInterval(t); }, [refetch, rfAgents]);
+  useEffect(() => { const t = setInterval(() => refetch(), 30_000); return () => clearInterval(t); }, [refetch]);
+  useEffect(() => { const t = setInterval(() => rfAgents(), 30_000); return () => clearInterval(t); }, [rfAgents]);
+  useEffect(() => { const t = setInterval(() => smartRefetch(), 30_000); return () => clearInterval(t); }, [smartRefetch]);
 
   const rows   = result?.rows ?? [];
   const online = agents?.filter(a => a.status === "online").length ?? 0;
   const total  = agents?.length ?? 0;
+  const smartFindings = smartResult?.findings ?? [];
+  const smartTotal    = smartResult?.total ?? 0;
   const curMeta = sm(section);
   const CurIcon = curMeta.icon;
 
@@ -530,10 +588,16 @@ export default function DeepAnalysis() {
           </div>
 
           {/* Search */}
-          <div className="relative flex-1 min-w-[160px] max-w-[240px]">
+          <div className="relative flex-1 min-w-[160px] max-w-[320px]">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400 pointer-events-none" />
-            <input type="text" placeholder="Search…" value={rawSearch}
-              onChange={e => { setRawSearch(e.target.value); if (deb.current) clearTimeout(deb.current); deb.current = setTimeout(() => { setSearch(e.target.value); setPage(0); }, 300); }}
+            <input type="text"
+              placeholder={searchScope === "all" ? "Search across ALL sections…" : `Search in ${section || "current section"}…`}
+              value={rawSearch}
+              onChange={e => {
+                setRawSearch(e.target.value);
+                if (deb.current) clearTimeout(deb.current);
+                deb.current = setTimeout(() => { setSearch(e.target.value); setPage(0); }, 300);
+              }}
               className="w-full pl-7 pr-7 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 placeholder-gray-300" />
             {rawSearch && (
               <button onClick={() => { setRawSearch(""); setSearch(""); setPage(0); }} className="absolute right-2 top-1/2 -translate-y-1/2">
@@ -542,7 +606,27 @@ export default function DeepAnalysis() {
             )}
           </div>
 
-          <button onClick={refetch} className="ml-auto p-1.5 hover:bg-gray-50 rounded-lg transition-colors">
+          {/* Search scope toggle: All sections / This section */}
+          {section && (
+            <div className="flex items-center bg-gray-100 rounded-lg p-0.5 flex-shrink-0">
+              <button
+                onClick={() => { setSearchScope("all"); setPage(0); }}
+                className={cn("px-2.5 py-1 text-[9px] font-bold rounded-md transition-all",
+                  searchScope === "all"
+                    ? "bg-white text-orange-600 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                )}>All Sections</button>
+              <button
+                onClick={() => { setSearchScope("section"); setPage(0); }}
+                className={cn("px-2.5 py-1 text-[9px] font-bold rounded-md transition-all",
+                  searchScope === "section"
+                    ? "bg-white text-orange-600 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                )}>This Section</button>
+            </div>
+          )}
+
+          <button onClick={refetch} className="p-1.5 hover:bg-gray-50 rounded-lg transition-colors">
             <RefreshCw className={cn("w-3.5 h-3.5 text-gray-400", loading && "animate-spin")} />
           </button>
         </div>
@@ -575,10 +659,12 @@ export default function DeepAnalysis() {
             {section ? (
               <div className="flex items-center gap-2">
                 <div className="w-2 h-2 rounded-full" style={{ background: curMeta.dot }} />
-                <CurIcon className="w-3.5 h-3.5 text-gray-500" />
-                <span className="text-[12px] font-bold text-gray-800">{curMeta.label}</span>
+                <CurIcon className="w-3.5 h-3.5" style={{ color: curMeta.dot }} />
+                <span className="text-[12px] font-bold text-gray-800">
+                  {search && searchScope === "all" ? "All Sections" : curMeta.label}
+                </span>
                 <span className="text-[10px] text-gray-400 font-mono">
-                  {rows.length}{rows.length === PAGE_SIZE ? "+" : ""} rows · {window_}
+                  {rows.length}{rows.length === PAGE_SIZE ? "+" : ""} rows{search ? ` matching "${search}"` : ""} · {window_}
                 </span>
               </div>
             ) : (
@@ -589,8 +675,100 @@ export default function DeepAnalysis() {
 
           {/* Rows */}
           <div className="flex-1 overflow-y-auto">
+            {search && smartFindings.length > 0 && (
+              <div className="border-b border-orange-200 bg-orange-50/30">
+                <button
+                  onClick={() => setShowSmartSearch(s => !s)}
+                  className="w-full flex items-center justify-between px-4 py-2 hover:bg-orange-50/50 transition-colors"
+                >
+                  <div className="flex items-center gap-2">
+                    <Target className="w-3.5 h-3.5 text-orange-500" />
+                    <span className="text-[11px] font-bold text-orange-700">
+                      Findings matching "{search}"
+                    </span>
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-orange-200 text-orange-800 tabular-nums">
+                      {smartTotal}
+                    </span>
+                  </div>
+                  {showSmartSearch ? <ChevronDown className="w-3 h-3 text-orange-400" /> : <ChevronRight className="w-3 h-3 text-orange-400" />}
+                </button>
+                {showSmartSearch && (
+                  <div className="divide-y divide-orange-100/60">
+                    {smartFindings.map(f => (
+                      <div key={f.finding_uid ?? f.id} className="px-4 py-2.5 hover:bg-orange-50/50 transition-colors">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                              <span className={cn("px-1.5 py-0.5 rounded text-[9px] font-bold",
+                                f.severity === "critical" ? "bg-red-100 text-red-700" :
+                                f.severity === "high" ? "bg-amber-100 text-amber-700" :
+                                "bg-blue-100 text-blue-700"
+                              )}>{f.severity}</span>
+                              {f.kev && <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-red-50 text-red-600 border border-red-200">KEV</span>}
+                              {f.exploit_available && <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-50 text-purple-600">Exploit</span>}
+                              {f.terrain && (
+                                <span className={cn("px-1.5 py-0.5 rounded text-[9px] font-bold",
+                                  f.terrain === "citadels" ? "bg-red-50 text-red-600" :
+                                  f.terrain === "vector" ? "bg-orange-50 text-orange-600" :
+                                  f.terrain === "origin" ? "bg-yellow-50 text-yellow-700" :
+                                  f.terrain === "identity" ? "bg-blue-50 text-blue-600" :
+                                  "bg-purple-50 text-purple-600"
+                                )}>{f.terrain}</span>
+                              )}
+                              <span className="text-[9px] font-mono text-gray-400">{f.external_id ?? `#${f.id}`}</span>
+                            </div>
+                            <div className="text-[11px] font-semibold text-gray-800 leading-tight mb-0.5">{f.title}</div>
+                            <div className="text-[10px] text-gray-500 line-clamp-2">{f.description ?? ""}</div>
+                            <div className="flex items-center gap-3 mt-1.5 text-[9px] text-gray-400">
+                              <span className="font-mono">{f.agent_id}</span>
+                              {f.agent_hostname && <span>{f.agent_hostname}</span>}
+                              {f.mitre_technique && <span className="flex items-center gap-1"><Target className="w-2.5 h-2.5" />{f.mitre_technique}</span>}
+                              <span className="font-semibold">relevance: {(f.relevance * 100).toFixed(0)}%</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3 flex-shrink-0">
+                            <div className="text-right">
+                              <div className="text-[10px] font-black tabular-nums text-gray-600">{(f.composite_score ?? f.relevance * 10).toFixed(1)}</div>
+                              <div className="text-[8px] text-gray-400">score</div>
+                            </div>
+                            <a
+                              href={`/api/v1/soc/findings/${f.id}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="p-1 hover:bg-orange-100 rounded transition-colors"
+                              onClick={e => e.stopPropagation()}
+                            >
+                              <ExternalLink className="w-3 h-3 text-gray-400 hover:text-orange-500" />
+                            </a>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {search && smartFindings.length === 0 && !smartLoading && (
+              <div className="px-4 py-2 border-b border-gray-100 bg-gray-50/50">
+                <div className="flex items-center gap-2 text-[10px] text-gray-500">
+                  <Search className="w-3 h-3" />
+                  No findings match "{search}" — showing raw telemetry results below
+                </div>
+              </div>
+            )}
+
+            {search && smartLoading && (
+              <div className="px-4 py-2 border-b border-gray-100 bg-gray-50/50">
+                <div className="flex items-center gap-2 text-[10px] text-gray-400">
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                  Searching findings…
+                </div>
+              </div>
+            )}
+
             {loading && rows.length === 0 ? <Skeleton /> :
-             rows.length === 0 ? (
+             rows.length === 0 && !search ? (
               <div className="flex flex-col items-center justify-center h-full gap-2 text-gray-300">
                 <Database className="w-10 h-10 opacity-30" />
                 <p className="text-[11px] text-gray-400">No records — try a wider time window</p>

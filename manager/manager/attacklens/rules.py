@@ -205,31 +205,35 @@ PROCESS_RULES: list[dict] = [
 _PARENT_CHILD_RAW: list[dict] = [
     {
         "parent_pattern": r"(?i)(microsoft\s+word|word|pages\.app|libreoffice|soffice)",
-        "child_pattern":  r"(?i)(bash|sh|zsh|python|perl|ruby|osascript|curl|wget)",
+        # \b word boundaries prevent "sh" matching inside "crash-reporter", "Shared", etc.
+        "child_pattern":  r"(?i)\b(bash|sh|zsh|python|perl|ruby|osascript|curl|wget)\b",
         "severity": "critical", "confidence": 0.96,
         "desc": "Office document spawning shell/interpreter (macro exploit)", "mitre": "T1566.001",
     },
     {
-        "parent_pattern": r"(?i)(safari|chrome|firefox|brave|opera|chromium|edge)",
-        "child_pattern":  r"(?i)(bash|sh|zsh|python3?|perl|ruby|osascript)",
+        "parent_pattern": r"(?i)(safari|chrome|firefox|brave|opera|chromium|edge|zen)",
+        # Must match the child PROCESS NAME, not substrings in its cmdline flags.
+        # \b prevents "sh" from matching inside "--enable-crash-reporter" or
+        # feature names like "SharedArrayBuffer" that appear in Chromium's argv.
+        "child_pattern":  r"(?i)\b(bash|sh|zsh|python3?|perl|ruby|osascript)\b",
         "severity": "critical", "confidence": 0.95,
         "desc": "Browser spawning shell (drive-by exploit)", "mitre": "T1189",
     },
     {
         "parent_pattern": r"(?i)(microsoft\s+excel|excel|numbers\.app)",
-        "child_pattern":  r"(?i)(bash|sh|zsh|python|perl|curl|wget|nc|ncat)",
+        "child_pattern":  r"(?i)\b(bash|sh|zsh|python|perl|curl|wget|nc|ncat)\b",
         "severity": "critical", "confidence": 0.96,
         "desc": "Spreadsheet spawning shell/downloader (macro exploit)", "mitre": "T1566.001",
     },
     {
         "parent_pattern": r"(?i)(mail\.app|thunderbird|outlook|evolution)",
-        "child_pattern":  r"(?i)(bash|sh|zsh|python3?|curl|wget|open\s+-a)",
+        "child_pattern":  r"(?i)\b(bash|sh|zsh|python3?|curl|wget)\b",
         "severity": "critical", "confidence": 0.94,
         "desc": "Email client spawning shell (phishing exploit)", "mitre": "T1566.002",
     },
     {
         "parent_pattern": r"(?i)(preview|adobe\s+acrobat|pdf\s*viewer|evince)",
-        "child_pattern":  r"(?i)(bash|sh|zsh|python3?|osascript|curl)",
+        "child_pattern":  r"(?i)\b(bash|sh|zsh|python3?|osascript|curl)\b",
         "severity": "critical", "confidence": 0.95,
         "desc": "PDF viewer spawning shell (malicious PDF exploit)", "mitre": "T1566.001",
     },
@@ -349,7 +353,7 @@ RISKY_PACKAGES: dict[str, dict] = {
 SUSPICIOUS_SERVICE_PATTERNS: list[dict] = [
     {"pattern": re.compile(r"(?i)com\.(update|sync|helper|agent)\d{6,}"),
      "severity": "medium", "desc": "LaunchDaemon with numeric suffix (common malware pattern)"},
-    {"pattern": re.compile(r"(?i)(miner|crypto|xmr|monero)"),
+    {"pattern": re.compile(r"(?i)\b(xmrig|xmr-?stak|cpuminer|minerd|xmr|monero|cryptonight)\b|(?<!\w)miner(?!\w)"),
      "severity": "critical","desc": "Cryptominer service label"},
     {"pattern": re.compile(r"(?i)/tmp/|/dev/shm/"),
      "severity": "critical","desc": "Service binary in memory-mapped or temp path"},

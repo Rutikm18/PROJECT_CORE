@@ -143,6 +143,15 @@ class TelemetryWorker:
             hostname=hostname,
         )
 
+        # 1b. Ledger the payload as received-pending-detection. The reconciler
+        # replays any row that never gets marked processed (lost hand-off). Best-
+        # effort: a ledger hiccup must not block storage or fail the message —
+        # worst case the reconciler simply doesn't know about this payload.
+        try:
+            await self._db.ledger_received(agent_id, section, collected)
+        except Exception as exc:
+            log.debug("ledger_received failed agent=%s section=%s: %s", agent_id, section, exc)
+
         # 2. SQLite payload summary (section timestamps for dashboard) — best-effort
         try:
             await self._db.insert_payload(agent_id, section, int(collected), data)

@@ -151,6 +151,14 @@ class TelemetryConsumer:
             log.error("store.write failed agent=%s section=%s: %s", agent_id, section, exc)
             raise
 
+        # 1b. Ledger the payload as received-pending-detection (same as
+        # TelemetryWorker) so the reconciler/outbox sees a consistent record no
+        # matter which of the two competing agent.telemetry consumers handled it.
+        try:
+            await self._db.ledger_received(agent_id, section, collected)
+        except Exception as exc:
+            log.debug("ledger_received failed agent=%s section=%s: %s", agent_id, section, exc)
+
         # 2. SQLite payload summary — best-effort, not all builds expose this
         insert = (
             getattr(self._db, "insert_telemetry", None)

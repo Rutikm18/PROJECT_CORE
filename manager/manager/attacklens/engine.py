@@ -101,12 +101,17 @@ _RECONCILE_SECTIONS: dict[str, tuple[str, ...]] = {
     "processes":   ("process",),
     "connections": ("connection",),
     "users":       ("user",),
+    "tasks":       ("task",),
+    "network":     ("network",),
+    "containers":  ("container",),
     # Origin — supply-chain / config inventories (clears removed packages,
-    # uninstalled apps, fixed sysctl, dropped SBOM components)
+    # uninstalled apps, fixed sysctl, dropped SBOM components, removed configs/binaries)
     "packages":    ("package",),
     "apps":        ("app",),
     "sbom":        ("sbom",),
     "sysctl":      ("sysctl",),
+    "configs":     ("config",),
+    "binaries":    ("binary",),
 }
 
 
@@ -139,6 +144,7 @@ _SECTION_CATEGORY: dict[str, str] = {
     "services": "service", "apps": "app", "packages": "package",
     "network": "network", "users": "user", "tasks": "task",
     "security": "security", "configs": "config", "binaries": "binary",
+    "metrics": "behavioral",
     "sysctl": "sysctl", "sbom": "sbom", "arp": "arp", "containers": "container",
 }
 
@@ -166,6 +172,11 @@ def _derive_item_key(rule_id: str, evidence: dict) -> str:
     return f"{rule_id}:{digest}"
 
 
+_SEV_PRECISION: dict[str, float] = {
+    "critical": 0.70, "high": 0.62, "medium": 0.50, "low": 0.35, "info": 0.20,
+}
+
+
 def _adapt_module_finding(f: dict, section: str) -> dict:
     """Map a detections/ module's alert dict → the engine finding format that
     upsert_finding / _dispatch_to_signals require (category, item_key, source,
@@ -179,6 +190,19 @@ def _adapt_module_finding(f: dict, section: str) -> dict:
     if "score" not in f:
         f["score"] = severity_to_score(f.get("severity", "info"))
     f["evidence"] = ev
+    # Seed a deterministic precision_score from the rule's own confidence so
+    # module findings are not permanently stuck at 0.0.  The AI validation
+    # pipeline overwrites this with a higher-fidelity value when it runs; for
+    # the common case (AI off, or finding not yet correlated) this gives the
+    # Validated Findings page a meaningful score floor to filter on.
+    if not f.get("precision_score"):
+        conf = f.get("confidence")
+        if conf is not None:
+            f["precision_score"] = round(float(conf), 3)
+        else:
+            f["precision_score"] = _SEV_PRECISION.get(
+                (f.get("severity") or "medium").lower(), 0.50
+            )
     return f
 
 
@@ -237,6 +261,10 @@ class AttackLensEngine:
         # → correlate-on-every-event latency, with bounded (1 per agent) work.
         self._correlate_inflight: set[str] = set()
         self._correlate_dirty:    set[str] = set()
+        # Per-agent metrics state — tracks consecutive high-resource readings so
+        # transient spikes (single payload) don't fire; sustained anomalies do.
+        # Structure: agent_id → {"cpu_high": int, "mem_high": int, "net_high": int}
+        self._metrics_state: dict[str, dict] = {}
 
         # Bounded detection executor (see module constants). The queue is created
         # lazily in start() on the running loop; workers drain it concurrently up
@@ -246,6 +274,30 @@ class AttackLensEngine:
         self._detect_stats = {
             "enqueued": 0, "processed": 0, "dropped_queue_full": 0, "errors": 0,
         }
+        # Auto-resolve stale period cache — read from org_settings on first use
+        # per cycle, refreshed each process() call (every ~payload; cheap warm read).
+        self._auto_resolve_sec_cache: float = 0.0
+        self._auto_resolve_sec_ts:    float = 0.0
+
+    async def _auto_resolve_stale_sec(self) -> float:
+        """Read the live Settings → Data Retention → auto_resolve_stale_days value
+        from org_settings with a 60 s in-process cache. Falls back to the env var
+        default (2 days) if unreadable — auto-resolve must never crash a payload."""
+        now = time.time()
+        if self._auto_resolve_sec_cache and (now - self._auto_resolve_sec_ts) < 60:
+            return self._auto_resolve_sec_cache
+        try:
+            row = await self._idb._fetchone(
+                "SELECT value FROM org_settings WHERE key='auto_resolve_stale_days'", ()
+            )
+            days = int(row["value"]) if row else 2
+            self._auto_resolve_sec_cache = float(max(1, min(14, days))) * 86400.0
+        except Exception:
+            self._auto_resolve_sec_cache = float(
+                ENGINE_CONFIG.get("auto_resolve_stale_sec", 2 * 86400)
+            )
+        self._auto_resolve_sec_ts = now
+        return self._auto_resolve_sec_cache
 
     def attach_ai_analyst(self, ai_analyst) -> None:
         """Late binding for the AI analyst (server constructs both lazily)."""
@@ -462,7 +514,9 @@ class AttackLensEngine:
                     # Stale cutoff must exceed the longest alert-dedup window, or
                     # a still-present-but-dedup'd finding (last_detected_at not
                     # refreshed during its dedup window) would be wrongly resolved.
-                    stale_sec = float(ENGINE_CONFIG.get("auto_resolve_stale_sec", 7 * 86400))
+                    # Reads the live Settings → Data Retention value (org_settings)
+                    # with a short cache, falling back to the env var default.
+                    stale_sec = await self._auto_resolve_stale_sec()
                     try:
                         n = await self._idb.auto_resolve_absent(
                             agent_id, list(recon_cats), t0 - stale_sec, "evidence_stale",
@@ -477,6 +531,19 @@ class AttackLensEngine:
 
             if not skip_correlation:
                 self._request_correlation(agent_id)
+
+            # Mark the payload's detection complete in the ledger (the reconciler
+            # replays anything that never reaches this point). Keyed on the same
+            # (agent, section, collected_at) the telemetry worker recorded as
+            # 'received'. Best-effort: a ledger write must never fail detection.
+            try:
+                if self._db is not None:
+                    await self._db.ledger_processed(
+                        agent_id, section, prov_ts, signal_count=len(signals),
+                    )
+            except Exception as exc:
+                log.debug("ledger_processed failed agent=%s section=%s: %s",
+                          agent_id, section, exc)
         except Exception as exc:
             log.warning("AttackLens.process error agent=%s section=%s: %s",
                         agent_id, section, exc)
@@ -1190,12 +1257,165 @@ class AttackLensEngine:
             "security":    self._security,
             "configs":     self._configs,
             "binaries":    self._binaries,
+            "metrics":     self._metrics,
         }.get(section)
         if fn is None:
             return []
         return await fn(agent_id, data)
 
     # ── Section analyzers ─────────────────────────────────────────────────────
+
+    # ── Resource-anomaly detection (metrics section) ──────────────────────────
+
+    # Thresholds — conservative to avoid alerting on temporary spikes.
+    _CPU_HIGH_PCT   = 90.0   # % total CPU
+    _MEM_HIGH_PCT   = 92.0   # % RAM used
+    _NET_HIGH_MB_S  = 50.0   # MB/s outbound (exfil signal)
+    _DISK_HIGH_MB_S = 150.0  # MB/s write (ransomware encryption signal)
+    _LOAD_RATIO     = 2.0    # load_1m / logical_cores — system under sustained load
+    _CONSEC_NEEDED  = 2      # consecutive high readings before alerting
+
+    async def _metrics(self, agent_id: str, data) -> list[dict]:
+        """Detect resource anomalies that signal cryptomining, ransomware, or exfil.
+
+        Requires _CONSEC_NEEDED consecutive high readings to fire — avoids
+        alerting on transient spikes (JIT compilation, Time Machine backup, etc.).
+        Auto-resolves when readings return to normal via the standard mechanism
+        (findings are NOT re-upserted once the anomaly clears).
+        """
+        findings = []
+        # The metrics section is a single dict per collection cycle.
+        m: dict = data if isinstance(data, dict) else (data[0] if data else {})
+        if not isinstance(m, dict):
+            return findings
+
+        cpu_pct    = float(m.get("cpu_percent") or 0.0)
+        mem_pct    = float(m.get("mem_percent") or 0.0)
+        net_out    = float(m.get("net_sent_mb_s") or 0.0)
+        disk_write = float(m.get("disk_write_mb_s") or 0.0)
+        load_1m    = float(m.get("load_1m") or 0.0)
+        cores      = int(m.get("cpu_cores") or 1) or 1
+
+        state = self._metrics_state.setdefault(agent_id, {
+            "cpu_high": 0, "mem_high": 0, "net_high": 0, "disk_high": 0,
+        })
+
+        # ── CPU spike ────────────────────────────────────────────────────────
+        load_ratio = load_1m / cores
+        cpu_anomaly = cpu_pct >= self._CPU_HIGH_PCT or load_ratio >= self._LOAD_RATIO
+        if cpu_anomaly:
+            state["cpu_high"] += 1
+        else:
+            state["cpu_high"] = 0
+
+        if state["cpu_high"] >= self._CONSEC_NEEDED:
+            findings.append(self._finding(
+                category="behavioral",
+                item_key=f"metrics:cpu_spike:{agent_id}",
+                severity="high",
+                score=7.5,
+                title="Sustained CPU spike — possible cryptominer",
+                desc=(
+                    f"System CPU has been at {cpu_pct:.1f}% for "
+                    f"{state['cpu_high']} consecutive readings "
+                    f"(load average: {load_1m:.2f} / {cores} cores = {load_ratio:.1f}x). "
+                    "Sustained high CPU on a desktop endpoint is a strong indicator "
+                    "of cryptocurrency mining (T1496) or a runaway malicious process."
+                ),
+                evidence=m,
+                source="rule:metrics_cpu_spike",
+                mitre="T1496",
+                tags=["metrics", "cryptominer", "resource_abuse"],
+                confidence=0.75,
+                weight=0.80,
+            ))
+
+        # ── Memory exhaustion ────────────────────────────────────────────────
+        if mem_pct >= self._MEM_HIGH_PCT:
+            state["mem_high"] += 1
+        else:
+            state["mem_high"] = 0
+
+        if state["mem_high"] >= self._CONSEC_NEEDED:
+            mem_used  = m.get("mem_used_mb", 0)
+            mem_total = m.get("mem_total_mb", 0)
+            findings.append(self._finding(
+                category="behavioral",
+                item_key=f"metrics:mem_pressure:{agent_id}",
+                severity="medium",
+                score=5.5,
+                title=f"Sustained memory pressure ({mem_pct:.1f}% used)",
+                desc=(
+                    f"RAM usage has been at {mem_pct:.1f}% "
+                    f"({mem_used} MB / {mem_total} MB) for "
+                    f"{state['mem_high']} consecutive readings. "
+                    "Excessive memory pressure can indicate process injection, "
+                    "memory-resident malware, or a DoS condition (T1499)."
+                ),
+                evidence=m,
+                source="rule:metrics_mem_pressure",
+                mitre="T1499",
+                tags=["metrics", "memory", "resource_abuse"],
+                confidence=0.60,
+                weight=0.65,
+            ))
+
+        # ── High outbound network (exfiltration signal) ───────────────────
+        if net_out >= self._NET_HIGH_MB_S:
+            state["net_high"] += 1
+        else:
+            state["net_high"] = 0
+
+        if state["net_high"] >= self._CONSEC_NEEDED:
+            findings.append(self._finding(
+                category="behavioral",
+                item_key=f"metrics:net_exfil:{agent_id}",
+                severity="high",
+                score=7.0,
+                title=f"High outbound network ({net_out:.1f} MB/s) — possible exfiltration",
+                desc=(
+                    f"Outbound network throughput has been {net_out:.1f} MB/s for "
+                    f"{state['net_high']} consecutive readings. "
+                    "Sustained high egress from an endpoint is a key indicator of "
+                    "data exfiltration (T1048). Correlate with connection and process data."
+                ),
+                evidence=m,
+                source="rule:metrics_net_exfil",
+                mitre="T1048",
+                tags=["metrics", "exfiltration", "network"],
+                confidence=0.70,
+                weight=0.75,
+            ))
+
+        # ── High disk write (ransomware encryption signal) ───────────────
+        if disk_write >= self._DISK_HIGH_MB_S:
+            state["disk_high"] += 1
+        else:
+            state["disk_high"] = 0
+
+        if state["disk_high"] >= self._CONSEC_NEEDED:
+            findings.append(self._finding(
+                category="behavioral",
+                item_key=f"metrics:disk_ransomware:{agent_id}",
+                severity="critical",
+                score=9.0,
+                title=f"High sustained disk write ({disk_write:.1f} MB/s) — possible ransomware",
+                desc=(
+                    f"Disk write throughput has been {disk_write:.1f} MB/s for "
+                    f"{state['disk_high']} consecutive readings — well above the "
+                    "threshold for normal user workloads. Sustained bulk writes at "
+                    "this rate on an endpoint are a hallmark of ransomware encrypting "
+                    "files in place (T1486). Isolate immediately and investigate."
+                ),
+                evidence=m,
+                source="rule:metrics_disk_ransomware",
+                mitre="T1486",
+                tags=["metrics", "ransomware", "disk"],
+                confidence=0.78,
+                weight=0.85,
+            ))
+
+        return findings
 
     async def _ports(self, agent_id: str, data: list) -> list[dict]:
         findings = []
@@ -1281,6 +1501,13 @@ class AttackLensEngine:
             ppid    = item.get("ppid") or item.get("parent_pid")
             full    = f"{exe} {cmd}".strip()
 
+            # Derive exe from cmdline first token when the field is absent.
+            # Some agents (macOS ps-based collector) omit exe but embed the full
+            # path as argv[0] in cmdline — without this, /System/Library/ and
+            # /usr/libexec/ processes pass is_apple_system_process unchecked.
+            if not exe and cmd:
+                exe = cmd.split()[0]
+
             # Skip Apple system processes entirely
             if is_apple_system_process(name, exe):
                 continue
@@ -1344,25 +1571,35 @@ class AttackLensEngine:
                         findings.append(f)
                     break
 
-            # Obfuscation pattern check against cmdline
-            for orule in OBFUSCATION_RULES:
-                if orule["compiled"].search(cmd):
-                    f = self._finding(
-                        category="process",
-                        item_key=f"obfusc:{name}:{_fp(cmd)}",
-                        severity=orule["severity"],
-                        score=severity_to_score(orule["severity"]) * orule.get("confidence", 0.8),
-                        title=f"Obfuscated command in process: {name}",
-                        desc=f"{orule['desc']} — PID {pid}: {cmd[:150]}",
-                        evidence=item, source="rule:obfuscation",
-                        mitre=orule["mitre"], tags=["process", "obfuscation"],
-                        confidence=orule.get("confidence"),
-                        # OBFUSCATION_RULES has no weight field — obfuscated/encoded
-                        # execution is itself the diagnostic signal, default high.
-                        weight=0.85,
-                    )
-                    findings.append(f)
-                    break
+            # Obfuscation pattern check against cmdline.
+            # Electron/Chromium helpers embed --field-trial-handle=1,i,<base64>
+            # which matches the generic long-base64 pattern — skip them.
+            # Double-check system processes too (belt-and-suspenders: the
+            # is_apple_system_process guard at the loop top may have been
+            # bypassed if exe was empty before the derivation above).
+            _obf_skip = (
+                (" helper" in name.lower() and exe.startswith("/Applications/"))
+                or is_apple_system_process(name, exe)
+            )
+            if not _obf_skip:
+                for orule in OBFUSCATION_RULES:
+                    if orule["compiled"].search(cmd):
+                        f = self._finding(
+                            category="process",
+                            item_key=f"obfusc:{name}:{_fp(cmd)}",
+                            severity=orule["severity"],
+                            score=severity_to_score(orule["severity"]) * orule.get("confidence", 0.8),
+                            title=f"Obfuscated command in process: {name}",
+                            desc=f"{orule['desc']} — PID {pid}: {cmd[:150]}",
+                            evidence=item, source="rule:obfuscation",
+                            mitre=orule["mitre"], tags=["process", "obfuscation"],
+                            confidence=orule.get("confidence"),
+                            # OBFUSCATION_RULES has no weight field — obfuscated/encoded
+                            # execution is itself the diagnostic signal, default high.
+                            weight=0.85,
+                        )
+                        findings.append(f)
+                        break
 
             # SUID / SGID check
             if item.get("suid") or item.get("is_suid"):
@@ -1427,6 +1664,11 @@ class AttackLensEngine:
                 continue
             label = str(item.get("label", "") or item.get("name", "") or "")
             prog  = str(item.get("program", "") or item.get("path", "") or "")
+            # Apple first-party LaunchDaemons/Agents use reverse-DNS com.apple. prefixes.
+            # They are always legitimate; pattern-matching their names generates FPs
+            # like com.apple.CryptoTokenKit matching "crypto".
+            if label.lower().startswith("com.apple.") or prog.startswith("/System/Library/"):
+                continue
             for rule in SUSPICIOUS_SERVICE_PATTERNS:
                 if rule["pattern"].search(label) or (prog and rule["pattern"].search(prog)):
                     findings.append(self._finding(
@@ -1454,6 +1696,13 @@ class AttackLensEngine:
             notarized = item.get("notarized", True)
             quarantine = item.get("quarantined", False)
             path   = str(item.get("path", "") or "")
+
+            # Apple system apps (/System/Applications/, /System/Library/CoreServices/)
+            # are signed directly by Apple and are not subject to the third-party
+            # notarization requirement. Flagging them as "non-notarized" is always
+            # a false positive — skip all signing/notarization checks for them.
+            if path and any(path.startswith(p) for p in APPLE_SYSTEM_PATH_PREFIXES):
+                continue
 
             if not signed:
                 findings.append(self._finding(

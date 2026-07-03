@@ -1141,12 +1141,13 @@ function ValidationSettingsPanel() {
 const RETENTION_API = "/api/v1/settings";
 
 interface RetentionConfig {
-  period_months:       number;
-  period_days:         number;
-  action:              "delete" | "archive";
-  slow_fetch_warning:  boolean;
-  available_periods:   number[];
-  available_actions:   string[];
+  period_months:           number;
+  period_days:             number;
+  action:                  "delete" | "archive";
+  slow_fetch_warning:      boolean;
+  auto_resolve_stale_days: number;
+  available_periods:       number[];
+  available_actions:       string[];
 }
 interface RetentionStats {
   live_payloads: { row_count: number; approx_bytes: number } | null;
@@ -1155,7 +1156,7 @@ interface RetentionStats {
 }
 
 const RETENTION_PERIOD_LABELS: Record<number, string> = {
-  1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year", 24: "2 years",
+  0: "7 days", 1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year", 24: "2 years",
 };
 
 function formatBytes(n: number | null | undefined): string {
@@ -1189,16 +1190,20 @@ function RetentionSettingsPanel() {
 
   useEffect(() => { load(); }, [load]);
 
-  const save = async (periodMonths: number, action: "delete" | "archive") => {
+  const save = async (periodMonths: number, action: "delete" | "archive", autoResolveDays?: number) => {
     setSaving(true); setSaved(false);
     try {
+      const body: Record<string, string> = {
+        retention_period_months: String(periodMonths),
+        retention_action: action,
+      };
+      if (autoResolveDays !== undefined) {
+        body.auto_resolve_stale_days = String(autoResolveDays);
+      }
       const r = await fetch(RETENTION_API, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          retention_period_months: String(periodMonths),
-          retention_action: action,
-        }),
+        body: JSON.stringify(body),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       await load();
@@ -1225,10 +1230,10 @@ function RetentionSettingsPanel() {
         <SectionLabel icon={Clock}>Retention Period</SectionLabel>
         <p className="text-[10px] text-[--gray-500] leading-relaxed">
           How long raw telemetry stays in the live, queryable store before the action below applies.
-          Default is 1 month.
+          Default is 1 month. 7 days keeps the smallest, freshest dataset.
         </p>
 
-        <Field label="Keep data for" hint="default: 1 month">
+        <Field label="Keep data for" hint="default: 1 month (30 days)">
           <select
             value={config.period_months}
             onChange={e => save(Number(e.target.value), config.action)}
@@ -1318,6 +1323,31 @@ function RetentionSettingsPanel() {
             </div>
           </button>
         </div>
+      </div>
+
+      {/* ── Auto-Resolve stale findings ──────────────────────────────────── */}
+      <div className="col-span-2 bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
+        <SectionLabel icon={CheckCircle2}>Auto-Resolve Stale Findings</SectionLabel>
+        <p className="text-[10px] text-[--gray-500] leading-relaxed">
+          When an agent's next scan no longer contains previously-seen evidence
+          (e.g. port 3389 was open but is now closed, a package was removed, a
+          process exited), the finding is automatically marked <strong>auto_resolved</strong> with
+          a timestamp after this many days. Covers ports, processes, connections,
+          services, users, tasks, packages, apps, containers, configs, binaries,
+          SBOM, sysctl, and network connections.
+        </p>
+        <Field label="Auto-resolve after" hint="default: 2 days (48h)">
+          <select
+            value={config.auto_resolve_stale_days}
+            onChange={e => save(config.period_months, config.action, Number(e.target.value))}
+            disabled={saving}
+            className={selectCls}
+          >
+            {[1, 2, 5, 7, 14].map(d => (
+              <option key={d} value={d}>{d === 1 ? "1 day" : `${d} days`}{d === 2 ? " (default)" : ""}</option>
+            ))}
+          </select>
+        </Field>
       </div>
 
       {/* ── Live data size ───────────────────────────────────────────────── */}

@@ -41,6 +41,7 @@ APPLE_SYSTEM_PROCS: frozenset[str] = frozenset({
 APPLE_SYSTEM_PATH_PREFIXES: tuple[str, ...] = (
     "/System/Library/",
     "/System/Applications/",
+    "/System/Cryptexes/",          # Cryptex-sealed system extensions (e.g. AuthenticationServicesAgent)
     "/usr/libexec/",
     "/usr/sbin/",
     "/usr/bin/",
@@ -96,6 +97,23 @@ BENIGN_PARENT_CHILD: dict[str, frozenset] = {
     "npm":           frozenset({"node", "bash", "sh", "python3"}),
     "pip3":          frozenset({"python3", "python", "bash"}),
     "cargo":         frozenset({"rustc", "gcc", "clang", "bash"}),
+    # Chromium / Electron apps spawn "<App> Helper (Renderer|GPU|Plugin)" — these
+    # are sandboxed IPC children, not shells. The PARENT_CHILD_RULES child regex
+    # now uses \b word boundaries, but listing them here as a belt-and-suspenders
+    # guard so they're suppressed even if a future rule is added without \b.
+    "Google Chrome":            frozenset({"google chrome helper", "google chrome helper (renderer)",
+                                           "google chrome helper (gpu)", "google chrome helper (plugin)",
+                                           "google chrome helper (alerts)"}),
+    "Chrome":                   frozenset({"chrome helper", "chrome helper (renderer)",
+                                           "chrome helper (gpu)", "chrome helper (plugin)"}),
+    "Chromium":                 frozenset({"chromium helper", "chromium helper (renderer)"}),
+    "Brave Browser":            frozenset({"brave browser helper", "brave browser helper (renderer)",
+                                           "brave browser helper (gpu)"}),
+    "Microsoft Edge":           frozenset({"microsoft edge helper", "microsoft edge helper (renderer)",
+                                           "microsoft edge helper (gpu)"}),
+    "Safari":                   frozenset({"com.apple.webkit.webcontent", "com.apple.webkit.networking",
+                                           "com.apple.webkit.gpu", "safari web content"}),
+    "Zen":                      frozenset({"zen helper", "zen helper (renderer)", "zen helper (gpu)"}),
 }
 
 # ── Suspicious parent processes (should NOT spawn shells/interpreters) ─────────
@@ -203,10 +221,22 @@ def get_dual_use_info(name: str, cmd: str = "") -> Optional[dict]:
 def has_benign_parent(parent_name: str, child_name: str) -> bool:
     """Return True if child spawned from this parent is an expected pattern."""
     parent_lower = parent_name.lower()
-    child_lower = child_name.lower()
+    child_lower  = child_name.lower()
     for parent, children in BENIGN_PARENT_CHILD.items():
         if parent.lower() in parent_lower:
+            # Exact match first (fast path, works for browser helper full names).
+            if child_lower in children:
+                return True
+            # Substring match for short canonical names like "bash", "node".
             return any(c in child_lower for c in children)
+    # Browser helper heuristic: if the child name contains the parent's name
+    # and " helper" it is a sandboxed IPC subprocess, not an exploit.
+    if " helper" in child_lower and any(
+        frag in child_lower
+        for frag in (parent_lower.split()[0],)  # first word of parent, e.g. "google"
+        if len(frag) > 3
+    ):
+        return True
     return False
 
 

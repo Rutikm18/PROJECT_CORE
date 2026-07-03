@@ -24,9 +24,11 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Any, Optional
 
 from .pg_pool import PgPool
+from . import finding_lifecycle as _lc
 
 log = logging.getLogger("manager.indexer")
 
@@ -36,6 +38,17 @@ log = logging.getLogger("manager.indexer")
 FLEET_AGENT_ID = "__fleet__"
 
 _SCHEMA = """
+-- ── Attack Terrain lookup table ──────────────────────────────────────────
+-- Defines the 5 canonical attack terrains. Used as a FK target for findings
+-- so every finding is classified into one terrain at creation time.
+CREATE TABLE IF NOT EXISTS terrains (
+    id          TEXT PRIMARY KEY,               -- 'citadels' | 'vector' | 'origin' | 'identity' | 'posture'
+    label       TEXT NOT NULL,                  -- Human-readable title
+    description TEXT NOT NULL DEFAULT '',
+    color       TEXT NOT NULL DEFAULT '',       -- UI hint for dashboard chips
+    created_at  DOUBLE PRECISION NOT NULL
+);
+
 -- ── Findings ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS findings (
     id                BIGSERIAL PRIMARY KEY,
@@ -95,6 +108,16 @@ CREATE TABLE IF NOT EXISTS findings (
     ai_validation_used INTEGER NOT NULL DEFAULT 0,
     -- Terrain-aware validation (per-criterion checklist)
     terrain_validation TEXT   NOT NULL DEFAULT '{}',
+    -- Unique Finding ID (UUIDv4 hex) — globally unique, non-sequential,
+    -- reference-safe across systems, audit logs, and external integrations.
+    finding_uid       TEXT    NOT NULL DEFAULT '',
+    -- Attack Terrain FK — canonical terrain classification at creation time.
+    -- References terrains(id): citadels | vector | origin | identity | posture.
+    terrain_id        TEXT    NOT NULL DEFAULT '',
+    -- Compact actions log (JSON array). Each entry: {action_id, action, actor,
+    -- timestamp}.  A lightweight summary on the finding itself so the UI never
+    -- needs to join to soc_activity just to show "who did what when".
+    actions_log       TEXT    NOT NULL DEFAULT '[]',
     UNIQUE(agent_id, category, item_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_find_external_id ON findings(external_id);
@@ -119,6 +142,11 @@ CREATE INDEX IF NOT EXISTS idx_find_active_sev_score ON findings(is_active, seve
 -- total. With these indexes: top_agents 136ms→10ms, trend loop 157ms→1ms.
 CREATE INDEX IF NOT EXISTS idx_find_active_agent     ON findings(is_active, agent_id);
 CREATE INDEX IF NOT EXISTS idx_find_first_detected   ON findings(first_detected_at);
+-- Unique Finding ID index — used for lookup-by-UID in API endpoints.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_find_finding_uid ON findings(finding_uid)
+    WHERE finding_uid != '';
+-- Attack Terrain index — fleet-wide filtering and dashboard grouping.
+CREATE INDEX IF NOT EXISTS idx_find_terrain_id ON findings(terrain_id);
 
 -- ── Full-text search ──────────────────────────────────────────────────────
 -- SQLite's FTS5 needed a separate virtual table + 3 triggers to mirror data
@@ -240,18 +268,32 @@ CREATE INDEX IF NOT EXISTS idx_tl_cat   ON change_timeline(agent_id, category, d
 -- ── SOC workflow: analyst activity log ───────────────────────────────────
 -- Records every analyst action on a finding (status change, assignment, etc.)
 CREATE TABLE IF NOT EXISTS soc_activity (
-    id          BIGSERIAL PRIMARY KEY,
-    finding_id  INTEGER NOT NULL,
-    agent_id    TEXT    NOT NULL,
-    action      TEXT    NOT NULL,   -- 'created','status_change','assigned','commented','escalated','resolved','false_positive','accepted_risk'
-    actor       TEXT    DEFAULT 'system',
-    old_value   TEXT    DEFAULT '',
-    new_value   TEXT    DEFAULT '',
-    detail      TEXT    DEFAULT '',
-    created_at  DOUBLE PRECISION    NOT NULL
+    id              BIGSERIAL PRIMARY KEY,
+    finding_id      INTEGER NOT NULL,
+    agent_id        TEXT    NOT NULL,
+    action          TEXT    NOT NULL,   -- 'created','status_change','assigned','commented','escalated','resolved','false_positive','accepted_risk'
+    actor           TEXT    DEFAULT 'system',
+    old_value       TEXT    DEFAULT '',
+    new_value       TEXT    DEFAULT '',
+    detail          TEXT    DEFAULT '',
+    created_at      DOUBLE PRECISION    NOT NULL,
+    -- Enhanced audit trail: canonical finding reference, network provenance
+    finding_uid     TEXT    NOT NULL DEFAULT '',
+    ip_address      TEXT    NOT NULL DEFAULT '',
+    session_id      TEXT    NOT NULL DEFAULT '',
+    -- Structured change tracking: JSON dict of {field: {old: val, new: val}}
+    changed_fields  TEXT    NOT NULL DEFAULT '{}',
+    -- Extensible metadata: browser, user-agent, geo, etc.
+    metadata        TEXT    NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_act_finding ON soc_activity(finding_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_act_agent   ON soc_activity(agent_id,   created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_finding    ON soc_activity(finding_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_agent      ON soc_activity(agent_id,   created_at DESC);
+-- Enhanced audit indexes
+CREATE INDEX IF NOT EXISTS idx_act_finding_uid ON soc_activity(finding_uid, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_actor       ON soc_activity(actor, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_action      ON soc_activity(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_ip          ON soc_activity(ip_address, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_act_created     ON soc_activity(created_at DESC);
 
 -- ── SOC workflow: analyst comments ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS soc_comments (
@@ -553,11 +595,8 @@ _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 _SLA_HOURS = {"critical": 4, "high": 24, "medium": 168, "low": 720, "info": 2160}
 
 # Valid SOC workflow statuses
-_SOC_STATUSES = {
-    "new", "triaging", "investigating", "in_remediation",
-    "remediated", "verified", "closed", "false_positive",
-    "accepted_risk", "duplicate",
-}
+# Canonical status vocabulary lives in finding_lifecycle (single source of truth).
+_SOC_STATUSES = set(_lc.ALL_STATUSES)
 
 # Migrations: add SOC workflow columns to existing findings table
 _SOC_MIGRATIONS = [
@@ -598,6 +637,18 @@ _SOC_MIGRATIONS = [
     ("findings", "ai_verdict",              "TEXT    DEFAULT '{}'"),
     ("findings", "ai_validation_used",      "INTEGER DEFAULT 0"),
     ("findings", "terrain_validation",      "TEXT    DEFAULT '{}'"),
+    # Unique Finding ID + Attack Terrain FK + Actions Log
+    ("findings", "finding_uid",             "TEXT    DEFAULT ''"),
+    ("findings", "terrain_id",              "TEXT    DEFAULT ''"),
+    ("findings", "actions_log",             "TEXT    DEFAULT '[]'"),
+    # Enhanced soc_activity columns
+    ("soc_activity", "finding_uid",         "TEXT    DEFAULT ''"),
+    ("soc_activity", "ip_address",          "TEXT    DEFAULT ''"),
+    ("soc_activity", "session_id",          "TEXT    DEFAULT ''"),
+    ("soc_activity", "changed_fields",      "TEXT    DEFAULT '{}'"),
+    ("soc_activity", "metadata",            "TEXT    DEFAULT '{}'"),
+    # Terrain source provenance — captures why a finding landed in its terrain
+    ("findings", "terrain_source",          "TEXT    DEFAULT ''"),
 ]
 
 
@@ -676,6 +727,76 @@ class IntelDB:
         async with self._conn.executescript(_SCHEMA):
             pass
         await self._conn.commit()
+
+        # 4. Seed terrain lookup data (idempotent — ON CONFLICT DO NOTHING).
+        try:
+            now = time.time()
+            terrain_seed = [
+                ('citadels','Citadels','Execution, persistence, and malware signals','#ef4444',now),
+                ('vector','Vector','Network connections, ports, ARP, lateral movement','#f97316',now),
+                ('origin','Origin','Vulnerabilities, packages, SBOM, config drift','#eab308',now),
+                ('identity','Identity','User accounts, credentials, identity anomalies','#3b82f6',now),
+                ('posture','Posture','Security posture, SIP, Gatekeeper, FileVault, firewall','#8b5cf6',now),
+            ]
+            for row in terrain_seed:
+                await self._conn.execute(
+                    "INSERT INTO terrains(id,label,description,color,created_at) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+                    row,
+                )
+            await self._conn.commit()
+        except Exception as _terr_exc:
+            await self._conn.rollback()
+            log.warning("Terrain seeding skipped (table may not exist): %s", _terr_exc)
+
+        # 5. Backfill finding_uid for existing findings that don't have one yet.
+        #    Uses uuid.uuid4().hex for each row without a UID.
+        try:
+            async with self._conn.execute(
+                "SELECT id FROM findings WHERE finding_uid IS NULL OR finding_uid = ''"
+            ) as cur:
+                uid_rows = await cur.fetchall()
+            for row in uid_rows:
+                await self._conn.execute(
+                    "UPDATE findings SET finding_uid=? WHERE id=?",
+                    (uuid.uuid4().hex, row[0]),
+                )
+            if uid_rows:
+                await self._conn.commit()
+                log.info("Backfilled finding_uid for %d existing findings", len(uid_rows))
+        except Exception:
+            await self._conn.rollback()
+
+        # 6. Backfill terrain_id for existing findings based on category → terrain mapping.
+        try:
+            from .attacklens.terrain_validators import CATEGORY_TO_TERRAIN
+            for category, terrain_id in CATEGORY_TO_TERRAIN.items():
+                await self._conn.execute(
+                    "UPDATE findings SET terrain_id=? "
+                    "WHERE (terrain_id IS NULL OR terrain_id = '') AND category=?",
+                    (terrain_id, category),
+                )
+            await self._conn.commit()
+        except Exception:
+            await self._conn.rollback()
+
+        # 7. Backfill terrain_source for existing findings from their category.
+        try:
+            async with self._conn.execute(
+                "SELECT id, category FROM findings WHERE terrain_source IS NULL OR terrain_source = ''"
+            ) as cur:
+                ts_rows = await cur.fetchall()
+            for row in ts_rows:
+                await self._conn.execute(
+                    "UPDATE findings SET terrain_source=? WHERE id=?",
+                    (row["category"], row["id"]),
+                )
+            if ts_rows:
+                await self._conn.commit()
+                log.info("Backfilled terrain_source for %d existing findings", len(ts_rows))
+        except Exception:
+            await self._conn.rollback()
+
         log.info("IntelDB initialised at %s (pool readers=3)", self._path)
 
     async def close(self) -> None:
@@ -712,6 +833,48 @@ class IntelDB:
         asset_tier = str(f.get("asset_tier") or "")
         asset_imp  = float(f.get("asset_importance") or 0)
         priority_reason = str(f.get("priority_reason") or _priority_reason(f))
+
+        # ── Unique Finding ID (UUIDv4 hex) ──────────────────────────────────
+        # Use existing finding_uid from the caller if provided (e.g. on re-insert),
+        # otherwise generate a fresh one.  Stored in findings.finding_uid.
+        finding_uid = f.get("finding_uid") or uuid.uuid4().hex
+        f["finding_uid"] = finding_uid
+
+        # ── Attack Terrain classification ────────────────────────────────────
+        # Resolve the canonical terrain from the finding's category.  Callers
+        # (e.g. the detection engine) may pre-set terrain_id; if absent we
+        # derive it here via terrain_validators, which is the single source of
+        # truth for category→terrain mapping.
+        terrain_id = f.get("terrain_id") or ""
+        if not terrain_id:
+            try:
+                from .attacklens.terrain_validators import terrain_for
+                terrain_id = terrain_for(f)
+            except Exception:
+                terrain_id = "origin"  # safest fallback
+        f["terrain_id"] = terrain_id
+
+        # ── Terrain source provenance ────────────────────────────────────────
+        # Captures the detection source (rule_id | source | category) that drove
+        # the terrain classification — visible in the UI as "via <source>".
+        terrain_source = f.get("terrain_source") or ""
+        if not terrain_source:
+            terrain_source = f.get("source") or f.get("rule_id") or category
+        f["terrain_source"] = terrain_source
+
+        # ── Actions log ──────────────────────────────────────────────────────
+        # Lightweight summary embedded on the finding itself.  The full detail
+        # (ip_address, session_id, changed_fields) lives in soc_activity.
+        # On first insert, seed with a "system.created" entry.
+        actions_log = f.get("actions_log") or []
+        if not actions_log:
+            actions_log = [{
+                "action_id": uuid.uuid4().hex[:12],
+                "action": "system.created",
+                "actor": "system",
+                "timestamp": ts,
+            }]
+        actions_log_j = json.dumps(actions_log, default=str)
 
         # AI precision validation fields
         precision_score   = float(f.get("precision_score") or 0.0)
@@ -751,9 +914,9 @@ class IntelDB:
                      first_detected_at,last_detected_at,scan_count,is_active,tags,
                      status,assignee,sla_due,priority,analyst_notes,
                      precision_score,precision_factors,ai_verdict,ai_validation_used,
-                     terrain_validation)
+                     terrain_validation,finding_uid,terrain_id,actions_log)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
-                           'new','',?,0,'',?,?,?,?,?)
+                           'new','',?,0,'',?,?,?,?,?,?,?,?)
                 """, (agent_id, category, item_key, fp,
                       sev, f.get("score",0),
                       f.get("title",""), f.get("description",""),
@@ -764,7 +927,8 @@ class IntelDB:
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
                       ts, ts, tags_j, sla_due,
                       precision_score, precision_factors_j, ai_verdict_j,
-                      ai_validation_used, terrain_validation_j))
+                      ai_validation_used, terrain_validation_j,
+                      finding_uid, terrain_id, actions_log_j))
                 await self._conn.commit()
                 # Log creation in SOC activity
                 cur2 = await self._conn.execute(
@@ -785,6 +949,7 @@ class IntelDB:
                     await self._log_activity(
                         new_row["id"], agent_id, "created", "system",
                         "", sev, f.get("title",""), ts,
+                        finding_uid=finding_uid,
                     )
                 await self._append_timeline(agent_id, category, "added",
                                             item_key, f.get("title",""),
@@ -805,7 +970,8 @@ class IntelDB:
                         is_active=1, tags=?,
                         precision_score=?, precision_factors=?,
                         ai_verdict=?, ai_validation_used=?,
-                        terrain_validation=?
+                        terrain_validation=?, terrain_id=?,
+                        actions_log=?
                     WHERE agent_id=? AND category=? AND item_key=?
                 """, (fp, f.get("severity","info"), f.get("score",0),
                       f.get("title",""), f.get("description",""),
@@ -817,6 +983,7 @@ class IntelDB:
                       ts, tags_j,
                       precision_score, precision_factors_j, ai_verdict_j,
                       ai_validation_used, terrain_validation_j,
+                      terrain_id, actions_log_j,
                       agent_id, category, item_key))
                 await self._conn.commit()
                 await self._append_timeline(agent_id, category, "modified",
@@ -903,19 +1070,24 @@ class IntelDB:
         )
         return [dict(r) for r in rows]
 
-    async def search_findings(self, agent_id: str, query: str,
-                              limit: int = 100) -> list[dict]:
-        """Full-text search via Postgres tsvector/tsquery (was SQLite FTS5
-        MATCH against a separate virtual table + JOIN; now a direct predicate
-        against findings.search_vector, a GENERATED column — see _SCHEMA)."""
+    async def search_by_external_id(self, id_term: str, *, active_only: bool = False, limit: int = 20) -> list[dict]:
+        """Direct indexed lookup by external_id prefix or exact match.  Uses the
+        UNIQUE index idx_find_external_id — O(log n), not a full scan.  Accepts
+        partial prefixes like 'AL-F-000' so the analyst can type incrementally."""
         rows = await self._fetchall(
-            "SELECT * FROM findings "
-            "WHERE agent_id=? AND search_vector @@ websearch_to_tsquery('english', ?) "
-            "ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ?)) DESC "
+            "SELECT f.*, "
+            "       ar.os         AS agent_os, "
+            "       ar.hostname   AS agent_hostname, "
+            "       ar.os_version AS agent_os_version "
+            "FROM findings f "
+            "LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
+            "WHERE f.external_id LIKE ? "
+            + ("AND f.is_active=1 " if active_only else "") +
+            "ORDER BY f.external_id "
             "LIMIT ?",
-            (agent_id, query, query, limit),
+            (id_term.replace("*", "%") + "%", limit),
         )
-        return [dict(r) for r in rows]
+        return [_shape_finding(dict(r)) for r in rows]
 
     async def get_summary(self, agent_id: str) -> dict:
         row = await self._fetchone(
@@ -1341,6 +1513,7 @@ class IntelDB:
     async def get_soc_findings(
         self, *,
         agent_id: str | None = None,
+        terrain_id: str | None = None,
         severity: str | None = None,
         status: str | None = None,
         category: str | None = None,
@@ -1397,6 +1570,8 @@ class IntelDB:
             parts.append("f.status=?"); args.append(status)
         if category:
             parts.append("f.category=?"); args.append(category)
+        if terrain_id:
+            parts.append("f.terrain_id=?"); args.append(terrain_id)
         if assignee:
             parts.append("f.assignee=?"); args.append(assignee)
         if sla_breached:
@@ -1512,6 +1687,8 @@ class IntelDB:
         analyst_notes: str | None = None,
         priority: int | None = None,
         actor: str = "analyst",
+        ip_address: str = "",
+        session_id: str = "",
     ) -> dict | None:
         """Update SOC workflow fields and log activity."""
         row = await self._fetchone(
@@ -1526,11 +1703,13 @@ class IntelDB:
         vals: list = []
         if status is not None and status in _SOC_STATUSES:
             sets.append("status=?"); vals.append(status)
-            if status in ("closed", "false_positive", "accepted_risk", "verified"):
+            if _lc.is_terminal(status):
+                # Terminal (closed/FP/accepted/verified/remediated/duplicate):
+                # resolve the finding — drop it off the active board, stamp closed_at.
                 sets.append("closed_at=?"); vals.append(ts)
                 sets.append("is_active=0")
-            elif old.get("status") in ("closed", "false_positive", "accepted_risk"):
-                # Re-opening
+            elif _lc.is_terminal(old.get("status")):
+                # Re-opening a previously-resolved finding.
                 sets.append("closed_at=NULL")
                 sets.append("is_active=1")
         if assignee is not None:
@@ -1550,22 +1729,90 @@ class IntelDB:
             )
             await self._conn.commit()
 
-            # Log activities
+            # Build changed_fields for structured audit trail.
+            # Captures every field that changed in this update and its
+            # before/after values — so the audit log is self-describing
+            # without needing to diff the entire finding record.
+            changed_fields: dict[str, dict[str, Any]] = {}
+            if status is not None and status != old.get("status"):
+                changed_fields["status"] = {"old": old.get("status",""), "new": status}
+            if assignee is not None and assignee != old.get("assignee",""):
+                changed_fields["assignee"] = {"old": old.get("assignee",""), "new": assignee}
+            if analyst_notes is not None:
+                changed_fields["analyst_notes"] = {"old": old.get("analyst_notes",""), "new": analyst_notes}
+            if priority is not None:
+                changed_fields["priority"] = {"old": old.get("priority",0), "new": priority}
+
+            # Log activities. These INSERTs need their OWN commit — the commit
+            # above only persisted the UPDATE. Without it the activity row hangs
+            # uncommitted until some later write flushes it, and a failure in the
+            # (best-effort) timeline append would roll the activity back with it —
+            # which is exactly how status-change history went silently missing.
+            finding_uid = old.get("finding_uid") or ""
             if status is not None and status != old.get("status"):
                 await self._log_activity(
                     finding_id, old["agent_id"], "status_change", actor,
                     old.get("status",""), status, "", ts,
+                    finding_uid=finding_uid,
+                    changed_fields=changed_fields,
+                    ip_address=ip_address,
+                    session_id=session_id,
                 )
-                if status in ("closed", "false_positive", "verified"):
-                    await self._append_timeline(
-                        old["agent_id"], old["category"], "resolved",
-                        old["item_key"], old["title"], None, None, ts,
-                    )
             if assignee is not None and assignee != old.get("assignee",""):
                 await self._log_activity(
                     finding_id, old["agent_id"], "assigned", actor,
                     old.get("assignee",""), assignee, "", ts,
+                    finding_uid=finding_uid,
+                    changed_fields=changed_fields,
+                    ip_address=ip_address,
+                    session_id=session_id,
                 )
+            # Append a summary entry to the finding's actions_log so the UI
+            # can show recent actions without hitting soc_activity.
+            if changed_fields:
+                action_entry = {
+                    "action_id": uuid.uuid4().hex[:12],
+                    "action": list(changed_fields.keys())[0],  # 'status' | 'assignee' | etc.
+                    "actor": actor,
+                    "timestamp": ts,
+                    "fields": list(changed_fields.keys()),
+                }
+                try:
+                    cur = await self._conn.execute(
+                        "SELECT actions_log FROM findings WHERE id=?", (finding_id,)
+                    )
+                    cur_r = await cur.fetchone()
+                    current = _json_value(cur_r["actions_log"] if cur_r else None, [])
+                    if not isinstance(current, list):
+                        current = []
+                    current.append(action_entry)
+                    await self._conn.execute(
+                        "UPDATE findings SET actions_log=? WHERE id=?",
+                        (json.dumps(current, default=str), finding_id),
+                    )
+                except Exception as act_exc:
+                    log.debug("actions_log append failed for finding %s: %s", finding_id, act_exc)
+
+            # Commit the activity log NOW, before the best-effort timeline write,
+            # so the audit trail is durable regardless of what follows.
+            await self._conn.commit()
+
+            # Timeline append is best-effort (a secondary view); never let it
+            # abort the transaction that carries the authoritative activity log.
+            if status is not None and status != old.get("status") \
+                    and _lc.is_terminal(status):
+                try:
+                    await self._append_timeline(
+                        old["agent_id"], old["category"], "resolved",
+                        old["item_key"], old["title"], None, None, ts,
+                    )
+                    await self._conn.commit()
+                except Exception as exc:
+                    log.debug("timeline append failed for finding %s: %s", finding_id, exc)
+                    try:
+                        await self._conn.rollback()
+                    except Exception:
+                        pass
 
         return await self.get_finding_by_id(finding_id)
 
@@ -1592,6 +1839,16 @@ class IntelDB:
         analyst: str, comment: str,
     ) -> dict:
         ts = time.time()
+        # Fetch the finding_uid for the audit log
+        finding_uid = ""
+        try:
+            row = await self._fetchone(
+                "SELECT finding_uid FROM findings WHERE id=?", (finding_id,)
+            )
+            if row and row.get("finding_uid"):
+                finding_uid = row["finding_uid"]
+        except Exception:
+            pass
         async with self._lock:
             await self._conn.execute(
                 "INSERT INTO soc_comments(finding_id,agent_id,analyst,comment,created_at) "
@@ -1601,6 +1858,7 @@ class IntelDB:
             await self._conn.commit()
             await self._log_activity(
                 finding_id, agent_id, "commented", analyst, "", "", comment[:100], ts,
+                finding_uid=finding_uid,
             )
         return {"finding_id": finding_id, "analyst": analyst, "comment": comment,
                 "created_at": ts}
@@ -1629,12 +1887,203 @@ class IntelDB:
     async def _log_activity(
         self, finding_id: int, agent_id: str, action: str,
         actor: str, old_val: str, new_val: str, detail: str, ts: float,
+        *,
+        finding_uid: str = "",
+        ip_address: str = "",
+        session_id: str = "",
+        changed_fields: Optional[dict] = None,
+        metadata: Optional[dict] = None,
     ) -> None:
         await self._conn.execute(
-            "INSERT INTO soc_activity(finding_id,agent_id,action,actor,old_value,new_value,detail,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (finding_id, agent_id, action, actor, old_val, new_val, detail, ts),
+            "INSERT INTO soc_activity(finding_id,agent_id,action,actor,old_value,new_value,detail,"
+            "created_at,finding_uid,ip_address,session_id,changed_fields,metadata) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (finding_id, agent_id, action, actor, old_val, new_val, detail, ts,
+             finding_uid, ip_address, session_id,
+             json.dumps(changed_fields or {}, default=str),
+             json.dumps(metadata or {}, default=str)),
         )
+
+    # ── Terrains ────────────────────────────────────────────────────────────────
+
+    async def get_terrains(self) -> list[dict]:
+        """Return the canonical list of all attack terrains."""
+        rows = await self._fetchall(
+            "SELECT * FROM terrains ORDER BY id",
+            (),
+        )
+        return [dict(r) for r in rows]
+
+    async def get_finding_by_uid(self, finding_uid: str) -> dict | None:
+        """Look up a finding by its UUIDv4 hex identifier."""
+        row = await self._fetchone(
+            "SELECT f.*, "
+            "       ar.os         AS agent_os, "
+            "       ar.hostname   AS agent_hostname, "
+            "       ar.os_version AS agent_os_version "
+            "FROM findings f "
+            "LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
+            "WHERE f.finding_uid=?",
+            (finding_uid,),
+        )
+        return _shape_finding(dict(row)) if row else None
+
+    async def get_finding_audit(self, finding_uid: str, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return the full audit trail for a specific finding by its UUID.
+        Returns soc_activity rows (the unbounded detail log), NOT the summary
+        actions_log embedded on the finding — use that for fast display and
+        this for the full immutable trail."""
+        rows = await self._fetchall(
+            "SELECT * FROM soc_activity "
+            "WHERE finding_uid=? "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (finding_uid, limit, offset),
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            _parse_activity_row(d)
+            out.append(d)
+        return out
+
+    async def get_audit_log(
+        self,
+        actor: str | None = None,
+        action_type: str | None = None,
+        finding_uid: str | None = None,
+        agent_id: str | None = None,
+        ip_address: str | None = None,
+        date_from: float | None = None,
+        date_to: float | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Global audit log with flexible filters. Every filter is optional;
+        when none are provided the entire log is returned (most recent first)."""
+        clauses: list[str] = ["1=1"]
+        params: list = []
+        if actor:
+            clauses.append("actor=?")
+            params.append(actor)
+        if action_type:
+            clauses.append("action=?")
+            params.append(action_type)
+        if finding_uid:
+            clauses.append("finding_uid=?")
+            params.append(finding_uid)
+        if agent_id:
+            clauses.append("agent_id=?")
+            params.append(agent_id)
+        if ip_address:
+            clauses.append("ip_address=?")
+            params.append(ip_address)
+        if date_from is not None:
+            clauses.append("created_at>=?")
+            params.append(date_from)
+        if date_to is not None:
+            clauses.append("created_at<=?")
+            params.append(date_to)
+        rows = await self._fetchall(
+            f"SELECT * FROM soc_activity WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            _parse_activity_row(d)
+            out.append(d)
+        return out
+
+    async def smart_search_findings(
+        self,
+        query: str,
+        *,
+        agent_id: str | None = None,
+        terrain_id: str | None = None,
+        severity: str | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """
+        Full-text search across ALL findings using the Postgres tsvector index.
+
+        Searches across title, description, evidence, tags, and cve_ids.
+        Supports websearch syntax: \"quoted phrase\", -exclude, OR.
+        Results ranked by ts_rank (relevance) descending.
+        """
+        if not query or not query.strip():
+            return []
+
+        parts: list[str] = ["f.search_vector @@ websearch_to_tsquery('english', ?)"]
+        args: list = [query]
+
+        if agent_id:
+            parts.append("f.agent_id=?")
+            args.append(agent_id)
+        if terrain_id:
+            parts.append("f.terrain_id=?")
+            args.append(terrain_id)
+        if severity:
+            parts.append("f.severity=?")
+            args.append(severity)
+        if category:
+            parts.append("f.category=?")
+            args.append(category)
+
+        where = " AND ".join(parts)
+        rows = await self._fetchall(f"""
+            SELECT f.*,
+                   ts_rank(f.search_vector, websearch_to_tsquery('english', ?)) AS relevance,
+                   ar.os         AS agent_os,
+                   ar.hostname   AS agent_hostname,
+                   ar.os_version AS agent_os_version
+            FROM findings f
+            LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id
+            WHERE {where}
+            ORDER BY relevance DESC, f.composite_score DESC
+            LIMIT ? OFFSET ?
+        """, (*args, query, limit, offset))
+
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["relevance"] = round(float(d.get("relevance", 0)), 4)
+            result.append(_shape_finding(d))
+        return result
+
+    async def smart_search_count(
+        self,
+        query: str,
+        *,
+        agent_id: str | None = None,
+        terrain_id: str | None = None,
+        severity: str | None = None,
+        category: str | None = None,
+    ) -> int:
+        """Count of findings matching the smart search query (for pagination)."""
+        if not query or not query.strip():
+            return 0
+        parts: list[str] = ["search_vector @@ websearch_to_tsquery('english', ?)"]
+        args: list = [query]
+        if agent_id:
+            parts.append("agent_id=?")
+            args.append(agent_id)
+        if terrain_id:
+            parts.append("terrain_id=?")
+            args.append(terrain_id)
+        if severity:
+            parts.append("severity=?")
+            args.append(severity)
+        if category:
+            parts.append("category=?")
+            args.append(category)
+        row = await self._fetchone(
+            f"SELECT COUNT(*) AS n FROM findings WHERE {' AND '.join(parts)}",
+            args,
+        )
+        return row["n"] if row else 0
 
     async def _ensure_default_actions(
         self, finding_id: int, agent_id: str, action_plan: list, ts: float,
@@ -2739,7 +3188,7 @@ class IntelDB:
 
 def _sla_status(sla_due: float, status: str) -> str:
     """Return 'ok' | 'warning' | 'breached' | 'closed' based on SLA due time."""
-    if status in ("closed", "false_positive", "accepted_risk", "verified", "duplicate"):
+    if _lc.is_terminal(status):
         return "closed"
     if not sla_due:
         return "ok"
@@ -2784,16 +3233,31 @@ def _json_value(v: Any, default: Any) -> Any:
         return default
 
 
+def _parse_activity_row(d: dict) -> None:
+    """Parse JSON string columns in a soc_activity row into Python objects."""
+    for fld in ("changed_fields", "metadata"):
+        v = d.get(fld)
+        if isinstance(v, str):
+            try:
+                d[fld] = json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                d[fld] = {}
+
+
 def _shape_finding(d: dict) -> dict:
     # search_vector is a Postgres GENERATED column (replaces SQLite's FTS5
     # shadow table) — internal-only, never part of the API response shape.
     d.pop("search_vector", None)
     d["external_id"] = d.get("external_id") or _external_id(d["id"])
     d["display_id"] = d["external_id"]
+    d["finding_uid"] = d.get("finding_uid") or ""
+    d["terrain_id"] = d.get("terrain_id") or ""
+    d["terrain_source"] = d.get("terrain_source") or d.get("category", "")
     d["kev"] = bool(d.get("kev"))
     d["exploit_available"] = bool(d.get("exploit_available"))
     d["exploit_sources"] = _json_value(d.get("exploit_sources"), [])
     d["action_plan"] = _json_value(d.get("action_plan"), [])
+    d["actions_log"] = _json_value(d.get("actions_log"), [])
     d["priority_reason"] = d.get("priority_reason") or _priority_reason(d)
     return d
 

@@ -22,6 +22,8 @@ import { cn } from "../../lib/utils";
 export interface DetectionFinding {
   id:                number;
   external_id?:      string;
+  finding_uid?:      string;      // UUIDv4 — globally unique, non-sequential reference
+  terrain_id?:       string;      // citadels|vector|origin|identity|posture
   agent_id:          string;
   category:          string;
   severity:          "critical" | "high" | "medium" | "low" | "info";
@@ -45,6 +47,13 @@ export interface DetectionFinding {
   last_detected_at:  number;
   scan_count:        number;
   status:            string;
+  // Canonical attack-terrain bucket (server-assigned via terrain_validators) —
+  // single source of truth so the same finding lands in the same terrain in
+  // All Incidents and the Attack Terrain sub-views.
+  terrain?:          string;   // origin | vector | citadels | identity | posture
+  // ── Triage lifecycle (server-driven, finding_lifecycle.py) ────────────────
+  is_terminal?:      boolean;
+  available_actions?: FindingAction[];
   sla_due?:          number;
   sla_status?:       string;
   priority_reason?:  string;
@@ -88,6 +97,11 @@ export interface DetectionFinding {
       contribution?: number;
     }>;
   } | string;
+  // Terrain source provenance — why this finding landed in its terrain
+  terrain_source?:        string;
+  // Validated status — true when precision_score >= resolved threshold
+  is_validated?:          boolean;
+  effective_threshold?:   number;
   // Agent context (joined from asset_registry on read)
   agent_os?:              string;
   agent_hostname?:        string;
@@ -330,6 +344,169 @@ export function SlaBadge({ status }: { status: string }) {
   return <span className={cn("px-1.5 py-0.5 text-[9px] font-bold rounded-full border uppercase", c[status] ?? c.ok)}>SLA {status}</span>;
 }
 
+// ── Triage lifecycle: status chip + action buttons ─────────────────────────────
+
+export interface FindingAction {
+  action:        string;   // open | investigate | close | accept_risk | false_positive | reopen
+  label:         string;
+  kind:          string;   // primary | resolve | dismiss
+  needs_reason:  boolean;
+  target_status: string;
+}
+
+const _STATUS_CHIP: Record<string, string> = {
+  new:            "bg-blue-50 text-blue-700 border-blue-200",
+  triaging:       "bg-indigo-50 text-indigo-700 border-indigo-200",
+  investigating:  "bg-violet-50 text-violet-700 border-violet-200",
+  in_remediation: "bg-amber-50 text-amber-700 border-amber-200",
+  remediated:     "bg-teal-50 text-teal-700 border-teal-200",
+  verified:       "bg-emerald-50 text-emerald-700 border-emerald-200",
+  closed:         "bg-gray-100 text-gray-600 border-gray-200",
+  false_positive: "bg-slate-100 text-slate-500 border-slate-200",
+  accepted_risk:  "bg-orange-50 text-orange-600 border-orange-200",
+  duplicate:      "bg-gray-100 text-gray-500 border-gray-200",
+};
+
+export function StatusChip({ status }: { status: string }) {
+  const cls = _STATUS_CHIP[status] ?? _STATUS_CHIP.new;
+  return (
+    <span className={cn("px-2 py-0.5 text-[9px] font-bold rounded-full border uppercase tracking-wide whitespace-nowrap", cls)}>
+      {(status ?? "new").replace(/_/g, " ")}
+    </span>
+  );
+}
+
+// Canonical attack-terrain → label + colour. Keyed on the SERVER-assigned
+// `terrain` field (origin/vector/citadels/identity/posture), never on a
+// client-side category guess — so a finding shows the same terrain in All
+// Incidents and the Attack Terrain sub-views.
+const _TERRAIN_CHIP: Record<string, { label: string; cls: string }> = {
+  origin:   { label: "Origin",   cls: "bg-amber-50 text-amber-700 border-amber-200" },
+  vector:   { label: "Vector",   cls: "bg-blue-50 text-blue-700 border-blue-200" },
+  citadels: { label: "Citadels", cls: "bg-red-50 text-red-700 border-red-200" },
+  identity: { label: "Identity", cls: "bg-purple-50 text-purple-700 border-purple-200" },
+  posture:  { label: "Posture",  cls: "bg-teal-50 text-teal-700 border-teal-200" },
+};
+
+export function TerrainChip({ terrain }: { terrain?: string }) {
+  const t = _TERRAIN_CHIP[(terrain ?? "origin").toLowerCase()] ?? { label: terrain ?? "Other", cls: "bg-gray-100 text-gray-600 border-gray-200" };
+  return (
+    <span className={cn("text-[9px] font-bold px-2 py-0.5 rounded-full border whitespace-nowrap", t.cls)}>
+      {t.label}
+    </span>
+  );
+}
+
+// The stable unique incident id (AL-F-00000042) with UUID tooltip.
+// Click the primary ID to copy; hover to see the full UUIDv4.
+export function IdChip({ f }: { f: DetectionFinding }) {
+  const id = f.external_id ?? `#${f.id}`;
+  const uid = f.finding_uid || "";
+  return (
+    <div className="flex items-center gap-1">
+      <button
+        onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(id).catch(() => {}); }}
+        title={uid ? `Click to copy "${id}"\nUUID: ${uid}` : `Click to copy "${id}"`}
+        className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border border-gray-200 bg-gray-50 text-gray-600 hover:bg-orange-50 hover:text-orange-700 hover:border-orange-200 transition-colors whitespace-nowrap"
+      >
+        {id}
+      </button>
+      {uid && (
+        <button
+          onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(uid).catch(() => {}); }}
+          title={`UUID: ${uid} (click to copy)`}
+          className="text-[8px] font-mono px-1 py-0.5 rounded border border-gray-100 bg-gray-50/50 text-gray-400 hover:bg-purple-50 hover:text-purple-600 hover:border-purple-200 transition-colors whitespace-nowrap"
+        >
+          {uid.slice(0, 8)}&hellip;
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Button styling per action intent.
+const _ACTION_BTN: Record<string, string> = {
+  primary: "bg-white hover:bg-blue-50 border-gray-200 hover:border-blue-300 text-gray-700 hover:text-blue-700",
+  resolve: "bg-white hover:bg-emerald-50 border-gray-200 hover:border-emerald-300 text-gray-700 hover:text-emerald-700",
+  dismiss: "bg-white hover:bg-slate-100 border-gray-200 hover:border-slate-300 text-gray-600 hover:text-slate-700",
+};
+
+/**
+ * Renders the triage action buttons the SERVER says are valid for this finding's
+ * current state (finding.available_actions), POSTs the chosen action to the
+ * unified lifecycle endpoint, prompts for a justification when the action
+ * requires one, surfaces a 409 (illegal transition) inline, and calls onChanged
+ * so the parent list/drawer can refresh. The state machine lives server-side —
+ * the UI just renders what it's told.
+ */
+export function FindingActions({
+  finding, onChanged, compact = false,
+}: {
+  finding: DetectionFinding;
+  onChanged?: (updated?: DetectionFinding) => void;
+  compact?: boolean;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr]   = useState<string | null>(null);
+  const actions = finding.available_actions ?? [];
+
+  async function run(a: FindingAction) {
+    setErr(null);
+    let reason: string | undefined;
+    if (a.needs_reason) {
+      const r = window.prompt(`${a.label}: enter a short justification`, "");
+      if (r === null) return;                 // cancelled
+      if (!r.trim()) { setErr("A justification is required."); return; }
+      reason = r.trim();
+    }
+    setBusy(a.action);
+    try {
+      const res = await fetch(`/api/v1/soc/findings/${finding.id}/action`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ action: a.action, actor: "analyst", reason }),
+      });
+      if (res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        setErr(body?.detail?.error ?? "Action no longer valid — refresh.");
+        onChanged?.();
+        return;
+      }
+      if (!res.ok) { setErr(`Failed (${res.status})`); return; }
+      const updated = await res.json().catch(() => undefined);
+      onChanged?.(updated as DetectionFinding | undefined);
+    } catch {
+      setErr("Network error — try again.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (!actions.length) return null;
+
+  return (
+    <div className={cn("flex flex-col gap-1.5", compact ? "" : "w-full")}>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {actions.map(a => (
+          <button
+            key={a.action}
+            onClick={(e) => { e.stopPropagation(); run(a); }}
+            disabled={busy !== null}
+            title={a.needs_reason ? `${a.label} (requires a reason)` : a.label}
+            className={cn(
+              "px-2.5 py-1 text-[10px] font-semibold rounded-lg border transition-all disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap",
+              _ACTION_BTN[a.kind] ?? _ACTION_BTN.primary,
+            )}
+          >
+            {busy === a.action ? "…" : a.label}
+          </button>
+        ))}
+      </div>
+      {err && <span className="text-[10px] text-red-600">{err}</span>}
+    </div>
+  );
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useDetectionData(url: string, refreshMs = 30_000) {
@@ -434,6 +611,18 @@ function MitreChip({ t }: { t: string }) {
   return (
     <span className="px-1.5 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded text-[8px] font-mono font-semibold">
       {t}
+    </span>
+  );
+}
+
+function ValidatedBadge({ f }: { f: DetectionFinding }) {
+  if (!f.is_validated) return null;
+  return (
+    <span
+      className="px-1.5 py-0.5 rounded text-[8px] font-black border bg-emerald-100 text-emerald-800 border-emerald-300"
+      title="Validated Finding — precision score meets or exceeds the configured detection threshold"
+    >
+      ✓ VALIDATED
     </span>
   );
 }
@@ -1308,7 +1497,7 @@ function Why({ children }: { children: React.ReactNode }) {
   return <p className="text-[9px] text-gray-400 italic leading-snug mt-1">Why: {children}</p>;
 }
 
-export function FindingDetail({ finding: f, onClose }: { finding: DetectionFinding; onClose: () => void }) {
+export function FindingDetail({ finding: f, onClose, onChanged }: { finding: DetectionFinding; onClose: () => void; onChanged?: () => void }) {
   const [tab, setTab] = useState<DTab>("overview");
   const evidence    = _parseJson(f.evidence, {}) as Record<string, unknown>;
   // action_plan no longer rendered inline — replaced by <OSRemediationPanel />.
@@ -1362,15 +1551,28 @@ export function FindingDetail({ finding: f, onClose }: { finding: DetectionFindi
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100 bg-gray-50/60 flex-shrink-0">
         <div className="flex items-center gap-1.5 flex-wrap min-w-0">
           <SevBadge sev={f.severity} />
+          <StatusChip status={f.status} />
           {f.kev && <KevChip />}
           {f.exploit_available && <ExploitChip />}
           {f.mitre_technique && <MitreChip t={f.mitre_technique} />}
-          <span className="text-[9px] font-mono text-gray-400">{f.external_id ?? `#${f.id}`}</span>
+          <span className="text-[9px] font-mono text-gray-400 select-all">{f.external_id ?? `#${f.id}`}</span>
         </div>
         <button onClick={onClose} className="p-1.5 hover:bg-gray-200 rounded-lg transition-colors flex-shrink-0 ml-2">
           <X className="w-3.5 h-3.5 text-gray-400" />
         </button>
       </div>
+
+      {/* Triage action bar — server-driven valid actions for this finding's state.
+          On success we refresh the parent list and close the drawer (the finding
+          may have left the current view, e.g. closed → drops off active). */}
+      {(f.available_actions?.length ?? 0) > 0 && (
+        <div className="px-4 py-2 border-b border-gray-100 bg-white flex-shrink-0">
+          <FindingActions
+            finding={f}
+            onChanged={() => { onChanged?.(); onClose(); }}
+          />
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex border-b border-gray-100 flex-shrink-0 bg-white">
@@ -1602,7 +1804,7 @@ export function DetectionFilters({
       <Filter className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
       <div className="relative">
         <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400 pointer-events-none" />
-        <input value={raw} onChange={e => handle(e.target.value)} placeholder="Search findings…"
+        <input value={raw} onChange={e => handle(e.target.value)} placeholder="Search or type ID (AL-F-…)"
           className="pl-7 pr-3 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300 w-44 transition-all" />
       </div>
       <select value={severity} onChange={e => onSeverity(e.target.value)}
@@ -1645,12 +1847,27 @@ export function GenericDetectionPage({ title, subtitle, apiUrl, accent, icon, em
   const [search,   setSearch]   = useState("");
   const [selected, setSelected] = useState<DetectionFinding | null>(null);
 
-  const url = `${apiUrl}?${new URLSearchParams({
-    ...(agentId  ? { agent_id: agentId } : {}),
-    ...(severity ? { severity }           : {}),
-    ...(search   ? { search }             : {}),
-    limit: "200",
-  })}`;
+  // ID Search detection: when the analyst types an ID (AL-F-00000515, 00000515,
+  // or a bare number), switch to direct indexed external_id lookup instead of
+  // full-text search.  The backend uses the UNIQUE index on external_id — O(log n).
+  const isIdSearch = (q: string): boolean => {
+    const t = q.trim();
+    if (!t) return false;
+    // Pattern: starts with AL-F-, or is purely numeric (internal id / external suffix)
+    return /^AL-F-/i.test(t) || /^\d+$/.test(t);
+  };
+
+  const params: Record<string, string> = { limit: "200" };
+  if (agentId)  params.agent_id = agentId;
+  if (severity) params.severity = severity;
+  if (search) {
+    if (isIdSearch(search)) {
+      params.id_search = search.trim();
+    } else {
+      params.search = search.trim();
+    }
+  }
+  const url = `${apiUrl}?${new URLSearchParams(params)}`;
 
   const { findings, loading, error, refetch } = useDetectionData(url);
 
@@ -1731,6 +1948,7 @@ export function GenericDetectionPage({ title, subtitle, apiUrl, accent, icon, em
               <thead>
                 <tr className="bg-gray-50/80 border-b border-gray-100">
                   <th className="pl-4 pr-2 py-2.5 w-10" />
+                  <th className="px-2 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">ID</th>
                   <th className="px-3 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">Finding</th>
                   {columns.map(c => (
                     <th key={c.key} className="px-3 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider whitespace-nowrap">{c.label}</th>
@@ -1782,13 +2000,22 @@ export function GenericDetectionPage({ title, subtitle, apiUrl, accent, icon, em
                           <SevDot sev={f.severity} />
                         </td>
 
+                        {/* ID column — unique incident identifier */}
+                        <td className="px-2 py-3">
+                          <IdChip f={f} />
+                        </td>
+
                         {/* Title + badge chips */}
                         <td className="px-3 py-3 max-w-[260px]">
-                          <div className="text-[11px] font-semibold text-gray-800 leading-tight truncate mb-1">{f.title}</div>
+                          <div className="flex items-center gap-1.5 mb-1">
+                            <div className="text-[11px] font-semibold text-gray-800 leading-tight truncate">{f.title}</div>
+                          </div>
                           <div className="flex items-center gap-1 flex-wrap">
                             <SevBadge sev={f.severity} />
+                            <StatusChip status={f.status} />
                             {f.kev && <KevChip />}
                             <PrecisionChip score={f.precision_score} />
+                            <ValidatedBadge f={f} />
                             {f.exploit_available && <ExploitChip />}
                             {f.mitre_technique && <MitreChip t={f.mitre_technique} />}
                           </div>
@@ -1840,7 +2067,7 @@ export function GenericDetectionPage({ title, subtitle, apiUrl, accent, icon, em
       </div>
 
       {/* Fixed right-side drawer — portaled to body */}
-      {selected && <FindingDetail finding={selected} onClose={() => setSelected(null)} />}
+      {selected && <FindingDetail finding={selected} onClose={() => setSelected(null)} onChanged={refetch} />}
     </div>
   );
 }
@@ -2106,7 +2333,7 @@ function TerrainFilterBar({
         {/* Search */}
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400 pointer-events-none" />
-          <input value={rawSearch} onChange={e => handleSearch(e.target.value)} placeholder="Search findings…"
+          <input value={rawSearch} onChange={e => handleSearch(e.target.value)} placeholder="Search or type ID (AL-F-…)"
             className="pl-7 pr-3 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300 w-40 transition-all" />
         </div>
 
@@ -2231,7 +2458,8 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
   const [selected, setSelected] = useState<DetectionFinding | null>(null);
   const [page, setPage] = useState(1);
 
-  const { findings: raw, loading, error, refetch } = useDetectionData(`${apiUrl}?limit=500`);
+  const qs = apiUrl.includes("?") ? `&limit=500` : `?limit=500`;
+  const { findings: raw, loading, error, refetch } = useDetectionData(`${apiUrl}${qs}`);
 
   // Dynamic dropdown options built from live data
   const mitreTactics = useMemo(() =>
@@ -2253,15 +2481,36 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
     if (filters.statusFilter)   r = r.filter(f => f.status === filters.statusFilter);
     if (filters.agentId)        r = r.filter(f => f.agent_id?.toLowerCase().includes(filters.agentId.toLowerCase()));
     if (filters.search) {
-      const q = filters.search.toLowerCase();
+      const q = filters.search.toLowerCase().trim();
+      // ID Search: when the analyst types an ID pattern (AL-F-00000515 or 00000515),
+      // match against external_id / display_id first for instant indexed lookup feel.
+      const isId = /^al-f-|^\d+$/.test(q);
       const cveArr = (f: DetectionFinding) => Array.isArray(f.cve_ids) ? f.cve_ids : [];
-      r = r.filter(f =>
-        f.title?.toLowerCase().includes(q) ||
-        f.description?.toLowerCase().includes(q) ||
-        f.category?.toLowerCase().includes(q) ||
-        f.source?.toLowerCase().includes(q) ||
-        cveArr(f).some(c => c.toLowerCase().includes(q))
-      );
+      r = r.filter(f => {
+        // ID search: prefix-match external_id for fast narrowing as the user types
+        if (isId) {
+          const ext = (f.external_id || "").toLowerCase();
+          if (ext.startsWith(q) || ext.includes(q)) return true;
+        }
+        return (
+          f.title?.toLowerCase().includes(q) ||
+          f.description?.toLowerCase().includes(q) ||
+          f.category?.toLowerCase().includes(q) ||
+          f.source?.toLowerCase().includes(q) ||
+          (f.external_id || "").toLowerCase().includes(q) ||
+          cveArr(f).some(c => c.toLowerCase().includes(q))
+        );
+      });
+      // ID search: sort exact matches first
+      if (isId) {
+        r = [...r].sort((a, b) => {
+          const ae = (a.external_id || "").toLowerCase();
+          const be = (b.external_id || "").toLowerCase();
+          if (ae === q && be !== q) return -1;
+          if (be === q && ae !== q) return 1;
+          return ae.length - be.length;
+        });
+      }
     }
 
     // Advanced field+operator conditions (ANDed on top of quick filters)
@@ -2360,6 +2609,7 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
               <thead>
                 <tr className="bg-gray-50/80 border-b border-gray-100">
                   <th className="pl-4 pr-2 py-2.5 w-10" />
+                  <th className="px-2 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">ID</th>
                   <th className="px-3 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">Finding</th>
                   {columns.map(c => (
                     <th key={c.key} className="px-3 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider whitespace-nowrap">{c.label}</th>
@@ -2419,6 +2669,7 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
                             <SevBadge sev={f.severity} />
                             {f.kev && <KevChip />}
                             <PrecisionChip score={f.precision_score} />
+                            <ValidatedBadge f={f} />
                             {f.exploit_available && <ExploitChip />}
                             {f.mitre_technique && <MitreChip t={f.mitre_technique} />}
                           </div>
@@ -2476,7 +2727,7 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
       </div>
 
       {/* Fixed right-side drawer — portaled to body */}
-      {selected && <FindingDetail finding={selected} onClose={() => setSelected(null)} />}
+      {selected && <FindingDetail finding={selected} onClose={() => setSelected(null)} onChanged={refetch} />}
     </div>
   );
 }

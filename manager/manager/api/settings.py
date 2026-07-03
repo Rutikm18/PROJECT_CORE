@@ -63,30 +63,38 @@ DEFAULTS: dict[str, str] = {
     "retention_period_months": "1",       # default: 1 month (current 30-day behavior)
     "retention_action":        "delete",  # default: delete — "archive" keeps a
                                           # compressed copy instead (see /retention)
+    # Auto-resolve: how long after evidence disappears from agent telemetry
+    # before findings are automatically marked resolved. 2 days (48h) default
+    # safely exceeds the longest per-rule alert-dedup window (24h), so a still-
+    # present entity isn't wrongly resolved during its dedup window.
+    "auto_resolve_stale_days": "2",       # default: 2 days (48h) — range 1–14d
 }
 
 REQUIRED_FIELDS   = {"org_name", "issue_date", "valid_until"}
 BOOLEAN_FIELDS    = {"notif_critical_email", "notif_sla_breach", "notif_digest_daily"}
 DATE_FIELDS       = {"issue_date", "valid_until"}
 
-# Allowed retention periods, in months → days (30 days/month, consistent with
-# the existing 30-day default this replaces). 12/24-month windows are flagged
-# "slow" — Deep Analysis queries scan a proportionally larger payloads table.
-RETENTION_PERIODS_MONTHS: tuple[int, ...] = (1, 3, 6, 12, 24)
+# Allowed retention periods, in "months" — 0 is the sentinel for 7 days, 1+
+# are actual months (30 days/month). 12/24-month windows are flagged "slow"
+# — Deep Analysis queries scan a proportionally larger payloads table.
+RETENTION_PERIODS_MONTHS: tuple[int, ...] = (0, 1, 3, 6, 12, 24)
 RETENTION_SLOW_FETCH_MONTHS: frozenset[int] = frozenset({12, 24})
 RETENTION_ACTIONS = ("delete", "archive")
 
 
 def retention_period_days(months_str: str) -> int:
-    """Convert a retention_period_months setting value to days. Falls back to
-    the 1-month default for an unset/invalid value rather than raising —
-    retention enforcement must never crash the cleanup job over a bad setting."""
+    """Convert a retention_period_months setting value to days. 0 → 7 days,
+    1+ → months × 30. Falls back to the 1-month default for an unset/invalid
+    value rather than raising — retention enforcement must never crash the
+    cleanup job over a bad setting."""
     try:
         months = int(months_str)
     except (TypeError, ValueError):
         months = 1
     if months not in RETENTION_PERIODS_MONTHS:
         months = min(RETENTION_PERIODS_MONTHS, key=lambda m: abs(m - months))
+    if months == 0:
+        return 7
     return months * 30
 
 # ── Validation / Confidence Scoring keys ──────────────────────────────────────
@@ -258,6 +266,7 @@ class SettingsUpdate(BaseModel):
     notif_email_recipient:  Optional[str] = None
     retention_period_months: Optional[str] = None
     retention_action:        Optional[str] = None
+    auto_resolve_stale_days: Optional[str] = None
 
     @field_validator("org_name")
     @classmethod
@@ -346,6 +355,19 @@ class SettingsUpdate(BaseModel):
         if action not in RETENTION_ACTIONS:
             raise ValueError(f"retention_action must be one of {RETENTION_ACTIONS}, got {v!r}")
         return action
+
+    @field_validator("auto_resolve_stale_days")
+    @classmethod
+    def valid_auto_resolve_days(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        try:
+            days = int(v.strip())
+        except ValueError:
+            raise ValueError(f"auto_resolve_stale_days must be an integer, got {v!r}")
+        if days < 1 or days > 14:
+            raise ValueError(f"auto_resolve_stale_days must be 1–14, got {days}")
+        return str(days)
 
     @model_validator(mode="after")
     def dates_ordered(self) -> "SettingsUpdate":
@@ -554,11 +576,13 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             raw = await _load()
             months = int(raw.get("retention_period_months", "1"))
             action = raw.get("retention_action", "delete")
+            auto_resolve_days = int(raw.get("auto_resolve_stale_days", "2"))
             config = {
                 "period_months": months,
                 "period_days":   retention_period_days(raw.get("retention_period_months", "1")),
                 "action":        action,
                 "slow_fetch_warning": months in RETENTION_SLOW_FETCH_MONTHS,
+                "auto_resolve_stale_days": auto_resolve_days,
                 "available_periods": list(RETENTION_PERIODS_MONTHS),
                 "available_actions": list(RETENTION_ACTIONS),
             }

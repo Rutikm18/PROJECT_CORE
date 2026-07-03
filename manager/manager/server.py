@@ -44,6 +44,7 @@ QueueProducer = None  # type: ignore[assignment]
 from .workers.telemetry   import TelemetryWorker
 from .workers.attacklens  import AttackLensWorker
 from .workers.dlq_replayer import DLQReplayer
+from .workers.reconciler   import PayloadReconciler
 from .chunk_tracker       import ChunkTracker
 from .workers.intel       import ThreatIntelWorker
 from .workers.enrichment  import EnrichmentWorker
@@ -286,7 +287,13 @@ def create_app() -> FastAPI:
             _dlq_replayer = DLQReplayer(rabbitmq_url)
             app.state.dlq_replayer = _dlq_replayer
             asyncio.create_task(_dlq_replayer.run())
-            log.info("RabbitMQ: producer + workers + consumer + DLQ replayer started (url=%s)", rabbitmq_url)
+            # Payload reconciler: replays any payload that was stored but never
+            # detected (lost hand-off past the DLQ) — the catch-all that makes
+            # "raw is reprocessable" true. Reads the payload_ledger.
+            _reconciler = PayloadReconciler(db, store, producer)
+            app.state.reconciler = _reconciler
+            asyncio.create_task(_reconciler.run())
+            log.info("RabbitMQ: producer + workers + consumer + DLQ replayer + reconciler started (url=%s)", rabbitmq_url)
         else:
             log.info("RabbitMQ: not configured — sync pipeline active")
 
@@ -531,6 +538,18 @@ def create_app() -> FastAPI:
     if os.path.isdir(dashboard_dir):
         app.mount("/static", StaticFiles(directory=dashboard_dir), name="static")
 
+    # index.html must NEVER be cached by the browser: it's the tiny entry that
+    # points at the content-hashed JS/CSS bundles. If it's cached, a fresh build
+    # (new bundle hashes) is invisible until a hard refresh — exactly the "I
+    # don't see my changes" trap. The hashed assets under /static ARE safely
+    # cacheable (their name changes when content changes), so only this file
+    # needs no-cache. Standard SPA caching: immutable assets + no-cache index.
+    _NO_CACHE = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma":        "no-cache",
+        "Expires":       "0",
+    }
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard():
         # Serve from static/index.html — vite build keeps this current.
@@ -541,7 +560,7 @@ def create_app() -> FastAPI:
         ]:
             if os.path.isfile(candidate):
                 with open(candidate) as f:
-                    return f.read()
+                    return HTMLResponse(f.read(), headers=_NO_CACHE)
         log.error("Dashboard index.html not found under dashboard/static or dashboard/templates")
         return HTMLResponse(
             "<h1>Dashboard unavailable</h1><p>Run: npm run build inside the frontend directory.</p>",

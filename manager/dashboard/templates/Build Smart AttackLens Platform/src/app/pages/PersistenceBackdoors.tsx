@@ -1,4 +1,5 @@
-import { Anchor } from "lucide-react";
+import { useState } from "react";
+import { Anchor, CheckCircle2 } from "lucide-react";
 import { GenericDetectionPage, type DetectionFinding } from "./DetectionShared";
 import { cn } from "../../lib/utils";
 
@@ -33,19 +34,39 @@ function RiskScore({ f }: { f: DetectionFinding }) {
 }
 
 export default function PersistenceBackdoors() {
+  const [validatedOnly, setValidatedOnly] = useState(false);
+
   return (
-    <GenericDetectionPage
-      title="Backdoor & Services"
-      subtitle="LaunchDaemons · cron/launchd tasks · shell config injection · SUID binaries · world-writable PATH"
-      apiUrl="/api/v1/detection/persistence"
-      accent="amber"
-      icon={<Anchor className="w-5 h-5 text-orange-500" />}
-      emptyMsg="No persistence findings yet. Agent needs to report services, tasks, configs, and binaries sections."
-      columns={[
-        { key: "category",        label: "Type",  render: f => <CatChip f={f} /> },
-        { key: "composite_score", label: "Risk",  render: f => <RiskScore f={f} /> },
-        { key: "source",          label: "Rule",  render: f => <span className="text-[9px] font-mono text-gray-500">{f.source}</span> },
-      ]}
-    />
+    <div className="space-y-2">
+      <div className="flex items-center gap-3 px-5 pt-4">
+        <div className="inline-flex bg-gray-100 rounded-lg p-0.5" role="group" aria-label="View mode">
+          <button onClick={() => setValidatedOnly(false)}
+            className={cn("px-3.5 py-1.5 rounded-md text-[10px] font-bold transition-all", !validatedOnly ? "bg-white text-orange-600 shadow-sm" : "text-gray-500 hover:text-gray-700")}>
+            All Persistence
+          </button>
+          <button onClick={() => setValidatedOnly(true)}
+            className={cn("px-3.5 py-1.5 rounded-md text-[10px] font-bold transition-all", validatedOnly ? "bg-white text-emerald-600 shadow-sm" : "text-gray-500 hover:text-gray-700")}>
+            Validated Findings
+          </button>
+        </div>
+        {validatedOnly && (
+          <span className="text-[9px] text-emerald-700 font-semibold flex items-center gap-1 bg-emerald-50 px-2 py-1 rounded border border-emerald-200">
+            <CheckCircle2 className="w-3 h-3" />precision_score ≥ threshold</span>
+        )}
+      </div>
+      <GenericDetectionPage
+        title="Backdoor & Services"
+        subtitle={validatedOnly ? "Auto-promoted by Detection Confidence" : "LaunchDaemons · cron/launchd tasks · shell config injection · SUID binaries · world-writable PATH"}
+        apiUrl={validatedOnly ? "/api/v1/detection/persistence?validated_only=true" : "/api/v1/detection/persistence"}
+        accent="amber"
+        icon={<Anchor className="w-5 h-5 text-orange-500" />}
+        emptyMsg={validatedOnly ? "No validated findings in Persistence." : "No persistence findings yet. Agent needs to report services, tasks, configs, and binaries sections."}
+        columns={[
+          { key: "category",        label: "Type",  render: f => <CatChip f={f} /> },
+          { key: "composite_score", label: "Risk",  render: f => <RiskScore f={f} /> },
+          { key: "source",          label: "Rule",  render: f => <span className="text-[9px] font-mono text-gray-500">{f.source}</span> },
+        ]}
+      />
+    </div>
   );
 }

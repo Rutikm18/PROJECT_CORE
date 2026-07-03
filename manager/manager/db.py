@@ -89,6 +89,27 @@ CREATE TABLE IF NOT EXISTS nonce_cache (
     expires_at DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nonce_exp ON nonce_cache(expires_at);
+
+-- Payload ledger: the durable outbox + reconciliation record for the detection
+-- pipeline. A row is written 'received' once a payload is stored (the telemetry
+-- worker), then marked 'processed' once detection runs (engine.process). The
+-- reconciler replays any payload that is received-but-not-processed past a grace
+-- window — closing the gap where a payload is stored but its detection hand-off
+-- was lost (worker crash, DLQ exhaustion, sync-path drop). This is what makes
+-- "raw is stored, so it's reprocessable" actually true instead of aspirational.
+CREATE TABLE IF NOT EXISTS payload_ledger (
+    agent_id     TEXT NOT NULL,
+    section      TEXT NOT NULL,
+    collected_at DOUBLE PRECISION NOT NULL,
+    received_at  DOUBLE PRECISION NOT NULL,
+    processed_at DOUBLE PRECISION,         -- NULL = detection not yet run
+    signal_count INTEGER,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_id, section, collected_at)
+);
+-- Partial index: the reconciler's hot query is "unprocessed, oldest first".
+CREATE INDEX IF NOT EXISTS idx_ledger_unprocessed
+    ON payload_ledger(received_at) WHERE processed_at IS NULL;
 """
 
 _MIGRATIONS = [
@@ -419,6 +440,136 @@ class Database:
                     VALUES(?,?,?,?,?)
                 """, (agent_id, section, collected_at, now, blob))
                 await db.commit()
+
+    # ── Payload ledger (outbox + reconciliation) ──────────────────────────────
+
+    @staticmethod
+    def _ledger_key(collected_at: float) -> float:
+        """Normalize the ledger key to integer seconds. The agent sends int-second
+        collected_at, but float drift creeps in across the pipeline (a
+        time.time() fallback when a message lacks collected_at, JSON round-trips),
+        which would make ledger_received and ledger_processed write DIFFERENT keys
+        for the same payload — leaving a phantom 'pending' row the reconciler then
+        needlessly replays. Flooring to the second collapses that drift so the two
+        writes always land on the same row."""
+        try:
+            return float(int(float(collected_at)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def ledger_received(
+        self, agent_id: str, section: str, collected_at: float
+    ) -> None:
+        """Record that a payload was stored and is awaiting detection. Idempotent
+        per (agent, section, collected_at) — a replay re-arms processed_at=NULL so
+        the reconciler will re-drive it if it's still not processed."""
+        now = time.time()
+        async with self._pool.write() as db:
+            await db.execute("""
+                INSERT INTO payload_ledger(agent_id, section, collected_at, received_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT (agent_id, section, collected_at) DO NOTHING
+            """, (agent_id, section, self._ledger_key(collected_at), now))
+            await db.commit()
+
+    async def ledger_processed(
+        self, agent_id: str, section: str, collected_at: float, signal_count: int = 0
+    ) -> None:
+        """Mark a payload's detection as complete. Upserts so a payload that was
+        processed without ever being ledger_received (e.g. sync path) still
+        records a terminal state rather than looking perpetually unprocessed."""
+        now = time.time()
+        async with self._pool.write() as db:
+            await db.execute("""
+                INSERT INTO payload_ledger(agent_id, section, collected_at, received_at,
+                                           processed_at, signal_count)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT (agent_id, section, collected_at)
+                DO UPDATE SET processed_at = excluded.processed_at,
+                              signal_count = excluded.signal_count
+            """, (agent_id, section, self._ledger_key(collected_at), now, now, int(signal_count)))
+            await db.commit()
+
+    async def ledger_unprocessed_sections(
+        self, grace_sec: float, max_attempts: int, limit: int = 200
+    ) -> list[dict]:
+        """The reconciler's work list: distinct (agent, section) with at least
+        one payload still unprocessed past the grace window and under the retry
+        cap. Returns the newest unprocessed collected_at per section so the
+        reconciler can replay the current snapshot and reconcile the backlog up
+        to it in one shot."""
+        cutoff = time.time() - grace_sec
+        async with self._pool.read() as db:
+            async with db.execute("""
+                SELECT agent_id, section,
+                       MAX(collected_at) AS latest_unprocessed,
+                       COUNT(*)          AS pending,
+                       MAX(attempts)     AS attempts
+                FROM payload_ledger
+                WHERE processed_at IS NULL AND received_at < ? AND attempts < ?
+                GROUP BY agent_id, section
+                ORDER BY MAX(received_at) ASC
+                LIMIT ?
+            """, (cutoff, max_attempts, limit)) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def ledger_reconcile_section(
+        self, agent_id: str, section: str, up_to_collected_at: float
+    ) -> int:
+        """After the reconciler replays the current snapshot of a section, fold
+        the whole unprocessed backlog for that (agent, section) up to that point
+        into one terminal 'reconciled' state (processed_at set, attempts bumped).
+        Snapshot-based detection means re-driving the latest payload recovers the
+        section's current detection state — we don't need to replay each missed
+        historical payload. Returns rows reconciled."""
+        now = time.time()
+        async with self._pool.write() as db:
+            cur = await db.execute("""
+                UPDATE payload_ledger
+                SET processed_at = ?, attempts = attempts + 1
+                WHERE agent_id = ? AND section = ?
+                  AND processed_at IS NULL AND collected_at <= ?
+            """, (now, agent_id, section, self._ledger_key(up_to_collected_at)))
+            await db.commit()
+            return getattr(cur, "rowcount", 0) or 0
+
+    async def ledger_bump_attempt(self, agent_id: str, section: str) -> None:
+        """Record a failed replay attempt (so a permanently-unreplayable section
+        eventually crosses max_attempts and stops being retried + alerts)."""
+        async with self._pool.write() as db:
+            await db.execute("""
+                UPDATE payload_ledger SET attempts = attempts + 1
+                WHERE agent_id = ? AND section = ? AND processed_at IS NULL
+            """, (agent_id, section))
+            await db.commit()
+
+    async def ledger_lag(self) -> dict:
+        """Health metric: how many payloads are stored-but-undetected, and the
+        oldest one's age. Surfaced on /api/v1/ingest/health so a stuck detection
+        pipeline is visible instead of silent."""
+        async with self._pool.read() as db:
+            async with db.execute("""
+                SELECT COUNT(*) AS pending, MIN(received_at) AS oldest
+                FROM payload_ledger WHERE processed_at IS NULL
+            """) as cur:
+                row = await cur.fetchone()
+        pending = int(row["pending"]) if row and row["pending"] else 0
+        oldest = float(row["oldest"]) if row and row["oldest"] else 0.0
+        return {
+            "pending": pending,
+            "oldest_age_sec": (time.time() - oldest) if oldest else 0.0,
+        }
+
+    async def prune_ledger(self, cutoff_ts: float) -> int:
+        """Delete processed ledger rows older than cutoff (the unprocessed ones
+        are kept — they are the reconciler's backlog). Returns rows deleted."""
+        async with self._pool.write() as db:
+            cur = await db.execute(
+                "DELETE FROM payload_ledger WHERE processed_at IS NOT NULL AND processed_at < ?",
+                (float(cutoff_ts),),
+            )
+            await db.commit()
+            return getattr(cur, "rowcount", 0) or 0
 
     async def prune_payloads(self, cutoff_ts: int) -> int:
         """Delete payload rows older than cutoff_ts. Returns rows deleted.

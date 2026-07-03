@@ -29,7 +29,52 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from .. import finding_lifecycle as lc
+
 log = logging.getLogger("manager.findings")
+
+
+def _get_request_context(req: Request) -> dict:
+    """Extract client IP, session ID, and other context from a FastAPI request.
+    Falls back gracefully when headers are absent."""
+    ip = req.client.host if req.client else ""
+    # Respect X-Forwarded-For when behind a reverse proxy
+    forwarded = req.headers.get("x-forwarded-for", "")
+    if forwarded and "," in forwarded:
+        ip = forwarded.split(",")[0].strip()
+    elif forwarded:
+        ip = forwarded.strip()
+    return {
+        "ip_address": ip,
+        "session_id": req.headers.get("x-session-id", ""),
+        "user_agent": req.headers.get("user-agent", ""),
+    }
+
+
+def _with_lifecycle(f: dict) -> dict:
+    """Attach the stable display id, canonical terrain, and the valid triage
+    actions for a finding's current state, so every page renders the same id,
+    the same terrain bucket, and consistent action buttons."""
+    status = lc.normalize(f.get("status"))
+    f["status"] = status
+    if not f.get("external_id") and f.get("id") is not None:
+        f["external_id"] = f"AL-F-{int(f['id']):08d}"
+    f["is_terminal"]       = lc.is_terminal(status)
+    f["available_actions"] = lc.available_actions(status)
+    # Canonical attack-terrain bucket — prefer stored terrain_id from the DB
+    # (set at creation time by upsert_finding), fall back to runtime inference
+    # for legacy rows that haven't been backfilled yet.
+    terrain = f.get("terrain_id") or ""
+    if not terrain:
+        try:
+            from ..attacklens.terrain_validators import terrain_for
+            terrain = terrain_for(f)
+        except Exception:
+            terrain = "origin"
+    f["terrain"] = terrain
+    f["terrain_id"] = terrain
+    f["terrain_source"] = f.get("terrain_source") or f.get("category", "")
+    return f
 
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -46,6 +91,12 @@ class FindingUpdate(BaseModel):
 class QuickAction(BaseModel):
     actor:  str = "analyst"
     reason: Optional[str] = None   # optional justification for close/accept/FP
+
+
+class FindingActionRequest(BaseModel):
+    action: str                    # open|investigate|close|accept_risk|false_positive|reopen
+    actor:  str = "analyst"
+    reason: Optional[str] = None
 
 
 class CommentCreate(BaseModel):
@@ -78,6 +129,29 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             log.warning("Live-agent lookup failed, showing unfiltered: %s", exc)
             return None
 
+    # ── Lifecycle definition (states + actions) ───────────────────────────────
+    @router.get("/lifecycle")
+    async def lifecycle_def():
+        """The canonical finding state machine, so the UI can render status
+        chips and action menus from one server-defined source of truth."""
+        return {
+            "statuses": {
+                "all":      sorted(lc.ALL_STATUSES),
+                "active":   sorted(lc.ACTIVE_STATUSES),
+                "terminal": sorted(lc.TERMINAL_STATUSES),
+            },
+            "actions": {
+                key: {
+                    "label":         spec["label"],
+                    "kind":          spec["kind"],
+                    "needs_reason":  spec["needs_reason"],
+                    "target_status": spec["target"],
+                    "from":          sorted(spec["from"]),
+                }
+                for key, spec in lc.ACTIONS.items()
+            },
+        }
+
     # ── Dashboard stats ───────────────────────────────────────────────────────
     @router.get("/dashboard")
     async def dashboard_stats():
@@ -109,12 +183,93 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             "total_at_risk": len(findings),
         }
 
+    # ── Attack Terrains ───────────────────────────────────────────────────────
+    @router.get("/terrains")
+    async def list_terrains():
+        """Return the canonical list of all attack terrains with their metadata."""
+        try:
+            return {"terrains": await intel_db.get_terrains()}
+        except Exception as exc:
+            log.exception("list_terrains failed")
+            raise HTTPException(500, f"Failed to load terrains: {exc}")
+
+    # ── Smart search (across findings) ─────────────────────────────────────────
+    @router.get("/smart-search")
+    async def smart_search(
+        q:           str             = Query(..., description="Search query (websearch syntax: \"phrase\", -exclude, OR)"),
+        agent_id:    Optional[str]   = Query(None, description="Filter by agent"),
+        terrain_id:  Optional[str]   = Query(None, description="citadels|vector|origin|identity|posture"),
+        severity:    Optional[str]   = Query(None, description="critical|high|medium|low|info"),
+        category:    Optional[str]   = Query(None, description="Finding category"),
+        limit:       int             = Query(50, ge=1, le=200),
+        offset:      int             = Query(0, ge=0),
+    ):
+        """
+        Full-text smart search across ALL findings using the Postgres tsvector
+        index. Supports websearch syntax:
+          - "quoted phrase"  → exact phrase match
+          - -exclude         → exclude term
+          - term1 OR term2   → boolean OR
+          - term1 term2      → AND (implicit)
+
+        Searches across: title, description, evidence, tags, CVE IDs.
+        Results ranked by relevance (ts_rank) then composite score.
+        """
+        try:
+            results = await intel_db.smart_search_findings(
+                q, agent_id=agent_id, terrain_id=terrain_id,
+                severity=severity, category=category,
+                limit=limit, offset=offset,
+            )
+            total = await intel_db.smart_search_count(
+                q, agent_id=agent_id, terrain_id=terrain_id,
+                severity=severity, category=category,
+            )
+        except Exception as exc:
+            log.exception("smart_search failed")
+            raise HTTPException(500, f"Search failed: {exc}")
+        return {
+            "findings": [_with_lifecycle(r) for r in results],
+            "count":    len(results),
+            "total":    total,
+            "offset":   offset,
+            "query":    q,
+        }
+
+    # ── Global audit log ──────────────────────────────────────────────────────
+    @router.get("/audit")
+    async def global_audit_log(
+        actor:       Optional[str] = Query(None, description="Filter by actor"),
+        action_type: Optional[str] = Query(None, description="Filter by action type"),
+        finding_uid: Optional[str] = Query(None, description="Filter by finding UID"),
+        agent_id:    Optional[str] = Query(None, description="Filter by agent"),
+        ip_address:  Optional[str] = Query(None, description="Filter by IP address"),
+        date_from:   Optional[float] = Query(None, description="Unix timestamp: start of range"),
+        date_to:     Optional[float] = Query(None, description="Unix timestamp: end of range"),
+        limit:       int = Query(100, ge=1, le=1000),
+        offset:      int = Query(0, ge=0),
+    ):
+        """Global audit log with flexible filters. Every filter is optional."""
+        try:
+            rows = await intel_db.get_audit_log(
+                actor=actor, action_type=action_type,
+                finding_uid=finding_uid, agent_id=agent_id,
+                ip_address=ip_address,
+                date_from=date_from, date_to=date_to,
+                limit=limit, offset=offset,
+            )
+            return {"audit": rows, "count": len(rows), "offset": offset}
+        except Exception as exc:
+            log.exception("global_audit_log failed")
+            raise HTTPException(500, f"Failed to load audit log: {exc}")
+
     # ── Findings list (global, all agents) ───────────────────────────────────
     _TERMINAL_STATUSES = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
 
     @router.get("/findings")
     async def list_findings(
         agent_id:     Optional[str]   = Query(None,  description="Filter by agent"),
+        terrain_id:   Optional[str]   = Query(None,  description="citadels|vector|origin|identity|posture"),
         severity:     Optional[str]   = Query(None,  description="critical|high|medium|low|info"),
         status:       Optional[str]   = Query(None,  description="SOC workflow status"),
         category:     Optional[str]   = Query(None,  description="Finding category"),
@@ -197,6 +352,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
         try:
             rows = await intel_db.get_soc_findings(
                 agent_id=agent_id,
+                terrain_id=terrain_id,
                 severity=severity,
                 status=status,
                 category=category,
@@ -228,12 +384,13 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
                 )
                 row_score = float(r.get("precision_score") or 0.0)
                 r["effective_threshold"] = round(thr, 3)
+                r["is_validated"] = row_score >= thr
                 if row_score >= thr:
                     keep.append(r)
             rows = keep
 
         body: dict = {
-            "findings": rows,
+            "findings": [_with_lifecycle(r) for r in rows],
             "count":    len(rows),
             "offset":   offset,
         }
@@ -329,7 +486,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
         activity = await intel_db.get_activity(finding_id)
         actions = await intel_db.get_actions(finding_id)
         return {
-            **finding,
+            **_with_lifecycle(dict(finding)),
             "comments": comments,
             "activity": activity,
             "actions": actions,
@@ -337,7 +494,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
 
     # ── Update finding ────────────────────────────────────────────────────────
     @router.patch("/findings/{finding_id}")
-    async def update_finding(finding_id: int, body: FindingUpdate):
+    async def update_finding(finding_id: int, body: FindingUpdate, req: Request):
         """
         Update SOC workflow fields. Automatically logs all changes to activity.
 
@@ -345,6 +502,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
           new → triaging → investigating → in_remediation → remediated → verified → closed
           Any → false_positive | accepted_risk | duplicate
         """
+        ctx = _get_request_context(req)
         # Capture old status before update (for feedback loop)
         old = await intel_db.get_finding_by_id(finding_id)
         if not old:
@@ -357,6 +515,8 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             analyst_notes=body.analyst_notes,
             priority=body.priority,
             actor=body.actor or "analyst",
+            ip_address=ctx["ip_address"],
+            session_id=ctx["session_id"],
         )
         if not updated:
             raise HTTPException(404, f"Finding {finding_id} not found")
@@ -429,6 +589,36 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             raise HTTPException(404, "Finding not found")
         activity = await intel_db.get_activity(finding_id)
         return {"activity": activity, "count": len(activity)}
+
+    # ── Finding by UUID ───────────────────────────────────────────────────────
+    @router.get("/findings/by-uid/{finding_uid}")
+    async def get_finding_by_uid(finding_uid: str):
+        """Full finding detail keyed by UUID instead of auto-increment id."""
+        finding = await intel_db.get_finding_by_uid(finding_uid)
+        if not finding:
+            raise HTTPException(404, f"Finding {finding_uid} not found")
+        comments = await intel_db.get_comments(finding["id"])
+        activity = await intel_db.get_activity(finding["id"])
+        actions = await intel_db.get_actions(finding["id"])
+        return {
+            **_with_lifecycle(dict(finding)),
+            "comments": comments,
+            "activity": activity,
+            "actions": actions,
+        }
+
+    # ── Finding audit trail ──────────────────────────────────────────────────
+    @router.get("/findings/{finding_uid}/audit")
+    async def get_finding_audit(finding_uid: str,
+                                limit: int = Query(100, ge=1, le=1000),
+                                offset: int = Query(0, ge=0)):
+        """Full immutable audit trail for a specific finding by its UUID."""
+        # Verify the finding exists first
+        finding = await intel_db.get_finding_by_uid(finding_uid)
+        if not finding:
+            raise HTTPException(404, f"Finding {finding_uid} not found")
+        audit = await intel_db.get_finding_audit(finding_uid, limit=limit, offset=offset)
+        return {"finding_uid": finding_uid, "audit": audit, "count": len(audit)}
 
     # ── Improvement metrics ───────────────────────────────────────────────────
     @router.get("/metrics")
@@ -514,68 +704,105 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             log.exception("improvement_metrics failed")
             raise HTTPException(500, f"Failed to compute metrics: {exc}")
 
-    # ── Quick-action convenience endpoints ───────────────────────────────────
-    # These wrap PATCH so the frontend can call a single intent endpoint
-    # instead of encoding state-machine knowledge on the client.
+    # ── Triage actions ────────────────────────────────────────────────────────
+    # One transition-validated path that all action endpoints funnel through, so
+    # the state machine (finding_lifecycle) is enforced server-side: the client
+    # cannot move a finding into an illegal state, and an action invalid from the
+    # finding's current state returns 409 with the actions that ARE allowed.
+
+    async def _apply_action(finding_id: int, action: str, actor: str,
+                            reason: str | None,
+                            ip_address: str = "",
+                            session_id: str = "") -> dict:
+        canon = lc.canonical_action(action)
+        if canon is None:
+            raise HTTPException(
+                400,
+                f"Unknown action '{action}'. Valid: {sorted(lc.ACTIONS)}",
+            )
+        finding = await intel_db.get_finding_by_id(finding_id)
+        if not finding:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+
+        current = lc.normalize(finding.get("status"))
+        if not lc.can_transition(current, canon):
+            raise HTTPException(
+                409,
+                detail={
+                    "error":             f"Action '{canon}' not allowed from status '{current}'",
+                    "current_status":    current,
+                    "available_actions": lc.available_actions(current),
+                },
+            )
+        if lc.ACTIONS[canon]["needs_reason"] and not (reason and reason.strip()):
+            raise HTTPException(400, f"Action '{canon}' requires a justification reason")
+
+        target = lc.target_status(canon)
+        updated = await intel_db.update_finding(
+            finding_id, status=target, actor=actor or "analyst",
+            analyst_notes=reason,
+            ip_address=ip_address,
+            session_id=session_id,
+        )
+        if not updated:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+
+        # Feedback loop (FP/TP/accepted) — same as PATCH, kept consistent here so
+        # quick actions also teach the confidence engine.
+        if target != current:
+            try:
+                from ..attacklens import feedback
+                if target == lc.FALSE_POSITIVE:
+                    await feedback.record_fp(intel_db, finding_id)
+                elif target in (lc.CLOSED, lc.VERIFIED, lc.REMEDIATED):
+                    await feedback.record_tp(intel_db, finding_id)
+                elif target == lc.ACCEPTED_RISK:
+                    await feedback.record_accepted(intel_db, finding_id)
+            except Exception as exc:
+                log.debug("feedback record failed for finding %s: %s", finding_id, exc)
+
+        return {"action": canon, **_with_lifecycle(dict(updated))}
+
+    @router.post("/findings/{finding_id}/action")
+    async def finding_action(finding_id: int, body: "FindingActionRequest", req: Request):
+        """Unified, transition-validated triage action. The UI sends the action
+        key it got from the finding's `available_actions` (open / investigate /
+        close / accept_risk / false_positive / reopen)."""
+        ctx = _get_request_context(req)
+        return await _apply_action(finding_id, body.action, body.actor, body.reason,
+                                   ip_address=ctx["ip_address"], session_id=ctx["session_id"])
+
+    # Named convenience endpoints — thin wrappers over the validated path so the
+    # UI can call a verb directly; all enforce the same state machine.
+    @router.post("/findings/{finding_id}/open")
+    async def open_finding(finding_id: int, body: QuickAction, req: Request):
+        ctx = _get_request_context(req)
+        return await _apply_action(finding_id, "open", body.actor, body.reason,
+                                   ip_address=ctx["ip_address"], session_id=ctx["session_id"])
 
     @router.post("/findings/{finding_id}/close")
-    async def close_finding(finding_id: int, body: QuickAction):
-        """Close a finding. Marks is_active=0, records closed_at."""
-        updated = await intel_db.update_finding(
-            finding_id, status="closed", actor=body.actor,
-            analyst_notes=body.reason,
-        )
-        if not updated:
-            raise HTTPException(404, f"Finding {finding_id} not found")
-        return {"status": "closed", **updated}
+    async def close_finding(finding_id: int, body: QuickAction, req: Request):
+        ctx = _get_request_context(req)
+        return await _apply_action(finding_id, "close", body.actor, body.reason,
+                                   ip_address=ctx["ip_address"], session_id=ctx["session_id"])
 
     @router.post("/findings/{finding_id}/accept-risk")
-    async def accept_risk(finding_id: int, body: QuickAction):
-        """Accept the risk. Marks is_active=0, status=accepted_risk."""
-        updated = await intel_db.update_finding(
-            finding_id, status="accepted_risk", actor=body.actor,
-            analyst_notes=body.reason,
-        )
-        if not updated:
-            raise HTTPException(404, f"Finding {finding_id} not found")
-        return {"status": "accepted_risk", **updated}
+    async def accept_risk(finding_id: int, body: QuickAction, req: Request):
+        ctx = _get_request_context(req)
+        return await _apply_action(finding_id, "accept_risk", body.actor, body.reason,
+                                   ip_address=ctx["ip_address"], session_id=ctx["session_id"])
 
     @router.post("/findings/{finding_id}/false-positive")
-    async def mark_false_positive(finding_id: int, body: QuickAction):
-        """Mark as false positive. Marks is_active=0, status=false_positive."""
-        updated = await intel_db.update_finding(
-            finding_id, status="false_positive", actor=body.actor,
-            analyst_notes=body.reason,
-        )
-        if not updated:
-            raise HTTPException(404, f"Finding {finding_id} not found")
-        return {"status": "false_positive", **updated}
+    async def mark_false_positive(finding_id: int, body: QuickAction, req: Request):
+        ctx = _get_request_context(req)
+        return await _apply_action(finding_id, "false_positive", body.actor, body.reason,
+                                   ip_address=ctx["ip_address"], session_id=ctx["session_id"])
 
     @router.post("/findings/{finding_id}/reopen")
-    async def reopen_finding(finding_id: int, body: QuickAction):
-        """
-        Reopen a closed/accepted/FP finding.
-        Sets status=triaging, is_active=1, clears closed_at.
-        """
-        finding = await intel_db.get_finding_by_id(finding_id)
-        if not finding:
-            raise HTTPException(404, f"Finding {finding_id} not found")
-        updated = await intel_db.update_finding(
-            finding_id, status="triaging", actor=body.actor,
-            analyst_notes=body.reason,
-        )
-        return {"status": "triaging", "reopened": True, **updated}
-
-    @router.post("/findings/{finding_id}/open")
-    async def open_finding(finding_id: int, body: QuickAction):
-        """Move finding to triaging (open). Alias for reopen."""
-        finding = await intel_db.get_finding_by_id(finding_id)
-        if not finding:
-            raise HTTPException(404, f"Finding {finding_id} not found")
-        updated = await intel_db.update_finding(
-            finding_id, status="triaging", actor=body.actor,
-        )
-        return {"status": "triaging", **updated}
+    async def reopen_finding(finding_id: int, body: QuickAction, req: Request):
+        ctx = _get_request_context(req)
+        return await _apply_action(finding_id, "reopen", body.actor, body.reason,
+                                   ip_address=ctx["ip_address"], session_id=ctx["session_id"])
 
     # ── 6-month historical trend ──────────────────────────────────────────────
     @router.get("/historical")

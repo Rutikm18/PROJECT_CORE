@@ -161,6 +161,13 @@ def make_ingest_router(
                 s["detection"] = engine.detection_stats()
             except Exception:
                 pass
+        # Ledger lag: payloads stored but not yet detected. A growing pending
+        # count / oldest_age means the detection pipeline is falling behind or
+        # stuck — the reconciler replays these, but persistent lag is a signal.
+        try:
+            s["ledger"] = await db.ledger_lag()
+        except Exception:
+            pass
         return s
 
     @router.post("/ingest", response_model=IngestResponse)
