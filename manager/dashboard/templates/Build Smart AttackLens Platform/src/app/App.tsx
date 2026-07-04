@@ -1,9 +1,11 @@
 import { useState, lazy, Suspense } from "react";
-import { ClipboardList } from "lucide-react";
+import { ClipboardList, Loader2 } from "lucide-react";
 import { Sidebar, type PageId } from "./components/Sidebar";
 import { TopHeader } from "./components/TopHeader";
 import { ComingSoon } from "./components/ComingSoon";
 import { RBACProvider } from "./context/RBACContext";
+import { AuthProvider, useAuth } from "./context/AuthContext";
+import LoginPage from "./pages/LoginPage";
 import { CIS_COMPLIANCE_LIVE } from "./featureFlags";
 
 // Dashboard is the landing page — keep it eager so first paint is instant.
@@ -72,8 +74,8 @@ function PageLoading() {
   );
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
-export default function App() {
+// ── Authenticated shell ───────────────────────────────────────────────────────
+function AuthenticatedApp() {
   const [activePage, setActivePage] = useState<PageId>("dashboard");
 
   return (
@@ -98,5 +100,36 @@ export default function App() {
         </div>
       </div>
     </RBACProvider>
+  );
+}
+
+// ── App root — auth gate ──────────────────────────────────────────────────────
+function AppInner() {
+  const { isAuthenticated, isLoading } = useAuth();
+
+  if (isLoading) {
+    // Brief check while localStorage hydrates — avoids login flash on refresh
+    return (
+      <div
+        className="min-h-screen flex items-center justify-center"
+        style={{ background: "#0a0e1a" }}
+      >
+        <Loader2 className="w-6 h-6 animate-spin text-orange-500" />
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <LoginPage onSuccess={() => {/* AuthContext re-renders automatically */}} />;
+  }
+
+  return <AuthenticatedApp />;
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppInner />
+    </AuthProvider>
   );
 }

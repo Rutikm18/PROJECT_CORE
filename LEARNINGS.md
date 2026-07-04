@@ -180,6 +180,18 @@ A running glossary of concepts/patterns introduced into this project, with a sho
 **What:** Sections in `_DEFAULT_SECTIONS` (and `SectionConfig` in agent.toml) can carry `timeout_sec` to override the global 25s collector deadline; `sca` uses 60s.
 **Why:** A full CIS scan runs ~30 shell probes sequentially (~1s each for systemsetup/pwpolicy); under the default 25s budget the tail of the checklist would degrade to not_applicable on every cold run. SectionConfig also had to gain the field — `SectionConfig(**cfg)` would have raised TypeError on a toml override.
 
+### Password policy and security controls layer
+**What:** `manager/security_policy.py` — PBKDF2-HMAC-SHA256 (600k iterations, stdlib only) for password hashing; `validate_password()` enforcing 16-char min, four character classes, 128-char max, common-password blocklist; `SECURITY_HEADERS` dict (HSTS, CSP, X-Frame-Options, Permissions-Policy, Referrer-Policy); lockout constants (IP: 5/15min, account: 10/30min).
+**Why:** The original auth used plaintext `hmac.compare_digest` against an env-var password. Upgrading to PBKDF2 makes offline brute-force ~600k× harder; dual IP+account lockout prevents credential stuffing across multiple IPs; security headers close clickjacking, MIME-sniffing, and referrer-leakage vectors. Also added a fake PBKDF2 call on unknown email (timing oracle prevention) and single-session enforcement (new login revokes all previous JTIs).
+
+### Idle timeout (frontend auto-logout)
+**What:** `AuthContext.tsx` listens to `mousedown`, `keydown`, `scroll`, `touchstart` etc. and resets a `setTimeout` on each event. No activity for `idle_minutes` (server-configured, default 30 min) triggers `logout("idle")`, which clears storage and records an `al_logout_reason=idle` in `sessionStorage`. The `LoginPage` reads that flag to show "signed out due to inactivity" instead of a generic error.
+**Why:** Absolute JWT expiry (8h) alone leaves an unattended logged-in browser exposed for hours. Idle timeout closes that window on unattended workstations — a core CIS macOS benchmark requirement for session lock.
+
+### Dashboard authentication (login page + JWT session)
+**What:** A complete auth layer: `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me` in `manager/api/auth_ui.py`; `AuthContext.tsx` and `LoginPage.tsx` on the frontend. JWT signed with HMAC-SHA256 (stdlib only — no new deps). httpOnly+SameSite=Strict cookie plus JSON bearer token for SPA dual delivery.
+**Why:** The dashboard had no authentication at all — any browser that reached port 8080 had full admin access. Security properties implemented: rate limiting (5 failures/IP → 15-min lockout), constant-time credential comparison (`hmac.compare_digest`), no user enumeration (identical 401 for wrong email or wrong password), token revocation on logout (JTI blacklist), and local expiry checked client-side to avoid stale-token flashes.
+
 ## 2026-06-29
 
 ### "Changes not showing on the dashboard" was stale index.html caching

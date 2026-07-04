@@ -31,6 +31,7 @@ from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect, HT
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .db        import Database
 from .pg_pool   import _redact_dsn
@@ -55,6 +56,7 @@ from .notifications.email import EmailNotifier
 from .api.remediation     import router as remediation_router
 from .intel               import IntelPipeline
 from .api.intel           import router as intel_router
+from .api.auth_ui         import router as auth_router
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
@@ -145,6 +147,23 @@ def create_app() -> FastAPI:
 
     # ── App ───────────────────────────────────────────────────────────────────
     app = FastAPI(title="mac_intel Manager", version="1.0.0", docs_url=None)
+
+    # ── Security headers middleware ────────────────────────────────────────────
+    from .security_policy import SECURITY_HEADERS
+
+    class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            response = await call_next(request)
+            for header, value in SECURITY_HEADERS.items():
+                # Don't overwrite headers already set by the route handler
+                if header not in response.headers:
+                    response.headers[header] = value
+            # Remove server fingerprinting
+            response.headers.pop("server", None)
+            response.headers.pop("x-powered-by", None)
+            return response
+
+    app.add_middleware(SecurityHeadersMiddleware)
 
     # CORS: default to same-origin only in production.
     # Set CORS_ORIGINS=https://your-dashboard.example.com in production env.
@@ -425,6 +444,7 @@ def create_app() -> FastAPI:
     app.include_router(allowlist_router,  prefix="/api/v1/allowlist")
     app.include_router(intel_router)        # prefix=/api/v1/intel defined inline — registered first so it wins over remediation duplicates
     app.include_router(remediation_router)  # prefixes defined inline (actors, news, overview — no overlap with intel_router)
+    app.include_router(auth_router)         # dashboard login/logout/me
 
     # ── Global exception handler ──────────────────────────────────────────────
     @app.exception_handler(Exception)

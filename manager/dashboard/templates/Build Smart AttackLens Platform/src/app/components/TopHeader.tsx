@@ -6,8 +6,9 @@
  * Role is persisted in localStorage via RBACContext.
  */
 import { useState, useEffect } from "react";
-import { Bell, ChevronDown, Shield, Clock } from "lucide-react";
+import { Bell, ChevronDown, Shield, Clock, LogOut } from "lucide-react";
 import { useRBAC, type Role } from "../context/RBACContext";
+import { useAuth } from "../context/AuthContext";
 import { type PageId } from "./Sidebar";
 import { cn } from "../../lib/utils";
 
@@ -49,6 +50,7 @@ interface TopHeaderProps {
 
 export function TopHeader({ activePage }: TopHeaderProps) {
   const { user, setRole } = useRBAC();
+  const { logout, user: authUser } = useAuth();
   const [roleOpen, setRoleOpen] = useState(false);
   const [time, setTime] = useState(() => new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
 
@@ -151,10 +153,20 @@ export function TopHeader({ activePage }: TopHeaderProps) {
           user.role === "analyst" ? "bg-gradient-to-br from-[--blue-500] to-[--indigo-600]" :
           "bg-gradient-to-br from-[--gray-400] to-[--gray-600]"
         )}
-          title={`${user.name} (${user.role})`}
+          title={`${authUser?.email ?? user.name} (${user.role})`}
         >
           {user.initials}
         </div>
+
+        {/* Logout */}
+        <button
+          onClick={() => logout()}
+          className="p-1.5 hover:bg-[--gray-50] rounded-md cursor-pointer transition-colors"
+          title="Sign out"
+          aria-label="Sign out"
+        >
+          <LogOut className="w-3.5 h-3.5 text-[--gray-400]" />
+        </button>
       </div>
 
       {/* Close role dropdown when clicking outside */}
