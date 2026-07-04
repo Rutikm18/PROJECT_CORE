@@ -9,6 +9,7 @@ Each submodule groups related collectors:
   system.py    — system state:   battery, openfiles, services,
                                   users, hardware, containers           (2 min)
   posture.py   — security posture: security, sysctl, configs           (1 hr)
+  sca.py       — CIS benchmark compliance scan (SCA)                   (12 hr)
   inventory.py — software:        storage, tasks, apps, packages,
                                   binaries, sbom                        (10 min – 24 hr)
 """
@@ -21,6 +22,7 @@ from .system    import (
     UsersCollector, HardwareCollector, ContainersCollector,
 )
 from .posture   import SecurityCollector, SysctlCollector, ConfigsCollector
+from .sca       import ScaCollector
 from .inventory import (
     StorageCollector, TasksCollector, AppsCollector,
     PackagesCollector, BinariesCollector, SbomCollector,
@@ -50,6 +52,8 @@ COLLECTORS: dict[str, object] = {
     "security":    SecurityCollector(),
     "sysctl":      SysctlCollector(),
     "configs":     ConfigsCollector(),
+    # compliance (12 hr)
+    "sca":         ScaCollector(),
     # inventory (24 hr)
     "apps":        AppsCollector(),
     "packages":    PackagesCollector(),

@@ -1,0 +1,346 @@
+# Security Configuration Assessment
+# CIS Checks for Apple macOS (Ventura/Sonoma/Sequoia — version-independent controls)
+#
+# SCA policy for Apple macOS based on the CIS Apple macOS Benchmark.
+# All checks are evaluable as root without network access; every command
+# completes in well under a second so a full scan stays inside the agent's
+# section budget.
+
+policy:
+  id: "sca_apple_macos"
+  file: "sca_apple_macos.yml"
+  name: "CIS Apple macOS Benchmark"
+  description: "Prescriptive guidance for establishing a secure configuration posture for Apple macOS, based on the CIS Apple macOS Benchmark."
+  references:
+    - https://www.cisecurity.org/cis-benchmarks/
+
+requirements:
+  title: "Check that the host is running macOS."
+  description: "Requirements for running the SCA scan against macOS"
+  condition: all
+  rules:
+    - "c:uname -> Darwin"
+
+checks:
+  # ── 1. Install Updates, Patches and Additional Security Software ──────────
+  - id: 40001
+    title: "Ensure Auto Update is enabled."
+    description: "Automatic checking for macOS software updates."
+    rationale: "Without automatic update checks, security patches must be discovered and applied manually, extending the window of exposure to known vulnerabilities."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool true"
+    compliance:
+      - cis: ["1.2"]
+      - cis_csc_v8: ["7.3"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -> 1"
+
+  - id: 40002
+    title: "Ensure Download New Updates When Available is enabled."
+    rationale: "Pre-downloading updates shortens the time between release and installation of security fixes."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true"
+    compliance:
+      - cis: ["1.3"]
+      - cis_csc_v8: ["7.3"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -> 1"
+
+  - id: 40003
+    title: "Ensure Install of macOS Updates is enabled."
+    rationale: "Automatic installation ensures OS security updates are applied without user action."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool true"
+    compliance:
+      - cis: ["1.4"]
+      - cis_csc_v8: ["7.3"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -> 1"
+
+  - id: 40004
+    title: "Ensure Install Application Updates from the App Store is enabled."
+    rationale: "Keeps App Store applications patched automatically."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool true"
+    compliance:
+      - cis: ["1.5"]
+      - cis_csc_v8: ["7.4"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.commerce AutoUpdate -> 1"
+
+  - id: 40005
+    title: "Ensure Install Security Responses and System Files is enabled."
+    rationale: "XProtect/MRT/Gatekeeper data and rapid security responses must install automatically for malware protection to stay current."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate ConfigDataInstall -bool true && sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool true"
+    compliance:
+      - cis: ["1.6"]
+      - cis_csc_v8: ["7.3", "10.1"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate ConfigDataInstall -> 1"
+      - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -> 1"
+
+  # ── 2. System Settings ────────────────────────────────────────────────────
+  - id: 40010
+    title: "Ensure Gatekeeper is enabled."
+    rationale: "Gatekeeper blocks execution of unsigned/unnotarised applications — the primary distribution shape of macOS malware."
+    remediation: "Run: sudo spctl --master-enable"
+    compliance:
+      - cis: ["2.6.4"]
+      - cis_csc_v8: ["10.5"]
+      - mitre_techniques: ["T1204.002"]
+    condition: all
+    rules:
+      - "c:spctl --status -> r:assessments enabled"
+
+  - id: 40011
+    title: "Ensure FileVault is enabled."
+    rationale: "Full-disk encryption protects data at rest against physical access and device theft."
+    remediation: "Enable FileVault in System Settings > Privacy & Security, or: sudo fdesetup enable"
+    compliance:
+      - cis: ["2.6.1.1"]
+      - cis_csc_v8: ["3.6"]
+      - mitre_techniques: ["T1005"]
+    condition: all
+    rules:
+      - "c:fdesetup status -> r:FileVault is On"
+
+  - id: 40012
+    title: "Ensure System Integrity Protection (SIP) is enabled."
+    rationale: "SIP prevents modification of system files and processes even by root, blocking a broad class of persistence and tampering techniques."
+    remediation: "Boot into Recovery and run: csrutil enable"
+    compliance:
+      - cis: ["2.6.5"]
+      - cis_csc_v8: ["2.3"]
+      - mitre_techniques: ["T1553", "T1547"]
+    condition: all
+    rules:
+      - "c:csrutil status -> r:System Integrity Protection status: enabled"
+
+  - id: 40013
+    title: "Ensure the application firewall is enabled."
+    rationale: "The application firewall blocks unsolicited inbound connections per-application."
+    remediation: "Run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+    compliance:
+      - cis: ["2.2.1"]
+      - cis_csc_v8: ["4.5"]
+      - mitre_techniques: ["T1021"]
+    condition: all
+    rules:
+      - "c:/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate -> r:enabled"
+
+  - id: 40014
+    title: "Ensure firewall stealth mode is enabled."
+    rationale: "Stealth mode drops ICMP echo and closed-port probes, reducing visibility to network scans."
+    remediation: "Run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on"
+    compliance:
+      - cis: ["2.2.2"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1046"]
+    condition: all
+    rules:
+      - "c:/usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode -> r:enabled"
+
+  - id: 40015
+    title: "Ensure firewall logging is enabled."
+    rationale: "Firewall logs are required to investigate blocked/allowed inbound connection attempts."
+    remediation: "Run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setloggingmode on"
+    compliance:
+      - cis: ["3.6"]
+      - cis_csc_v8: ["8.2"]
+    condition: all
+    rules:
+      - "c:/usr/libexec/ApplicationFirewall/socketfilterfw --getloggingmode -> r:on"
+
+  - id: 40016
+    title: "Ensure the Guest account is disabled."
+    rationale: "The guest account allows unauthenticated console access and is a common local foothold."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false"
+    compliance:
+      - cis: ["2.11.1"]
+      - cis_csc_v8: ["5.2"]
+      - mitre_techniques: ["T1078.003"]
+    condition: any
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled -> 0"
+      - "not c:defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled -> r:1"
+
+  - id: 40017
+    title: "Ensure automatic login is disabled."
+    rationale: "Auto-login bypasses authentication at boot, exposing the session to anyone with physical access."
+    remediation: "Run: sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser"
+    compliance:
+      - cis: ["2.11.2"]
+      - cis_csc_v8: ["4.7"]
+      - mitre_techniques: ["T1078"]
+    condition: none
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null -> r:\\S"
+
+  - id: 40018
+    title: "Ensure the root account is disabled."
+    rationale: "An enabled root account with a password is a direct privilege-escalation and lateral-movement target; sudo provides audited alternatives."
+    remediation: "Run: sudo dscl . -delete /Users/root AuthenticationAuthority; sudo passwd -d root (or disable via Directory Utility)"
+    compliance:
+      - cis: ["5.5"]
+      - cis_csc_v8: ["5.4"]
+      - mitre_techniques: ["T1078.003"]
+    condition: none
+    rules:
+      - "c:dscl . -read /Users/root AuthenticationAuthority 2>&1 -> r:ShadowHash|Kerberos"
+
+  # ── Sharing services ──────────────────────────────────────────────────────
+  - id: 40020
+    title: "Ensure Remote Login (SSH) is disabled."
+    rationale: "SSH provides remote shell access; on endpoints it should be off unless explicitly required."
+    remediation: "Run: sudo systemsetup -setremotelogin off"
+    compliance:
+      - cis: ["2.3.3.5"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1021.004"]
+    condition: all
+    rules:
+      - "c:systemsetup -getremotelogin -> r:Remote Login: Off"
+
+  - id: 40021
+    title: "Ensure Remote Apple Events is disabled."
+    rationale: "Remote Apple Events allows remote applications to send commands to this Mac."
+    remediation: "Run: sudo systemsetup -setremoteappleevents off"
+    compliance:
+      - cis: ["2.3.3.8"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1021"]
+    condition: all
+    rules:
+      - "c:systemsetup -getremoteappleevents -> r:Remote Apple Events: Off"
+
+  - id: 40022
+    title: "Ensure Screen Sharing is disabled."
+    rationale: "Screen Sharing (VNC) exposes the interactive session to the network."
+    remediation: "Run: sudo launchctl disable system/com.apple.screensharing"
+    compliance:
+      - cis: ["2.3.3.1"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1021.005"]
+    condition: all
+    rules:
+      - "c:launchctl print system/com.apple.screensharing 2>&1 -> r:Could not find service"
+
+  - id: 40023
+    title: "Ensure File Sharing (SMB) is disabled."
+    rationale: "SMB file sharing exposes local directories to the network and is a common lateral-movement channel."
+    remediation: "Run: sudo launchctl disable system/com.apple.smbd"
+    compliance:
+      - cis: ["2.3.3.3"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1021.002"]
+    condition: all
+    rules:
+      - "c:launchctl print system/com.apple.smbd 2>&1 -> r:Could not find service"
+
+  - id: 40024
+    title: "Ensure Printer Sharing is disabled."
+    rationale: "CUPS printer sharing opens a network listener and increases attack surface."
+    remediation: "Run: sudo cupsctl --no-share-printers"
+    compliance:
+      - cis: ["2.3.3.2"]
+      - cis_csc_v8: ["4.8"]
+    condition: all
+    rules:
+      - "c:cupsctl -> r:_share_printers=0"
+
+  # ── Time & logging ────────────────────────────────────────────────────────
+  - id: 40030
+    title: "Ensure Set time and date automatically is enabled."
+    rationale: "Accurate, NTP-synchronised clocks are required for log correlation, certificate validation and Kerberos."
+    remediation: "Run: sudo systemsetup -setusingnetworktime on"
+    compliance:
+      - cis: ["2.3.2.1"]
+      - cis_csc_v8: ["8.4"]
+      - mitre_techniques: ["T1070.006"]
+    condition: all
+    rules:
+      - "c:systemsetup -getusingnetworktime -> r:Network Time: On"
+
+  - id: 40031
+    title: "Ensure security auditing (BSM audit flags) is configured."
+    rationale: "Without configured audit flags the BSM subsystem records nothing useful for incident investigation."
+    remediation: "Edit /etc/security/audit_control and set e.g. flags:lo,aa (login/logout, authentication and authorization), then: sudo audit -s"
+    compliance:
+      - cis: ["3.1", "3.2"]
+      - cis_csc_v8: ["8.2", "8.5"]
+      - mitre_techniques: ["T1562.008"]
+    condition: all
+    rules:
+      - "f:/etc/security/audit_control -> r:^flags:\\S"
+
+  - id: 40032
+    title: "Ensure audit retention (expire-after) is configured."
+    rationale: "Audit records must be retained long enough (CIS: 60d or more) to support investigations."
+    remediation: "Edit /etc/security/audit_control and set expire-after:60d (or larger)."
+    compliance:
+      - cis: ["3.4"]
+      - cis_csc_v8: ["8.3", "8.10"]
+    condition: all
+    rules:
+      - "f:/etc/security/audit_control -> r:^expire-after:\\S"
+
+  # ── Password / session policy ─────────────────────────────────────────────
+  - id: 40040
+    title: "Ensure a global account (password) policy is configured."
+    rationale: "Without a pwpolicy account policy there is no enforced minimum length, complexity or lockout for local accounts."
+    remediation: "Apply a policy, e.g.: sudo pwpolicy -setaccountpolicies /path/to/policy.plist"
+    compliance:
+      - cis: ["5.2"]
+      - cis_csc_v8: ["5.2"]
+      - mitre_techniques: ["T1110"]
+    condition: none
+    rules:
+      - "c:pwpolicy -getaccountpolicies 2>&1 -> r:No account policies|Error"
+
+  - id: 40041
+    title: "Ensure sshd disallows root login (when SSH config is present)."
+    rationale: "Direct root SSH login defeats per-user accountability and is a brute-force target. CIS requires PermitRootLogin no explicitly."
+    remediation: "In /etc/ssh/sshd_config set: PermitRootLogin no, then reload sshd."
+    compliance:
+      - cis: ["5.8"]
+      - cis_csc_v8: ["4.1", "5.4"]
+      - mitre_techniques: ["T1021.004", "T1110"]
+    condition: all
+    rules:
+      - "f:/etc/ssh/sshd_config -> r:^\\s*PermitRootLogin\\s+no"
+
+  - id: 40042
+    title: "Ensure sshd uses key-based authentication (PasswordAuthentication no) when SSH config is present."
+    rationale: "Password authentication over SSH is brute-forceable; key-based auth removes that vector."
+    remediation: "In /etc/ssh/sshd_config set: PasswordAuthentication no and KbdInteractiveAuthentication no, then reload sshd."
+    compliance:
+      - cis: ["5.9"]
+      - cis_csc_v8: ["4.1"]
+      - mitre_techniques: ["T1110"]
+    condition: all
+    rules:
+      - "f:/etc/ssh/sshd_config -> r:^\\s*PasswordAuthentication\\s+no"
+
+  # ── Power / misc hardening ────────────────────────────────────────────────
+  - id: 40050
+    title: "Ensure Wake for network access is disabled."
+    rationale: "Wake-on-LAN (womp) lets network packets power the machine into an attackable state unattended."
+    remediation: "Run: sudo pmset -a womp 0"
+    compliance:
+      - cis: ["2.9.2"]
+      - cis_csc_v8: ["4.8"]
+    condition: none
+    rules:
+      - "c:pmset -g -> r:womp\\s+1"
+
+  - id: 40051
+    title: "Ensure a software update schedule check runs (softwareupdate --schedule on)."
+    rationale: "The background softwareupdate scheduler is what actually triggers the automatic checks configured in preferences."
+    remediation: "Run: sudo softwareupdate --schedule on"
+    compliance:
+      - cis: ["1.1"]
+      - cis_csc_v8: ["7.3"]
+    condition: all
+    rules:
+      - "c:softwareupdate --schedule -> r:on|enabled"

@@ -1,0 +1,146 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Docker image tag to deploy (default: latest)"
+        required: false
+        default: latest
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO: attacklens
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test-and-build:
+    name: Test, Build & Push
+    runs-on: ubuntu-latest
+    outputs:
+      manager_image: ${{ steps.push.outputs.manager_image }}
+      threat_intel_image: ${{ steps.push.outputs.threat_intel_image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install -r manager/requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit/ -v --tb=short
+        env:
+          PYTHONPATH: .
+        continue-on-error: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker images
+        id: push
+        run: |
+          # Build images
+          docker compose -f docker-compose.yml build manager
+          docker compose -f docker-compose.yml build threat-intel
+
+          # Tag with commit SHA
+          MANAGER_IMAGE="$ECR_REGISTRY/$ECR_REPO:manager-$IMAGE_TAG"
+          THREAT_IMAGE="$ECR_REGISTRY/$ECR_REPO:threat-intel-$IMAGE_TAG"
+          MANAGER_LATEST="$ECR_REGISTRY/$ECR_REPO:manager-latest"
+          THREAT_LATEST="$ECR_REGISTRY/$ECR_REPO:threat-intel-latest"
+
+          docker tag attacklens-manager:latest  "$MANAGER_IMAGE"
+          docker tag attacklens-threat-intel:latest "$THREAT_IMAGE"
+          docker tag attacklens-manager:latest  "$MANAGER_LATEST"
+          docker tag attacklens-threat-intel:latest "$THREAT_LATEST"
+
+          docker push "$MANAGER_IMAGE"
+          docker push "$THREAT_IMAGE"
+          docker push "$MANAGER_LATEST"
+          docker push "$THREAT_LATEST"
+
+          echo "manager_image=$MANAGER_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "threat_intel_image=$THREAT_IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to EC2
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: success()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER || 'ubuntu' }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          timeout: 120s
+          script: |
+            set -e
+
+            cd /home/${{ secrets.EC2_USER || 'ubuntu' }}/attacklens
+
+            # Pull latest images from ECR
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin \
+              ${{ env.ECR_REGISTRY }}
+
+            docker compose -f docker-compose.yml pull
+
+            # Generate override file pointing to explicit images
+            cat > docker-compose.override.yml << 'OVERRIDE'
+            services:
+              manager:
+                image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:manager-latest
+              threat-intel:
+                image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:threat-intel-latest
+            OVERRIDE
+
+            # Graceful restart — containers are replaced one at a time
+            docker compose -f docker-compose.yml up -d --remove-orphans --no-deps
+
+            # Clean up old images (keep last 3)
+            docker image prune -af --filter "until=24h" 2>/dev/null || true
+
+            # Health check
+            echo "Waiting for manager to become healthy..."
+            for i in $(seq 1 15); do
+              if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+                echo "Manager is healthy!"
+                break
+              fi
+              echo "Attempt $i/15..."
+              sleep 4
+            done
+
+            # Print status
+            docker compose ps

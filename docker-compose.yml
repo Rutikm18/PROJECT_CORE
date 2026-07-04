@@ -33,6 +33,11 @@ services:
     image: postgres:16-alpine
     container_name: attacklens-postgres
     restart: unless-stopped
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       POSTGRES_USER:     "${POSTGRES_USER:-attacklens}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-attacklens}"
@@ -54,6 +59,7 @@ services:
     image: rabbitmq:3.13-management-alpine
     container_name: attacklens-rabbitmq
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "5672:5672"
       - "15672:15672"

@@ -1,10 +1,12 @@
 """
 agent/agent/sca/engine.py — Security Configuration Assessment (SCA) engine.
 
-Evaluates Wazuh-compatible SCA policy files (CIS benchmarks) against the local
-host and produces per-check pass/fail results with compliance mappings.
+Evaluates SCA policy files (CIS benchmarks) against the local host and
+produces per-check pass/fail results with compliance mappings. The policy
+schema follows the de-facto industry format for SCA policies, so existing
+public CIS policy files run unmodified.
 
-Policy format (YAML, same schema as Wazuh SCA):
+Policy format (YAML):
 
     policy:        {id, name, description, references}
     requirements:  {condition, rules}     — host-applicability gate
@@ -32,8 +34,8 @@ Rule grammar (one string per rule):
 A line satisfies a PATTERN when every minterm holds for that line ("!" inverts
 one minterm). A rule with at least one positive minterm passes if ANY line
 satisfies; a rule whose minterms are ALL negative passes only if EVERY line
-does (i.e. no line matches the forbidden form) — matching Wazuh semantics for
-"ensure no line has X" rules.
+does (i.e. no line matches the forbidden form) — the standard SCA semantics
+for "ensure no line has X" rules.
 
 Check result: passed / failed / not_applicable (rule type unusable on this OS,
 or evaluation could not run — e.g. section budget exhausted).
@@ -43,7 +45,7 @@ The engine is OS-agnostic: command execution is delegated to an injectable
 platform's collector supplies its own budget/timeout policy. Policies are
 root-owned files shipped inside the agent's source tree (same trust domain as
 the agent code itself); `c:` rules therefore execute with the agent's
-privileges by design, exactly as Wazuh SCA does.
+privileges by design.
 """
 from __future__ import annotations
 
@@ -352,7 +354,7 @@ class ScaEngine:
 
     @staticmethod
     def _compliance_map(compliance) -> dict:
-        """Wazuh stores compliance as a list of single-key dicts — flatten it."""
+        """Policies store compliance as a list of single-key dicts — flatten it."""
         out: dict = {}
         if isinstance(compliance, list):
             for entry in compliance:

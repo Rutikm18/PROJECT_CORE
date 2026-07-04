@@ -1,0 +1,23 @@
+# =============================================================================
+#  docker-compose.ecr.yml — Pull pre-built images from ECR instead of building
+#
+#  Use with the main docker-compose.yml:
+#    docker compose -f docker-compose.yml -f docker-compose.ecr.yml up -d
+#
+#  AWS ECR auth (one-time):
+#    aws ecr get-login-password --region <region> | \
+#      docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+#
+#  Environment variables required:
+#    AWS_ACCOUNT_ID  — 12-digit AWS account ID
+#    AWS_REGION      — e.g. us-east-1
+# =============================================================================
+
+services:
+  manager:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION:-us-east-1}.amazonaws.com/attacklens:manager-${DEPLOY_TAG:-latest}
+    build: !reset []
+
+  threat-intel:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION:-us-east-1}.amazonaws.com/attacklens:threat-intel-${DEPLOY_TAG:-latest}
+    build: !reset []

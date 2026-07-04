@@ -45,3 +45,16 @@ build/
 bandit-report.json
 *-audit.json
 sast-report.json
+
+# ── Production deployment ─────────────────────────────────────────────────────
+.env
+.env.*
+!env.sh
+Caddyfile
+docker-compose.override.yml
+*.swp
+*.swo
+
+# ── AWS / EC2 deployment artifacts ────────────────────────────────────────────
+*.pem
+*.pkk

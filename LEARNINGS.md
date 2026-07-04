@@ -162,6 +162,24 @@ A running glossary of concepts/patterns introduced into this project, with a sho
 **What:** Apps bundled under `/System/Applications/` and `/System/Library/` are signed DIRECTLY by Apple using an internal certificate — they are exempt from the third-party notarization requirement and legitimately report `notarized=False`.
 **Why:** The `_apps()` detection rule was flagging Calculator, Calendar, Chess, etc. as "Non-notarized application" at medium severity. Fixed by skipping any app whose `path` starts with an entry in `APPLE_SYSTEM_PATH_PREFIXES` before evaluating signing/notarization — the same prefix list already used by `is_apple_system_process()`.
 
+## 2026-07-04
+
+### SCA policy format (CIS benchmarking)
+**What:** A YAML policy schema for Security Configuration Assessment: `policy` metadata, a `requirements` block gating host applicability, and `checks` whose `rules` are compact strings (`f:` file, `d:` directory, `c:` command, `p:` process, `r:` registry) with `-> pattern` content matching (`r:` regex, `n:... compare` numeric, `!` negation, `&&` same-line conjunction) combined by `condition: all/any/none`.
+**Why:** The agent needed CIS benchmark testing capability; adopting the de-facto industry SCA policy schema means the entire public library of CIS policies (the user supplied the Distribution Independent Linux v2.0.0 one, 190 checks) runs unmodified, instead of inventing a bespoke check DSL. Implemented in `agent/agent/sca/engine.py` with policies under `agent/agent/sca/policies/`.
+
+### All-negative pattern semantics in SCA rules
+**What:** When every minterm in a content pattern is negated (`!r:...`), the rule passes only if EVERY line satisfies it (i.e. no line matches the forbidden form) — vacuously true for empty content. A pattern with at least one positive minterm passes if ANY line satisfies all minterms.
+**Why:** CIS policies express "ensure no line enables X" as `-> !r:pattern`; treating it with any-line semantics would make the rule pass whenever a single innocent line existed, silently green-lighting misconfigured hosts.
+
+### Injectable command runner for OS-agnostic engines
+**What:** The SCA engine takes a `runner(cmd, timeout) -> (rc, stdout)` callable instead of shelling out directly; the macOS collector injects a budget-aware runner built on the section-budget thread-local (`run_budget_remaining`), and `rc=None` maps to `not_applicable` rather than `failed`.
+**Why:** Keeps the engine platform-independent (Linux/Windows collectors can wrap their own runners) and preserves the agent's core resilience contract — a slow command degrades one check instead of blowing the 25s section timeout; unprivileged dev runs (systemsetup demanding admin) report not_applicable instead of false FAILs.
+
+### Per-section timeout_sec override
+**What:** Sections in `_DEFAULT_SECTIONS` (and `SectionConfig` in agent.toml) can carry `timeout_sec` to override the global 25s collector deadline; `sca` uses 60s.
+**Why:** A full CIS scan runs ~30 shell probes sequentially (~1s each for systemsetup/pwpolicy); under the default 25s budget the tail of the checklist would degrade to not_applicable on every cold run. SectionConfig also had to gain the field — `SectionConfig(**cfg)` would have raised TypeError on a toml override.
+
 ## 2026-06-29
 
 ### "Changes not showing on the dashboard" was stale index.html caching

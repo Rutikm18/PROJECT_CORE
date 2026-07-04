@@ -77,6 +77,10 @@ _DEFAULT_SECTIONS: dict = {
     "storage":     {"enabled": True,  "interval_sec": 600,   "send": True},
     "tasks":       {"enabled": True,  "interval_sec": 600,   "send": True},
     "security":    {"enabled": True,  "interval_sec": 3600,  "send": True},
+# CIS compliance scan: many short shell probes; 60 s ceiling instead of the
+# 25 s default so a cold first run (systemsetup/pwpolicy are ~1 s each) never
+# degrades checks to not_applicable via the section budget.
+"sca":         {"enabled": True,  "interval_sec": 43200, "send": True, "timeout_sec": 60},
     "sysctl":      {"enabled": True,  "interval_sec": 3600,  "send": True},
     "configs":     {"enabled": True,  "interval_sec": 3600,  "send": True},
     "apps":        {"enabled": True,  "interval_sec": 86400, "send": True},

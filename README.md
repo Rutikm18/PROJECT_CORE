@@ -282,6 +282,84 @@ sudo attacklens-ctl enroll    # force re-enrollment
 
 ---
 
+## Production Deployment
+
+### One-time EC2 setup
+
+1. Launch an EC2 instance (recommended: `t3.medium` or larger, 30GB+ gp3 EBS)
+2. Attach an IAM role with `AmazonEC2ContainerRegistryReadOnly` and `AmazonSSMManagedInstanceCore`
+3. Open ports `22`, `443`/`8443`, and `80` in the security group
+4. Paste the contents of `ec2-userdata.sh` into User Data on launch
+
+After the instance boots:
+
+```bash
+ssh ubuntu@<ec2-ip>
+cd ~/attacklens
+
+# If ec2-userdata.sh didn't clone the repo:
+git clone <your-repo-url> .
+
+# Generate config:
+bash env.sh
+
+# Start everything:
+docker compose up -d
+
+# Monitor:
+./scripts/monitor.sh
+```
+
+### Backup
+
+```bash
+# Backup all Postgres databases + secrets:
+sudo ./scripts/backup.sh /backup/dir
+
+# Restore:
+sudo ./scripts/backup.sh /backup/dir --restore
+
+# Backup to S3:
+sudo ./scripts/backup.sh /backup/dir --s3-bucket my-bucket
+```
+
+### CI/CD (GitHub Actions)
+
+Push to `main` triggers automatic build + deploy. Set these GitHub Secrets:
+
+| Secret | Value |
+|--------|-------|
+| `AWS_ACCESS_KEY_ID` | IAM user with ECR push + EC2 access |
+| `AWS_SECRET_ACCESS_KEY` | Corresponding secret key |
+| `AWS_ACCOUNT_ID` | 12-digit AWS account number |
+| `EC2_HOST` | EC2 public IP or DNS |
+| `EC2_SSH_KEY` | Private SSH key for the EC2 instance |
+
+### Manual deploy
+
+```bash
+# Build and deploy from your dev machine:
+./scripts/deploy.sh ubuntu@<ec2-ip>
+
+# Restart only (pull latest images):
+./scripts/deploy.sh ubuntu@<ec2-ip> --restart
+```
+
+### Health monitoring
+
+```bash
+# Full report:
+./scripts/monitor.sh
+
+# Live dashboard (Ctrl+C to stop):
+./scripts/monitor.sh --watch
+
+# Quick check:
+./scripts/monitor.sh --quick
+```
+
+---
+
 ## Contributing
 
 1. Fork the repo and create a feature branch

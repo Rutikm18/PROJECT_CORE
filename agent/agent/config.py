@@ -145,6 +145,8 @@ class SectionConfig:
     enabled:      bool = True
     interval_sec: int  = 60
     send:         bool = True
+    # Per-section hard timeout override (None → collection.section_timeout_sec)
+    timeout_sec:  int | None = None
 
 
 @dataclass
@@ -227,7 +229,7 @@ class AgentConfig:
         """Return a raw dict for internal consumers."""
         sections = {
             name: {"enabled": s.enabled, "interval_sec": s.interval_sec,
-                   "send": s.send}
+                   "send": s.send, "timeout_sec": s.timeout_sec}
             for name, s in self.collection.sections.items()
         }
         return {
