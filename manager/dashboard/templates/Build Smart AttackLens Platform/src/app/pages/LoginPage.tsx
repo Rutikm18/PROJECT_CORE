@@ -226,8 +226,29 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
           </form>
         </div>
 
-        {/* Footer note */}
-        <p className="text-center text-[10px] mt-6" style={{ color: "rgba(255,255,255,0.2)" }}>
+        {/* Dev credentials hint */}
+        <div
+          className="rounded-xl px-4 py-3 mt-4 cursor-pointer select-none"
+          style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}
+          onClick={() => { setEmail("admin@attacklens.ai"); setPassword("!HLwS=f73fHo$?p!#M77XA*M"); setError(null); }}
+          title="Click to fill credentials"
+        >
+          <p className="text-[10px] font-semibold mb-1.5" style={{ color: "rgba(255,255,255,0.3)" }}>
+            DEFAULT CREDENTIALS · CLICK TO FILL
+          </p>
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] w-14" style={{ color: "rgba(255,255,255,0.25)" }}>Email</span>
+              <span className="text-[11px] font-mono" style={{ color: "rgba(255,255,255,0.55)" }}>admin@attacklens.ai</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] w-14" style={{ color: "rgba(255,255,255,0.25)" }}>Password</span>
+              <span className="text-[11px] font-mono" style={{ color: "rgba(255,255,255,0.55)" }}>!HLwS=f73fHo$?p!#M77XA*M</span>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-center text-[10px] mt-4" style={{ color: "rgba(255,255,255,0.15)" }}>
           AttackLens · Secure access only · All activity is logged
         </p>
       </div>
