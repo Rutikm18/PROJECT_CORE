@@ -3,6 +3,19 @@
 **Stack:** EC2 → Docker Compose → Caddy (TLS) + Manager + Threat-Intel + RabbitMQ  
 **Time:** ~20 minutes (IP-only) · ~30 minutes (custom domain + Let's Encrypt)
 
+> **Important — OS choice:** Use **Ubuntu 22.04 LTS**. Amazon Linux 2023 lacks
+> `docker-compose-plugin` in dnf and ships BuildKit 0.12 (need ≥ 0.16) — the
+> installer handles it automatically, but Ubuntu avoids those hurdles entirely.
+
+**Minimum dependency versions enforced by the installer:**
+
+| Tool | Minimum | Why |
+|---|---|---|
+| Docker | 25.0 | BuildKit feature flags |
+| Docker Compose | 2.27 | `--build` parallelism |
+| Docker Buildx | 0.17 | multi-platform support |
+| BuildKit | 0.16 | cache mounts |
+
 ---
 
 ## Contents
@@ -44,9 +57,11 @@ Start with **IP-only** if you just want it running. Upgrade to a domain later.
 |---|---|
 | **AMI** | Ubuntu 22.04 LTS (`ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64`) |
 | **Instance type** | `t3.large` (2 vCPU, 8 GB RAM) — threat-intel needs RAM for CVE data |
-| **Minimum type** | `t3.medium` (2 vCPU, 4 GB) — works but tight |
+| **Minimum type** | `t3.medium` (2 vCPU, 4 GB) — works but tight for a demo |
 | **Storage** | 30 GB gp3 root volume (50 GB if you plan long-term telemetry retention) |
-| **Region** | Any — pick one close to your endpoints |
+| **Region** | Pick closest to your endpoints — us-east-1 (N. Virginia) or us-west-2 (Oregon) |
+
+> Do **not** use Amazon Linux 2023 — see the note at the top.
 
 ### Via AWS Console
 
@@ -147,17 +162,46 @@ ssh -i ~/.ssh/attacklens-key.pem ubuntu@YOUR_EC2_IP
 # Update system
 sudo apt-get update && sudo apt-get upgrade -y
 
-# Install Docker
+# Install Docker (official get.docker.com — ships 25+, not the Ubuntu snap)
 curl -fsSL https://get.docker.com | sudo bash
 sudo usermod -aG docker ubuntu
 newgrp docker   # apply group without logout
 
-# Verify Docker
-docker --version        # Docker 25+
-docker compose version  # Docker Compose v2+
+# Verify versions against minimums
+docker --version                      # must be 25.0+
+docker compose version                # must be 2.27+
+docker buildx version                 # must be 0.17+
 
 # Install Git
-sudo apt-get install -y git
+sudo apt-get install -y git curl
+```
+
+> If Buildx is below 0.17 (common on older Ubuntu images), the installer's
+> `--repair` flag or `attacklens repair` command will auto-upgrade it.
+
+### Pre-flight check
+
+The installer validates all versions before building. Run this once to confirm your environment is clean:
+
+```bash
+bash install.sh --doctor
+# or after cloning (step 6):
+./attacklens doctor
+```
+
+Sample passing output:
+```
+[ok] Docker 25.0.6
+[ok] Compose v2.29.1
+[ok] Buildx v0.17.1
+[ok] BuildKit 0.16.0 (attacklens-builder)
+[ok] Disk ≥ 5 GB (28 GB free)
+[ok] RAM ≥ 2 GB (7.5 GB)
+[ok] Port 80 free
+[ok] Port 8080 free
+[ok] Internet reachable
+
+Overall: PASSED
 ```
 
 ---
@@ -167,7 +211,7 @@ sudo apt-get install -y git
 ```bash
 # Clone into home directory
 cd ~
-git clone https://github.com/YOUR_ORG/macbook_data.git attacklens
+git clone https://github.com/Rutikm18/PROJECT_CORE.git attacklens
 cd attacklens
 ```
 
@@ -209,6 +253,24 @@ You should see values for `PUBLIC_IP`, `ADMIN_TOKEN`, and `BIND_PORT`.
 
 ---
 
+### Retrieve your ADMIN_TOKEN
+
+The ADMIN_TOKEN (for key management API) is displayed once at startup:
+
+```bash
+# Extract from logs and copy to clipboard
+docker compose logs manager | grep "ADMIN TOKEN" | awk -F': ' '{print $NF}' | pbcopy
+# (or xclip on Linux: | xclip -selection clipboard)
+
+# Or just view it
+docker compose logs manager | grep -A1 "ADMIN TOKEN"
+```
+
+Save it for safe keeping — you'll need it for:
+- `curl -H "X-Admin-Token: $ADMIN_TOKEN" http://localhost:8080/api/v1/keys`
+- Rotating agent API keys
+- Access control management
+
 ### Optional: add API keys to .env
 
 Edit `.env` to add optional integrations:
@@ -240,13 +302,36 @@ ALERT_RECIPIENTS=you@gmail.com
 
 ```bash
 # Build images and start all containers
-docker compose up -d --build
-
-# Watch startup progress
-docker compose logs -f
+bash install.sh
 ```
 
-First start takes **2–4 minutes** — Docker builds the manager and threat-intel images, then RabbitMQ must pass its health check before the manager starts.
+The installer runs pre-flight checks, builds images, and starts all containers in one step. It prints progress for each of 10 steps:
+
+```
+━━━ Step 1/10: Checking OS + user ━━━
+━━━ Step 2/10: Validating dependencies ━━━
+...
+━━━ Step 8/10: Building images ━━━
+━━━ Step 9/10: Starting containers ━━━
+━━━ Step 10/10: Verifying health ━━━
+```
+
+First build takes **3–5 minutes** — Docker compiles the manager and threat-intel images, then RabbitMQ must pass its health check before the manager starts.
+
+**If the build fails** (e.g. Buildx or Compose version too old):
+
+```bash
+# Auto-repair: upgrades Buildx + Compose + creates BuildKit builder
+bash install.sh --repair
+# or
+./attacklens repair
+```
+
+Watch live logs after start:
+
+```bash
+docker compose logs -f
+```
 
 Press `Ctrl+C` to stop following logs (containers keep running).
 
@@ -290,30 +375,71 @@ Domain mode:    https://attacklens.your-domain.com
 > **Browser TLS warning (IP-only):** This is expected. Caddy uses a self-signed cert.
 > Click "Advanced → Proceed" in Chrome, or "Accept Risk" in Firefox.
 
+### Default login credentials
+
+**Email:** `admin@attacklens.ai`  
+**Password:** `!HLwS=f73fHo$?p!#M77XA*M`
+
+These are shown on the login page. After login, navigate to **Settings → API Keys** to retrieve your `ADMIN_TOKEN` (also shown in `docker compose logs manager` at startup).
+
 ---
 
 ## 10. Connect Agents
 
-### macOS agent (quickest)
+### macOS agent (binary PKG — v2.1.0+)
 
-On the Mac you want to monitor:
+Build the PKG on your dev Mac, then distribute it to endpoints:
 
 ```bash
-# Option A — run from source (dev/testing)
+# On your dev Mac — build the PKG
 cd /path/to/macbook_data
-# Edit agent.toml — change manager URL to your EC2 IP
-sed -i '' 's|url.*=.*|url = "https://YOUR_EC2_IP:8443"|' agent.toml
-sed -i '' 's|tls_verify.*=.*|tls_verify = false|' agent.toml
-PYTHONPATH=. python3 agent/agent_entry.py run --config agent.toml
-
-# Option B — install the built binary (production)
-sudo agent/dist/attacklens-agent install --manager https://YOUR_EC2_IP:8443
+MANAGER_IP=YOUR_EC2_IP MANAGER_PORT=8080 VERSION=2.1.0 ARCH=arm64 \
+  bash agent/os/macos/pkg/build_pkg.sh
+# Output: agent/os/macos/pkg/dist/attacklens-agent-2.1.0-arm64.pkg
 ```
 
-> Use `tls_verify = false` when the manager has a self-signed cert.  
-> Use `tls_verify = true` when using a Let's Encrypt domain cert.
+Install on the endpoint Mac:
 
-### Check agent appeared in dashboard
+```bash
+sudo installer -pkg attacklens-agent-2.1.0-arm64.pkg -target /
+```
+
+The postinstall automatically:
+- derives a stable Agent ID from the hardware UUID (`mac-<uuid>`)
+- writes `/Library/AttackLens/agent.toml` with your EC2 IP baked in
+- loads both LaunchDaemons (the agent + watchdog)
+
+**Verify on the endpoint:**
+
+```bash
+sudo attacklens-service status      # both services ● running
+sudo attacklens-service diagnose    # tests manager /health endpoint
+```
+
+**Agent didn't appear in the dashboard?** Check connectivity first:
+
+```bash
+# On the Mac
+sudo attacklens-service diagnose
+# Section 4 will report: manager reachable / NOT reachable + HTTP code
+
+# If reachable, check manager received it
+curl http://YOUR_EC2_IP:8080/api/v1/agents
+```
+
+> Use `tls_verify = false` when the manager has a self-signed cert (IP-only mode).  
+> Use `tls_verify = true` with a Let's Encrypt domain cert (domain mode).
+
+### macOS agent management CLI
+
+```bash
+sudo attacklens-service status      # agent + watchdog state
+sudo attacklens-service restart     # stop watchdog first, then agent, then restart both
+sudo attacklens-service logs 100    # last 100 lines of agent/watchdog logs
+sudo attacklens-service diagnose    # full health: files, services, manager connectivity
+```
+
+### Check agent appeared in the manager
 
 ```bash
 curl http://localhost:8080/api/v1/agents
@@ -489,6 +615,40 @@ sudo attacklens-agent install --manager https://YOUR_IP:8443 --token sk-enroll-.
 
 ## 15. Troubleshooting
 
+### Run the doctor first
+
+```bash
+./attacklens doctor
+```
+
+This checks all dependencies, services, ports, disk, RAM, and internet in one pass. Fix anything reported as `[fail]` before proceeding.
+
+### "compose build requires buildx 0.17.0 or later"
+
+Your Buildx is too old. Auto-repair:
+
+```bash
+bash install.sh --repair
+# or
+./attacklens repair
+```
+
+This downloads the latest Buildx + Compose binaries from GitHub and creates an `attacklens-builder` BuildKit builder. Takes ~2 minutes.
+
+### "docker-compose: command not found" / compose plugin missing
+
+On Amazon Linux 2023 (or older Ubuntu), the compose plugin may not be installed. The `--repair` flag installs it automatically. Or manually:
+
+```bash
+COMPOSE_VER=$(curl -s https://api.github.com/repos/docker/compose/releases/latest \
+  | grep '"tag_name"' | cut -d'"' -f4)
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version   # verify
+```
+
 ### Containers not starting
 
 ```bash
@@ -513,14 +673,40 @@ docker compose restart rabbitmq
 ### Agent can't reach manager
 
 ```bash
-# From the agent machine, test connectivity:
+# From the Mac, run the built-in diagnostic:
+sudo attacklens-service diagnose
+# Section 4 tests /health and prints HTTP status + error message
+
+# Or test manually:
 curl -k https://YOUR_EC2_IP:8443/health
+curl    http://YOUR_EC2_IP:8080/health
 
 # Common causes:
-# 1. Port 8443 not open in security group → re-check step 3
-# 2. tls_verify = true but cert is self-signed → set tls_verify = false
+# 1. Port 8443/8080 not open in security group → re-check step 3
+# 2. tls_verify = true but cert is self-signed → set tls_verify = false in agent.toml
 # 3. EC2 public IP changed (Elastic IP prevents this — see below)
+# 4. Manager URL in agent.toml uses https:// but manager only listens on http://
+#    → grep url /Library/AttackLens/agent.toml — should be http://IP:8080 for direct
 ```
+
+### macOS agent: "Bootstrap failed: 5" or service not starting
+
+```bash
+# Not a real failure — means the service was already loaded.
+# Use bootout → bootstrap instead:
+sudo launchctl bootout system/com.attacklens.agent
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.agent.plist
+# or simply:
+sudo attacklens-service restart
+```
+
+### macOS agent: "attacklens-service: command not found"
+
+You installed a pre-2.1.0 PKG. Rebuild the PKG from the repo (v2.1.0+) and reinstall — the new PKG ships the management CLI to `/usr/local/bin/attacklens-service`.
+
+### macOS agent: SCA section missing from dashboard payloads
+
+Pre-2.1.0 frozen binaries shipped without policy files (PyInstaller `--onefile` doesn't bundle data files automatically). Rebuild + reinstall the PKG — the 57-check CIS macOS policy is now bundled with `--add-data`. To add custom policies without rebuilding, drop `.yml` files into `/Library/AttackLens/sca/` and restart the agent.
 
 ### Assign an Elastic IP (prevents IP changes on reboot)
 
@@ -568,13 +754,21 @@ sudo resize2fs /dev/sda1
 ## Quick Reference
 
 ```bash
-# Start
+# Full install (with pre-flight checks + progress output)
+bash install.sh
+
+# Health check — all dependencies, services, ports
+./attacklens doctor
+
+# Auto-repair Buildx/Compose versions + create BuildKit builder
+bash install.sh --repair   # or: ./attacklens repair
+
+# Status of all containers
+./attacklens status
+
+# Start / Stop / Restart
 cd ~/attacklens && docker compose up -d
-
-# Stop
 docker compose down
-
-# Restart one container
 docker compose restart manager
 
 # Rebuild after code changes
@@ -582,8 +776,10 @@ docker compose up -d --build manager
 
 # View live logs
 docker compose logs -f
+./attacklens logs             # shorthand
+./attacklens logs manager     # specific service
 
-# Check health
+# Check health endpoint
 curl http://localhost:8080/health
 
 # List agents
@@ -592,6 +788,12 @@ curl http://localhost:8080/api/v1/agents | python3 -m json.tool
 # Update to latest code
 git pull
 docker compose up -d --build
+
+# macOS agent management (on endpoint)
+sudo attacklens-service status
+sudo attacklens-service diagnose
+sudo attacklens-service restart
+sudo attacklens-service logs 100
 ```
 
 ---

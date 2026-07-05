@@ -37,7 +37,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-2.1.0}"
 ARCH="${ARCH:-arm64}"
 NOTARIZE="${NOTARIZE:-false}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
@@ -121,6 +121,11 @@ PYTHONPATH="${REPO_ROOT}" python3 -m PyInstaller \
     --hidden-import "agent.os.macos.collectors.system" \
     --hidden-import "agent.os.macos.collectors.posture" \
     --hidden-import "agent.os.macos.collectors.inventory" \
+    --hidden-import "agent.os.macos.collectors.sca" \
+    --hidden-import "agent.agent.sca" \
+    --hidden-import "agent.agent.sca.engine" \
+    --hidden-import "yaml" \
+    --add-data "agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies" \
     --hidden-import "agent.os.macos.normalizer" \
     --hidden-import "agent.os.macos.keystore" \
     --hidden-import "psutil" \
@@ -249,6 +254,11 @@ cp "${OS_MACOS_DIR}/installer/generate_config.sh" \
    "${PKG_ROOT}${CONFIG_DIR}/generate_config.sh"
 chmod 750 "${PKG_ROOT}${CONFIG_DIR}/generate_config.sh"
 
+# Management CLI → /usr/local/bin/attacklens-service
+mkdir -p "${PKG_ROOT}/usr/local/bin"
+cp "${SCRIPT_DIR}/attacklens-service" "${PKG_ROOT}/usr/local/bin/attacklens-service"
+chmod 755 "${PKG_ROOT}/usr/local/bin/attacklens-service"
+
 # Ownership — only root can chown; pkgbuild --ownership recommended handles
 # this at install time so failures here are non-fatal for dev builds.
 chown -R root:wheel "${PKG_ROOT}${INSTALL_DIR}"       2>/dev/null || true
@@ -267,6 +277,7 @@ cat > "${SCRIPTS_DIR}/preinstall" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 for LABEL in com.attacklens.watchdog com.attacklens.agent; do
+  launchctl bootout "system/${LABEL}" 2>/dev/null || true
   PLIST="/Library/LaunchDaemons/${LABEL}.plist"
   if [[ -f "$PLIST" ]]; then
     launchctl unload -w "$PLIST" 2>/dev/null || true
@@ -338,11 +349,27 @@ chmod 644 "${LAUNCHDAEMON_DIR}/com.attacklens.watchdog.plist"
 # ── Remove quarantine ──────────────────────────────────────────────────────────
 xattr -dr com.apple.quarantine "${INSTALL_DIR}/bin/" 2>/dev/null || true
 
-# ── Load LaunchDaemons ────────────────────────────────────────────────────────
-launchctl load -w "${LAUNCHDAEMON_DIR}/com.attacklens.watchdog.plist" 2>/dev/null || true
-launchctl load -w "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist"    2>/dev/null || true
+# ── Management CLI symlink + legacy cleanup ───────────────────────────────────
+ln -sf /usr/local/bin/attacklens-service /usr/local/bin/attacklens-ctl
+# dangling symlink from old installs
+if [[ -L /usr/local/bin/attacklens-control && ! -e /usr/local/bin/attacklens-control ]]; then
+  rm -f /usr/local/bin/attacklens-control
+fi
 
-echo "  MacIntel agent installed and started."
+# ── Load LaunchDaemons (bootout stale copy first, then bootstrap) ─────────────
+for LABEL in com.attacklens.agent com.attacklens.watchdog; do
+  PLIST="${LAUNCHDAEMON_DIR}/${LABEL}.plist"
+  launchctl bootout "system/${LABEL}" 2>/dev/null || true
+  launchctl enable  "system/${LABEL}" 2>/dev/null || true
+  if ! launchctl bootstrap system "${PLIST}" 2>/dev/null; then
+    # already loaded (error 5) or transient — kick it, fall back to legacy load
+    launchctl kickstart -k "system/${LABEL}" 2>/dev/null \
+      || launchctl load -w "${PLIST}" 2>/dev/null || true
+  fi
+done
+
+echo "  AttackLens agent installed and started."
+echo "  Manage it with: sudo attacklens-service status|start|stop|diagnose"
 exit 0
 SCRIPT_BODY
 
@@ -471,6 +498,8 @@ echo "    sudo installer -pkg '${PKG_FINAL}' -target /"
 echo ""
 echo "  ── What happens on install ──────────────────────────────────────────────"
 echo "    • Binaries installed to /Library/AttackLens/bin/"
+echo "    • Management CLI installed: /usr/local/bin/attacklens-service"
+echo "    • SCA policy (CIS macOS, 57 checks) bundled in agent binary"
 echo "    • Agent ID auto-derived from hardware UUID (stable across reinstalls)"
 echo "    • Config written to '/Library/AttackLens/agent.toml'"
 echo "    • LaunchDaemons loaded: com.attacklens.agent + com.attacklens.watchdog"

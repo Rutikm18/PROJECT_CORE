@@ -162,6 +162,24 @@ A running glossary of concepts/patterns introduced into this project, with a sho
 **What:** Apps bundled under `/System/Applications/` and `/System/Library/` are signed DIRECTLY by Apple using an internal certificate — they are exempt from the third-party notarization requirement and legitimately report `notarized=False`.
 **Why:** The `_apps()` detection rule was flagging Calculator, Calendar, Chess, etc. as "Non-notarized application" at medium severity. Fixed by skipping any app whose `path` starts with an entry in `APPLE_SYSTEM_PATH_PREFIXES` before evaluating signing/notarization — the same prefix list already used by `is_apple_system_process()`.
 
+## 2026-07-05
+
+### Per-user SCA checks via shell loops over /Users
+**What:** SCA `c:` rules can audit every user account (not just the console user) by looping over `/Users/*` in `/bin/sh`, reading each home's plist with `plutil -extract <key> raw`, echoing a `violation <user>` line per offender, and asserting `-> !r:violation` (all-negative pattern: passes only when no violations print, vacuously true when no user has the pref). TCC-protected paths (Safari's container) skip on "not permitted" output so an unreadable profile isn't misreported as a violation.
+**Why:** CIS Apple macOS controls like AirDrop, AirPlay Receiver, screensaver idle time, Safari auto-open and Terminal Secure Keyboard Entry are per-user preferences; checking only the current user would pass a machine where any other account is misconfigured. Implemented in `sca_apple_macos.yml` (expanded 27 → 57 checks covering CIS sections 1–6).
+
+### PyInstaller onefile data bundling for policy files
+**What:** PyInstaller `--onefile` only bundles Python modules it can trace — package data files (like SCA policy `.yml`s) are silently omitted unless passed with `--add-data "src:dest"`, where `dest` mirrors the package path so `os.path.dirname(__file__)`-relative lookups resolve inside `sys._MEIPASS`.
+**Why:** The binary PKG's frozen agent shipped with the SCA engine but zero policies (`BUILTIN_POLICY_DIR` was empty at runtime), so `sca` sections would come back empty on deployed endpoints. Fixed in `pkg/build_pkg.sh` with `--add-data agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies` plus explicit `agent.agent.sca` / `yaml` hidden-imports.
+
+### launchctl bootstrap error 5 = already loaded
+**What:** `launchctl bootstrap system <plist>` fails with "Bootstrap failed: 5: Input/output error" when the service is already in the system domain; the robust load sequence is bootout → enable → bootstrap, with `kickstart -k` as the fallback when bootstrap still reports 5.
+**Why:** The PKG postinstall used legacy `launchctl load -w`, so users following modern docs (`bootstrap`) hit error 5 on any reinstall and read it as a broken install. Postinstall, the new `pkg/attacklens-service` CLI, and the watchdog's service subcommands all now use the bootout-first pattern.
+
+### Dual-purpose daemon binaries (foreground default + service subcommands)
+**What:** A LaunchDaemon-managed binary can keep its plist contract (`binary --config path` = run foreground) while adding an optional positional subcommand (`status|start|stop|restart|logs`) that delegates to `launchctl` — argparse `nargs="?"` with `default="run"`.
+**Why:** Users naturally typed `attacklens-watchdog start` and got "unrecognized arguments" because the watchdog only accepted `--config`; giving both binaries human-facing subcommands makes the CLI match user intuition without touching the plists. Implemented in `agent/agent/watchdog.py`.
+
 ## 2026-07-04
 
 ### SCA policy format (CIS benchmarking)

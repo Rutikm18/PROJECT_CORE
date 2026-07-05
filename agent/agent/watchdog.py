@@ -275,16 +275,120 @@ def setup_logging(cfg: dict) -> None:
     root.addHandler(sh)
 
 
+# ── Service-control subcommands ───────────────────────────────────────────────
+#
+# The LaunchDaemon plist invokes this binary with just --config (foreground
+# run).  When a human runs `attacklens-watchdog status|start|stop|restart|logs`
+# from a terminal, delegate to launchctl instead of erroring out.
+
+WATCHDOG_LABEL = "com.attacklens.watchdog"
+WATCHDOG_PLIST = "/Library/LaunchDaemons/com.attacklens.watchdog.plist"
+WATCHDOG_LOG   = "/Library/AttackLens/logs/watchdog.log"
+
+
+def _launchctl(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["launchctl", *argv], capture_output=True, text=True, timeout=30
+    )
+
+
+def _require_root(cmd: str) -> None:
+    if os.geteuid() != 0:
+        print(f"ERROR: '{cmd}' requires root. Re-run with: sudo attacklens-watchdog {cmd}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _service_command(cmd: str, log_lines: int) -> None:
+    if cmd == "status":
+        out = _launchctl("print", f"system/{WATCHDOG_LABEL}")
+        if out.returncode != 0:
+            print(f"○ {WATCHDOG_LABEL} is NOT loaded")
+            print(f"  start it with: sudo attacklens-watchdog start")
+            sys.exit(3)
+        pid = ""
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("pid ="):
+                pid = line.split("=", 1)[1].strip()
+        if pid:
+            print(f"● {WATCHDOG_LABEL} running  PID {pid}")
+        else:
+            print(f"◐ {WATCHDOG_LABEL} loaded but not running (launchd will restart it)")
+        sys.exit(0)
+
+    if cmd == "start":
+        _require_root(cmd)
+        if not os.path.exists(WATCHDOG_PLIST):
+            print(f"ERROR: {WATCHDOG_PLIST} not found — reinstall the agent PKG.",
+                  file=sys.stderr)
+            sys.exit(1)
+        # Already loaded? bootstrap would fail with error 5 — kickstart instead.
+        if _launchctl("print", f"system/{WATCHDOG_LABEL}").returncode == 0:
+            _launchctl("kickstart", "-k", f"system/{WATCHDOG_LABEL}")
+            print(f"● {WATCHDOG_LABEL} restarted (was already loaded)")
+        else:
+            _launchctl("enable", f"system/{WATCHDOG_LABEL}")
+            res = _launchctl("bootstrap", "system", WATCHDOG_PLIST)
+            if res.returncode != 0:
+                print(f"ERROR: bootstrap failed: {res.stderr.strip()}", file=sys.stderr)
+                sys.exit(1)
+            print(f"● {WATCHDOG_LABEL} started")
+        sys.exit(0)
+
+    if cmd == "stop":
+        _require_root(cmd)
+        _launchctl("bootout", f"system/{WATCHDOG_LABEL}")
+        print(f"○ {WATCHDOG_LABEL} stopped")
+        sys.exit(0)
+
+    if cmd == "restart":
+        _require_root(cmd)
+        if _launchctl("print", f"system/{WATCHDOG_LABEL}").returncode == 0:
+            _launchctl("kickstart", "-k", f"system/{WATCHDOG_LABEL}")
+        else:
+            _launchctl("enable", f"system/{WATCHDOG_LABEL}")
+            _launchctl("bootstrap", "system", WATCHDOG_PLIST)
+        print(f"● {WATCHDOG_LABEL} restarted")
+        sys.exit(0)
+
+    if cmd == "logs":
+        if not os.path.exists(WATCHDOG_LOG):
+            print(f"No log file yet at {WATCHDOG_LOG}")
+            sys.exit(0)
+        subprocess.run(["tail", "-n", str(log_lines), WATCHDOG_LOG])
+        sys.exit(0)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="mac_intel process watchdog")
+    parser = argparse.ArgumentParser(
+        description="mac_intel process watchdog",
+        epilog="With no COMMAND, runs the watchdog loop in the foreground "
+               "(this is how the LaunchDaemon invokes it).",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["run", "status", "start", "stop", "restart", "logs"],
+        default="run",
+        help="service control command (default: run in foreground)",
+    )
     parser.add_argument(
         "--config",
         default="/Library/AttackLens/agent.toml",
         help="Path to agent.toml",
     )
+    parser.add_argument(
+        "--lines", type=int, default=50,
+        help="number of log lines for 'logs' (default 50)",
+    )
     args = parser.parse_args()
+
+    if args.command != "run":
+        _service_command(args.command, args.lines)
+        return
 
     try:
         with open(args.config, "rb") as f:

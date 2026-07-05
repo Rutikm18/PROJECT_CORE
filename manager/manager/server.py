@@ -158,9 +158,10 @@ def create_app() -> FastAPI:
                 # Don't overwrite headers already set by the route handler
                 if header not in response.headers:
                     response.headers[header] = value
-            # Remove server fingerprinting
-            response.headers.pop("server", None)
-            response.headers.pop("x-powered-by", None)
+            # Remove server fingerprinting (MutableHeaders.pop removed in Starlette 0.38+)
+            for _hdr in ("server", "x-powered-by"):
+                if _hdr in response.headers:
+                    del response.headers[_hdr]
             return response
 
     app.add_middleware(SecurityHeadersMiddleware)

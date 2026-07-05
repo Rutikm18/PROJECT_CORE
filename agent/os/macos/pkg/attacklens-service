@@ -1,0 +1,283 @@
+#!/bin/bash
+# attacklens-service — management CLI for the AttackLens macOS agent (binary install)
+#
+# Installed by the AttackLens agent PKG to /usr/local/bin/attacklens-service
+# (with an `attacklens-ctl` convenience symlink).
+#
+# This version targets the BINARY install layout:
+#   /Library/AttackLens/bin/attacklens-agent      (PyInstaller binary)
+#   /Library/AttackLens/bin/attacklens-watchdog   (PyInstaller binary)
+#   /Library/AttackLens/agent.toml
+#   /Library/LaunchDaemons/com.attacklens.agent.plist
+#   /Library/LaunchDaemons/com.attacklens.watchdog.plist
+
+set -u
+
+VERSION="2.1.0"
+INSTALL_DIR="/Library/AttackLens"
+BIN_DIR="${INSTALL_DIR}/bin"
+CONFIG_FILE="${INSTALL_DIR}/agent.toml"
+LOG_DIR="${INSTALL_DIR}/logs"
+
+AGENT_LABEL="com.attacklens.agent"
+WATCHDOG_LABEL="com.attacklens.watchdog"
+AGENT_PLIST="/Library/LaunchDaemons/${AGENT_LABEL}.plist"
+WATCHDOG_PLIST="/Library/LaunchDaemons/${WATCHDOG_LABEL}.plist"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLW=$'\033[0;33m'; BLU=$'\033[0;34m'; NC=$'\033[0m'
+
+info()  { echo "${BLU}[info]${NC} $*"; }
+ok()    { echo "${GRN}[ ok ]${NC} $*"; }
+warn()  { echo "${YLW}[warn]${NC} $*"; }
+err()   { echo "${RED}[fail]${NC} $*" >&2; }
+
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "'$1' requires root. Re-run with: sudo attacklens-service $1"
+        exit 1
+    fi
+}
+
+# PID of a loaded system service, empty if not running
+svc_pid() {
+    launchctl print "system/$1" 2>/dev/null | awk -F' = ' '/^\s*pid = /{gsub(/ /,"",$2); print $2}'
+}
+
+svc_loaded() {
+    launchctl print "system/$1" >/dev/null 2>&1
+}
+
+# Load a service robustly: bootout stale copy first, then bootstrap.
+# "Bootstrap failed: 5: Input/output error" means it was already loaded —
+# in that case kickstart it instead of failing.
+svc_load() {
+    local label="$1" plist="$2"
+    if [ ! -f "$plist" ]; then
+        err "$plist not found — reinstall the agent PKG."
+        return 1
+    fi
+    launchctl enable "system/${label}" 2>/dev/null
+    if svc_loaded "$label"; then
+        launchctl kickstart -k "system/${label}" 2>/dev/null
+        ok "$label restarted (was already loaded)"
+        return 0
+    fi
+    local out
+    out=$(launchctl bootstrap system "$plist" 2>&1)
+    if [ $? -ne 0 ]; then
+        case "$out" in
+            *"Input/output error"*|*"service already loaded"*|*" 5: "*)
+                launchctl kickstart -k "system/${label}" 2>/dev/null
+                ok "$label kickstarted (was already loaded)"
+                return 0 ;;
+            *)
+                err "bootstrap $label failed: $out"
+                return 1 ;;
+        esac
+    fi
+    ok "$label started"
+}
+
+svc_unload() {
+    local label="$1"
+    if svc_loaded "$label"; then
+        launchctl bootout "system/${label}" 2>/dev/null
+        ok "$label stopped"
+    else
+        info "$label not loaded"
+    fi
+}
+
+status_line() {
+    local label="$1" pid
+    if ! svc_loaded "$label"; then
+        echo "  ○ ${label}  NOT loaded"
+        return 1
+    fi
+    pid=$(svc_pid "$label")
+    if [ -n "$pid" ]; then
+        echo "  ● ${label}  running  PID ${pid}"
+    else
+        echo "  ◐ ${label}  loaded, not running (launchd will restart it)"
+    fi
+    return 0
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    echo "AttackLens agent — service status"
+    echo "─────────────────────────────────"
+    local rc=0
+    status_line "$AGENT_LABEL"    || rc=1
+    status_line "$WATCHDOG_LABEL" || rc=1
+    echo ""
+    if [ -x "${BIN_DIR}/attacklens-agent" ] && [ -f "$CONFIG_FILE" ]; then
+        "${BIN_DIR}/attacklens-agent" status --dir "$INSTALL_DIR" 2>/dev/null || true
+    fi
+    return $rc
+}
+
+cmd_start() {
+    need_root start
+    svc_load "$AGENT_LABEL"    "$AGENT_PLIST"
+    svc_load "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"
+}
+
+cmd_stop() {
+    need_root stop
+    # stop watchdog FIRST so it doesn't resurrect the agent
+    svc_unload "$WATCHDOG_LABEL"
+    svc_unload "$AGENT_LABEL"
+}
+
+cmd_restart() {
+    need_root restart
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_logs() {
+    local n="${1:-50}"
+    for f in "${LOG_DIR}/agent.log" "${LOG_DIR}/agent-stderr.log" "${LOG_DIR}/watchdog.log"; do
+        if [ -f "$f" ]; then
+            echo "── ${f} (last ${n} lines) ──"
+            tail -n "$n" "$f"
+            echo ""
+        fi
+    done
+}
+
+cmd_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        cat "$CONFIG_FILE"
+    else
+        err "config not found: $CONFIG_FILE"
+        exit 1
+    fi
+}
+
+cmd_diagnose() {
+    echo "AttackLens agent — diagnostics"
+    echo "══════════════════════════════"
+    echo ""
+
+    echo "1. Install layout"
+    for p in "$BIN_DIR/attacklens-agent" "$BIN_DIR/attacklens-watchdog" "$CONFIG_FILE" \
+             "$AGENT_PLIST" "$WATCHDOG_PLIST"; do
+        if [ -e "$p" ]; then ok "$p"; else err "MISSING: $p"; fi
+    done
+    echo ""
+
+    echo "2. Services"
+    status_line "$AGENT_LABEL"
+    status_line "$WATCHDOG_LABEL"
+    echo ""
+
+    echo "3. Last exit status"
+    for label in "$AGENT_LABEL" "$WATCHDOG_LABEL"; do
+        local le
+        le=$(launchctl print "system/${label}" 2>/dev/null | grep -E "last exit (code|reason)" | head -2)
+        [ -n "$le" ] && echo "  ${label}: ${le}"
+    done
+    echo ""
+
+    echo "4. Manager connectivity"
+    if [ -f "$CONFIG_FILE" ]; then
+        local url
+        url=$(awk -F'"' '/^url/{print $2; exit}' "$CONFIG_FILE")
+        if [ -n "$url" ]; then
+            local code
+            code=$(curl -sk -o /dev/null -w '%{http_code}' -m 5 "${url}/health" 2>/dev/null)
+            if [ "$code" = "200" ]; then
+                ok "manager reachable: ${url} (HTTP ${code})"
+            else
+                err "manager NOT reachable: ${url} (HTTP ${code:-timeout})"
+                echo "     check: server up? firewall? correct url in ${CONFIG_FILE}?"
+            fi
+        else
+            warn "no url found in ${CONFIG_FILE}"
+        fi
+    else
+        err "config missing — run: sudo ${INSTALL_DIR}/generate_config.sh"
+    fi
+    echo ""
+
+    echo "5. Recent errors (agent-stderr.log)"
+    if [ -f "${LOG_DIR}/agent-stderr.log" ]; then
+        tail -n 10 "${LOG_DIR}/agent-stderr.log" | sed 's/^/  /'
+    else
+        info "no stderr log yet"
+    fi
+    echo ""
+
+    echo "6. Enrollment / keystore"
+    if [ -f "${INSTALL_DIR}/keystore.json" ]; then
+        ok "keystore present (agent enrolled)"
+    else
+        warn "keystore.json missing — agent not yet enrolled (will enroll on first successful contact)"
+    fi
+    echo ""
+
+    echo "Common fixes:"
+    echo "  restart services : sudo attacklens-service restart"
+    echo "  view live logs   : tail -f ${LOG_DIR}/agent.log"
+    echo "  full reinstall   : sudo attacklens-service uninstall && re-run the PKG"
+}
+
+cmd_uninstall() {
+    need_root uninstall
+    warn "Removing AttackLens agent from this machine…"
+    svc_unload "$WATCHDOG_LABEL"
+    svc_unload "$AGENT_LABEL"
+    rm -f "$AGENT_PLIST" "$WATCHDOG_PLIST"
+    rm -rf "$INSTALL_DIR"
+    rm -f /usr/local/bin/attacklens-service /usr/local/bin/attacklens-ctl
+    # legacy leftovers from older installs
+    rm -f /usr/local/bin/attacklens-control
+    pkgutil --forget com.attacklens.agent >/dev/null 2>&1
+    ok "AttackLens agent removed"
+}
+
+cmd_version() {
+    echo "attacklens-service ${VERSION} (binary install)"
+    [ -x "${BIN_DIR}/attacklens-agent" ] && "${BIN_DIR}/attacklens-agent" --help 2>/dev/null | head -1 || true
+}
+
+usage() {
+    cat <<EOF
+attacklens-service ${VERSION} — AttackLens macOS agent control
+
+Usage: sudo attacklens-service <command>
+
+Commands:
+  status       show agent + watchdog service state
+  start        start both services (handles already-loaded case)
+  stop         stop both services (watchdog first)
+  restart      stop + start
+  logs [N]     show last N lines of agent/watchdog logs (default 50)
+  config       print agent.toml
+  diagnose     full health check: files, services, manager connectivity, errors
+  uninstall    stop services and remove the agent completely
+  version      show versions
+EOF
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    status)    cmd_status ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
+    logs)      cmd_logs "${2:-50}" ;;
+    config)    cmd_config ;;
+    diagnose|doctor) cmd_diagnose ;;
+    uninstall) cmd_uninstall ;;
+    version|--version|-v) cmd_version ;;
+    ""|help|--help|-h) usage ;;
+    *) err "unknown command: $1"; usage; exit 1 ;;
+esac

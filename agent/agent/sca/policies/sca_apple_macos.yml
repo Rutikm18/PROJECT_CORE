@@ -2,9 +2,13 @@
 # CIS Checks for Apple macOS (Ventura/Sonoma/Sequoia — version-independent controls)
 #
 # SCA policy for Apple macOS based on the CIS Apple macOS Benchmark.
-# All checks are evaluable as root without network access; every command
-# completes in well under a second so a full scan stays inside the agent's
-# section budget.
+# Coverage: Section 1 (Updates), 2 (System Settings: networking, sharing,
+# lock screen, users, energy), 3 (Logging & Auditing), 4 (Network Services),
+# 5 (System Access & sudo), 6 (Applications — per-user checks).
+#
+# All checks are evaluable as root without network access. Per-user controls
+# (AirDrop, AirPlay, Safari, Terminal) iterate every home under /Users so a
+# single misconfigured account is caught, not just the console user.
 
 policy:
   id: "sca_apple_macos"
@@ -22,7 +26,7 @@ requirements:
     - "c:uname -> Darwin"
 
 checks:
-  # ── 1. Install Updates, Patches and Additional Security Software ──────────
+  # ═══ 1. Install Updates, Patches and Additional Security Software ═════════
   - id: 40001
     title: "Ensure Auto Update is enabled."
     description: "Automatic checking for macOS software updates."
@@ -80,7 +84,18 @@ checks:
       - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate ConfigDataInstall -> 1"
       - "c:defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -> 1"
 
-  # ── 2. System Settings ────────────────────────────────────────────────────
+  - id: 40051
+    title: "Ensure a software update schedule check runs (softwareupdate --schedule on)."
+    rationale: "The background softwareupdate scheduler is what actually triggers the automatic checks configured in preferences."
+    remediation: "Run: sudo softwareupdate --schedule on"
+    compliance:
+      - cis: ["1.1"]
+      - cis_csc_v8: ["7.3"]
+    condition: all
+    rules:
+      - "c:softwareupdate --schedule -> r:on|enabled"
+
+  # ═══ 2. System Settings — core security controls ══════════════════════════
   - id: 40010
     title: "Ensure Gatekeeper is enabled."
     rationale: "Gatekeeper blocks execution of unsigned/unnotarised applications — the primary distribution shape of macOS malware."
@@ -152,44 +167,18 @@ checks:
     rules:
       - "c:/usr/libexec/ApplicationFirewall/socketfilterfw --getloggingmode -> r:on"
 
-  - id: 40016
-    title: "Ensure the Guest account is disabled."
-    rationale: "The guest account allows unauthenticated console access and is a common local foothold."
-    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false"
+  - id: 40074
+    title: "Ensure Location Services is enabled."
+    rationale: "Location Services keeps the timezone (and therefore log timestamps) accurate and enables Find My for lost-device response. CIS recommends it enabled."
+    remediation: "Enable Location Services in System Settings > Privacy & Security > Location Services."
     compliance:
-      - cis: ["2.11.1"]
-      - cis_csc_v8: ["5.2"]
-      - mitre_techniques: ["T1078.003"]
-    condition: any
+      - cis: ["2.6.2.1"]
+      - cis_csc_v8: ["4.1"]
+    condition: all
     rules:
-      - "c:defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled -> 0"
-      - "not c:defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled -> r:1"
+      - "c:defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd.plist LocationServicesEnabled 2>/dev/null -> 1"
 
-  - id: 40017
-    title: "Ensure automatic login is disabled."
-    rationale: "Auto-login bypasses authentication at boot, exposing the session to anyone with physical access."
-    remediation: "Run: sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser"
-    compliance:
-      - cis: ["2.11.2"]
-      - cis_csc_v8: ["4.7"]
-      - mitre_techniques: ["T1078"]
-    condition: none
-    rules:
-      - "c:defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null -> r:\\S"
-
-  - id: 40018
-    title: "Ensure the root account is disabled."
-    rationale: "An enabled root account with a password is a direct privilege-escalation and lateral-movement target; sudo provides audited alternatives."
-    remediation: "Run: sudo dscl . -delete /Users/root AuthenticationAuthority; sudo passwd -d root (or disable via Directory Utility)"
-    compliance:
-      - cis: ["5.5"]
-      - cis_csc_v8: ["5.4"]
-      - mitre_techniques: ["T1078.003"]
-    condition: none
-    rules:
-      - "c:dscl . -read /Users/root AuthenticationAuthority 2>&1 -> r:ShadowHash|Kerberos"
-
-  # ── Sharing services ──────────────────────────────────────────────────────
+  # ── 2.3.3 Sharing services ────────────────────────────────────────────────
   - id: 40020
     title: "Ensure Remote Login (SSH) is disabled."
     rationale: "SSH provides remote shell access; on endpoints it should be off unless explicitly required."
@@ -249,7 +238,90 @@ checks:
     rules:
       - "c:cupsctl -> r:_share_printers=0"
 
-  # ── Time & logging ────────────────────────────────────────────────────────
+  - id: 40062
+    title: "Ensure Remote Management (Apple Remote Desktop) is disabled."
+    rationale: "ARD grants full remote control of the machine; the ARDAgent process running means management is active."
+    remediation: "Run: sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -stop"
+    compliance:
+      - cis: ["2.3.3.6"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1021.005"]
+    condition: all
+    rules:
+      - "not p:ARDAgent"
+
+  - id: 40061
+    title: "Ensure Internet Sharing is disabled."
+    rationale: "Internet Sharing turns the Mac into a router/NAT gateway, bridging networks and bypassing perimeter controls."
+    remediation: "Disable Internet Sharing in System Settings > General > Sharing."
+    compliance:
+      - cis: ["2.3.3.9"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1090"]
+    condition: none
+    rules:
+      - "c:defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null -> r:Enabled = 1"
+
+  - id: 40060
+    title: "Ensure Content Caching is disabled."
+    rationale: "Content Caching stores Apple content and serves it to other devices — an unnecessary listener and disk consumer on most endpoints."
+    remediation: "Run: sudo AssetCacheManagerUtil deactivate"
+    compliance:
+      - cis: ["2.3.3.11"]
+      - cis_csc_v8: ["4.8"]
+    condition: any
+    rules:
+      - "c:AssetCacheManagerUtil status 2>&1 -> r:Activated: false"
+      - "c:AssetCacheManagerUtil status 2>&1 -> r:deactivated|disabled"
+
+  - id: 40075
+    title: "Ensure DVD or CD Sharing is disabled."
+    rationale: "Optical media sharing (ODSAgent) opens a network service that has no place on managed endpoints."
+    remediation: "Run: sudo launchctl disable system/com.apple.ODSAgent"
+    compliance:
+      - cis: ["2.3.3.2"]
+      - cis_csc_v8: ["4.8"]
+    condition: all
+    rules:
+      - "c:launchctl print system/com.apple.ODSAgent 2>&1 -> r:Could not find service"
+
+  - id: 40070
+    title: "Ensure guest access to shared folders (SMB) is disabled."
+    rationale: "Guest SMB access lets unauthenticated network users read shared folders."
+    remediation: "Run: sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server AllowGuestAccess -bool false"
+    compliance:
+      - cis: ["2.12.2"]
+      - cis_csc_v8: ["5.2"]
+      - mitre_techniques: ["T1078.001"]
+    condition: none
+    rules:
+      - "c:defaults read /Library/Preferences/SystemConfiguration/com.apple.smb.server AllowGuestAccess 2>/dev/null -> 1"
+
+  # ── 2.3.1 AirDrop / AirPlay (per-user) ────────────────────────────────────
+  - id: 40072
+    title: "Ensure AirDrop is disabled for all users."
+    rationale: "AirDrop allows ad-hoc file transfer to/from nearby devices, bypassing network DLP controls. Every user account is checked; any account without DisableAirDrop set is a violation."
+    remediation: "Per user: defaults write com.apple.NetworkBrowser DisableAirDrop -bool true (or enforce via configuration profile)."
+    compliance:
+      - cis: ["2.3.1.1"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1052"]
+    condition: all
+    rules:
+      - 'c:for d in /Users/*; do u=${d##*/}; case $u in Shared|Guest) continue;; esac; [ -d "$d" ] || continue; v=$(plutil -extract DisableAirDrop raw -o - "$d/Library/Preferences/com.apple.NetworkBrowser.plist" 2>/dev/null); [ "$v" = true ] || [ "$v" = 1 ] || echo "violation $u"; done -> !r:violation'
+
+  - id: 40073
+    title: "Ensure AirPlay Receiver is not explicitly enabled for any user."
+    rationale: "AirPlay Receiver accepts incoming streaming connections from nearby devices, opening network listeners on the endpoint. Flags any account with the receiver explicitly enabled."
+    remediation: "Per user: System Settings > General > AirDrop & Handoff > AirPlay Receiver: off (or enforce via configuration profile)."
+    compliance:
+      - cis: ["2.3.1.2"]
+      - cis_csc_v8: ["4.8"]
+    condition: all
+    rules:
+      - 'c:for f in /Users/*/Library/Preferences/ByHost/com.apple.controlcenter.*.plist; do [ -f "$f" ] || continue; v=$(plutil -extract AirplayRecieverEnabled raw -o - "$f" 2>/dev/null); { [ "$v" = true ] || [ "$v" = 1 ]; } && echo "violation $f"; done; true -> !r:violation'
+
+  # ── 2.3.2 Date & Time ─────────────────────────────────────────────────────
   - id: 40030
     title: "Ensure Set time and date automatically is enabled."
     rationale: "Accurate, NTP-synchronised clocks are required for log correlation, certificate validation and Kerberos."
@@ -262,17 +334,165 @@ checks:
     rules:
       - "c:systemsetup -getusingnetworktime -> r:Network Time: On"
 
+  # ── 2.9 Energy / power ────────────────────────────────────────────────────
+  - id: 40050
+    title: "Ensure Wake for network access is disabled."
+    rationale: "Wake-on-LAN (womp) lets network packets power the machine into an attackable state unattended."
+    remediation: "Run: sudo pmset -a womp 0"
+    compliance:
+      - cis: ["2.9.2"]
+      - cis_csc_v8: ["4.8"]
+    condition: none
+    rules:
+      - 'c:pmset -g -> r:womp\s+1'
+
+  - id: 40064
+    title: "Ensure Power Nap is disabled."
+    rationale: "Power Nap wakes the system periodically while 'asleep', running network activity outside user awareness and defeating sleep-state assumptions."
+    remediation: "Run: sudo pmset -a powernap 0"
+    compliance:
+      - cis: ["2.9.3"]
+      - cis_csc_v8: ["4.8"]
+    condition: none
+    rules:
+      - 'c:pmset -g -> r:powernap\s+1'
+
+  - id: 40065
+    title: "Ensure FileVault key is destroyed on standby (DestroyFVKeyOnStandby)."
+    rationale: "By default the FileVault key stays in memory during standby, so a stolen sleeping laptop is effectively unencrypted to a memory-extraction attack. Level 2 control."
+    remediation: "Run: sudo pmset -a destroyfvkeyonstandby 1 && sudo pmset -a hibernatemode 25"
+    compliance:
+      - cis: ["2.9.1"]
+      - cis_csc_v8: ["3.6"]
+      - mitre_techniques: ["T1005"]
+    condition: all
+    rules:
+      - 'c:pmset -g -> r:DestroyFVKeyOnStandby\s+1'
+
+  # ── 2.10 Lock Screen / login window ───────────────────────────────────────
+  - id: 40066
+    title: "Ensure login window displays name and password fields (not user list)."
+    rationale: "A user list on the login window hands an attacker half of every credential pair; requiring the username to be typed removes that head start."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool true"
+    compliance:
+      - cis: ["2.10.3"]
+      - cis_csc_v8: ["4.1"]
+      - mitre_techniques: ["T1087"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -> 1"
+
+  - id: 40067
+    title: "Ensure password hints are disabled at the login window."
+    rationale: "Password hints materially reduce brute-force effort and often contain the password itself."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.loginwindow RetriesUntilHint -int 0"
+    compliance:
+      - cis: ["2.10.4"]
+      - cis_csc_v8: ["4.1"]
+      - mitre_techniques: ["T1110"]
+    condition: none
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.loginwindow RetriesUntilHint 2>/dev/null -> r:[1-9]"
+
+  - id: 40068
+    title: "Ensure a login window banner (PolicyBanner) is configured."
+    rationale: "A legal notice at login is required by most compliance regimes to support prosecution of unauthorized access."
+    remediation: "Create /Library/Security/PolicyBanner.txt (or .rtf/.rtfd) with the organization's access policy text."
+    compliance:
+      - cis: ["2.10.5"]
+      - cis_csc_v8: ["4.1"]
+    condition: any
+    rules:
+      - "f:/Library/Security/PolicyBanner.txt"
+      - "f:/Library/Security/PolicyBanner.rtf"
+      - "d:/Library/Security/PolicyBanner.rtfd"
+
+  - id: 40078
+    title: "Ensure screensaver idle time is 20 minutes or less for all users."
+    rationale: "An unattended unlocked session is an open door; every user's screensaver must engage within 20 minutes (and never be set to 'never')."
+    remediation: "Per user: System Settings > Lock Screen > Start Screen Saver when inactive: 20 minutes or less."
+    compliance:
+      - cis: ["2.10.1"]
+      - cis_csc_v8: ["4.3"]
+      - mitre_techniques: ["T1078"]
+    condition: all
+    rules:
+      - 'c:for f in /Users/*/Library/Preferences/ByHost/com.apple.screensaver.*.plist; do [ -f "$f" ] || continue; v=$(plutil -extract idleTime raw -o - "$f" 2>/dev/null); [ -n "$v" ] || continue; if [ "$v" -eq 0 ] || [ "$v" -gt 1200 ]; then echo "violation $f idleTime=$v"; fi; done; true -> !r:violation'
+
+  # ── 2.12 Users & Groups ───────────────────────────────────────────────────
+  - id: 40016
+    title: "Ensure the Guest account is disabled."
+    rationale: "The guest account allows unauthenticated console access and is a common local foothold."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false"
+    compliance:
+      - cis: ["2.12.1"]
+      - cis_csc_v8: ["5.2"]
+      - mitre_techniques: ["T1078.003"]
+    condition: any
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled -> 0"
+      - "not c:defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled -> r:1"
+
+  - id: 40017
+    title: "Ensure automatic login is disabled."
+    rationale: "Auto-login bypasses authentication at boot, exposing the session to anyone with physical access."
+    remediation: "Run: sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser"
+    compliance:
+      - cis: ["2.12.3"]
+      - cis_csc_v8: ["4.7"]
+      - mitre_techniques: ["T1078"]
+    condition: none
+    rules:
+      - 'c:defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null -> r:\S'
+
+  - id: 40069
+    title: "Ensure Fast User Switching is disabled."
+    rationale: "Fast user switching leaves multiple sessions live simultaneously, letting one user's processes observe shared resources and complicating attribution. Level 2 control."
+    remediation: "Run: sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool false"
+    compliance:
+      - cis: ["2.12.4"]
+      - cis_csc_v8: ["4.3"]
+    condition: none
+    rules:
+      - "c:defaults read /Library/Preferences/.GlobalPreferences MultipleSessionEnabled 2>/dev/null -> 1"
+
+  - id: 40018
+    title: "Ensure the root account is disabled."
+    rationale: "An enabled root account with a password is a direct privilege-escalation and lateral-movement target; sudo provides audited alternatives."
+    remediation: "Run: sudo dscl . -delete /Users/root AuthenticationAuthority; sudo passwd -d root (or disable via Directory Utility)"
+    compliance:
+      - cis: ["5.5"]
+      - cis_csc_v8: ["5.4"]
+      - mitre_techniques: ["T1078.003"]
+    condition: none
+    rules:
+      - "c:dscl . -read /Users/root AuthenticationAuthority 2>&1 -> r:ShadowHash|Kerberos"
+
+  # ═══ 3. Logging & Auditing ════════════════════════════════════════════════
+  - id: 40033
+    title: "Ensure the security auditing service (auditd) is enabled."
+    rationale: "The BSM audit subsystem is the OS-level record of authentication and administrative actions; without it running, nothing below the application layer is captured."
+    remediation: "Run: sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.auditd.plist"
+    compliance:
+      - cis: ["3.1"]
+      - cis_csc_v8: ["8.2"]
+      - mitre_techniques: ["T1562.008"]
+    condition: any
+    rules:
+      - "c:launchctl list com.apple.auditd 2>&1 -> r:com.apple.auditd"
+      - "c:launchctl print system/com.apple.auditd 2>&1 -> r:state = |com.apple.auditd"
+
   - id: 40031
-    title: "Ensure security auditing (BSM audit flags) is configured."
+    title: "Ensure security auditing flags are configured."
     rationale: "Without configured audit flags the BSM subsystem records nothing useful for incident investigation."
     remediation: "Edit /etc/security/audit_control and set e.g. flags:lo,aa (login/logout, authentication and authorization), then: sudo audit -s"
     compliance:
-      - cis: ["3.1", "3.2"]
+      - cis: ["3.2"]
       - cis_csc_v8: ["8.2", "8.5"]
       - mitre_techniques: ["T1562.008"]
     condition: all
     rules:
-      - "f:/etc/security/audit_control -> r:^flags:\\S"
+      - 'f:/etc/security/audit_control -> r:^flags:\S'
 
   - id: 40032
     title: "Ensure audit retention (expire-after) is configured."
@@ -283,9 +503,83 @@ checks:
       - cis_csc_v8: ["8.3", "8.10"]
     condition: all
     rules:
-      - "f:/etc/security/audit_control -> r:^expire-after:\\S"
+      - 'f:/etc/security/audit_control -> r:^expire-after:\S'
 
-  # ── Password / session policy ─────────────────────────────────────────────
+  - id: 40034
+    title: "Ensure install.log is retained for at least 365 days with no size cap."
+    rationale: "install.log is the authoritative record of what software was installed and when — essential provenance during incident response. A size cap (all_max) silently truncates it."
+    remediation: "Edit /etc/asl/com.apple.install: set ttl=365 on the install.log line and remove any all_max= clause."
+    compliance:
+      - cis: ["3.3"]
+      - cis_csc_v8: ["8.3", "8.10"]
+    condition: all
+    rules:
+      - 'f:/etc/asl/com.apple.install -> n:ttl=(\d+) compare >= 365'
+      - "not f:/etc/asl/com.apple.install -> r:all_max="
+
+  - id: 40035
+    title: "Ensure audit configuration files are owned by root:wheel and not world-accessible."
+    rationale: "Writable audit configuration lets an attacker silence the audit trail before acting."
+    remediation: "Run: sudo chown root:wheel /etc/security/audit_control && sudo chmod o-rwx /etc/security/audit_control"
+    compliance:
+      - cis: ["3.5"]
+      - cis_csc_v8: ["3.3"]
+      - mitre_techniques: ["T1070", "T1562.008"]
+    condition: all
+    rules:
+      - "c:stat -f %Su:%Sg:%Lp /etc/security/audit_control -> r:^root:wheel:[0-7][0-7]0$"
+
+  - id: 40036
+    title: "Ensure audit log folder (/var/audit) is restricted to root."
+    rationale: "World- or group-readable audit logs leak authentication history; writable ones allow tampering."
+    remediation: "Run: sudo chown -R root:wheel /var/audit && sudo chmod 700 /var/audit"
+    compliance:
+      - cis: ["3.5"]
+      - cis_csc_v8: ["3.3"]
+      - mitre_techniques: ["T1070"]
+    condition: all
+    rules:
+      - "c:stat -f %Su:%Sg:%Lp /var/audit -> r:^root:wheel:[0-7]00$"
+
+  # ═══ 4. Network Services ══════════════════════════════════════════════════
+  - id: 40063
+    title: "Ensure Bonjour multicast advertising is disabled."
+    rationale: "Bonjour advertisements broadcast the machine's presence and service inventory to the local network — free reconnaissance for an attacker. Level 2 control."
+    remediation: "Run: sudo defaults write /Library/Preferences/com.apple.mDNSResponder.plist NoMulticastAdvertisements -bool true"
+    compliance:
+      - cis: ["4.1"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1046"]
+    condition: all
+    rules:
+      - "c:defaults read /Library/Preferences/com.apple.mDNSResponder.plist NoMulticastAdvertisements -> 1"
+
+  - id: 40080
+    title: "Ensure the built-in HTTP server (Apache) is not running."
+    rationale: "The bundled Apache serves no purpose on an endpoint and is a classic staging/persistence beachhead."
+    remediation: "Run: sudo apachectl stop && sudo launchctl disable system/org.apache.httpd"
+    compliance:
+      - cis: ["4.2"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1071.001"]
+    condition: all
+    rules:
+      - "not p:httpd"
+
+  - id: 40081
+    title: "Ensure NFS server is disabled."
+    rationale: "nfsd exports local filesystems to the network; /etc/exports existing at all indicates NFS sharing has been configured."
+    remediation: "Run: sudo launchctl disable system/com.apple.nfsd && sudo rm /etc/exports"
+    compliance:
+      - cis: ["4.3"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1021.002"]
+    condition: all
+    rules:
+      - "not p:nfsd"
+      - "not f:/etc/exports"
+
+  # ═══ 5. System Access, Authentication & Authorization ═════════════════════
   - id: 40040
     title: "Ensure a global account (password) policy is configured."
     rationale: "Without a pwpolicy account policy there is no enforced minimum length, complexity or lockout for local accounts."
@@ -298,6 +592,18 @@ checks:
     rules:
       - "c:pwpolicy -getaccountpolicies 2>&1 -> r:No account policies|Error"
 
+  - id: 40094
+    title: "Ensure account lockout threshold is 10 or fewer failed attempts."
+    rationale: "Unlimited authentication attempts make online brute-force practical; CIS requires lockout after at most 10 failures."
+    remediation: "Set policyAttributeMaximumFailedAuthentications <= 10 via pwpolicy -setaccountpolicies."
+    compliance:
+      - cis: ["5.2.1"]
+      - cis_csc_v8: ["4.10"]
+      - mitre_techniques: ["T1110"]
+    condition: all
+    rules:
+      - 'c:pwpolicy -getaccountpolicies 2>/dev/null | tr -d "\n\t" -> n:policyAttributeMaximumFailedAuthentications\D{0,60}?(\d+) compare <= 10'
+
   - id: 40041
     title: "Ensure sshd disallows root login (when SSH config is present)."
     rationale: "Direct root SSH login defeats per-user accountability and is a brute-force target. CIS requires PermitRootLogin no explicitly."
@@ -308,7 +614,7 @@ checks:
       - mitre_techniques: ["T1021.004", "T1110"]
     condition: all
     rules:
-      - "f:/etc/ssh/sshd_config -> r:^\\s*PermitRootLogin\\s+no"
+      - 'f:/etc/ssh/sshd_config -> r:^\s*PermitRootLogin\s+no'
 
   - id: 40042
     title: "Ensure sshd uses key-based authentication (PasswordAuthentication no) when SSH config is present."
@@ -320,27 +626,89 @@ checks:
       - mitre_techniques: ["T1110"]
     condition: all
     rules:
-      - "f:/etc/ssh/sshd_config -> r:^\\s*PasswordAuthentication\\s+no"
+      - 'f:/etc/ssh/sshd_config -> r:^\s*PasswordAuthentication\s+no'
 
-  # ── Power / misc hardening ────────────────────────────────────────────────
-  - id: 40050
-    title: "Ensure Wake for network access is disabled."
-    rationale: "Wake-on-LAN (womp) lets network packets power the machine into an attackable state unattended."
-    remediation: "Run: sudo pmset -a womp 0"
+  - id: 40090
+    title: "Ensure home folders are not accessible by other users."
+    rationale: "World-accessible home directories expose every user's documents, ssh keys and browser data to any local account or process."
+    remediation: "For each flagged home: sudo chmod og-rwx /Users/<name> (or 750 if group sharing is intended)."
     compliance:
-      - cis: ["2.9.2"]
-      - cis_csc_v8: ["4.8"]
-    condition: none
-    rules:
-      - "c:pmset -g -> r:womp\\s+1"
-
-  - id: 40051
-    title: "Ensure a software update schedule check runs (softwareupdate --schedule on)."
-    rationale: "The background softwareupdate scheduler is what actually triggers the automatic checks configured in preferences."
-    remediation: "Run: sudo softwareupdate --schedule on"
-    compliance:
-      - cis: ["1.1"]
-      - cis_csc_v8: ["7.3"]
+      - cis: ["2.12.5"]
+      - cis_csc_v8: ["3.3"]
+      - mitre_techniques: ["T1005", "T1552.004"]
     condition: all
     rules:
-      - "c:softwareupdate --schedule -> r:on|enabled"
+      - "c:find /Users -mindepth 1 -maxdepth 1 -type d -not -name Shared -not -name Guest -perm +007 2>/dev/null -> !r:/Users/"
+
+  - id: 40091
+    title: "Ensure /etc/sudoers is owned by root:wheel with mode 440."
+    rationale: "A writable sudoers file is instant root for any process that can modify it."
+    remediation: "Run: sudo chown root:wheel /etc/sudoers && sudo chmod 440 /etc/sudoers"
+    compliance:
+      - cis: ["5.4"]
+      - cis_csc_v8: ["3.3"]
+      - mitre_techniques: ["T1548.003"]
+    condition: all
+    rules:
+      - "c:stat -f %Su:%Sg:%Lp /etc/sudoers -> r:^root:wheel:440$"
+
+  - id: 40092
+    title: "Ensure sudo re-authenticates every time (timestamp timeout 0)."
+    rationale: "A cached sudo timestamp lets any malware running in the user's session piggyback root for the grace period. CIS requires timestamp_timeout=0."
+    remediation: "Run: sudo visudo — add: Defaults timestamp_timeout=0"
+    compliance:
+      - cis: ["5.3"]
+      - cis_csc_v8: ["5.4"]
+      - mitre_techniques: ["T1548.003"]
+    condition: all
+    rules:
+      - "c:sudo -V -> r:Authentication timestamp timeout: 0.0 minutes"
+
+  - id: 40093
+    title: "Ensure sudo uses a separate timestamp per tty."
+    rationale: "A shared (non-tty) sudo timestamp lets a process on another terminal reuse an operator's authentication."
+    remediation: "Run: sudo visudo — ensure: Defaults timestamp_type=tty (default on current macOS sudo)."
+    compliance:
+      - cis: ["5.3.1"]
+      - cis_csc_v8: ["5.4"]
+      - mitre_techniques: ["T1548.003"]
+    condition: all
+    rules:
+      - "c:sudo -V -> r:Type of authentication timestamp record: tty"
+
+  - id: 40095
+    title: "Ensure the 'at' job scheduler is disabled."
+    rationale: "The at/atrun scheduler is a legacy persistence mechanism with no audit integration; launchd replaces it entirely."
+    remediation: "Run: sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.atrun.plist"
+    compliance:
+      - cis: ["5.10"]
+      - cis_csc_v8: ["4.8"]
+      - mitre_techniques: ["T1053.002"]
+    condition: all
+    rules:
+      - "c:launchctl list com.apple.atrun 2>&1 -> r:Could not find"
+
+  # ═══ 6. Applications (per-user) ═══════════════════════════════════════════
+  - id: 40100
+    title: "Ensure Safari does not auto-open 'safe' downloads (all users)."
+    rationale: "Safari's auto-open of 'safe' files executes downloaded content without user action — the delivery step of many macOS malware chains. Every user profile is checked."
+    remediation: "Per user: Safari > Settings > General > untick 'Open safe files after downloading' (key AutoOpenSafeDownloads=false)."
+    compliance:
+      - cis: ["6.3.1"]
+      - cis_csc_v8: ["9.4"]
+      - mitre_techniques: ["T1204.002"]
+    condition: all
+    rules:
+      - 'c:for d in /Users/*; do u=${d##*/}; case $u in Shared|Guest) continue;; esac; f="$d/Library/Containers/com.apple.Safari/Data/Library/Preferences/com.apple.Safari.plist"; [ -f "$f" ] || continue; v=$(plutil -extract AutoOpenSafeDownloads raw -o - "$f" 2>&1); case "$v" in *"not permitted"*) continue;; esac; { [ "$v" = false ] || [ "$v" = 0 ]; } || echo "violation $u"; done; true -> !r:violation'
+
+  - id: 40101
+    title: "Ensure Terminal Secure Keyboard Entry is enabled (all users)."
+    rationale: "Secure Keyboard Entry stops other processes from reading keystrokes typed into Terminal — a direct keylogger countermeasure for the highest-value input surface."
+    remediation: "Per user: Terminal > Secure Keyboard Entry (key SecureKeyboardEntry=true)."
+    compliance:
+      - cis: ["6.2.1"]
+      - cis_csc_v8: ["10.5"]
+      - mitre_techniques: ["T1056.001"]
+    condition: all
+    rules:
+      - 'c:for f in /Users/*/Library/Preferences/com.apple.Terminal.plist; do [ -f "$f" ] || continue; v=$(plutil -extract SecureKeyboardEntry raw -o - "$f" 2>/dev/null); { [ "$v" = true ] || [ "$v" = 1 ]; } || echo "violation $f"; done; true -> !r:violation'
