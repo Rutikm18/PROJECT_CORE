@@ -203,7 +203,9 @@ detect_pkg_manager() {
       2*)    IS_AMAZON_LINUX=2 ;;
     esac
   fi
-  [ "${IS_AMAZON_LINUX}" != "0" ] && info "Detected Amazon Linux ${IS_AMAZON_LINUX}"
+  if [ "${IS_AMAZON_LINUX}" != "0" ]; then
+    info "Detected Amazon Linux ${IS_AMAZON_LINUX}"
+  fi
 }
 
 # ── Install packages ──────────────────────────────────────────────────────────
@@ -249,14 +251,38 @@ install_pkgs() {
 preflight_checks() {
   local warnings=0
 
-  # Disk
+  # Disk — auto-clean before checking so apt/docker cache doesn't block installs
   local disk_avail
   disk_avail=$(df -m . 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
   if [ "$disk_avail" -lt 5120 ]; then
-    fail "Insufficient disk: ${disk_avail}MB available, need ≥ 5 GB"
-    die "Free disk space and re-run." 6
+    info "Disk low (${disk_avail}MB) — auto-cleaning package cache..."
+    $SUDO apt-get clean -qq 2>/dev/null || true
+    $SUDO apt-get autoremove -y -qq 2>/dev/null || true
+    $SUDO journalctl --vacuum-size=50M 2>/dev/null || true
+    if command -v docker &>/dev/null; then
+      docker system prune -f --filter "until=24h" 2>/dev/null || true
+    fi
+    disk_avail=$(df -m . 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+    info "Disk after cleanup: ${disk_avail}MB free"
   fi
-  ok "Disk: ${disk_avail}MB free"
+  if [ "$disk_avail" -lt 3072 ]; then
+    fail "Insufficient disk: ${disk_avail}MB available, need ≥ 3 GB"
+    echo ""
+    echo "   Fix options:"
+    echo "   1. Expand your EBS volume (recommended):"
+    echo "      AWS Console → EC2 → Volumes → Modify → increase to 20 GB"
+    echo "      Then: sudo growpart /dev/xvda1 1 && sudo resize2fs /dev/xvda1"
+    echo "   2. Free space manually:"
+    echo "      sudo apt-get clean && sudo apt-get autoremove -y"
+    echo "      docker system prune -af  (if Docker is installed)"
+    die "Expand disk and re-run." 6
+  elif [ "$disk_avail" -lt 5120 ]; then
+    warn "Disk tight (${disk_avail}MB) — recommend ≥ 5 GB for production"
+    warn "If the build fails, expand EBS volume: AWS Console → EC2 → Volumes → Modify"
+    warnings=$((warnings + 1))
+  else
+    ok "Disk: ${disk_avail}MB free"
+  fi
 
   # RAM
   local mem_mb
@@ -586,7 +612,7 @@ setup_config() {
     if [ ! -f Caddyfile ] && [ -f env.sh ]; then
       bash env.sh || _write_minimal_caddyfile
     fi
-    [ ! -f Caddyfile ] && _write_minimal_caddyfile
+    if [ ! -f Caddyfile ]; then _write_minimal_caddyfile; fi
     ok "Config ready"
     return 0
   fi
@@ -750,8 +776,13 @@ diagnose_failure() {
 
   local disk_avail
   disk_avail=$(df -m . 2>/dev/null | awk 'NR==2{print $4}' || echo "?")
-  [ "$disk_avail" -lt 1024 ] && { fail "Disk full — Docker cannot create containers"; echo "   Fix: docker system prune -af"; }
-  [ ! -f .env ] && fail ".env missing — run: bash env.sh"
+  if [ "$disk_avail" -lt 1024 ] 2>/dev/null; then
+    fail "Disk full — Docker cannot create containers"
+    echo "   Fix: docker system prune -af"
+  fi
+  if [ ! -f .env ]; then
+    fail ".env missing — run: bash env.sh"
+  fi
 }
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -829,7 +860,7 @@ print_summary() {
   admin_token=$(grep -oP '^ADMIN_TOKEN=\K.*' .env 2>/dev/null | head -1 || echo "")
 
   local mgr_url
-  [ -n "$domain" ] && mgr_url="https://${domain}" || mgr_url="https://${public_ip}:${bind_port}"
+  if [ -n "$domain" ]; then mgr_url="https://${domain}"; else mgr_url="https://${public_ip}:${bind_port}"; fi
 
   echo ""
   echo -e "${GRN}${BLD}"
@@ -840,7 +871,7 @@ print_summary() {
   echo ""
   echo -e "  ${BLD}Dashboard:${NC}    ${mgr_url}"
   echo -e "  ${BLD}Health:${NC}       ${mgr_url}/health"
-  [ -n "$admin_token" ] && echo -e "  ${BLD}Admin token:${NC}  ${admin_token}"
+  if [ -n "$admin_token" ]; then echo -e "  ${BLD}Admin token:${NC}  ${admin_token}"; fi
   echo ""
   echo -e "  ${BLD}Useful commands:${NC}"
   echo "    docker compose logs -f            # live logs"
@@ -853,8 +884,9 @@ print_summary() {
   echo "    url        = \"${mgr_url}\""
   echo "    tls_verify = ${domain:+true}${domain:-false}"
   echo ""
-  [ "${DOCKER_GROUP_CHANGED:-false}" = true ] && \
+  if [ "${DOCKER_GROUP_CHANGED:-false}" = true ]; then
     warn "Run 'newgrp docker' or log out/in for docker group changes"
+  fi
   echo -e "  ${DIM}Install log: ${LOG_FILE}${NC}"
   echo ""
 }
