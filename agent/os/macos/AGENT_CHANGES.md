@@ -1,7 +1,7 @@
 # macOS Agent — Change Log & Troubleshooting Reference
 
 **Path:** `agent/os/macos/`  
-**Last updated:** 2026-05-25
+**Last updated:** 2026-07-06
 
 ---
 
@@ -42,6 +42,189 @@
 ---
 
 ## Changes Made
+
+### 2026-07-06 — Self-healing hardening (survive ANY config/plist/binary mismatch)
+
+After the three install bugs below, every layer now defends itself — no single
+stale config, wrong plist, or mismatched binary version can crash-loop the agent.
+
+| Layer | File | Defense |
+|---|---|---|
+| Agent CLI | `agent/agent_entry.py` | Legacy invocation tolerance: `attacklens-agent --config X` (no subcommand) auto-maps to `run --config X`. Exit code 2 from a stale plist/watchdog is now impossible. |
+| Watchdog | `agent/agent/watchdog.py` | **Fallback target resolution**: if the configured `[binaries] agent` path is missing, auto-switch to the first existing candidate (`attacklens-agent` → `run_agent.sh` → `run_agent.py`) instead of FATAL-looping. **Exit-2 self-adaptation**: if the agent exits 2 twice in a row, toggle the `run` subcommand form and retry — heals mixed-version installs automatically. |
+| Service CLI | `pkg/attacklens-service` | New **`repair`** command (aliases `fix`, `heal`): one shot auto-fixes all known faults — stale `[binaries]` paths, plist missing `run`, missing wrapper/symlinks/exec bits, quarantine, stuck services. `diagnose` step 7 now scans for these faults and points at `repair`. |
+| PKG installer | `pkg/build_pkg.sh` postinstall | On upgrade, migrates preserved configs (`run_agent.py` → native binary paths) and always ships the `run_agent.sh` compatibility wrapper. |
+
+**One-command fix for any broken install:**
+```bash
+sudo attacklens-service repair
+```
+
+---
+
+### 2026-07-06 — PKG v2.1.0 install bug fixes
+
+Three bugs that caused the agent to crash-loop on every fresh v2.1.0 PKG install.
+All are in source — the next PKG build (`build_pkg.sh`) will include all fixes.
+
+---
+
+#### Bug 1 — `generate_config.sh` wrong binary paths in `[binaries]`
+
+**Symptom:** Watchdog log shows `FATAL: agent target not found at /Library/AttackLens/bin/run_agent.py`
+
+**Root cause:** `installer/generate_config.sh` had the `[binaries]` section hardcoded
+to `.py` entry-point paths from the old source-mode deployment:
+```toml
+[binaries]
+agent    = "{install_dir}/bin/run_agent.py"    # ← doesn't exist in PKG install
+watchdog = "{install_dir}/bin/run_watchdog.py" # ← doesn't exist in PKG install
+```
+The PKG ships native binaries named `attacklens-agent` and `attacklens-watchdog`.
+
+**Fix** (`installer/generate_config.sh` line 147–148):
+```toml
+[binaries]
+agent    = "{install_dir}/bin/attacklens-agent"
+watchdog = "{install_dir}/bin/attacklens-watchdog"
+```
+
+**Live fix (already-installed Mac):**
+```bash
+sudo sed -i '' \
+  's|/Library/AttackLens/bin/run_agent\.py|/Library/AttackLens/bin/run_agent.sh|g;
+   s|/Library/AttackLens/bin/run_watchdog\.py|/Library/AttackLens/bin/attacklens-watchdog|g' \
+  /Library/AttackLens/agent.toml
+```
+
+---
+
+#### Bug 2 — `watchdog.py` `_build_cmd()` missing `run` subcommand
+
+**Symptom:** Watchdog log shows `Agent exited with code 2` (argparse failure) in a crash loop.
+`agent.log` is never created because the agent exits before opening it.
+
+**Root cause:** `watchdog.py` `_build_cmd()` built the launch command for native
+binaries as:
+```
+/Library/AttackLens/bin/attacklens-agent --config /Library/AttackLens/agent.toml
+```
+But `agent_entry.py` uses subcommand-based argparse — `--config` belongs to the
+`run` subparser. Without `run`, argparse exits with code 2 on every launch.
+The "default to run when no args" shortcut at line 65 of `agent_entry.py` only
+fires when `len(sys.argv) == 1` (zero arguments), not when `--config` is present.
+
+**Fix** (`agent/agent/watchdog.py` `_build_cmd()` line 174):
+```python
+# Before:
+cmd = [self.agent_bin]
+
+# After:
+cmd = [self.agent_bin, "run"]  # native binary requires 'run' subcommand
+```
+
+**Live fix for already-installed Mac (wrapper script — no rebuild needed):**
+```bash
+# Create wrapper that inserts 'run' transparently
+sudo tee /Library/AttackLens/bin/run_agent.sh > /dev/null << 'EOF'
+#!/bin/bash
+exec /Library/AttackLens/bin/attacklens-agent run "$@"
+EOF
+sudo chmod 755 /Library/AttackLens/bin/run_agent.sh
+
+# Point agent.toml at the wrapper
+sudo sed -i '' \
+  's|/Library/AttackLens/bin/attacklens-agent"|/Library/AttackLens/bin/run_agent.sh"|g' \
+  /Library/AttackLens/agent.toml
+```
+
+---
+
+#### Bug 3 — `build_pkg.sh` agent plist missing `run` subcommand
+
+**Symptom:** `com.attacklens.agent` LaunchDaemon (loaded directly by launchd, not
+via watchdog) also exits with code 2 → KeepAlive restart loop, `agent.log` never created.
+
+**Root cause:** The agent plist `ProgramArguments` array in `build_pkg.sh` had:
+```xml
+<string>/Library/AttackLens/bin/attacklens-agent</string>
+<string>--config</string>
+<string>/Library/AttackLens/agent.toml</string>
+```
+Same argparse failure as Bug 2 — no `run` subcommand.
+
+**Fix** (`agent/os/macos/pkg/build_pkg.sh` plist section):
+```xml
+<string>/Library/AttackLens/bin/attacklens-agent</string>
+<string>run</string>
+<string>--config</string>
+<string>/Library/AttackLens/agent.toml</string>
+```
+
+**Live fix for already-installed Mac:**
+```bash
+sudo python3 -c "
+import plistlib
+path = '/Library/LaunchDaemons/com.attacklens.agent.plist'
+with open(path, 'rb') as f:
+    p = plistlib.load(f)
+args = p['ProgramArguments']
+if 'run' not in args:
+    args.insert(args.index('--config'), 'run')
+with open(path, 'wb') as f:
+    plistlib.dump(p, f)
+print('Fixed:', args)
+"
+```
+
+---
+
+#### Full live-fix sequence (for already-installed v2.1.0 PKG)
+
+Run these in order on any Mac that shows the crash-loop symptoms:
+
+```bash
+# 1. Fix agent.toml [binaries] paths and create run_agent.sh wrapper
+sudo sed -i '' \
+  's|/Library/AttackLens/bin/run_agent\.py|/Library/AttackLens/bin/run_agent.sh|g;
+   s|/Library/AttackLens/bin/run_watchdog\.py|/Library/AttackLens/bin/attacklens-watchdog|g;
+   s|/Library/AttackLens/bin/attacklens-agent"|/Library/AttackLens/bin/run_agent.sh"|g' \
+  /Library/AttackLens/agent.toml
+
+sudo tee /Library/AttackLens/bin/run_agent.sh > /dev/null << 'EOF'
+#!/bin/bash
+exec /Library/AttackLens/bin/attacklens-agent run "$@"
+EOF
+sudo chmod 755 /Library/AttackLens/bin/run_agent.sh
+
+# 2. Patch the agent plist
+sudo python3 -c "
+import plistlib
+path = '/Library/LaunchDaemons/com.attacklens.agent.plist'
+with open(path, 'rb') as f: p = plistlib.load(f)
+args = p['ProgramArguments']
+if 'run' not in args: args.insert(args.index('--config'), 'run')
+with open(path, 'wb') as f: plistlib.dump(p, f)
+print('Agent plist fixed:', args)
+"
+
+# 3. Install attacklens-service CLI (if missing)
+sudo cp agent/os/macos/pkg/attacklens-service /usr/local/bin/
+sudo chmod 755 /usr/local/bin/attacklens-service
+
+# 4. Restart both services
+sudo launchctl bootout system/com.attacklens.watchdog 2>/dev/null || true
+sudo launchctl bootout system/com.attacklens.agent    2>/dev/null || true
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.agent.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.watchdog.plist
+
+# 5. Verify
+sleep 5
+sudo launchctl list | grep attacklens   # both should have PIDs
+sudo tail -20 /Library/AttackLens/logs/agent.log
+```
+
+---
 
 ### 2026-05-25 — Unified single binary (agent/build.sh)
 

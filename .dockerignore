@@ -29,13 +29,19 @@ htmlcov/
 Thumbs.db
 
 # Runtime data (mounted as volumes)
+# NOTE: dockerignore patterns are context-root-relative — "data/" alone does
+# NOT match manager/data/, which held 447MB of live telemetry (manager.db +
+# hot/warm/cold tiers) and was silently baked into every image build.
 data/
 certs/
 logs/
-agent/logs/
-agent/data/
-agent/security/
-agent/spool/
+manager/data/
+manager/logs/
+
+# Agent tree — no manager/threat-intel Dockerfile copies it, but without this
+# the whole ~450MB (PyInstaller dists, PKGs, logs, spool) is still sent to the
+# docker daemon as build context on every build.
+agent/
 
 # Secrets
 .env
@@ -48,6 +54,13 @@ agent/spool/
 agent/build/
 agent/dist/
 *.spec
+
+# Dashboard node_modules — dashboard is mounted as a volume at runtime,
+# node_modules must never be copied into the image (adds 500MB+ of
+# platform-specific binaries that break Linux builds from macOS dev machines)
+**/node_modules
+manager/dashboard/**/node_modules
+manager/dashboard/templates/**/node_modules
 
 # Windows artifacts
 agent/os/windows/pkg/*.msi

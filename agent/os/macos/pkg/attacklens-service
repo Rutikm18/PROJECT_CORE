@@ -222,10 +222,157 @@ cmd_diagnose() {
     fi
     echo ""
 
+    echo "7. Known-fault scan (auto-fixable via: sudo attacklens-service repair)"
+    local faults=0
+    if [ -f "$CONFIG_FILE" ] && grep -qE 'run_agent\.py|run_watchdog\.py' "$CONFIG_FILE"; then
+        err "agent.toml [binaries] points at removed .py entry scripts"
+        faults=$((faults+1))
+    fi
+    if [ -f "$AGENT_PLIST" ] && ! /usr/libexec/PlistBuddy -c "Print :ProgramArguments" \
+            "$AGENT_PLIST" 2>/dev/null | grep -q '^\s*run$'; then
+        err "agent plist missing 'run' subcommand (agent exits 2 on every launch)"
+        faults=$((faults+1))
+    fi
+    for b in "${BIN_DIR}/attacklens-agent" "${BIN_DIR}/attacklens-watchdog"; do
+        if [ -f "$b" ] && [ ! -x "$b" ]; then
+            err "not executable: $b"
+            faults=$((faults+1))
+        fi
+    done
+    if [ -f "${LOG_DIR}/watchdog.log" ] && \
+            tail -n 20 "${LOG_DIR}/watchdog.log" | grep -q "exited with code 2"; then
+        err "watchdog log shows agent exit code 2 (argparse rejection) recently"
+        faults=$((faults+1))
+    fi
+    if [ "$faults" -eq 0 ]; then
+        ok "no known faults detected"
+    else
+        warn "${faults} known fault(s) found — run: sudo attacklens-service repair"
+    fi
+    echo ""
+
     echo "Common fixes:"
+    echo "  auto-fix faults  : sudo attacklens-service repair"
     echo "  restart services : sudo attacklens-service restart"
     echo "  view live logs   : tail -f ${LOG_DIR}/agent.log"
     echo "  full reinstall   : sudo attacklens-service uninstall && re-run the PKG"
+}
+
+# repair — auto-fix every known install fault, idempotent, safe to re-run.
+# Covers all failure modes seen in the field:
+#   1. agent.toml [binaries] pointing at removed run_agent.py / run_agent.py
+#   2. agent plist missing the 'run' subcommand (agent exits 2 forever)
+#   3. missing run_agent.sh compatibility wrapper
+#   4. attacklens-service / attacklens-watchdog not in /usr/local/bin
+#   5. binaries missing +x or quarantined
+#   6. services not loaded / stuck (Bootstrap failed: 5)
+cmd_repair() {
+    need_root repair
+    echo "AttackLens agent — auto-repair"
+    echo "══════════════════════════════"
+    local fixed=0
+
+    # 0. Sanity: core binary must exist; nothing to repair without it
+    if [ ! -f "${BIN_DIR}/attacklens-agent" ]; then
+        err "core binary missing: ${BIN_DIR}/attacklens-agent — reinstall the PKG."
+        exit 1
+    fi
+
+    # 1. Executable bits + quarantine on shipped binaries
+    for b in "${BIN_DIR}/attacklens-agent" "${BIN_DIR}/attacklens-watchdog"; do
+        if [ -f "$b" ] && [ ! -x "$b" ]; then
+            chmod 755 "$b" && ok "made executable: $b" && fixed=$((fixed+1))
+        fi
+    done
+    xattr -dr com.apple.quarantine "${BIN_DIR}" 2>/dev/null || true
+
+    # 2. Compatibility wrapper (old watchdogs launch this; it inserts 'run')
+    if [ ! -x "${BIN_DIR}/run_agent.sh" ]; then
+        cat > "${BIN_DIR}/run_agent.sh" <<'WRAP'
+#!/bin/bash
+exec /Library/AttackLens/bin/attacklens-agent run "$@"
+WRAP
+        chmod 755 "${BIN_DIR}/run_agent.sh"
+        ok "created compatibility wrapper: ${BIN_DIR}/run_agent.sh"
+        fixed=$((fixed+1))
+    fi
+
+    # 3. agent.toml [binaries] — retarget stale .py entry-script paths
+    if [ -f "$CONFIG_FILE" ]; then
+        if grep -qE 'run_agent\.py|run_watchdog\.py' "$CONFIG_FILE"; then
+            sed -i '' \
+                -e 's|/Library/AttackLens/bin/run_agent\.py|/Library/AttackLens/bin/attacklens-agent|g' \
+                -e 's|/Library/AttackLens/bin/run_watchdog\.py|/Library/AttackLens/bin/attacklens-watchdog|g' \
+                "$CONFIG_FILE"
+            ok "agent.toml [binaries] retargeted to native binaries"
+            fixed=$((fixed+1))
+        fi
+    else
+        warn "config missing: $CONFIG_FILE — regenerating"
+        if [ -x "${INSTALL_DIR}/generate_config.sh" ]; then
+            bash "${INSTALL_DIR}/generate_config.sh" && ok "config regenerated" && fixed=$((fixed+1))
+        else
+            err "generate_config.sh missing too — reinstall the PKG."
+        fi
+    fi
+
+    # 4. Agent plist — ensure 'run' subcommand precedes --config
+    if [ -f "$AGENT_PLIST" ]; then
+        if ! /usr/libexec/PlistBuddy -c "Print :ProgramArguments" "$AGENT_PLIST" 2>/dev/null \
+                | grep -q '^\s*run$'; then
+            /usr/bin/python3 - "$AGENT_PLIST" <<'PYEOF'
+import plistlib, sys
+path = sys.argv[1]
+with open(path, "rb") as f:
+    p = plistlib.load(f)
+args = p.get("ProgramArguments", [])
+if "run" not in args and "--config" in args:
+    args.insert(args.index("--config"), "run")
+    with open(path, "wb") as f:
+        plistlib.dump(p, f)
+    print("patched")
+PYEOF
+            ok "agent plist patched: 'run' subcommand inserted"
+            fixed=$((fixed+1))
+        fi
+    else
+        err "agent plist missing: $AGENT_PLIST — reinstall the PKG."
+    fi
+
+    # 5. CLI tools in /usr/local/bin
+    mkdir -p /usr/local/bin
+    if [ ! -x /usr/local/bin/attacklens-service ] && [ -f "$0" ]; then
+        cp "$0" /usr/local/bin/attacklens-service
+        chmod 755 /usr/local/bin/attacklens-service
+        ok "installed /usr/local/bin/attacklens-service"
+        fixed=$((fixed+1))
+    fi
+    if [ -x "${BIN_DIR}/attacklens-watchdog" ] && [ ! -e /usr/local/bin/attacklens-watchdog ]; then
+        ln -sf "${BIN_DIR}/attacklens-watchdog" /usr/local/bin/attacklens-watchdog
+        ok "symlinked /usr/local/bin/attacklens-watchdog"
+        fixed=$((fixed+1))
+    fi
+
+    # 6. Reload both services (svc_load already handles Bootstrap error 5)
+    info "reloading services…"
+    launchctl bootout "system/${WATCHDOG_LABEL}" 2>/dev/null || true
+    launchctl bootout "system/${AGENT_LABEL}"    2>/dev/null || true
+    sleep 1
+    svc_load "$AGENT_LABEL"    "$AGENT_PLIST"    || true
+    svc_load "$WATCHDOG_LABEL" "$WATCHDOG_PLIST" || true
+
+    # 7. Verify outcome
+    sleep 3
+    echo ""
+    status_line "$AGENT_LABEL"
+    status_line "$WATCHDOG_LABEL"
+    echo ""
+    if [ -f "${LOG_DIR}/agent.log" ]; then
+        info "recent agent log:"
+        tail -n 5 "${LOG_DIR}/agent.log" | sed 's/^/  /'
+    fi
+    echo ""
+    ok "repair complete (${fixed} item(s) fixed). Run 'attacklens-service diagnose' to confirm."
 }
 
 cmd_uninstall() {
@@ -261,6 +408,7 @@ Commands:
   logs [N]     show last N lines of agent/watchdog logs (default 50)
   config       print agent.toml
   diagnose     full health check: files, services, manager connectivity, errors
+  repair       auto-fix all known install faults (config paths, plist, wrappers)
   uninstall    stop services and remove the agent completely
   version      show versions
 EOF
@@ -276,6 +424,7 @@ case "${1:-}" in
     logs)      cmd_logs "${2:-50}" ;;
     config)    cmd_config ;;
     diagnose|doctor) cmd_diagnose ;;
+    repair|fix|heal) cmd_repair ;;
     uninstall) cmd_uninstall ;;
     version|--version|-v) cmd_version ;;
     ""|help|--help|-h) usage ;;

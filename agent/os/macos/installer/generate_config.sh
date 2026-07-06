@@ -144,8 +144,8 @@ spool_dir    = "{install_dir}/spool"
 pid_file     = "{install_dir}/attacklens-agent.pid"
 
 [binaries]
-agent    = "{install_dir}/bin/run_agent.py"
-watchdog = "{install_dir}/bin/run_watchdog.py"
+agent    = "{install_dir}/bin/attacklens-agent"
+watchdog = "{install_dir}/bin/attacklens-watchdog"
 
 [logging]
 level   = "INFO"

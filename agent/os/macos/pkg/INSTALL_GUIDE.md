@@ -68,6 +68,7 @@ sudo attacklens-service restart
 sudo attacklens-service logs 100    # last 100 lines of agent/watchdog logs
 sudo attacklens-service config      # print agent.toml
 sudo attacklens-service diagnose    # files, services, exit codes, manager connectivity
+sudo attacklens-service repair      # AUTO-FIX all known install faults, reload, verify
 sudo attacklens-service uninstall   # complete removal
 ```
 
@@ -81,6 +82,16 @@ sudo attacklens-watchdog status|start|stop|restart|logs   # if /Library/AttackLe
 ---
 
 ## 5. Troubleshooting
+
+**Start with the one-shot auto-fix — it resolves everything below except a
+missing CLI:**
+```bash
+sudo attacklens-service repair
+```
+It fixes: stale `[binaries]` paths in agent.toml, agent plist missing the
+`run` subcommand (exit-code-2 crash loop), missing `run_agent.sh` wrapper,
+missing `/usr/local/bin` tools, lost exec bits / quarantine flags, and stuck
+services (Bootstrap error 5). Idempotent — safe to run any time.
 
 ### "attacklens-service: command not found"
 You installed a pre-2.1.0 PKG, which didn't ship the CLI. Rebuild the PKG from

@@ -1,6 +1,6 @@
 # AttackLens macOS Agent — Troubleshoot Guide
 
-**Agent v2.0.0 · macOS 15+ (Sequoia / Tahoe)**
+**Agent v2.1.0 · macOS 15+ (Sequoia / Tahoe)**
 
 ---
 
@@ -9,13 +9,36 @@
 Always start here:
 
 ```bash
+sudo attacklens-service repair     # AUTO-FIX: one shot fixes every known
+                                   # install fault (stale config paths, plist
+                                   # missing 'run', wrappers, exec bits,
+                                   # quarantine, stuck services) — idempotent,
+                                   # safe to run any time
 attacklens-service diagnose        # quick: install + connectivity checklist
+                                   # (step 7 scans for repair-able faults)
 attacklens-service status          # service state + recent log
 sudo attacklens-service doctor     # DEEP: decodes log messages, identifies a
                                    # rogue server squatting the manager port (by
                                    # PID), and flags the spool-storm trend
 sudo attacklens-service logs       # live log tail
 ```
+
+**If the agent is crash-looping and you don't know why: run `repair` first.**
+It covers every failure mode documented in this file's "PKG Issue" sections.
+
+### Built-in self-healing (2026-07-06)
+
+Even without running `repair`, the agent stack now recovers from the common
+mismatches on its own:
+
+- **Agent CLI** accepts the legacy `--config`-only invocation (auto-maps to
+  `run`), so a stale plist or old watchdog can no longer cause exit-code-2
+  restart loops.
+- **Watchdog** falls back to known-good agent paths when `[binaries] agent`
+  points at a missing file, and toggles the `run` subcommand form automatically
+  if the agent rejects its command line twice.
+- **PKG postinstall** migrates preserved configs from old `.py` entry-script
+  paths to the native binaries on every upgrade.
 
 `doctor` is the deep self-diagnosis (added 2026-06-22): it runs
 `agent/os/macos/diagnostics.py`, which knows every agent log message and the
@@ -24,6 +47,189 @@ fix. A periodic **self-heal LaunchDaemon** (`com.attacklens.selfheal`, every
 5 min) runs the same checks automatically — it re-loads the agent if launchd
 dropped it, and escalates (never silently) when the agent is alive but can't
 deliver. State it writes: `/Library/AttackLens/health_diagnosis.json`.
+
+---
+
+## Issues Found in v2.1.0 PKG Install (2026-06-18)
+
+These errors all surface immediately after running
+`sudo installer -pkg attacklens-agent-2.1.0-arm64.pkg -target /` on a fresh Mac.
+
+> **Shortcut:** every issue in this section is auto-fixed by
+> `sudo attacklens-service repair` — the manual steps below are kept for
+> understanding and for machines where the CLI itself is missing.
+
+---
+
+### PKG Issue 1 — `attacklens-service: command not found`
+
+**What you see:**
+```
+% attacklens-service status
+zsh: command not found: attacklens-service
+```
+
+**Root cause:**
+The v2.0.x `pkg/build_pkg.sh` never copied `pkg/attacklens-service` into the
+pkgroot, so `/usr/local/bin/attacklens-service` was never installed.
+
+**Fix (v2.1.0 — already resolved in the current build):**
+The build script now copies the CLI into the pkgroot at Step 3:
+```bash
+cp pkg/attacklens-service "$PKGROOT/usr/local/bin/attacklens-service"
+chmod 755 "$PKGROOT/usr/local/bin/attacklens-service"
+```
+On fresh installs the binary lands at `/usr/local/bin/attacklens-service`.
+
+**If you're on an older PKG, install the CLI manually:**
+```bash
+sudo cp agent/os/macos/pkg/attacklens-service /usr/local/bin/
+sudo chmod 755 /usr/local/bin/attacklens-service
+sudo xattr -d com.apple.quarantine /usr/local/bin/attacklens-service 2>/dev/null || true
+attacklens-service version          # should print v2.1.0
+```
+
+---
+
+### PKG Issue 2 — `attacklens-watchdog start: unrecognized arguments`
+
+**What you see:**
+```
+% sudo attacklens-service start
+usage: attacklens-watchdog [-h] [--config CONFIG]
+attacklens-watchdog: error: unrecognized arguments: start
+```
+
+**Root cause:**
+`watchdog.py` in v2.0.x accepted only `--config`; it had no subcommand support.
+When `attacklens-service start` called `attacklens-watchdog start`, argparse
+rejected the `start` argument.
+
+**Fix (v2.1.0 — already resolved):**
+`watchdog.py` now uses:
+```python
+parser.add_argument("command", nargs="?",
+    choices=["run","status","start","stop","restart","logs"],
+    default="run")
+```
+LaunchDaemon invokes `attacklens-watchdog --config <path>` (no subcommand →
+defaults to `run`, i.e. foreground mode). Human operators use
+`attacklens-watchdog status|start|stop|restart|logs` from the terminal.
+
+**Quick verify:**
+```bash
+attacklens-watchdog status          # shows ● com.attacklens.watchdog ...
+sudo attacklens-watchdog restart    # restarts the LaunchDaemon
+sudo attacklens-watchdog logs       # live log tail
+```
+
+**If you're on an older binary, rebuild the PKG:**
+```bash
+cd /Users/rutikmangale/Downloads/macbook_data
+VERSION=2.1.0 ARCH=arm64 \
+  MANAGER_URL="http://<your-manager-ip>:8080" \
+  TLS_VERIFY=false \
+  bash agent/os/macos/pkg/build_pkg.sh
+sudo installer -pkg agent/os/macos/pkg/dist/attacklens-agent-2.1.0-arm64.pkg -target /
+```
+
+---
+
+### PKG Issue 3 — `Bootstrap failed: 5: Input/output error`
+
+**What you see:**
+```
+Bootstrap failed: 5: Input/output error
+```
+or
+```
+launchctl: service already loaded
+```
+(printed by the postinstall script, but the installer UI may show it as a
+postinstall error)
+
+**Root cause:**
+Running `launchctl bootstrap system <plist>` when the service is already loaded
+(from a previous install) always fails with error 5 (ENXIO — "Input/output
+error"). The v2.0.x postinstall used the legacy `launchctl load -w`, which has
+the same failure mode.
+
+**Fix (v2.1.0 — already resolved in postinstall):**
+The postinstall now runs a safe bootout→enable→bootstrap sequence with a
+`kickstart -k` fallback:
+```bash
+launchctl bootout "system/${label}" 2>/dev/null || true
+launchctl enable  "system/${label}" 2>/dev/null
+out=$(launchctl bootstrap system "$plist" 2>&1)
+if echo "$out" | grep -qE "Input/output error|already loaded| 5: "; then
+  launchctl kickstart -k "system/${label}" 2>/dev/null
+fi
+```
+
+**If you hit this during a reinstall (PKG already installed), fix manually:**
+```bash
+# Step 1 — bootout the old services
+sudo launchctl bootout system/com.attacklens.agent    2>/dev/null || true
+sudo launchctl bootout system/com.attacklens.watchdog 2>/dev/null || true
+
+# Step 2 — enable them (required before bootstrap on macOS 13+)
+sudo launchctl enable system/com.attacklens.agent
+sudo launchctl enable system/com.attacklens.watchdog
+
+# Step 3 — load
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.agent.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.attacklens.watchdog.plist
+
+# Step 4 — verify
+launchctl list | grep attacklens
+attacklens-service status
+```
+
+**If bootstrap still fails after the above sequence:**
+```bash
+# Use kickstart to force-restart an already-running service
+sudo launchctl kickstart -k system/com.attacklens.agent
+sudo launchctl kickstart -k system/com.attacklens.watchdog
+```
+
+---
+
+### PKG Issue 4 — SCA section missing from dashboard / `sca_apple_macos.yml not found`
+
+**What you see:**
+The Security Posture module in the dashboard shows no SCA data, or the agent
+log contains:
+```
+agent.sca ERROR Policy file not found: .../agent/agent/sca/policies/sca_apple_macos.yml
+```
+
+**Root cause:**
+PyInstaller `--onefile` does NOT bundle data files (YAML policy files) unless
+explicitly passed with `--add-data`. Without it the `policies/` directory is
+empty inside the frozen binary's `sys._MEIPASS` directory.
+
+**Fix (v2.1.0 — already resolved in build_pkg.sh):**
+```bash
+--add-data "agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies"
+```
+This mirrors the package path so `os.path.dirname(__file__)`-relative resolution
+works correctly inside the frozen binary.
+
+**Verify the policies are bundled (before distributing):**
+```bash
+# Extract the binary's _MEIPASS and check
+/Library/AttackLens/bin/attacklens-agent run --list-policies 2>&1 | head -5
+# or check inside the build spec:
+grep "sca_apple_macos" agent/os/macos/pkg/attacklens-agent.spec
+```
+
+**If you're on an older build, rebuild with the fix:**
+```bash
+VERSION=2.1.0 ARCH=arm64 \
+  MANAGER_URL="http://<manager-ip>:8080" \
+  TLS_VERIFY=false \
+  bash agent/os/macos/pkg/build_pkg.sh
+```
 
 ---
 
@@ -560,7 +766,8 @@ sudo attacklens-service restart  # full restart
 | `attacklens-service logs` | No | Live `tail -f` of agent.log |
 | `attacklens-service config` | No | Print agent.toml |
 | `attacklens-service version` | No | Version + Python info |
-| `attacklens-service diagnose` | No | Full connectivity + install health check |
+| `attacklens-service diagnose` | No | Full connectivity + install health check (incl. known-fault scan) |
+| `sudo attacklens-service repair` | Yes | Auto-fix all known install faults, then reload + verify services |
 | `sudo attacklens-service doctor` | No* | Deep diagnosis: decode logs, name a rogue server on the manager port (by PID), spool-storm trend (*sudo for full log access) |
 | `sudo attacklens-service start` | Yes | Start agent + watchdog + self-heal LaunchDaemons |
 | `sudo attacklens-service stop` | Yes | Stop agent + watchdog |
@@ -572,4 +779,5 @@ sudo attacklens-service restart  # full restart
 
 ---
 
-*Generated 2026-05-15 · AttackLens v2.0.0 · macOS arm64*
+*Generated 2026-05-15 · Updated 2026-06-18 · AttackLens v2.1.0 · macOS arm64*  
+*Reference: `agent/os/macos/AGENT_CHANGES.md` · Install guide: `agent/os/macos/pkg/INSTALL_GUIDE.md`*

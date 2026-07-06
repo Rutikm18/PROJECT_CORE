@@ -6,7 +6,7 @@
  * PUT  /api/v1/settings        — persist changes
  * POST /api/v1/settings/reset  — factory reset
  */
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Building2, MapPin, Mail, Calendar, ShieldCheck, Settings2,
   Bell, RefreshCw, Save, AlertTriangle, CheckCircle2, Info,
@@ -1150,14 +1150,17 @@ interface RetentionConfig {
   available_actions:       string[];
 }
 interface RetentionStats {
-  live_payloads: { row_count: number; approx_bytes: number } | null;
+  live_payloads: { row_count: number; approx_bytes: number; table_bytes: number } | null;
   archive: { path: string; file_count: number; total_bytes: number;
              oldest_file_ts: number | null; newest_file_ts: number | null } | null;
+  postgres: { db_bytes: number } | null;
 }
 
 const RETENTION_PERIOD_LABELS: Record<number, string> = {
-  0: "7 days", 1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year", 24: "2 years",
+  0: "1 day", 1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year", 24: "2 years",
 };
+
+const STORAGE_REFRESH_INTERVAL_MS = 60_000; // refresh storage stats every 60 s
 
 function formatBytes(n: number | null | undefined): string {
   if (n == null || n <= 0) return "0 B";
@@ -1168,27 +1171,41 @@ function formatBytes(n: number | null | undefined): string {
 }
 
 function RetentionSettingsPanel() {
-  const [config,  setConfig]  = useState<RetentionConfig | null>(null);
-  const [stats,   setStats]   = useState<RetentionStats | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving,  setSaving]  = useState(false);
-  const [saved,   setSaved]   = useState(false);
-  const [error,   setError]   = useState<string | null>(null);
+  const [config,      setConfig]      = useState<RetentionConfig | null>(null);
+  const [stats,       setStats]       = useState<RetentionStats | null>(null);
+  const [loading,     setLoading]     = useState(true);
+  const [refreshing,  setRefreshing]  = useState(false);
+  const [saving,      setSaving]      = useState(false);
+  const [saved,       setSaved]       = useState(false);
+  const [error,       setError]       = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const loadStats = useCallback(async (quiet = false) => {
+    if (!quiet) setRefreshing(true);
     try {
       const r = await fetch(`${RETENTION_API}/retention`);
       if (!r.ok) throw new Error(`${r.status}`);
       const d = await r.json();
       setConfig(d.config);
       setStats(d.stats);
+      setLastUpdated(new Date());
       setError(null);
     } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+    finally { if (!quiet) setRefreshing(false); }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  const load = useCallback(async () => {
+    setLoading(true);
+    await loadStats(true);
+    setLoading(false);
+  }, [loadStats]);
+
+  useEffect(() => {
+    load();
+    timerRef.current = setInterval(() => loadStats(true), STORAGE_REFRESH_INTERVAL_MS);
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [load, loadStats]);
 
   const save = async (periodMonths: number, action: "delete" | "archive", autoResolveDays?: number) => {
     setSaving(true); setSaved(false);
@@ -1230,10 +1247,10 @@ function RetentionSettingsPanel() {
         <SectionLabel icon={Clock}>Retention Period</SectionLabel>
         <p className="text-[10px] text-[--gray-500] leading-relaxed">
           How long raw telemetry stays in the live, queryable store before the action below applies.
-          Default is 1 month. 7 days keeps the smallest, freshest dataset.
+          Default is 1 day — the smallest, freshest dataset and lowest disk usage.
         </p>
 
-        <Field label="Keep data for" hint="default: 1 month (30 days)">
+        <Field label="Keep data for" hint="default: 1 day">
           <select
             value={config.period_months}
             onChange={e => save(Number(e.target.value), config.action)}
@@ -1352,15 +1369,46 @@ function RetentionSettingsPanel() {
 
       {/* ── Live data size ───────────────────────────────────────────────── */}
       <div className="col-span-2 bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-3">
-        <SectionLabel icon={Database}>Current Data Size</SectionLabel>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="flex items-center justify-between">
+          <SectionLabel icon={Database}>Current Data Size</SectionLabel>
+          <div className="flex items-center gap-2">
+            {lastUpdated && (
+              <span className="text-[9px] text-[--gray-400]">
+                Updated {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => loadStats(false)}
+              disabled={refreshing}
+              className="p-1 rounded-lg hover:bg-[--gray-100] text-[--gray-400] hover:text-[--gray-600] transition-colors"
+              title="Refresh storage stats"
+            >
+              <RefreshCw className={cn("w-3.5 h-3.5", refreshing && "animate-spin")} />
+            </button>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
           <div className="rounded-xl border border-[--gray-100] bg-[--gray-25] p-3.5">
-            <div className="text-[9px] font-semibold text-[--gray-400] uppercase tracking-wide">Live (queryable)</div>
+            <div className="text-[9px] font-semibold text-[--gray-400] uppercase tracking-wide">Live payloads</div>
             <div className="text-[18px] font-black text-[--gray-800] mt-1">
               {formatBytes(stats?.live_payloads?.approx_bytes)}
             </div>
             <div className="text-[10px] text-[--gray-400] mt-0.5">
-              {(stats?.live_payloads?.row_count ?? 0).toLocaleString()} telemetry rows
+              {(stats?.live_payloads?.row_count ?? 0).toLocaleString()} rows
+              {stats?.live_payloads?.table_bytes
+                ? ` · ${formatBytes(stats.live_payloads.table_bytes)} on disk`
+                : ""}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-[--gray-100] bg-[--gray-25] p-3.5">
+            <div className="text-[9px] font-semibold text-[--gray-400] uppercase tracking-wide">Total database</div>
+            <div className="text-[18px] font-black text-[--gray-800] mt-1">
+              {formatBytes(stats?.postgres?.db_bytes ?? null)}
+            </div>
+            <div className="text-[10px] text-[--gray-400] mt-0.5">
+              Postgres total (all tables)
             </div>
           </div>
 
@@ -1389,6 +1437,7 @@ function RetentionSettingsPanel() {
             )}
           </div>
         </div>
+        <p className="text-[9px] text-[--gray-400]">Auto-refreshes every 60 s — or click the refresh icon above.</p>
       </div>
     </div>
   );

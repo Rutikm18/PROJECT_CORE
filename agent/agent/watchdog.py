@@ -69,6 +69,11 @@ class Watchdog:
         # overridden with [binaries] python = "...".
         self.python_bin      = bins.get("python") or sys.executable or "python3"
         self._use_interpreter = self.agent_bin.endswith(".py")
+        # Whether to pass the 'run' subcommand. Default True (current CLI).
+        # Toggled automatically if the agent exits 2 (argparse rejection) —
+        # covers mismatched agent/watchdog builds without operator action.
+        self._use_run_subcommand = True
+        self._consecutive_exit2  = 0
         self.config_path     = cfg.get("_config_path", "")
         self.pid_file        = paths.get("pid_file", "/Library/AttackLens/attacklens-agent.pid")
         self.check_interval  = int(wdcfg.get("check_interval_sec", 30))
@@ -117,6 +122,26 @@ class Watchdog:
             return p if (os.path.isfile(p) and os.access(p, os.X_OK)) else None
         return shutil.which(p)
 
+    # Fallback agent targets tried (in order) when the configured path is
+    # missing — covers stale configs pointing at removed .py entry scripts.
+    _FALLBACK_AGENT_TARGETS = (
+        "/Library/AttackLens/bin/attacklens-agent",
+        "/Library/AttackLens/bin/run_agent.sh",
+        "/Library/AttackLens/bin/run_agent.py",
+    )
+
+    def _resolve_fallback(self) -> str | None:
+        """Find a launchable agent target when the configured one is missing."""
+        for cand in self._FALLBACK_AGENT_TARGETS:
+            if cand == self.agent_bin or not os.path.isfile(cand):
+                continue
+            if cand.endswith(".py"):
+                if os.access(cand, os.R_OK) and self._interpreter_path():
+                    return cand
+            elif os.access(cand, os.X_OK):
+                return cand
+        return None
+
     def _verify_binary(self) -> bool:
         """Check the agent target exists and is launchable, and warn on tampering.
 
@@ -124,14 +149,29 @@ class Watchdog:
           • native binary  → the target itself must be executable (X_OK)
           • .py entry script → the target must be readable AND a usable Python
             interpreter must exist (the script need not be executable)
+
+        Self-healing: if the configured target is missing (stale agent.toml
+        from an older install), fall back to known-good candidate paths
+        instead of FATAL-looping until an operator edits the config.
         """
         if not os.path.isfile(self.agent_bin):
-            log.critical(
-                "FATAL: agent target not found at %s. "
-                "Re-install or update [binaries] agent = ... in agent.toml.",
-                self.agent_bin,
-            )
-            return False
+            fallback = self._resolve_fallback()
+            if fallback:
+                log.warning(
+                    "Configured agent target %s not found — auto-switching to %s "
+                    "(update [binaries] agent = ... in agent.toml to silence this).",
+                    self.agent_bin, fallback,
+                )
+                self.agent_bin = fallback
+                self._use_interpreter = fallback.endswith(".py")
+            else:
+                log.critical(
+                    "FATAL: agent target not found at %s (no fallback candidate "
+                    "exists either). Re-install or update [binaries] agent = ... "
+                    "in agent.toml.",
+                    self.agent_bin,
+                )
+                return False
 
         if self._use_interpreter:
             if not os.access(self.agent_bin, os.R_OK):
@@ -170,8 +210,14 @@ class Watchdog:
         """Build the agent launch command (interpreter-prefixed for .py targets)."""
         if self._use_interpreter:
             cmd = [self._interpreter_path() or self.python_bin, self.agent_bin]
+            if self._use_run_subcommand:
+                cmd.append("run")
         else:
+            # Native PyInstaller binary uses subcommand-based argparse;
+            # 'run' is required — bare '--config' without a subcommand exits 2.
             cmd = [self.agent_bin]
+            if self._use_run_subcommand:
+                cmd.append("run")
         if self.config_path:
             cmd += ["--config", self.config_path]
         return cmd
@@ -205,6 +251,24 @@ class Watchdog:
             return   # still running — all good
 
         log.warning("Agent exited with code %d (PID=%d)", rc, self._proc.pid)
+
+        # Exit 2 = argparse rejected the command line. If it happens twice in
+        # a row, flip the 'run' subcommand form — the agent build we're
+        # launching expects the other CLI shape. This self-heals mixed-version
+        # installs (old binary + new watchdog, or vice versa).
+        if rc == 2:
+            self._consecutive_exit2 += 1
+            if self._consecutive_exit2 >= 2:
+                self._use_run_subcommand = not self._use_run_subcommand
+                self._consecutive_exit2 = 0
+                log.warning(
+                    "Agent rejected its command line twice (exit 2) — "
+                    "retrying with%s the 'run' subcommand.",
+                    "" if self._use_run_subcommand else "out",
+                )
+        else:
+            self._consecutive_exit2 = 0
+
         self._proc = None
         self._clear_pid()
         self._rate_limited_restart()

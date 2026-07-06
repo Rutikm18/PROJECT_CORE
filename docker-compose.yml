@@ -140,6 +140,12 @@ services:
 
       # Manager always runs plain HTTP — Caddy handles TLS
       BIND_PORT:               "8080"
+
+      # Per-agent ingest rate limits (raised from defaults for demo/single-agent use)
+      # Default: rate=10 burst=30 slots=4 — too tight when agent drains a large spool
+      AGENT_RATE:              "${AGENT_RATE:-50}"
+      AGENT_BURST:             "${AGENT_BURST:-150}"
+      AGENT_SLOTS:             "${AGENT_SLOTS:-12}"
       TLS_MODE:                "none"
 
       # Postgres — base DSN shared by manager.db + intel.db (server.py appends

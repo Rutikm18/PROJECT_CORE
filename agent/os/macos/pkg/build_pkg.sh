@@ -201,6 +201,7 @@ cat > "${PKG_ROOT}${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" <<'PLIST'
     <key>ProgramArguments</key>
     <array>
         <string>/Library/AttackLens/bin/attacklens-agent</string>
+        <string>run</string>
         <string>--config</string>
         <string>/Library/AttackLens/agent.toml</string>
     </array>
@@ -339,6 +340,25 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
 else
   echo "  Existing config preserved (upgrade): ${CONFIG_PATH}"
 fi
+
+# ── Migrate/repair preserved configs (idempotent) ──────────────────────────────
+# Older configs point [binaries] at removed .py entry scripts — the watchdog
+# would FATAL-loop on them. Retarget to the shipped native binaries.
+if grep -qE 'run_agent\.py|run_watchdog\.py' "${CONFIG_PATH}" 2>/dev/null; then
+  sed -i '' \
+    -e 's|/Library/AttackLens/bin/run_agent\.py|/Library/AttackLens/bin/attacklens-agent|g' \
+    -e 's|/Library/AttackLens/bin/run_watchdog\.py|/Library/AttackLens/bin/attacklens-watchdog|g' \
+    "${CONFIG_PATH}"
+  echo "  Migrated [binaries] paths in preserved config to native binaries"
+fi
+
+# Compatibility wrapper: anything still launching run_agent.sh gets the
+# correct 'run' subcommand inserted transparently.
+cat > "${INSTALL_DIR}/bin/run_agent.sh" <<'WRAP'
+#!/bin/bash
+exec /Library/AttackLens/bin/attacklens-agent run "$@"
+WRAP
+chmod 755 "${INSTALL_DIR}/bin/run_agent.sh"
 
 # ── Fix plist ownership ────────────────────────────────────────────────────────
 chown root:wheel "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist"

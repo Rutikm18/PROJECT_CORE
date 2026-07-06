@@ -12,7 +12,7 @@ Covers:
   - GET/PUT /api/v1/settings round-trips retention_period_months/action
   - GET /api/v1/settings/retention returns config + live stats, with
     slow_fetch_warning true only for 12/24-month windows
-  - default settings (no PUT yet) are period=1 month, action=delete
+  - default settings (no PUT yet) are period=1 day (0-sentinel), action=delete
 """
 from __future__ import annotations
 
@@ -51,15 +51,16 @@ def _run(coro):
 
 # ── retention_period_days() ───────────────────────────────────────────────────
 
-@pytest.mark.parametrize("months,days", [("1", 30), ("3", 90), ("6", 180),
-                                         ("12", 360), ("24", 720)])
+@pytest.mark.parametrize("months,days", [("0", 1), ("1", 30), ("3", 90),
+                                         ("6", 180), ("12", 360), ("24", 720)])
 def test_retention_period_days_conversion(months, days):
     assert retention_period_days(months) == days
 
 
-def test_retention_period_days_bad_input_falls_back_to_one_month():
-    assert retention_period_days("not-a-number") == 30
-    assert retention_period_days(None) == 30
+def test_retention_period_days_bad_input_falls_back_to_default():
+    # Default is the 0-sentinel (1 day) — bad input must degrade to it, not crash
+    assert retention_period_days("not-a-number") == 1
+    assert retention_period_days(None) == 1
     assert retention_period_days("999") == 24 * 30, \
         "an out-of-range month count must clamp to the nearest valid period, not crash"
 
@@ -249,11 +250,11 @@ def client(app):
         yield c
 
 
-def test_default_retention_settings_are_one_month_delete(client):
+def test_default_retention_settings_are_one_day_delete(client):
     r = client.get("/api/v1/settings")
     assert r.status_code == 200
     settings = r.json()["settings"]
-    assert settings["retention_period_months"] == "1"
+    assert settings["retention_period_months"] == "0"   # 0-sentinel = 1 day
     assert settings["retention_action"] == "delete"
 
 

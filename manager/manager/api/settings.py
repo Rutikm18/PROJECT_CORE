@@ -60,7 +60,7 @@ DEFAULTS: dict[str, str] = {
     # as the archive when retention_action="archive") and server.py's
     # _cleanup_store (reads these live, so a change here takes effect on the
     # next hourly sweep with no restart).
-    "retention_period_months": "1",       # default: 1 month (current 30-day behavior)
+    "retention_period_months": "0",        # default: 1 day — keeps the smallest hot dataset
     "retention_action":        "delete",  # default: delete — "archive" keeps a
                                           # compressed copy instead (see /retention)
     # Auto-resolve: how long after evidence disappears from agent telemetry
@@ -83,18 +83,18 @@ RETENTION_ACTIONS = ("delete", "archive")
 
 
 def retention_period_days(months_str: str) -> int:
-    """Convert a retention_period_months setting value to days. 0 → 7 days,
-    1+ → months × 30. Falls back to the 1-month default for an unset/invalid
+    """Convert a retention_period_months setting value to days. 0 → 1 day,
+    1+ → months × 30. Falls back to the 1-day default for an unset/invalid
     value rather than raising — retention enforcement must never crash the
     cleanup job over a bad setting."""
     try:
         months = int(months_str)
     except (TypeError, ValueError):
-        months = 1
+        months = 0
     if months not in RETENTION_PERIODS_MONTHS:
         months = min(RETENTION_PERIODS_MONTHS, key=lambda m: abs(m - months))
     if months == 0:
-        return 7
+        return 1
     return months * 30
 
 # ── Validation / Confidence Scoring keys ──────────────────────────────────────
@@ -587,19 +587,27 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 "available_actions": list(RETENTION_ACTIONS),
             }
 
-            stats: dict[str, Any] = {"live_payloads": None, "archive": None}
+            stats: dict[str, Any] = {"live_payloads": None, "archive": None, "postgres": None}
             if db is not None:
                 try:
                     async with db._pool.read() as conn:
+                        # Single query: payload counts + Postgres-native table/DB sizes
                         async with conn.execute(
-                            "SELECT COUNT(*) AS n, SUM(LENGTH(data)) AS approx_bytes "
-                            "FROM payloads"
+                            "SELECT COUNT(*) AS row_count,"
+                            "       SUM(octet_length(data)) AS approx_bytes,"
+                            "       pg_total_relation_size('payloads') AS table_bytes,"
+                            "       pg_database_size(current_database()) AS db_bytes"
+                            " FROM payloads"
                         ) as cur:
                             row = await cur.fetchone()
                     if row:
                         stats["live_payloads"] = {
-                            "row_count":    row["n"] or 0,
-                            "approx_bytes": row["approx_bytes"] or 0,
+                            "row_count":    int(row["row_count"] or 0),
+                            "approx_bytes": int(row["approx_bytes"] or 0),
+                            "table_bytes":  int(row["table_bytes"] or 0),
+                        }
+                        stats["postgres"] = {
+                            "db_bytes": int(row["db_bytes"] or 0),
                         }
                 except Exception as exc:
                     log.debug("retention live_payloads stats failed: %s", exc)

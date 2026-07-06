@@ -66,7 +66,14 @@ def main() -> None:
         _cmd_run(config=None)
         return
 
-    args = _parser().parse_args()
+    # Legacy-invocation tolerance: old plists and watchdogs call
+    # `attacklens-agent --config PATH` with no subcommand. Without this,
+    # argparse exits 2 and launchd/watchdog restart-loops the agent forever.
+    argv = sys.argv[1:]
+    if argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        argv = ["run"] + argv
+
+    args = _parser().parse_args(argv)
 
     if args.cmd == "install":
         from agent.selfinstall import install
