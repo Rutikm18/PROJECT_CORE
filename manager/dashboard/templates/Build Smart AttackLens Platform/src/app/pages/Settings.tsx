@@ -12,6 +12,7 @@ import {
   Bell, RefreshCw, Save, AlertTriangle, CheckCircle2, Info,
   Clock, Users, Lock, Unlock, Globe, RotateCcw, ChevronRight,
   Brain, Target, Trash2, Plus, Database, Archive, FolderOpen,
+  Cpu, Eye, EyeOff, Zap, ExternalLink, TestTube2,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -55,7 +56,7 @@ interface RoleEntry {
   color:       string;
 }
 
-type TabId = "org" | "license" | "roles" | "platform" | "validation" | "retention";
+type TabId = "org" | "license" | "roles" | "platform" | "validation" | "retention" | "ai";
 
 const EMPTY: OrgSettings = {
   org_name: "", org_description: "", org_location: "", contact_email: "",
@@ -228,6 +229,7 @@ export default function Settings() {
     { id: "platform",   label: "Platform",      icon: Settings2  },
     { id: "validation", label: "Validation",    icon: Brain      },
     { id: "retention",  label: "Data Retention", icon: Database  },
+    { id: "ai",         label: "AI Provider",   icon: Cpu        },
   ];
 
   return (
@@ -741,6 +743,13 @@ export default function Settings() {
       ══════════════════════════════════════════════════════════════════════ */}
       {tab === "retention" && (
         <RetentionSettingsPanel />
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          TAB: AI Provider
+      ══════════════════════════════════════════════════════════════════════ */}
+      {tab === "ai" && (
+        <AIProviderPanel />
       )}
     </div>
   );
@@ -1438,6 +1447,409 @@ function RetentionSettingsPanel() {
           </div>
         </div>
         <p className="text-[9px] text-[--gray-400]">Auto-refreshes every 60 s — or click the refresh icon above.</p>
+      </div>
+    </div>
+  );
+}
+
+// ── AI Provider panel ──────────────────────────────────────────────────────────
+
+type AIProvider = "anthropic" | "openai" | "gemini" | "ollama";
+
+interface AIProviderConfig {
+  configured:  boolean;
+  provider:    AIProvider | null;
+  model:       string | null;
+  key_set:     boolean;
+  key_preview: string | null;
+  base_url:    string;
+  updated_at:  number | null;
+}
+
+interface ModelInfo {
+  id:      string;
+  note:    string;
+  default: boolean;
+}
+
+interface ProviderInfo {
+  models:       ModelInfo[];
+  requires_key: boolean;
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  anthropic: "Anthropic (Claude)",
+  openai:    "OpenAI (GPT)",
+  gemini:    "Google Gemini",
+  ollama:    "Ollama (Local)",
+};
+
+const PROVIDER_COLORS: Record<string, string> = {
+  anthropic: "from-orange-500 to-amber-500",
+  openai:    "from-green-500 to-emerald-500",
+  gemini:    "from-blue-500 to-indigo-500",
+  ollama:    "from-purple-500 to-violet-500",
+};
+
+const PROVIDER_DESCRIPTIONS: Record<string, string> = {
+  anthropic: "Claude Haiku 4.5 — fast, cost-efficient, great for security analysis",
+  openai:    "GPT-4o-mini — affordable API, broad compatibility",
+  gemini:    "Gemini 1.5 Flash — fast & cheap, 1M token context",
+  ollama:    "Local LLM — zero cost, complete data privacy, no internet required",
+};
+
+function AIProviderPanel() {
+  const [config,     setConfig]     = useState<AIProviderConfig | null>(null);
+  const [models,     setModels]     = useState<Record<string, ProviderInfo>>({});
+  const [loading,    setLoading]    = useState(true);
+  const [saving,     setSaving]     = useState(false);
+  const [testing,    setTesting]    = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string; latency_ms?: number } | null>(null);
+  const [error,      setError]      = useState<string | null>(null);
+  const [success,    setSuccess]    = useState<string | null>(null);
+
+  // Form state
+  const [provider, setProvider] = useState<AIProvider>("anthropic");
+  const [apiKey,   setApiKey]   = useState("");
+  const [model,    setModel]    = useState("");
+  const [baseUrl,  setBaseUrl]  = useState("");
+  const [showKey,  setShowKey]  = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [cfgRes, modRes] = await Promise.all([
+        fetch("/api/v1/ai/provider"),
+        fetch("/api/v1/ai/models"),
+      ]);
+      const cfg = await cfgRes.json();
+      const mod = await modRes.json();
+      setConfig(cfg);
+      setModels(mod.providers ?? {});
+      if (cfg.configured && cfg.provider) {
+        setProvider(cfg.provider);
+        setModel(cfg.model ?? "");
+        setBaseUrl(cfg.base_url ?? "");
+      }
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const availableModels = models[provider]?.models ?? [];
+  const requiresKey     = models[provider]?.requires_key ?? true;
+
+  const handleProviderChange = (p: AIProvider) => {
+    setProvider(p);
+    setModel("");
+    setApiKey("");
+    setBaseUrl(p === "ollama" ? "http://localhost:11434" : "");
+    setTestResult(null);
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const selectedModel = model || (availableModels.find(m => m.default)?.id ?? availableModels[0]?.id ?? "");
+      const resp = await fetch("/api/v1/ai/provider", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          provider,
+          api_key:    apiKey,
+          model:      selectedModel,
+          base_url:   baseUrl,
+          test_first: true,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail ?? "Save failed");
+      setSuccess(`Saved — ${data.message}`);
+      setApiKey("");
+      await load();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const resp = await fetch("/api/v1/ai/test", { method: "POST" });
+      const data = await resp.json();
+      setTestResult({ ok: data.ok, message: data.message, latency_ms: data.latency_ms });
+    } catch (e: any) {
+      setTestResult({ ok: false, message: e.message });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!confirm("Remove the AI provider configuration?")) return;
+    await fetch("/api/v1/ai/provider", { method: "DELETE" });
+    setSuccess("Configuration removed");
+    setConfig(null);
+    await load();
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-20 text-[--gray-400]">
+        <RefreshCw className="w-4 h-4 animate-spin mr-2" />Loading AI provider config…
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4 pb-8">
+
+      {/* ── Header card ─────────────────────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card overflow-hidden">
+        <div className="h-[3px] bg-gradient-to-r from-violet-500 via-purple-500 to-indigo-500" />
+        <div className="p-5">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+              style={{ background: "linear-gradient(135deg,rgba(124,58,237,0.1),rgba(139,92,246,0.15))", border: "1px solid rgba(124,58,237,0.2)" }}>
+              <Cpu className="w-5 h-5" style={{ color: "#7C3AED" }} />
+            </div>
+            <div className="flex-1">
+              <h2 className="text-sm font-bold text-[--gray-900]">AI Provider</h2>
+              <p className="text-[11px] text-[--gray-500] mt-0.5">
+                Customer-managed AI keys · Provider-agnostic · API keys encrypted at rest (AES-256-GCM)
+              </p>
+            </div>
+            {config?.configured && (
+              <div className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg border border-emerald-200">
+                <CheckCircle2 className="w-3 h-3" />Configured
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Current config summary ────────────────────────────────────── */}
+      {config?.configured && config.provider && (
+        <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5">
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-[11px] font-bold text-[--gray-700] uppercase tracking-wider">Active Configuration</span>
+            <div className="flex items-center gap-2">
+              <button onClick={handleTest} disabled={testing}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold border border-violet-200 text-violet-700 bg-violet-50 rounded-lg hover:bg-violet-100 transition-all disabled:opacity-50">
+                <TestTube2 className={cn("w-3 h-3", testing && "animate-pulse")} />
+                {testing ? "Testing…" : "Test Connection"}
+              </button>
+              <button onClick={handleDelete}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold border border-red-200 text-red-600 rounded-lg hover:bg-red-50 transition-all">
+                <Trash2 className="w-3 h-3" />Remove
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+            {[
+              { label: "Provider",   value: PROVIDER_LABELS[config.provider] ?? config.provider },
+              { label: "Model",      value: config.model ?? "—" },
+              { label: "API Key",    value: config.key_set ? config.key_preview ?? "set" : "not set" },
+              { label: "Updated",    value: config.updated_at ? new Date(config.updated_at * 1000).toLocaleDateString() : "—" },
+            ].map(item => (
+              <div key={item.label} className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                <p className="text-[9px] font-bold text-[--gray-400] uppercase tracking-wider mb-1">{item.label}</p>
+                <p className="text-[11px] font-semibold text-[--gray-800] font-mono truncate">{item.value}</p>
+              </div>
+            ))}
+          </div>
+          {testResult && (
+            <div className={cn(
+              "mt-3 flex items-start gap-2 px-3 py-2.5 rounded-xl text-[10px] border",
+              testResult.ok
+                ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                : "bg-red-50 text-red-800 border-red-200"
+            )}>
+              {testResult.ok
+                ? <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                : <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />}
+              <span>{testResult.message}{testResult.latency_ms ? ` (${testResult.latency_ms}ms)` : ""}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Configure / update form ───────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100">
+          <span className="text-[11px] font-bold text-[--gray-700] uppercase tracking-wider">
+            {config?.configured ? "Update Configuration" : "Configure AI Provider"}
+          </span>
+        </div>
+
+        <div className="p-5 space-y-6">
+
+          {/* Provider selector */}
+          <div>
+            <p className="text-[10px] font-bold text-[--gray-600] uppercase tracking-wider mb-3">Choose Provider</p>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {(["anthropic","openai","gemini","ollama"] as AIProvider[]).map(p => (
+                <button key={p} onClick={() => handleProviderChange(p)}
+                  className={cn(
+                    "flex flex-col items-start p-3 rounded-xl border-2 text-left transition-all",
+                    provider === p
+                      ? "border-violet-400 bg-violet-50"
+                      : "border-gray-200 hover:border-gray-300 hover:bg-gray-50"
+                  )}>
+                  <div className={cn("w-6 h-6 rounded-lg mb-2 bg-gradient-to-br", PROVIDER_COLORS[p])} />
+                  <p className="text-[10px] font-bold text-[--gray-800]">{PROVIDER_LABELS[p]}</p>
+                  <p className="text-[9px] text-[--gray-500] mt-0.5 leading-tight">{PROVIDER_DESCRIPTIONS[p]}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Model selector */}
+          <div>
+            <label className="block text-[10px] font-bold text-[--gray-600] uppercase tracking-wider mb-2">
+              Model
+            </label>
+            <select value={model} onChange={e => setModel(e.target.value)}
+              className="w-full px-3 py-2 text-[11px] border border-[--gray-200] rounded-xl bg-white text-[--gray-800] focus:outline-none focus:ring-2 focus:ring-violet-200">
+              <option value="">— Select model (or use default) —</option>
+              {availableModels.map(m => (
+                <option key={m.id} value={m.id}>
+                  {m.id}{m.default ? " ★ default" : ""}{m.note ? `  ·  ${m.note}` : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* API Key */}
+          {requiresKey && (
+            <div>
+              <label className="block text-[10px] font-bold text-[--gray-600] uppercase tracking-wider mb-2">
+                API Key
+                {config?.configured && config.provider === provider && config.key_set && (
+                  <span className="ml-2 normal-case text-emerald-600 font-normal">
+                    (currently set: {config.key_preview})
+                  </span>
+                )}
+              </label>
+              <div className="relative">
+                <input
+                  type={showKey ? "text" : "password"}
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  placeholder={
+                    config?.configured && config.provider === provider && config.key_set
+                      ? "Leave blank to keep existing key"
+                      : `Paste your ${PROVIDER_LABELS[provider]} API key`
+                  }
+                  className="w-full px-3 py-2 pr-10 text-[11px] font-mono border border-[--gray-200] rounded-xl bg-white text-[--gray-800] focus:outline-none focus:ring-2 focus:ring-violet-200 placeholder-[--gray-400]"
+                />
+                <button type="button" onClick={() => setShowKey(v => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[--gray-400] hover:text-[--gray-600]">
+                  {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+              <p className="text-[9px] text-[--gray-400] mt-1">
+                Encrypted with AES-256-GCM before being written to disk. Never logged or transmitted.
+              </p>
+            </div>
+          )}
+
+          {/* Base URL (Ollama / custom) */}
+          {(provider === "ollama" || baseUrl) && (
+            <div>
+              <label className="block text-[10px] font-bold text-[--gray-600] uppercase tracking-wider mb-2">
+                {provider === "ollama" ? "Ollama Endpoint" : "Custom Base URL"}
+              </label>
+              <input
+                type="text"
+                value={baseUrl}
+                onChange={e => setBaseUrl(e.target.value)}
+                placeholder={provider === "ollama" ? "http://localhost:11434" : "https://your-proxy.example.com/v1"}
+                className="w-full px-3 py-2 text-[11px] font-mono border border-[--gray-200] rounded-xl bg-white text-[--gray-800] focus:outline-none focus:ring-2 focus:ring-violet-200"
+              />
+              {provider === "ollama" && (
+                <p className="text-[9px] text-[--gray-400] mt-1">
+                  Make sure Ollama is running: <code className="font-mono">ollama serve</code>
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Cost / capability card */}
+          <div className="bg-gradient-to-br from-violet-50 to-indigo-50 border border-violet-100 rounded-xl p-4">
+            <div className="flex items-center gap-2 mb-2">
+              <Zap className="w-3.5 h-3.5 text-violet-600" />
+              <span className="text-[10px] font-bold text-violet-800 uppercase tracking-wider">Recommended Use</span>
+            </div>
+            <div className="grid grid-cols-2 gap-3 text-[10px]">
+              <div>
+                <p className="font-semibold text-violet-700 mb-1">Finding Validation (fast)</p>
+                <p className="text-violet-600">
+                  {provider === "anthropic" ? "claude-haiku-4-5 — ~$0.001/finding" :
+                   provider === "openai"    ? "gpt-4o-mini — ~$0.0003/finding" :
+                   provider === "gemini"    ? "gemini-1.5-flash — ~$0.0001/finding" :
+                                              "Any local model — $0 cost"}
+                </p>
+              </div>
+              <div>
+                <p className="font-semibold text-violet-700 mb-1">Remediation Plans (thorough)</p>
+                <p className="text-violet-600">
+                  {provider === "anthropic" ? "claude-sonnet-4-6 — ~$0.01/plan" :
+                   provider === "openai"    ? "gpt-4o — ~$0.005/plan" :
+                   provider === "gemini"    ? "gemini-1.5-pro — ~$0.003/plan" :
+                                              "llama3.2:8b or mistral:7b — $0 cost"}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Feedback */}
+          {error && (
+            <div className="flex items-start gap-2 p-3 bg-red-50 text-red-800 rounded-xl border border-red-200 text-[11px]">
+              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />{error}
+            </div>
+          )}
+          {success && (
+            <div className="flex items-start gap-2 p-3 bg-emerald-50 text-emerald-800 rounded-xl border border-emerald-200 text-[11px]">
+              <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />{success}
+            </div>
+          )}
+
+          {/* Save */}
+          <div className="flex justify-end">
+            <button onClick={handleSave} disabled={saving}
+              className="flex items-center gap-2 px-5 py-2.5 text-[11px] font-bold bg-violet-600 text-white rounded-xl hover:bg-violet-700 disabled:opacity-50 transition-all shadow-sm">
+              {saving
+                ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" />Saving &amp; Testing…</>
+                : <><Save className="w-3.5 h-3.5" />Save Configuration</>}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Info card ─────────────────────────────────────────────────── */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5">
+        <div className="flex items-center gap-2 mb-3">
+          <Info className="w-3.5 h-3.5 text-[--gray-400]" />
+          <span className="text-[10px] font-bold text-[--gray-600] uppercase tracking-wider">About AI-Assisted Analysis</span>
+        </div>
+        <div className="space-y-2 text-[10px] text-[--gray-600]">
+          <p>• <strong>Finding Analysis</strong> — AI generates threat context, risk narrative, and urgency assessment for each finding</p>
+          <p>• <strong>Remediation Plans</strong> — OS-specific step-by-step plans with actual shell commands and verification steps</p>
+          <p>• <strong>Prioritization</strong> — AI ranks findings by true business risk (KEV + EPSS + attack chain) rather than CVSS alone</p>
+          <p>• <strong>Caching</strong> — results are cached in intel.db; regenerate on demand with force=true</p>
+          <p>• <strong>Privacy</strong> — only finding metadata is sent to the AI (no raw telemetry, no agent PII)</p>
+          <p>• <strong>API key security</strong> — keys encrypted with AES-256-GCM, derived from your JWT_SECRET</p>
+        </div>
       </div>
     </div>
   );

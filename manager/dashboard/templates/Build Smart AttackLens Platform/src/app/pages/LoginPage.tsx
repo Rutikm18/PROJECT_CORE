@@ -1,9 +1,15 @@
 import { useState, useRef, useEffect, type FormEvent } from "react";
-import { Eye, EyeOff, AlertCircle, Loader2 } from "lucide-react";
+import { Eye, EyeOff, AlertCircle, Loader2, KeyRound, Copy, Check, Wand2 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
 interface LoginPageProps {
   onSuccess: () => void;
+}
+
+interface DefaultCreds {
+  active:   boolean;
+  email:    string | null;
+  password: string | null;
 }
 
 export default function LoginPage({ onSuccess }: LoginPageProps) {
@@ -17,6 +23,9 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
   const [locked,   setLocked]   = useState(false);
   const [notice,   setNotice]   = useState<string | null>(null);
 
+  const [defaultCreds, setDefaultCreds] = useState<DefaultCreds | null>(null);
+  const [copied,       setCopied]       = useState(false);
+
   const emailRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -25,7 +34,36 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
       const reason = sessionStorage.getItem("al_logout_reason");
       if (reason === "idle") setNotice("You were signed out due to inactivity.");
     } catch { /* ignore */ }
+
+    // Fetch the default bootstrap credential — the backend only returns the
+    // password while the built-in default is still in use (first-run setup).
+    (async () => {
+      try {
+        const r = await fetch("/api/v1/auth/policy");
+        if (!r.ok) return;
+        const p = await r.json();
+        if (p?.default_credentials?.active) setDefaultCreds(p.default_credentials);
+      } catch { /* ignore — feature simply won't show */ }
+    })();
   }, []);
+
+  // Fill both fields with the default credential
+  function autofillDefault() {
+    if (!defaultCreds?.active) return;
+    setEmail(defaultCreds.email ?? "");
+    setPassword(defaultCreds.password ?? "");
+    setShowPw(true);
+    setError(null);
+  }
+
+  async function copyPassword() {
+    if (!defaultCreds?.password) return;
+    try {
+      await navigator.clipboard.writeText(defaultCreds.password);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked — user can still read/type it */ }
+  }
 
   // Basic client-side validation — catches obvious mistakes before hitting the API
   function validate(): string | null {
@@ -85,9 +123,9 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
         {/* Logo / brand */}
         <div className="text-center mb-8">
           {/* AttackLens Logo */}
-          <img 
-            src="/logo-icon.svg" 
-            alt="AttackLens" 
+          <img
+            src="/static/logo-icon.svg"
+            alt="AttackLens"
             className="w-16 h-16 mx-auto mb-4 drop-shadow-lg"
           />
           <h1 className="text-2xl font-bold text-white tracking-tight">AttackLens</h1>
@@ -110,6 +148,51 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
               <div className="mb-5 p-3 rounded-xl bg-amber-50 border border-amber-200 flex gap-2">
                 <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
                 <span className="text-sm text-amber-800">{notice}</span>
+              </div>
+            )}
+
+            {/* First-run default credentials — shown only while the built-in
+                default password is still active (backend gates this). */}
+            {defaultCreds?.active && (
+              <div className="mb-5 p-3.5 rounded-xl bg-indigo-50 border border-indigo-200">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <KeyRound className="w-4 h-4 text-indigo-600" />
+                  <span className="text-xs font-bold text-indigo-800">First-time sign in</span>
+                  <span className="ml-auto text-[9px] font-semibold text-indigo-500 uppercase tracking-wider">Default credentials</span>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
+                    <span className="text-indigo-500 font-medium">Email</span>
+                    <code className="font-mono text-indigo-900 select-all">{defaultCreds.email}</code>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
+                    <span className="text-indigo-500 font-medium">Password</span>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <code className="font-mono text-indigo-900 select-all truncate">{defaultCreds.password}</code>
+                      <button
+                        type="button"
+                        onClick={copyPassword}
+                        title="Copy password"
+                        className="flex-shrink-0 p-1 rounded-md text-indigo-500 hover:text-indigo-700 hover:bg-indigo-100 transition"
+                      >
+                        {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={autofillDefault}
+                  className="mt-2.5 w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-indigo-600 text-white text-[11px] font-bold hover:bg-indigo-700 transition"
+                >
+                  <Wand2 className="w-3.5 h-3.5" />
+                  Autofill &amp; sign in
+                </button>
+                <p className="mt-2 text-[9px] text-indigo-400 leading-tight">
+                  Change this password after first login — this box disappears once a custom password is set.
+                </p>
               </div>
             )}
 
@@ -174,8 +257,11 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
 
         {/* Footer info */}
         <div className="mt-6 text-center text-xs" style={{ color: "rgba(255,255,255,0.5)" }}>
-          <p>Default: admin@attacklens.ai</p>
-          <p className="mt-1">Password shown on first login screen</p>
+          {defaultCreds?.active ? (
+            <p>First-run default credentials shown above — change after sign in.</p>
+          ) : (
+            <p>Authorized access only · AttackLens Security Operations</p>
+          )}
         </div>
       </div>
     </div>

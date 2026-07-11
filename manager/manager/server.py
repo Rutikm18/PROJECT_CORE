@@ -55,8 +55,11 @@ from .ai_analyst          import AIAnalyst
 from .notifications.email import EmailNotifier
 from .api.remediation     import router as remediation_router
 from .intel               import IntelPipeline
-from .api.intel           import router as intel_router
-from .api.auth_ui         import router as auth_router
+from .api.intel              import router as intel_router
+from .api.finding_validation import router as finding_validation_router
+from .api.auth_ui            import router as auth_router
+from .api.ai_settings        import router as ai_settings_router
+from .api.integrations       import router as integrations_router
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
@@ -443,9 +446,12 @@ def create_app() -> FastAPI:
     app.include_router(accuracy_router,   prefix="/api/v1/accuracy")
     app.include_router(settings_router,   prefix="/api/v1/settings")
     app.include_router(allowlist_router,  prefix="/api/v1/allowlist")
-    app.include_router(intel_router)        # prefix=/api/v1/intel defined inline — registered first so it wins over remediation duplicates
-    app.include_router(remediation_router)  # prefixes defined inline (actors, news, overview — no overlap with intel_router)
-    app.include_router(auth_router)         # dashboard login/logout/me
+    app.include_router(intel_router)              # prefix=/api/v1/intel defined inline
+    app.include_router(finding_validation_router) # prefix=/api/v1/findings (POST /{id}/validate etc.)
+    app.include_router(remediation_router)        # prefixes defined inline (actors, news, overview)
+    app.include_router(ai_settings_router)        # prefix=/api/v1/ai (provider config + analysis)
+    app.include_router(integrations_router)       # prefix=/api/v1/integrations (reliability health)
+    app.include_router(auth_router)               # dashboard login/logout/me
 
     # ── Global exception handler ──────────────────────────────────────────────
     @app.exception_handler(Exception)

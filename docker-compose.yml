@@ -42,6 +42,8 @@ services:
       POSTGRES_USER:     "${POSTGRES_USER:-attacklens}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-attacklens}"
       POSTGRES_DB:       "manager"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - attacklens_pg_data:/var/lib/postgresql/data
       - ./manager/postgres-init:/docker-entrypoint-initdb.d:ro

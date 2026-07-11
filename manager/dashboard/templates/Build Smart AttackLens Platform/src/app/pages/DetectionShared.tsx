@@ -13,7 +13,8 @@ import {
   ExternalLink, Copy, Info, Eye, Crosshair, Database,
   GitBranch, Brain, TrendingUp, FileCode, Network,
   Radio, ChevronRight, ChevronDown,
-  Plus, Trash2, SlidersHorizontal,
+  Plus, Trash2, SlidersHorizontal, Cpu, Clock, ArrowUpRight,
+  MessageSquare, Lightbulb, TriangleAlert,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -29,6 +30,8 @@ export interface DetectionFinding {
   severity:          "critical" | "high" | "medium" | "low" | "info";
   score:             number;
   composite_score?:  number;
+  exploitability_score?: number;
+  exploitability_band?:  string;
   title:             string;
   description:       string;
   evidence:          Record<string, unknown> | string;
@@ -1489,7 +1492,7 @@ export function OSRemediationPanel({
 
 // ── Detail panel — 4-tab ─────────────────────────────────────────────────────
 
-type DTab = "overview" | "validation" | "blueprint" | "hunt";
+type DTab = "overview" | "validation" | "blueprint" | "hunt" | "ai";
 
 // One-line "why this matters" caption shown under each field group, so the
 // analyst understands the purpose of every value (customer-POV curation).
@@ -1524,6 +1527,7 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
 
   const TABS: { id: DTab; label: string; icon: React.ReactNode }[] = [
     { id: "overview",   label: "Overview",   icon: <Eye className="w-3 h-3" /> },
+    { id: "ai",         label: "AI Analysis",icon: <Cpu className="w-3 h-3" /> },
     { id: "validation", label: "Validate",   icon: <CheckCircle2 className="w-3 h-3" /> },
     { id: "blueprint",  label: "Blueprint",  icon: <BookOpen className="w-3 h-3" /> },
     { id: "hunt",       label: "Hunt",       icon: <Crosshair className="w-3 h-3" /> },
@@ -1623,6 +1627,11 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
                 ))}
               </div>
               <Why>Risk = blended priority · CVSS = base technical severity · EPSS = probability it'll be exploited in the next 30 days.</Why>
+            </div>
+
+            {/* Unified exploitability score — the prioritisation signal */}
+            <div className="px-4 py-3">
+              <ExploitabilityCard finding={f} />
             </div>
 
             {/* Is it actively exploited — the single biggest prioritisation signal */}
@@ -1774,10 +1783,554 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
             <p className="text-[11px] text-gray-400">Detection blueprint not yet mapped for this category.</p>
           </div>
         )}
+
+        {/* ── AI ANALYSIS ─────────────────────────────────────────── */}
+        {tab === "ai" && <AIAnalysisPanel finding={f} />}
+
       </div>
       </div>
     </>,
     document.body
+  );
+}
+
+// ── Exploitability breakdown card ─────────────────────────────────────────────
+
+type ExploitFactor = { factor: string; value: number; weight: number; points: number; detail: string };
+type ExploitResult = {
+  exploitability_score: number;
+  band:        string;
+  base_score:  number;
+  factors:     ExploitFactor[];
+  escalations: string[];
+  summary:     string;
+};
+
+const EXPLOIT_BAND_STYLE: Record<string, { text: string; bg: string; ring: string }> = {
+  critical: { text: "text-red-700",    bg: "bg-red-50 border-red-200",       ring: "#dc2626" },
+  high:     { text: "text-orange-700", bg: "bg-orange-50 border-orange-200", ring: "#ea580c" },
+  moderate: { text: "text-amber-700",  bg: "bg-amber-50 border-amber-200",   ring: "#d97706" },
+  low:      { text: "text-blue-700",   bg: "bg-blue-50 border-blue-200",     ring: "#2563eb" },
+  minimal:  { text: "text-gray-600",   bg: "bg-gray-50 border-gray-200",     ring: "#9ca3af" },
+};
+
+const FACTOR_LABEL: Record<string, string> = {
+  cvss:              "CVSS severity",
+  epss:              "EPSS probability",
+  kev:               "KEV (in the wild)",
+  exploit_available: "Exploit availability",
+  recency:           "Vuln. recency",
+  asset:             "Asset criticality",
+};
+
+function ExploitabilityCard({ finding: f }: { finding: DetectionFinding }) {
+  const [data,    setData]    = useState<ExploitResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState<string | null>(null);
+  const [open,    setOpen]    = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    (async () => {
+      try {
+        const r = await fetch(`/api/v1/findings/${f.id}/exploitability`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        if (!cancelled) setData(d);
+      } catch (e: any) {
+        if (!cancelled) setError(e.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [f.id]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-[10px] text-gray-400 py-2">
+        <RefreshCw className="w-3 h-3 animate-spin" />Computing exploitability…
+      </div>
+    );
+  }
+  if (error || !data) {
+    return <div className="text-[10px] text-gray-400 py-1">Exploitability unavailable{error ? `: ${error}` : ""}.</div>;
+  }
+
+  const st = EXPLOIT_BAND_STYLE[data.band] ?? EXPLOIT_BAND_STYLE.minimal;
+  const pct = Math.min(100, Math.max(0, data.exploitability_score));
+
+  return (
+    <div className={cn("rounded-xl border overflow-hidden", st.bg)}>
+      {/* Header: score gauge + band */}
+      <div className="flex items-center gap-3 px-3 py-2.5">
+        {/* Radial-ish gauge via conic gradient */}
+        <div className="relative w-12 h-12 flex-shrink-0">
+          <div className="w-12 h-12 rounded-full" style={{ background: `conic-gradient(${st.ring} ${pct * 3.6}deg, #e5e7eb 0deg)` }} />
+          <div className="absolute inset-1 rounded-full bg-white flex items-center justify-center">
+            <span className={cn("text-[13px] font-black tabular-nums", st.text)}>{data.exploitability_score.toFixed(0)}</span>
+          </div>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <Crosshair className={cn("w-3.5 h-3.5", st.text)} />
+            <span className="text-[11px] font-bold text-gray-800">Exploitability</span>
+            <span className={cn("text-[8px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-full border", st.text, st.bg)}>{data.band}</span>
+            <span className="ml-auto text-[8px] text-gray-400 tabular-nums">base {data.base_score.toFixed(0)}/100</span>
+          </div>
+          <p className="text-[9px] text-gray-600 mt-0.5 leading-tight">{data.summary}</p>
+        </div>
+      </div>
+
+      {/* Escalations (what floored/amplified the score) */}
+      {data.escalations.length > 0 && (
+        <div className="px-3 pb-1.5 flex flex-wrap gap-1">
+          {data.escalations.map((e, i) => (
+            <span key={i} className="inline-flex items-center gap-1 text-[8px] font-semibold px-1.5 py-0.5 rounded-full bg-white/70 border border-current/20 text-gray-600">
+              <Zap className="w-2.5 h-2.5" />{e}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Factor breakdown toggle */}
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-1 px-3 py-1.5 text-[9px] font-bold text-gray-500 hover:text-gray-700 border-t border-white/60">
+        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        Factor breakdown (6 inputs)
+      </button>
+
+      {open && (
+        <div className="px-3 pb-2.5 space-y-1.5">
+          {data.factors.map(fac => (
+            <div key={fac.factor} className="flex items-center gap-2">
+              <span className="text-[9px] text-gray-600 w-28 flex-shrink-0">{FACTOR_LABEL[fac.factor] ?? fac.factor}</span>
+              <div className="flex-1 h-1.5 rounded-full bg-white/70 overflow-hidden">
+                <div className="h-full rounded-full" style={{ width: `${Math.round(fac.value * 100)}%`, background: st.ring }} />
+              </div>
+              <span className="text-[8px] text-gray-500 tabular-nums w-24 text-right flex-shrink-0">{fac.detail}</span>
+              <span className="text-[8px] font-bold text-gray-700 tabular-nums w-9 text-right flex-shrink-0">+{fac.points.toFixed(0)}</span>
+            </div>
+          ))}
+          <p className="text-[8px] text-gray-400 pt-1 leading-tight">
+            Weighted base of 6 factors, escalated by active-exploitation floors (KEV/exploit/EPSS) and amplified for crown-jewel assets — the model top SOC platforms use to rank real-world risk over raw CVSS.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── AI Analysis Panel ─────────────────────────────────────────────────────────
+
+type AIAnalysisResult = {
+  provider:       string;
+  model:          string;
+  analysis:       string;
+  threat_context: string;
+  risk_factors:   string[];
+  urgency:        string;
+  confidence:     number;
+  mitre_context:  string;
+  tokens_used:    number;
+  latency_ms:     number;
+  generated_at:   number;
+};
+
+type AIRemediationResult = {
+  provider:     string;
+  model:        string;
+  os_type:      string;
+  summary:      string;
+  effort:       string;
+  risk_level:   string;
+  steps:        { step: number; title: string; description: string; command?: string; verification?: string; risk?: string }[];
+  verification: string[];
+  long_term:    string[];
+  compensating: string;
+  tokens_used:  number;
+  latency_ms:   number;
+};
+
+const URGENCY_STYLE: Record<string, string> = {
+  immediate:     "bg-red-100 text-red-700 border-red-200",
+  urgent:        "bg-orange-100 text-orange-700 border-orange-200",
+  scheduled:     "bg-blue-100 text-blue-700 border-blue-200",
+  informational: "bg-gray-100 text-gray-600 border-gray-200",
+};
+
+function AIAnalysisPanel({ finding: f }: { finding: DetectionFinding }) {
+  const [analysis,    setAnalysis]    = useState<AIAnalysisResult | null>(null);
+  const [remediation, setRemediation] = useState<AIRemediationResult | null>(null);
+  const [loading,     setLoading]     = useState(false);
+  const [remLoading,  setRemLoading]  = useState(false);
+  const [error,       setError]       = useState<string | null>(null);
+  const [remError,    setRemError]    = useState<string | null>(null);
+  const [osType,      setOsType]      = useState<"macos" | "windows" | "linux">("macos");
+  const [noProvider,  setNoProvider]  = useState(false);
+
+  // Peek cache on mount (GET — never spends an API call). Also detect whether
+  // a provider is configured so we can show the setup prompt.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      // Check provider configuration first
+      try {
+        const cfgResp = await fetch("/api/v1/ai/provider");
+        const cfg = await cfgResp.json();
+        if (!cancelled && !cfg.configured) { setNoProvider(true); return; }
+      } catch { /* ignore — treat as configured, generation will surface errors */ }
+
+      // Peek cached analysis without generating
+      try {
+        const resp = await fetch(`/api/v1/ai/analysis/${f.id}`);
+        if (!cancelled && resp.ok) setAnalysis(await resp.json());
+      } catch { /* no cache yet — user can click Analyze */ }
+    })();
+    return () => { cancelled = true; };
+  }, [f.id]);
+
+  // Explicit generation (POST — spends an API call). Only on button click.
+  const loadAnalysis = async (force: boolean) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const resp = await fetch(`/api/v1/ai/analyze/${f.id}${force ? "?force=true" : ""}`, {
+        method: "POST",
+      });
+      if (resp.status === 503) {
+        const data = await resp.json();
+        if (data.detail?.includes("not configured")) {
+          setNoProvider(true);
+          return;
+        }
+        throw new Error(data.detail ?? "AI service unavailable");
+      }
+      if (!resp.ok) {
+        const data = await resp.json();
+        throw new Error(data.detail ?? `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      setNoProvider(false);
+      setAnalysis(data);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Peek cached remediation on mount / OS change (GET — no API spend)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(`/api/v1/ai/remediation/${f.id}?os_type=${osType}`);
+        if (!cancelled && resp.ok) setRemediation(await resp.json());
+      } catch { /* no cache — user can click Generate */ }
+    })();
+    return () => { cancelled = true; };
+  }, [f.id, osType]);
+
+  const loadRemediation = async (force: boolean = false) => {
+    setRemLoading(true);
+    setRemError(null);
+    try {
+      const resp = await fetch(`/api/v1/ai/remediate/${f.id}?os_type=${osType}${force ? "&force=true" : ""}`, {
+        method: "POST",
+      });
+      if (!resp.ok) {
+        const data = await resp.json();
+        throw new Error(data.detail ?? `HTTP ${resp.status}`);
+      }
+      setRemediation(await resp.json());
+    } catch (e: any) {
+      setRemError(e.message);
+    } finally {
+      setRemLoading(false);
+    }
+  };
+
+  // Not configured
+  if (noProvider) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
+        <Cpu className="w-10 h-10 text-gray-200 mb-3" />
+        <p className="text-[12px] font-semibold text-gray-700 mb-1">AI Provider Not Configured</p>
+        <p className="text-[10px] text-gray-500 mb-4 max-w-64">
+          Configure an AI provider in <strong>Settings → AI Provider</strong> to unlock threat analysis and remediation plans.
+        </p>
+        <a href="/settings" className="inline-flex items-center gap-1.5 px-3 py-2 text-[10px] font-bold text-violet-700 bg-violet-50 border border-violet-200 rounded-lg hover:bg-violet-100 transition-all">
+          <ArrowUpRight className="w-3 h-3" />Go to Settings
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <div className="divide-y divide-gray-50">
+
+      {/* ── Analysis section ──────────────────────────────────────── */}
+      <div className="px-4 py-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Brain className="w-3.5 h-3.5 text-violet-500" />
+            <span className="text-[10px] font-bold text-gray-700 uppercase tracking-wider">AI Threat Analysis</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            {analysis && (
+              <span className="text-[9px] text-gray-400 font-mono">
+                {analysis.provider} · {analysis.model} · {analysis.tokens_used} tok
+              </span>
+            )}
+            <button
+              onClick={() => loadAnalysis(true)}
+              disabled={loading}
+              className="flex items-center gap-1 px-2.5 py-1.5 text-[9px] font-bold bg-white border border-gray-200 rounded-lg hover:border-violet-200 hover:text-violet-600 transition-all disabled:opacity-50"
+            >
+              <RefreshCw className={cn("w-3 h-3", loading && "animate-spin")} />
+              {loading ? "Analyzing…" : analysis ? "Regenerate" : "Analyze"}
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div className="flex items-start gap-2 p-3 bg-red-50 text-red-700 rounded-xl border border-red-200 text-[10px]">
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />{error}
+          </div>
+        )}
+
+        {loading && !analysis && (
+          <div className="flex items-center justify-center py-8 text-gray-400">
+            <Cpu className="w-4 h-4 animate-pulse mr-2" />
+            <span className="text-[11px]">Running AI analysis…</span>
+          </div>
+        )}
+
+        {analysis && (
+          <div className="space-y-3">
+            {/* Urgency + confidence row */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className={cn(
+                "text-[9px] font-bold px-2 py-1 rounded-lg border uppercase tracking-wider",
+                URGENCY_STYLE[analysis.urgency] ?? URGENCY_STYLE.informational
+              )}>
+                {analysis.urgency}
+              </span>
+              <div className="flex items-center gap-1.5 text-[9px] text-gray-500">
+                <div className="w-24 h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                  <div
+                    className={cn("h-full rounded-full", analysis.confidence >= 0.8 ? "bg-emerald-500" : analysis.confidence >= 0.5 ? "bg-amber-500" : "bg-red-400")}
+                    style={{ width: `${Math.round(analysis.confidence * 100)}%` }}
+                  />
+                </div>
+                <span>{Math.round(analysis.confidence * 100)}% confidence</span>
+              </div>
+              {analysis.generated_at && (
+                <span className="text-[9px] text-gray-400 ml-auto flex items-center gap-1">
+                  <Clock className="w-2.5 h-2.5" />
+                  {new Date(analysis.generated_at * 1000).toLocaleTimeString()}
+                </span>
+              )}
+            </div>
+
+            {/* Analysis narrative */}
+            <div className="bg-gray-50 border border-gray-100 rounded-xl p-3">
+              <div className="flex items-center gap-1.5 mb-2">
+                <MessageSquare className="w-3 h-3 text-violet-500" />
+                <span className="text-[9px] font-bold text-gray-600 uppercase tracking-wider">Analysis</span>
+              </div>
+              <p className="text-[10px] text-gray-700 leading-relaxed">{analysis.analysis}</p>
+            </div>
+
+            {/* Threat context */}
+            {analysis.threat_context && (
+              <div className="bg-orange-50 border border-orange-100 rounded-xl p-3">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <TriangleAlert className="w-3 h-3 text-orange-500" />
+                  <span className="text-[9px] font-bold text-orange-700 uppercase tracking-wider">Threat Context</span>
+                </div>
+                <p className="text-[10px] text-orange-800 leading-relaxed">{analysis.threat_context}</p>
+              </div>
+            )}
+
+            {/* Risk factors */}
+            {analysis.risk_factors?.length > 0 && (
+              <div>
+                <div className="flex items-center gap-1.5 mb-2">
+                  <Lightbulb className="w-3 h-3 text-amber-500" />
+                  <span className="text-[9px] font-bold text-gray-600 uppercase tracking-wider">Risk Factors</span>
+                </div>
+                <ul className="space-y-1">
+                  {analysis.risk_factors.map((r, i) => (
+                    <li key={i} className="flex items-start gap-2 text-[10px] text-gray-700">
+                      <span className="w-4 h-4 rounded-full bg-amber-100 text-amber-700 text-[8px] font-black flex items-center justify-center flex-shrink-0 mt-0.5">{i + 1}</span>
+                      {r}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* MITRE context */}
+            {analysis.mitre_context && (
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-3">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <Target className="w-3 h-3 text-blue-500" />
+                  <span className="text-[9px] font-bold text-blue-700 uppercase tracking-wider">MITRE ATT&amp;CK</span>
+                </div>
+                <p className="text-[10px] text-blue-800 leading-relaxed">{analysis.mitre_context}</p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Remediation section ────────────────────────────────────── */}
+      <div className="px-4 py-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3.5 h-3.5 text-amber-500" />
+            <span className="text-[10px] font-bold text-gray-700 uppercase tracking-wider">AI Remediation Plan</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            {/* OS selector */}
+            <select
+              value={osType}
+              onChange={e => { setOsType(e.target.value as any); setRemediation(null); }}
+              className="px-2 py-1 text-[9px] border border-gray-200 rounded-lg bg-white text-gray-700 focus:outline-none"
+            >
+              <option value="macos">macOS</option>
+              <option value="linux">Linux</option>
+              <option value="windows">Windows</option>
+            </select>
+            <button
+              onClick={() => loadRemediation(remediation !== null)}
+              disabled={remLoading}
+              className="flex items-center gap-1 px-2.5 py-1.5 text-[9px] font-bold bg-white border border-gray-200 rounded-lg hover:border-amber-200 hover:text-amber-600 transition-all disabled:opacity-50"
+            >
+              <RefreshCw className={cn("w-3 h-3", remLoading && "animate-spin")} />
+              {remLoading ? "Generating…" : remediation ? "Regenerate" : "Generate Plan"}
+            </button>
+          </div>
+        </div>
+
+        {remError && (
+          <div className="flex items-start gap-2 p-3 bg-red-50 text-red-700 rounded-xl border border-red-200 text-[10px]">
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />{remError}
+          </div>
+        )}
+
+        {remLoading && !remediation && (
+          <div className="flex items-center justify-center py-8 text-gray-400">
+            <Zap className="w-4 h-4 animate-pulse mr-2" />
+            <span className="text-[11px]">Generating remediation plan…</span>
+          </div>
+        )}
+
+        {remediation && (
+          <div className="space-y-3">
+            {/* Summary + effort */}
+            <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={cn(
+                  "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
+                  remediation.effort === "low" ? "bg-green-100 text-green-700 border-green-200" :
+                  remediation.effort === "high" ? "bg-red-100 text-red-700 border-red-200" :
+                  "bg-amber-100 text-amber-700 border-amber-200"
+                )}>
+                  effort: {remediation.effort}
+                </span>
+                <span className={cn(
+                  "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
+                  remediation.risk_level === "low" ? "bg-green-100 text-green-700 border-green-200" :
+                  remediation.risk_level === "high" ? "bg-red-100 text-red-700 border-red-200" :
+                  "bg-amber-100 text-amber-700 border-amber-200"
+                )}>
+                  risk: {remediation.risk_level}
+                </span>
+                <span className="text-[9px] text-gray-400 ml-auto">{remediation.provider} · {remediation.model}</span>
+              </div>
+              <p className="text-[10px] text-amber-900 leading-relaxed">{remediation.summary}</p>
+            </div>
+
+            {/* Steps */}
+            {remediation.steps?.map((step, i) => (
+              <div key={i} className="bg-white border border-gray-100 rounded-xl p-3 shadow-xs">
+                <div className="flex items-start gap-2 mb-2">
+                  <span className="w-5 h-5 rounded-full bg-violet-100 text-violet-700 text-[9px] font-black flex items-center justify-center flex-shrink-0 mt-0.5">
+                    {step.step}
+                  </span>
+                  <p className="text-[10px] font-bold text-gray-800">{step.title}</p>
+                </div>
+                <p className="text-[10px] text-gray-600 ml-7 mb-2 leading-relaxed">{step.description}</p>
+                {step.command && (
+                  <div className="ml-7 bg-gray-900 rounded-lg px-3 py-2 flex items-center gap-2 mb-1.5">
+                    <code className="text-[9px] font-mono text-green-400 flex-1 break-all">{step.command}</code>
+                    <button
+                      onClick={() => navigator.clipboard.writeText(step.command!)}
+                      className="text-gray-500 hover:text-gray-300 flex-shrink-0"
+                    >
+                      <Copy className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+                {step.verification && (
+                  <p className="text-[9px] text-emerald-700 ml-7 flex items-center gap-1">
+                    <CheckCircle2 className="w-2.5 h-2.5 flex-shrink-0" />
+                    Verify: {step.verification}
+                  </p>
+                )}
+                {step.risk && (
+                  <p className="text-[9px] text-amber-600 ml-7 flex items-center gap-1 mt-0.5">
+                    <AlertTriangle className="w-2.5 h-2.5 flex-shrink-0" />
+                    Risk: {step.risk}
+                  </p>
+                )}
+              </div>
+            ))}
+
+            {/* Verification */}
+            {remediation.verification?.length > 0 && (
+              <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3">
+                <p className="text-[9px] font-bold text-emerald-700 uppercase tracking-wider mb-2">Final Verification</p>
+                <ul className="space-y-1">
+                  {remediation.verification.map((v, i) => (
+                    <li key={i} className="flex items-start gap-1.5 text-[10px] text-emerald-800">
+                      <CheckCircle2 className="w-3 h-3 flex-shrink-0 mt-0.5" />{v}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Long-term */}
+            {remediation.long_term?.length > 0 && (
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-3">
+                <p className="text-[9px] font-bold text-blue-700 uppercase tracking-wider mb-2">Long-term Recommendations</p>
+                <ul className="space-y-1">
+                  {remediation.long_term.map((lt, i) => (
+                    <li key={i} className="flex items-start gap-1.5 text-[10px] text-blue-800">
+                      <ArrowUpRight className="w-3 h-3 flex-shrink-0 mt-0.5" />{lt}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Compensating controls */}
+            {remediation.compensating && (
+              <div className="bg-gray-50 border border-gray-100 rounded-xl p-3">
+                <p className="text-[9px] font-bold text-gray-600 uppercase tracking-wider mb-1">If Immediate Fix Is Not Possible</p>
+                <p className="text-[10px] text-gray-700">{remediation.compensating}</p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2114,6 +2667,8 @@ export const FILTER_FIELDS: { key: string; label: string }[] = [
   { key: "confidence_pct",   label: "Confidence %" },
   { key: "kev",              label: "KEV" },
   { key: "exploit_available",label: "Exploit Available" },
+  { key: "terrain",          label: "Terrain" },
+  { key: "package_manager",  label: "Package Manager" },
 ];
 
 export function newCondition(): FilterCondition {
@@ -2260,26 +2815,33 @@ export function AdvancedFilter({
 
 // ── Terrain filter types ──────────────────────────────────────────────────────
 
-type SortKey = "risk" | "cvss" | "epss" | "first_seen" | "last_seen";
+type SortKey = "risk" | "exploitability" | "cvss" | "epss" | "first_seen" | "last_seen";
 
-interface TerrainFilterState {
+export interface TerrainFilterState {
   severity:       string;
   search:         string;
   agentId:        string;
   mitreFilter:    string;
   categoryFilter: string;
   statusFilter:   string;
+  terrainFilter:  string;
   kevOnly:        boolean;
   exploitOnly:    boolean;
   sortBy:         SortKey;
   sortDir:        "asc" | "desc";
 }
 
-const DEFAULT_TERRAIN_FILTERS: TerrainFilterState = {
+export const DEFAULT_TERRAIN_FILTERS: TerrainFilterState = {
   severity: "", search: "", agentId: "", mitreFilter: "",
-  categoryFilter: "", statusFilter: "", kevOnly: false, exploitOnly: false,
+  categoryFilter: "", statusFilter: "", terrainFilter: "",
+  kevOnly: false, exploitOnly: false,
   sortBy: "risk", sortDir: "desc",
 };
+
+const STATUS_LIST = [
+  "new","triaging","investigating","in_remediation","remediated",
+  "verified","closed","false_positive","accepted_risk",
+];
 
 // ── Terrain rich filter bar ───────────────────────────────────────────────────
 
@@ -2319,8 +2881,9 @@ function TerrainFilterBar({
     ...(filters.severity       ? [{ label: `Sev: ${filters.severity}`,        onRemove: () => set("severity",       "") }] : []),
     ...(filters.mitreFilter    ? [{ label: `MITRE: ${filters.mitreFilter}`,    onRemove: () => set("mitreFilter",    "") }] : []),
     ...(filters.categoryFilter ? [{ label: `Cat: ${filters.categoryFilter}`,   onRemove: () => set("categoryFilter", "") }] : []),
-    ...(filters.statusFilter   ? [{ label: `Status: ${filters.statusFilter}`,  onRemove: () => set("statusFilter",   "") }] : []),
-    ...(filters.agentId        ? [{ label: `Agent: ${filters.agentId}`,        onRemove: () => set("agentId",        "") }] : []),
+    ...(filters.statusFilter   ? [{ label: `Status: ${filters.statusFilter}`,   onRemove: () => set("statusFilter",   "") }] : []),
+    ...(filters.terrainFilter  ? [{ label: `Terrain: ${filters.terrainFilter}`, onRemove: () => set("terrainFilter",  "") }] : []),
+    ...(filters.agentId        ? [{ label: `Agent: ${filters.agentId}`,         onRemove: () => set("agentId",        "") }] : []),
     ...(filters.kevOnly        ? [{ label: "KEV Only",    onRemove: () => set("kevOnly",     false) }] : []),
     ...(filters.exploitOnly    ? [{ label: "Exploit Only",onRemove: () => set("exploitOnly", false) }] : []),
   ];
@@ -2364,6 +2927,15 @@ function TerrainFilterBar({
           </select>
         )}
 
+        {/* Status */}
+        <select value={filters.statusFilter} onChange={e => set("statusFilter", e.target.value)}
+          className="px-2 py-1.5 text-[10px] border border-gray-200 rounded-xl bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer max-w-[130px] truncate">
+          <option value="">All Statuses</option>
+          {STATUS_LIST.map(s => (
+            <option key={s} value={s}>{s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}</option>
+          ))}
+        </select>
+
         {/* KEV Only */}
         <button onClick={() => set("kevOnly", !filters.kevOnly)}
           className={cn(
@@ -2394,6 +2966,7 @@ function TerrainFilterBar({
           <select value={filters.sortBy} onChange={e => set("sortBy", e.target.value as SortKey)}
             className="px-2 py-1.5 text-[10px] border border-gray-200 rounded-xl bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer">
             <option value="risk">Risk Score</option>
+            <option value="exploitability">Exploitability</option>
             <option value="cvss">CVSS</option>
             <option value="epss">EPSS</option>
             <option value="first_seen">First Seen</option>
@@ -2441,19 +3014,25 @@ function TerrainFilterBar({
 // ── Terrain detection page (replaces GenericDetectionPage for terrain views) ──
 
 export interface TerrainPageProps {
-  title:    string;
-  subtitle: string;
-  apiUrl:   string;
-  accent:   string;
-  icon:     React.ReactNode;
-  emptyMsg: string;
-  columns:  { key: string; label: string; render?: (f: DetectionFinding) => React.ReactNode }[];
+  title:                 string;
+  subtitle:              string;
+  apiUrl:                string;
+  accent:                string;
+  icon:                  React.ReactNode;
+  emptyMsg:              string;
+  columns:               { key: string; label: string; render?: (f: DetectionFinding) => React.ReactNode }[];
+  initialTerrainFilter?: string;
+  initialStatusFilter?:  string;
 }
 
-export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, emptyMsg, columns }: TerrainPageProps) {
+export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, emptyMsg, columns, initialTerrainFilter, initialStatusFilter }: TerrainPageProps) {
   const PAGE_SIZE = 25;
 
-  const [filters, setFilters] = useState<TerrainFilterState>(DEFAULT_TERRAIN_FILTERS);
+  const [filters, setFilters] = useState<TerrainFilterState>({
+    ...DEFAULT_TERRAIN_FILTERS,
+    terrainFilter: initialTerrainFilter ?? "",
+    statusFilter:  initialStatusFilter  ?? "",
+  });
   const [adv, setAdv] = useState<FilterCondition[]>([]);
   const [selected, setSelected] = useState<DetectionFinding | null>(null);
   const [page, setPage] = useState(1);
@@ -2479,6 +3058,7 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
     if (filters.mitreFilter)    r = r.filter(f => f.mitre_tactic === filters.mitreFilter || f.mitre_technique?.includes(filters.mitreFilter));
     if (filters.categoryFilter) r = r.filter(f => f.category === filters.categoryFilter);
     if (filters.statusFilter)   r = r.filter(f => f.status === filters.statusFilter);
+    if (filters.terrainFilter)  r = r.filter(f => (f as any).terrain === filters.terrainFilter);
     if (filters.agentId)        r = r.filter(f => f.agent_id?.toLowerCase().includes(filters.agentId.toLowerCase()));
     if (filters.search) {
       const q = filters.search.toLowerCase().trim();
@@ -2520,6 +3100,7 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
       let av = 0, bv = 0;
       switch (filters.sortBy) {
         case "risk":       av = a.composite_score ?? a.score; bv = b.composite_score ?? b.score; break;
+        case "exploitability": av = a.exploitability_score ?? 0; bv = b.exploitability_score ?? 0; break;
         case "cvss":       av = a.cvss_score  ?? 0;           bv = b.cvss_score  ?? 0;           break;
         case "epss":       av = a.epss_score  ?? 0;           bv = b.epss_score  ?? 0;           break;
         case "first_seen": av = a.first_detected_at;          bv = b.first_detected_at;          break;
@@ -2533,7 +3114,7 @@ export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, em
   useEffect(() => setPage(1), [
     filters.severity, filters.search, filters.mitreFilter,
     filters.categoryFilter, filters.kevOnly, filters.exploitOnly,
-    filters.statusFilter, filters.agentId, adv,
+    filters.statusFilter, filters.terrainFilter, filters.agentId, adv,
   ]);
 
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);

@@ -2032,6 +2032,10 @@ class AttackLensEngine:
                         f["cvss_vector"]  = cve.get("cvss_vector", "")
                         f["kev"]          = is_kev
                         f["epss_score"]   = epss_val
+                        # Vulnerability recency: parse the CVE publication date so
+                        # the exploitability scorer (computed in upsert_finding)
+                        # weights newer CVEs higher.
+                        f["cve_published_ts"] = _cve_published_ts(cve)
                         f.update(_intel_fields_from_cve(cve_enriched, raw))
                         f["composite_score"] = score_matrix.compute(
                             f, agent_id=agent_id, collected_ts=time.time(),
@@ -2140,6 +2144,27 @@ _build_rule_index()
 
 def _lookup_rule_by_source(source: str) -> dict | None:
     return _RULE_BY_SOURCE.get(source)
+
+
+def _cve_published_ts(cve: dict) -> float:
+    """
+    Parse a CVE publication date (ISO-8601 from NVD, e.g. '2024-03-14T00:00:00')
+    into an epoch timestamp. Returns 0.0 when absent/unparseable so the
+    exploitability scorer falls back to neutral recency.
+    """
+    raw = cve.get("published_at") or cve.get("published") or ""
+    if not raw:
+        return 0.0
+    s = str(raw).strip().replace("Z", "+00:00")
+    from datetime import datetime
+    for fmt in (None, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            if fmt is None:
+                return datetime.fromisoformat(s).timestamp()
+            return datetime.strptime(s.split("+")[0], fmt).timestamp()
+        except (ValueError, TypeError):
+            continue
+    return 0.0
 
 
 def _intel_fields_from_cve(cve: dict, evidence: dict) -> dict:

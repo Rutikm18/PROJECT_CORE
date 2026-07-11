@@ -70,19 +70,32 @@ _ADMIN_EMAIL = os.environ.get("DASHBOARD_EMAIL", "admin@attacklens.ai").strip().
 # Prefer a pre-hashed password from env; fall back to plaintext (hashed once at import)
 _stored_hash: str
 
+_DEFAULT_PASSWORD = "!HLwS=f73fHo$?p!#M77XA*M"
+
 _env_hash      = os.environ.get("DASHBOARD_PASSWORD_HASH", "").strip()
-_env_plaintext = os.environ.get("DASHBOARD_PASSWORD", "!HLwS=f73fHo$?p!#M77XA*M").strip()
+_env_plaintext = os.environ.get("DASHBOARD_PASSWORD", _DEFAULT_PASSWORD).strip()
 
 if _env_hash:
     _stored_hash = _env_hash
 else:
     # Hash the plaintext password at startup (600k PBKDF2 rounds — ~0.5s once)
     _stored_hash = hash_password(_env_plaintext)
-    if _env_plaintext not in ("!HLwS=f73fHo$?p!#M77XA*M",):
+    if _env_plaintext not in (_DEFAULT_PASSWORD,):
         log.warning(
             "auth: DASHBOARD_PASSWORD_HASH not set — password hashed at startup. "
             "Set DASHBOARD_PASSWORD_HASH in production to avoid recomputing on every restart."
         )
+
+# The built-in default credential is "active" (safe to surface on the login
+# screen for first-run convenience) ONLY when the operator has NOT overridden it
+# via DASHBOARD_PASSWORD_HASH or a custom DASHBOARD_PASSWORD. We never expose an
+# operator-set password (we only hold its hash) — only this known default.
+_USING_DEFAULT_CREDENTIALS = (not _env_hash) and (_env_plaintext == _DEFAULT_PASSWORD)
+if _USING_DEFAULT_CREDENTIALS:
+    log.warning(
+        "auth: using built-in DEFAULT dashboard password — surfaced on the login "
+        "screen for first-run setup. Set DASHBOARD_PASSWORD_HASH before deploying."
+    )
 
 # Dummy hash used when the email is wrong: we still run PBKDF2 so the response
 # time is identical whether the email exists or not (timing oracle prevention).
@@ -425,4 +438,13 @@ async def auth_policy():
             "account_duration_minutes": ACCOUNT_LOCKOUT_DURATION // 60,
         },
         "mfa_enabled": _MFA_ENABLED,
+        # First-run convenience: expose the built-in default credential so the
+        # login screen can offer click-to-autofill — but ONLY while that default
+        # is actually in use. Once an operator sets a custom password, `active`
+        # is false and no password is returned.
+        "default_credentials": {
+            "active":   _USING_DEFAULT_CREDENTIALS,
+            "email":    _ADMIN_EMAIL if _USING_DEFAULT_CREDENTIALS else None,
+            "password": _DEFAULT_PASSWORD if _USING_DEFAULT_CREDENTIALS else None,
+        },
     }

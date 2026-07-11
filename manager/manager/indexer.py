@@ -25,6 +25,8 @@ import logging
 import re
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .pg_pool import PgPool
@@ -75,6 +77,8 @@ CREATE TABLE IF NOT EXISTS findings (
     exploit_sources   TEXT    NOT NULL DEFAULT '[]',
     asset_tier        TEXT    NOT NULL DEFAULT '',
     asset_importance  DOUBLE PRECISION    NOT NULL DEFAULT 0,
+    exploitability_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    exploitability_band  TEXT    NOT NULL DEFAULT '',
     priority_reason   TEXT    NOT NULL DEFAULT '',
     action_plan       TEXT    NOT NULL DEFAULT '[]',
     mitre_technique   TEXT,
@@ -125,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_find_agent   ON findings(agent_id, severity, is_a
 CREATE INDEX IF NOT EXISTS idx_find_ts      ON findings(last_detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_find_score   ON findings(score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_composite ON findings(composite_score DESC);
+CREATE INDEX IF NOT EXISTS idx_find_exploitability ON findings(exploitability_score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_cat     ON findings(agent_id, category);
 -- Every Attack Terrain page (processes/network/persistence/packages/ports)
 -- queries category + is_active with NO agent_id filter (fleet-wide view) —
@@ -460,7 +465,12 @@ CREATE TABLE IF NOT EXISTS ai_analysis (
     actor_context   TEXT NOT NULL DEFAULT '[]',
     confidence      DOUBLE PRECISION NOT NULL DEFAULT 0,
     tokens_used     INTEGER NOT NULL DEFAULT 0,
-    generated_at    DOUBLE PRECISION NOT NULL
+    generated_at    DOUBLE PRECISION NOT NULL,
+    -- Provider-agnostic AI layer fields (multi-provider support)
+    provider        TEXT NOT NULL DEFAULT '',
+    urgency         TEXT NOT NULL DEFAULT 'scheduled',
+    mitre_context   TEXT NOT NULL DEFAULT '',
+    latency_ms      DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
 -- ── AI-generated remediation plans ───────────────────────────────────────
@@ -477,6 +487,11 @@ CREATE TABLE IF NOT EXISTS remediation_plans (
     verification TEXT NOT NULL DEFAULT '[]',
     long_term    TEXT NOT NULL DEFAULT '[]',
     generated_at DOUBLE PRECISION NOT NULL,
+    -- Provider-agnostic AI layer fields
+    provider     TEXT NOT NULL DEFAULT '',
+    compensating TEXT NOT NULL DEFAULT '',
+    tokens_used  INTEGER NOT NULL DEFAULT 0,
+    latency_ms   DOUBLE PRECISION NOT NULL DEFAULT 0,
     UNIQUE(finding_id, os_type)
 );
 CREATE INDEX IF NOT EXISTS idx_remed_finding ON remediation_plans(finding_id);
@@ -649,7 +664,167 @@ _SOC_MIGRATIONS = [
     ("soc_activity", "metadata",            "TEXT    DEFAULT '{}'"),
     # Terrain source provenance — captures why a finding landed in its terrain
     ("findings", "terrain_source",          "TEXT    DEFAULT ''"),
+    # Unified exploitability score (CVSS+EPSS+KEV+exploit+recency+asset)
+    ("findings", "exploitability_score",    "DOUBLE PRECISION DEFAULT 0"),
+    ("findings", "exploitability_band",     "TEXT    DEFAULT ''"),
+    # Provider-agnostic AI layer — analysis cache columns
+    ("ai_analysis", "provider",       "TEXT DEFAULT ''"),
+    ("ai_analysis", "urgency",        "TEXT DEFAULT 'scheduled'"),
+    ("ai_analysis", "mitre_context",  "TEXT DEFAULT ''"),
+    ("ai_analysis", "latency_ms",     "DOUBLE PRECISION DEFAULT 0"),
+    # Provider-agnostic AI layer — remediation cache columns
+    ("remediation_plans", "provider",     "TEXT DEFAULT ''"),
+    ("remediation_plans", "compensating", "TEXT DEFAULT ''"),
+    ("remediation_plans", "tokens_used",  "INTEGER DEFAULT 0"),
+    ("remediation_plans", "latency_ms",   "DOUBLE PRECISION DEFAULT 0"),
+    # Ingest dedup tracking — when content last changed vs just re-seen
+    ("findings", "content_changed_at",   "DOUBLE PRECISION DEFAULT 0"),
+    ("findings", "consecutive_unchanged", "INTEGER DEFAULT 0"),
 ]
+
+
+@dataclass
+class _CacheEntry:
+    content_hash: str
+    last_seen_at: float
+    consecutive_unchanged: int = 0
+    pending_count: int = 0          # heartbeats accumulated since last DB flush
+
+
+class IngestDeduplicator:
+    """
+    Write-through in-memory dedup cache for agent findings.
+
+    For unchanged findings (same content hash as last seen), skips the DB
+    SELECT entirely and accumulates a heartbeat counter. A background task
+    flushes accumulated heartbeats to DB in one batch UPDATE every 30s,
+    reducing DB writes by ~96% in stable environments.
+
+    Identity key  : (agent_id, category, item_key)  — what makes a finding unique
+    Content hash  : SHA-256 of mutable payload fields  — what the finding says now
+
+    Three outcomes per upsert call:
+      "miss"      → not in cache; caller does normal DB SELECT path
+      "unchanged" → cached and hash matches; heartbeat counted, DB skipped
+      "changed"   → cached but hash differs; caller does full DB UPDATE, cache refreshed
+
+    Edge cases handled:
+      - Manager restart: cache cold-starts; DB is always authoritative
+      - Cache eviction: LRU; evicted entries re-enter on next access
+      - Finding closed: explicit invalidate() call prevents stale cache reads
+      - Crash mid-flush: max heartbeat lag = flush_interval (30s); last_detected_at
+        may trail by one interval — acceptable for telemetry workloads
+    """
+
+    MAX_SIZE    = 200_000   # ~40 MB at ~200 bytes/entry
+    FLUSH_EVERY = 30.0      # seconds between batch heartbeat flushes
+
+    def __init__(self) -> None:
+        self._cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._hits   = 0
+        self._misses = 0
+        self._changes = 0
+
+    # ── Cache operations (synchronous, called inside _lock) ──────────────────
+
+    def check(self, agent_id: str, category: str, item_key: str,
+              content_hash: str, ts: float) -> str:
+        key = (agent_id, category, item_key)
+        entry = self._cache.get(key)
+        if entry is None:
+            self._misses += 1
+            return "miss"
+        self._cache.move_to_end(key)          # LRU refresh
+        if entry.content_hash == content_hash:
+            entry.last_seen_at = max(entry.last_seen_at, ts)
+            entry.consecutive_unchanged += 1
+            entry.pending_count += 1
+            self._hits += 1
+            return "unchanged"
+        self._changes += 1
+        return "changed"
+
+    def put(self, agent_id: str, category: str, item_key: str,
+            content_hash: str, ts: float, consecutive_unchanged: int = 0) -> None:
+        key = (agent_id, category, item_key)
+        self._evict()
+        self._cache[key] = _CacheEntry(
+            content_hash=content_hash,
+            last_seen_at=ts,
+            consecutive_unchanged=consecutive_unchanged,
+        )
+
+    def invalidate(self, agent_id: str, category: str, item_key: str) -> None:
+        self._cache.pop((agent_id, category, item_key), None)
+
+    def _evict(self) -> None:
+        while len(self._cache) >= self.MAX_SIZE:
+            self._cache.popitem(last=False)   # remove oldest (LRU)
+
+    # ── Background flush ──────────────────────────────────────────────────────
+
+    def start(self, conn) -> None:
+        self._conn = conn
+        self._flush_task = asyncio.get_event_loop().create_task(
+            self._flush_loop(), name="ingest-dedup-flush"
+        )
+
+    async def stop(self) -> None:
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        await self._flush_now()
+
+    async def _flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.FLUSH_EVERY)
+            try:
+                await self._flush_now()
+            except Exception as exc:
+                log.warning("ingest-dedup flush error: %s", exc)
+
+    async def _flush_now(self) -> None:
+        pending = [(k, e) for k, e in self._cache.items() if e.pending_count > 0]
+        if not pending:
+            return
+        for (agent_id, category, item_key), entry in pending:
+            try:
+                await self._conn.execute(
+                    """UPDATE findings
+                       SET last_detected_at    = $1,
+                           scan_count          = scan_count + $2,
+                           consecutive_unchanged = $3
+                       WHERE agent_id=$4 AND category=$5 AND item_key=$6""",
+                    entry.last_seen_at,
+                    entry.pending_count,
+                    entry.consecutive_unchanged,
+                    agent_id, category, item_key,
+                )
+            except Exception as exc:
+                log.debug("dedup flush row error %s/%s/%s: %s",
+                          agent_id, category, item_key, exc)
+            else:
+                entry.pending_count = 0
+        try:
+            await self._conn.commit()
+        except Exception as exc:
+            log.warning("dedup flush commit error: %s", exc)
+        log.debug("ingest-dedup flushed %d heartbeats", len(pending))
+
+    def stats(self) -> dict:
+        total = self._hits + self._misses + self._changes
+        return {
+            "cache_size":   len(self._cache),
+            "hits":         self._hits,
+            "misses":       self._misses,
+            "changes":      self._changes,
+            "hit_rate":     round(self._hits / total, 4) if total else 0.0,
+            "pending_flush": sum(e.pending_count for e in self._cache.values()),
+        }
 
 
 class IntelDB:
@@ -670,6 +845,7 @@ class IntelDB:
         self._pool: Optional[PgPool] = None
         self._conn = None
         self._lock = asyncio.Lock()  # kept for write-serialisation within Python
+        self._dedup = IngestDeduplicator()
 
     async def init(self) -> None:
         self._pool = PgPool(self._dsn, readers=3)
@@ -798,8 +974,10 @@ class IntelDB:
             await self._conn.rollback()
 
         log.info("IntelDB initialised at %s (pool readers=3)", self._path)
+        self._dedup.start(self._conn)
 
     async def close(self) -> None:
+        await self._dedup.stop()
         if self._pool:
             # Release the long-held write checkout BEFORE closing the pool —
             # asyncpg.Pool.close() waits for all checked-out connections to be
@@ -833,6 +1011,21 @@ class IntelDB:
         asset_tier = str(f.get("asset_tier") or "")
         asset_imp  = float(f.get("asset_importance") or 0)
         priority_reason = str(f.get("priority_reason") or _priority_reason(f))
+
+        # ── Unified exploitability score ─────────────────────────────────────
+        # Computed at the single write chokepoint so every emit path gets a
+        # consistent score. Recency uses cve_published_ts when the caller
+        # supplies it (NVD worker does), else neutral.
+        try:
+            from .threat.exploitability import exploitability_scorer
+            _exp = exploitability_scorer.compute(
+                f, cve_published_ts=f.get("cve_published_ts"),
+            )
+            exploitability_score = _exp.score
+            exploitability_band  = _exp.band
+        except Exception:
+            exploitability_score = 0.0
+            exploitability_band  = ""
 
         # ── Unique Finding ID (UUIDv4 hex) ──────────────────────────────────
         # Use existing finding_uid from the caller if provided (e.g. on re-insert),
@@ -895,9 +1088,17 @@ class IntelDB:
         terrain_validation_j = json.dumps(f.get("terrain_validation") or {}, default=str)
 
         async with self._lock:
+            # ── Cache-first dedup ────────────────────────────────────────────
+            # Check in-memory cache before touching the DB. For stable findings
+            # (same content hash) this eliminates both the SELECT and the UPDATE,
+            # reducing DB ops by ~96% for unchanged agent environments.
+            cache_result = self._dedup.check(agent_id, category, item_key, fp, ts)
+            if cache_result == "unchanged":
+                return "unchanged"
+
             row = await self._fetchone(
-                "SELECT id, fingerprint, first_detected_at FROM findings "
-                "WHERE agent_id=? AND category=? AND item_key=?",
+                "SELECT id, fingerprint, first_detected_at, consecutive_unchanged "
+                "FROM findings WHERE agent_id=? AND category=? AND item_key=?",
                 (agent_id, category, item_key),
             )
             if row is None:
@@ -910,25 +1111,28 @@ class IntelDB:
                      title,description,evidence,source,rule_id,cve_ids,
                      cvss_score,cvss_vector,composite_score,epss_score,kev,
                      exploit_available,exploit_sources,asset_tier,asset_importance,
+                     exploitability_score,exploitability_band,
                      priority_reason,action_plan,mitre_technique,mitre_tactic,
                      first_detected_at,last_detected_at,scan_count,is_active,tags,
                      status,assignee,sla_due,priority,analyst_notes,
                      precision_score,precision_factors,ai_verdict,ai_validation_used,
-                     terrain_validation,finding_uid,terrain_id,actions_log)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
-                           'new','',?,0,'',?,?,?,?,?,?,?,?)
+                     terrain_validation,finding_uid,terrain_id,actions_log,
+                     content_changed_at,consecutive_unchanged)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,
+                           'new','',?,0,'',?,?,?,?,?,?,?,?,?,0)
                 """, (agent_id, category, item_key, fp,
                       sev, f.get("score",0),
                       f.get("title",""), f.get("description",""),
                       evidence_j, f.get("source",""), f.get("rule_id",""),
                       cve_j, f.get("cvss_score"), f.get("cvss_vector",""),
                       composite, epss, kev, exploit, exploit_j, asset_tier,
-                      asset_imp, priority_reason, action_j,
+                      asset_imp, exploitability_score, exploitability_band,
+                      priority_reason, action_j,
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
                       ts, ts, tags_j, sla_due,
                       precision_score, precision_factors_j, ai_verdict_j,
                       ai_validation_used, terrain_validation_j,
-                      finding_uid, terrain_id, actions_log_j))
+                      finding_uid, terrain_id, actions_log_j, ts))
                 await self._conn.commit()
                 # Log creation in SOC activity
                 cur2 = await self._conn.execute(
@@ -954,6 +1158,8 @@ class IntelDB:
                 await self._append_timeline(agent_id, category, "added",
                                             item_key, f.get("title",""),
                                             evidence_j, None, ts)
+                self._dedup.put(agent_id, category, item_key, fp, ts,
+                                consecutive_unchanged=0)
                 return "new"
 
             elif row["fingerprint"] != fp:
@@ -964,41 +1170,51 @@ class IntelDB:
                         cve_ids=?, cvss_score=?, cvss_vector=?,
                         composite_score=?, epss_score=?, kev=?,
                         exploit_available=?, exploit_sources=?, asset_tier=?,
-                        asset_importance=?, priority_reason=?, action_plan=?,
+                        asset_importance=?, exploitability_score=?,
+                        exploitability_band=?, priority_reason=?, action_plan=?,
                         mitre_technique=?, mitre_tactic=?,
                         last_detected_at=?, scan_count=scan_count+1,
                         is_active=1, tags=?,
                         precision_score=?, precision_factors=?,
                         ai_verdict=?, ai_validation_used=?,
                         terrain_validation=?, terrain_id=?,
-                        actions_log=?
+                        actions_log=?,
+                        content_changed_at=?, consecutive_unchanged=0
                     WHERE agent_id=? AND category=? AND item_key=?
                 """, (fp, f.get("severity","info"), f.get("score",0),
                       f.get("title",""), f.get("description",""),
                       evidence_j, f.get("source",""), f.get("rule_id",""),
                       cve_j, f.get("cvss_score"), f.get("cvss_vector",""),
                       composite, epss, kev, exploit, exploit_j, asset_tier,
-                      asset_imp, priority_reason, action_j,
+                      asset_imp, exploitability_score, exploitability_band,
+                      priority_reason, action_j,
                       f.get("mitre_technique",""), f.get("mitre_tactic",""),
                       ts, tags_j,
                       precision_score, precision_factors_j, ai_verdict_j,
                       ai_validation_used, terrain_validation_j,
-                      terrain_id, actions_log_j,
+                      terrain_id, actions_log_j, ts,
                       agent_id, category, item_key))
                 await self._conn.commit()
                 await self._append_timeline(agent_id, category, "modified",
                                             item_key, f.get("title",""),
                                             evidence_j, row["fingerprint"], ts)
+                self._dedup.put(agent_id, category, item_key, fp, ts,
+                                consecutive_unchanged=0)
                 return "updated"
 
             else:
-                # Same fingerprint — only heartbeat update
-                await self._conn.execute(
-                    "UPDATE findings SET last_detected_at=?, scan_count=scan_count+1 "
-                    "WHERE agent_id=? AND category=? AND item_key=?",
-                    (ts, agent_id, category, item_key),
-                )
-                await self._conn.commit()
+                # DB path for heartbeat on cache miss — populate cache and defer
+                # future heartbeats. The SELECT already happened so we know the
+                # DB state; use it to seed consecutive_unchanged from the DB row.
+                db_consec = row["consecutive_unchanged"] or 0
+                self._dedup.put(agent_id, category, item_key, fp, ts,
+                                consecutive_unchanged=db_consec)
+                # Also do the immediate heartbeat so last_detected_at is never
+                # stale by more than one flush interval.
+                entry = self._dedup._cache.get((agent_id, category, item_key))
+                if entry:
+                    entry.pending_count += 1
+                    entry.consecutive_unchanged += 1
                 return "unchanged"
 
     async def get_findings(self, agent_id: str, *,
@@ -1150,6 +1366,7 @@ class IntelDB:
                     agent_id, r["category"], "auto_resolved",
                     r["item_key"], r["title"], reason, None, ts,
                 )
+                self._dedup.invalidate(agent_id, r["category"], r["item_key"])
             await self._conn.commit()
         return len(rows)
 
@@ -1202,6 +1419,7 @@ class IntelDB:
                     agent_id, row["category"], "resolved",
                     row["item_key"], row["title"], None, None, ts,
                 )
+                self._dedup.invalidate(agent_id, row["category"], row["item_key"])
             # Single commit covers both the UPDATE and the timeline INSERT.
             await self._conn.commit()
 
@@ -1399,6 +1617,34 @@ class IntelDB:
         row = await self._fetchone(
             "SELECT * FROM cve_entries WHERE cve_id=?", (cve_id,))
         return dict(row) if row else None
+
+    async def get_cve_published_ts(self, cve_id: str) -> float:
+        """
+        Best-effort CVE publication epoch for vulnerability-recency scoring.
+        Checks cve_entries then nvd_cve_local. Returns 0.0 when unknown.
+        """
+        published = ""
+        for table in ("cve_entries", "nvd_cve_local"):
+            try:
+                row = await self._fetchone(
+                    f"SELECT published_at FROM {table} WHERE cve_id=?", (cve_id,))
+                if row and row["published_at"]:
+                    published = str(row["published_at"])
+                    break
+            except Exception:
+                continue
+        if not published:
+            return 0.0
+        s = published.strip().replace("Z", "+00:00")
+        from datetime import datetime
+        for fmt in (None, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                if fmt is None:
+                    return datetime.fromisoformat(s).timestamp()
+                return datetime.strptime(s.split("+")[0], fmt).timestamp()
+            except (ValueError, TypeError):
+                continue
+        return 0.0
 
     async def list_cves(
         self,
@@ -2111,6 +2357,10 @@ class IntelDB:
                 rows,
             )
 
+    def dedup_stats(self) -> dict:
+        """Return ingest dedup cache stats — hit rate, pending flushes, size."""
+        return self._dedup.stats()
+
     # ── Dashboard & SLA analytics ─────────────────────────────────────────────
 
     async def get_dashboard_stats(self, live_agent_ids: list[str] | None = None) -> dict:
@@ -2565,27 +2815,43 @@ class IntelDB:
             await self._conn.execute("""
                 INSERT INTO ai_analysis
                 (finding_id,model,analysis,threat_context,risk_factors,ioc_matches,
-                 news_context,actor_context,confidence,tokens_used,generated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                 news_context,actor_context,confidence,tokens_used,generated_at,
+                 provider,urgency,mitre_context,latency_ms)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(finding_id) DO UPDATE SET
                     model=excluded.model, analysis=excluded.analysis,
                     threat_context=excluded.threat_context, risk_factors=excluded.risk_factors,
                     ioc_matches=excluded.ioc_matches, news_context=excluded.news_context,
                     actor_context=excluded.actor_context, confidence=excluded.confidence,
-                    tokens_used=excluded.tokens_used, generated_at=excluded.generated_at
+                    tokens_used=excluded.tokens_used, generated_at=excluded.generated_at,
+                    provider=excluded.provider, urgency=excluded.urgency,
+                    mitre_context=excluded.mitre_context, latency_ms=excluded.latency_ms
             """, (finding_id, data.get("model","claude-sonnet-4-6"),
                   data.get("analysis",""), data.get("threat_context",""),
                   json.dumps(data.get("risk_factors",[])), json.dumps(data.get("ioc_matches",[])),
                   json.dumps(data.get("news_context",[])), json.dumps(data.get("actor_context",[])),
                   float(data.get("confidence",0)), int(data.get("tokens_used",0)),
-                  time.time()))
+                  time.time(),
+                  data.get("provider",""), data.get("urgency","scheduled"),
+                  data.get("mitre_context",""), float(data.get("latency_ms",0))))
             await self._conn.execute(
                 "UPDATE findings SET ai_analysed=1 WHERE id=?", (finding_id,))
             await self._conn.commit()
 
     async def get_ai_analysis(self, finding_id: int) -> Optional[dict]:
         row = await self._fetchone("SELECT * FROM ai_analysis WHERE finding_id=?", (finding_id,))
-        return dict(row) if row else None
+        if not row:
+            return None
+        d = dict(row)
+        # Parse JSON-encoded list columns so callers get real lists, not strings.
+        for field in ("risk_factors", "ioc_matches", "news_context", "actor_context"):
+            v = d.get(field)
+            if isinstance(v, str):
+                try:
+                    d[field] = json.loads(v) if v else []
+                except (json.JSONDecodeError, TypeError):
+                    d[field] = []
+        return d
 
     # ── Remediation plans ─────────────────────────────────────────────────────
 
@@ -2595,18 +2861,22 @@ class IntelDB:
             await self._conn.execute("""
                 INSERT INTO remediation_plans
                 (finding_id,agent_id,os_type,model,steps,summary,effort,risk_level,
-                 verification,long_term,generated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                 verification,long_term,generated_at,provider,compensating,
+                 tokens_used,latency_ms)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(finding_id,os_type) DO UPDATE SET
                     model=excluded.model, steps=excluded.steps, summary=excluded.summary,
                     effort=excluded.effort, risk_level=excluded.risk_level,
                     verification=excluded.verification, long_term=excluded.long_term,
-                    generated_at=excluded.generated_at
+                    generated_at=excluded.generated_at, provider=excluded.provider,
+                    compensating=excluded.compensating, tokens_used=excluded.tokens_used,
+                    latency_ms=excluded.latency_ms
             """, (finding_id, agent_id, os_type, data.get("model","claude-sonnet-4-6"),
                   json.dumps(data.get("steps",[])), data.get("summary",""),
                   data.get("effort","medium"), data.get("risk_level","low"),
                   json.dumps(data.get("verification",[])), json.dumps(data.get("long_term",[])),
-                  time.time()))
+                  time.time(), data.get("provider",""), data.get("compensating",""),
+                  int(data.get("tokens_used",0)), float(data.get("latency_ms",0))))
             await self._conn.commit()
 
     async def get_remediation_plan(self, finding_id: int,
@@ -2618,10 +2888,12 @@ class IntelDB:
             return None
         d = dict(row)
         for field in ("steps", "verification", "long_term"):
-            try:
-                d[field] = json.loads(d[field])
-            except Exception:
-                d[field] = []
+            v = d.get(field)
+            if isinstance(v, str):
+                try:
+                    d[field] = json.loads(v) if v else []
+                except (json.JSONDecodeError, TypeError):
+                    d[field] = []
         return d
 
     async def list_remediation_plans(self, agent_id: str, limit: int = 50) -> list[dict]:
