@@ -3023,15 +3023,27 @@ export interface TerrainPageProps {
   columns:               { key: string; label: string; render?: (f: DetectionFinding) => React.ReactNode }[];
   initialTerrainFilter?: string;
   initialStatusFilter?:  string;
+  initialKevOnly?:       boolean;
+  initialExploitOnly?:   boolean;
+  initialCategoryFilter?:string;
+  initialSearch?:        string;
 }
 
-export function TerrainDetectionPage({ title, subtitle, apiUrl, accent, icon, emptyMsg, columns, initialTerrainFilter, initialStatusFilter }: TerrainPageProps) {
+export function TerrainDetectionPage({
+  title, subtitle, apiUrl, accent, icon, emptyMsg, columns,
+  initialTerrainFilter, initialStatusFilter,
+  initialKevOnly, initialExploitOnly, initialCategoryFilter, initialSearch,
+}: TerrainPageProps) {
   const PAGE_SIZE = 25;
 
   const [filters, setFilters] = useState<TerrainFilterState>({
     ...DEFAULT_TERRAIN_FILTERS,
-    terrainFilter: initialTerrainFilter ?? "",
-    statusFilter:  initialStatusFilter  ?? "",
+    terrainFilter:  initialTerrainFilter  ?? "",
+    statusFilter:   initialStatusFilter   ?? "",
+    kevOnly:        initialKevOnly        ?? false,
+    exploitOnly:    initialExploitOnly    ?? false,
+    categoryFilter: initialCategoryFilter ?? "",
+    search:         initialSearch         ?? "",
   });
   const [adv, setAdv] = useState<FilterCondition[]>([]);
   const [selected, setSelected] = useState<DetectionFinding | null>(null);

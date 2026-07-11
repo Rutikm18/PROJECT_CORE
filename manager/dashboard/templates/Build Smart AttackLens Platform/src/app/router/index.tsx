@@ -1,0 +1,181 @@
+/**
+ * Route tree for AttackLens dashboard.
+ *
+ * Architecture:
+ *   RootLayout (AuthProvider + RBACProvider — wraps every route)
+ *   ├─ /login                     → LoginPage (public)
+ *   └─ /  (ProtectedRoute + AppShell)
+ *      ├─ /dashboard
+ *      ├─ /findings
+ *      ├─ /incidents
+ *      ├─ /terrain/:page
+ *      ├─ /posture/:page
+ *      ├─ /intelligence/:tab      (ioc | cve | kev | hunt | feeds)
+ *      ├─ /assets
+ *      ├─ /timeline
+ *      ├─ /analysis/:page
+ *      └─ /settings/:section      (org | license | roles | platform | validation | retention | ai)
+ *
+ * The SPA catch-all in server.py returns index.html for every non-API path,
+ * so bookmarking or refreshing any deep URL works correctly.
+ */
+
+import { createBrowserRouter, Navigate, Outlet } from "react-router";
+import { lazy, Suspense } from "react";
+import { AuthProvider } from "../context/AuthContext";
+import { RBACProvider } from "../context/RBACContext";
+import { ProtectedRoute } from "./guards";
+import AppShell from "../layouts/AppShell";
+import LoginPage from "../pages/LoginPage";
+import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
+import { ComingSoon } from "../components/ComingSoon";
+import { ClipboardList } from "lucide-react";
+
+// ── Root layout: one Auth + RBAC context shared by ALL routes ─────────────────
+function RootLayout() {
+  return (
+    <AuthProvider>
+      <RBACProvider>
+        <Outlet />
+      </RBACProvider>
+    </AuthProvider>
+  );
+}
+
+// ── Lazy page imports ─────────────────────────────────────────────────────────
+const Dashboard          = lazy(() => import("../pages/Dashboard"));
+const ThreatQueue        = lazy(() => import("../pages/ThreatQueue"));
+const Incidents          = lazy(() => import("../pages/Incidents"));
+const VulnerabilitySurface = lazy(() => import("../pages/VulnerabilitySurface"));
+const NetworkThreats     = lazy(() => import("../pages/NetworkThreats"));
+const ExecutionThreats   = lazy(() => import("../pages/ExecutionThreats"));
+const PersistenceBackdoors = lazy(() => import("../pages/PersistenceBackdoors"));
+const IdentityAccess     = lazy(() => import("../pages/IdentityAccess"));
+const SecurityPosture    = lazy(() => import("../pages/SecurityPosture"));
+const CISCompliance      = CIS_COMPLIANCE_LIVE ? lazy(() => import("../pages/CISCompliance")) : null;
+const ThreatIntelligence = lazy(() => import("../pages/ThreatIntelligence"));
+const AssetRegistry      = lazy(() => import("../pages/AssetRegistry"));
+const Timeline           = lazy(() => import("../pages/Timeline"));
+const DeepAnalysis       = lazy(() => import("../pages/DeepAnalysis"));
+const Accuracy           = lazy(() => import("../pages/Accuracy"));
+const DetectionCoverage  = lazy(() => import("../pages/DetectionCoverage"));
+const Settings           = lazy(() => import("../pages/Settings"));
+
+// ── Suspense wrapper ──────────────────────────────────────────────────────────
+function PageLoading() {
+  return (
+    <div className="flex items-center justify-center py-32">
+      <span className="w-3.5 h-3.5 border-2 border-gray-200 border-t-orange-400 rounded-full animate-spin" />
+    </div>
+  );
+}
+function S({ children }: { children: React.ReactNode }) {
+  return <Suspense fallback={<PageLoading />}>{children}</Suspense>;
+}
+
+const CompliancePage = CIS_COMPLIANCE_LIVE && CISCompliance
+  ? () => <S><CISCompliance /></S>
+  : () => (
+      <ComingSoon
+        icon={<ClipboardList className="w-6 h-6 text-[--gray-400]" />}
+        title="CIS Compliance"
+        description="CIS Benchmark compliance scoring is coming soon — will track macOS hardening against the CIS macOS Benchmark."
+      />
+    );
+
+// ── Route tree ────────────────────────────────────────────────────────────────
+export const router = createBrowserRouter([
+  {
+    // Root layout: provides shared auth + RBAC context
+    element: <RootLayout />,
+    children: [
+
+      // ── Public ─────────────────────────────────────────────────────────────
+      {
+        path: "login",
+        element: <LoginPage onSuccess={() => {}} />,
+      },
+
+      // ── Authenticated shell ─────────────────────────────────────────────────
+      {
+        path: "/",
+        element: (
+          <ProtectedRoute>
+            <AppShell />
+          </ProtectedRoute>
+        ),
+        children: [
+
+          // Root redirect
+          { index: true, element: <Navigate to="/dashboard" replace /> },
+
+          // ── Operations ─────────────────────────────────────────────────────
+          { path: "dashboard",  element: <S><Dashboard /></S> },
+          { path: "findings",   element: <S><ThreatQueue /></S> },
+          { path: "incidents",  element: <S><Incidents /></S> },
+
+          // ── Attack Terrain ──────────────────────────────────────────────────
+          {
+            path: "terrain",
+            children: [
+              { index: true,          element: <Navigate to="/terrain/origin" replace /> },
+              { path: "origin",       element: <S><VulnerabilitySurface /></S> },
+              { path: "vector",       element: <S><NetworkThreats /></S> },
+              { path: "citadels",     element: <S><ExecutionThreats /></S> },
+              // { path: "persistence",  element: <S><PersistenceBackdoors /></S> },
+              // { path: "identity",     element: <S><IdentityAccess /></S> },
+            ],
+          },
+
+          // ── Posture ─────────────────────────────────────────────────────────
+          {
+            path: "posture",
+            children: [
+              // { index: true,         element: <Navigate to="/posture/overview" replace /> },
+              { index: true,         element: <Navigate to="/posture/compliance" replace /> },
+              // { path: "overview",    element: <S><SecurityPosture /></S> },
+              { path: "compliance",  element: <CompliancePage /> },
+            ],
+          },
+
+          // ── Intelligence (/intelligence/:tab?) ─────────────────────────────
+          {
+            path: "intelligence",
+            children: [
+              { index: true, element: <Navigate to="/intelligence/ioc" replace /> },
+              { path: "feeds", element: <Navigate to="/intelligence/ioc" replace /> },
+              { path: ":tab", element: <S><ThreatIntelligence /></S> },
+            ],
+          },
+
+          // ── Inventory ───────────────────────────────────────────────────────
+          { path: "assets",    element: <S><AssetRegistry /></S> },
+          { path: "timeline",  element: <S><Timeline /></S> },
+
+          // ── Analysis (/analysis/deep|accuracy|coverage) ─────────────────────
+          {
+            path: "analysis",
+            children: [
+              { index: true,          element: <Navigate to="/analysis/deep" replace /> },
+              { path: "deep",         element: <S><DeepAnalysis /></S> },
+              // { path: "accuracy",     element: <S><Accuracy /></S> },
+              // { path: "coverage",     element: <S><DetectionCoverage /></S> },
+            ],
+          },
+
+          // ── Settings (/settings/:section?) ──────────────────────────────────
+          {
+            path: "settings",
+            children: [
+              { index: true,        element: <Navigate to="/settings/org" replace /> },
+              { path: ":section",   element: <S><Settings /></S> },
+            ],
+          },
+
+          // Unknown paths fall back to dashboard
+          { path: "*", element: <Navigate to="/dashboard" replace /> },
+        ],
+      },
+    ],
+  },
+]);

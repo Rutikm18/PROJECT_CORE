@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, type FormEvent } from "react";
+import { useNavigate, useLocation } from "react-router";
 import { Eye, EyeOff, AlertCircle, Loader2, KeyRound, Copy, Check, Wand2 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
@@ -13,7 +14,17 @@ interface DefaultCreds {
 }
 
 export default function LoginPage({ onSuccess }: LoginPageProps) {
-  const { login } = useAuth();
+  const { login, isAuthenticated } = useAuth();
+  const navigate  = useNavigate();
+  const location  = useLocation();
+  // Redirect to the page the user tried to visit before being sent to /login,
+  // or fall back to /dashboard if they navigated here directly.
+  const from = (location.state as { from?: Location } | null)?.from?.pathname ?? "/dashboard";
+
+  // Already logged in — bounce straight to the app (handles browser-back after login)
+  useEffect(() => {
+    if (isAuthenticated) navigate(from, { replace: true });
+  }, [isAuthenticated, navigate, from]);
 
   const [email,    setEmail]    = useState("");
   const [password, setPassword] = useState("");
@@ -89,7 +100,8 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
     setLoading(false);
 
     if (result.ok) {
-      onSuccess();
+      onSuccess(); // backward-compat hook (no-op in new router)
+      navigate(from, { replace: true });
     } else {
       const msg = result.error ?? "Login failed.";
       setError(msg);

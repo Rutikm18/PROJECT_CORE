@@ -7,6 +7,7 @@
  * POST /api/v1/settings/reset  — factory reset
  */
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useParams, useNavigate } from "react-router";
 import {
   Building2, MapPin, Mail, Calendar, ShieldCheck, Settings2,
   Bell, RefreshCw, Save, AlertTriangle, CheckCircle2, Info,
@@ -164,8 +165,13 @@ const PERM_LABELS: Record<string, string> = {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
+const VALID_SECTIONS: TabId[] = ["org", "license", "roles", "platform", "validation", "retention", "ai"];
+
 export default function Settings() {
-  const [tab,     setTab]     = useState<TabId>("org");
+  const { section } = useParams<{ section?: string }>();
+  const navigate = useNavigate();
+  const tab: TabId = VALID_SECTIONS.includes(section as TabId) ? (section as TabId) : "org";
+  const setTab = (t: TabId) => navigate(`/settings/${t}`);
   const [form,    setForm]    = useState<OrgSettings>(EMPTY);
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [roles,   setRoles]   = useState<Record<string, RoleEntry>>({});

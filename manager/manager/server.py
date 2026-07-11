@@ -577,10 +577,8 @@ def create_app() -> FastAPI:
         "Expires":       "0",
     }
 
-    @app.get("/", response_class=HTMLResponse)
-    async def dashboard():
-        # Serve from static/index.html — vite build keeps this current.
-        # templates/index.html is a stale copy; reading from static avoids drift.
+    def _serve_index() -> HTMLResponse:
+        """Read index.html from the built static directory."""
         for candidate in [
             os.path.join(_pkg_root, "dashboard", "static", "index.html"),
             os.path.join(_pkg_root, "dashboard", "templates", "index.html"),
@@ -593,6 +591,23 @@ def create_app() -> FastAPI:
             "<h1>Dashboard unavailable</h1><p>Run: npm run build inside the frontend directory.</p>",
             status_code=503,
         )
+
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard():
+        return _serve_index()
+
+    # SPA catch-all: any path that doesn't match an API route or /static/*
+    # must return index.html so React Router can handle client-side navigation.
+    # This is what makes direct URL access (/settings, /findings, etc.) work.
+    # Registered last so it never shadows API routes.
+    @app.get("/{full_path:path}", response_class=HTMLResponse)
+    async def spa_fallback(full_path: str):
+        # Let the static-files mount handle /static/* itself; only fall through
+        # for non-static, non-API paths that are purely client-side routes.
+        if full_path.startswith("api/") or full_path.startswith("static/"):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404)
+        return _serve_index()
 
     return app
 
