@@ -602,19 +602,27 @@ def create_app() -> FastAPI:
     async def dashboard():
         return _serve_index()
 
-    # SPA 404 handler: any path that isn't handled by an API route or the
-    # static-files mount falls here.  API and static paths get a JSON 404;
-    # everything else (React client-side routes) gets index.html.
-    # Using an exception handler instead of a catch-all GET route avoids
-    # route-ordering races where /{full_path:path} can shadow specific API
-    # routes depending on FastAPI/Starlette version internals.
-    @app.exception_handler(404)
-    async def spa_not_found_handler(request: Request, exc):
-        path = request.url.path
-        # Non-GET requests to unknown paths get a JSON 404, never HTML.
-        # Serving index.html for POST/PUT/DELETE would confuse API clients.
-        if request.method != "GET" or path.startswith("/api/") or path.startswith("/static/"):
-            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    # SPA catch-all — must be registered LAST, after every include_router() call.
+    #
+    # WHY a catch-all route instead of @app.exception_handler(404):
+    #   In some Starlette versions the Router satisfies "no route matched" by
+    #   calling `await PlainTextResponse("Not Found", 404)(scope, receive, send)`
+    #   directly — it never raises an HTTPException — so the exception handler
+    #   is never invoked.  A catch-all route is evaluated during normal route
+    #   matching and is therefore version-stable and guaranteed to fire.
+    #
+    # ROUTE ORDER SAFETY:
+    #   All include_router() calls above have already added their routes to the
+    #   app's route list.  Starlette evaluates routes in registration order; the
+    #   `path` converter has the lowest specificity, so every concrete /api/*
+    #   route registered earlier takes priority and the catch-all only fires when
+    #   nothing else matched.
+    @app.get("/{full_path:path}", response_class=HTMLResponse, include_in_schema=False)
+    async def spa_catchall(request: Request, full_path: str):
+        # Unmatched API or static paths get a JSON 404 — never HTML.
+        if full_path.startswith(("api/", "static/")):
+            raise HTTPException(status_code=404, detail="Not Found")
+        # Everything else is a React client-side route — serve the SPA shell.
         return _serve_index()
 
     return app
