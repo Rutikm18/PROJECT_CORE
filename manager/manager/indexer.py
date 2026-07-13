@@ -122,6 +122,9 @@ CREATE TABLE IF NOT EXISTS findings (
     -- timestamp}.  A lightweight summary on the finding itself so the UI never
     -- needs to join to soc_activity just to show "who did what when".
     actions_log       TEXT    NOT NULL DEFAULT '[]',
+    -- Ingest dedup tracking (promoted from _SOC_MIGRATIONS so fresh DBs have them)
+    content_changed_at    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    consecutive_unchanged INTEGER          NOT NULL DEFAULT 0,
     UNIQUE(agent_id, category, item_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_find_external_id ON findings(external_id);
@@ -602,6 +605,54 @@ CREATE TABLE IF NOT EXISTS allowlist_suggestions (
     reviewed_at  DOUBLE PRECISION,
     UNIQUE(rule_id, entity_key)
 );
+
+-- ── Analyst-defined custom correlation rules ──────────────────────────────
+CREATE TABLE IF NOT EXISTS custom_correlation_rules (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL DEFAULT '',
+    description        TEXT NOT NULL DEFAULT '',
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    action             TEXT NOT NULL DEFAULT 'alert',
+    severity           TEXT NOT NULL DEFAULT 'medium',
+    confidence         INTEGER NOT NULL DEFAULT 70,
+    conditions         TEXT NOT NULL DEFAULT '{"operator":"AND","rules":[]}',
+    required_count     INTEGER NOT NULL DEFAULT 1,
+    time_window_hours  INTEGER NOT NULL DEFAULT 24,
+    tags               TEXT NOT NULL DEFAULT '[]',
+    attack_chain       TEXT NOT NULL DEFAULT '[]',
+    recommendation     TEXT NOT NULL DEFAULT '',
+    created_by         TEXT NOT NULL DEFAULT 'analyst',
+    created_at         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    hit_count          INTEGER NOT NULL DEFAULT 0,
+    last_hit_at        DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_custom_corr_enabled ON custom_correlation_rules(enabled, created_at DESC);
+
+-- ── Per-finding case management ───────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS finding_cases (
+    finding_id  INTEGER          PRIMARY KEY,
+    status      TEXT             NOT NULL DEFAULT 'new',
+    assignee    TEXT             NOT NULL DEFAULT '',
+    priority    INTEGER          NOT NULL DEFAULT 3,
+    due_date    TEXT             NOT NULL DEFAULT '',
+    notes       TEXT             NOT NULL DEFAULT '',
+    sla_due_at  TEXT             NOT NULL DEFAULT '',
+    created_at  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at  DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS finding_timeline (
+    id          BIGSERIAL        PRIMARY KEY,
+    finding_id  INTEGER          NOT NULL,
+    actor       TEXT             NOT NULL DEFAULT 'system',
+    action      TEXT             NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    note        TEXT,
+    created_at  DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_finding_timeline_fid ON finding_timeline(finding_id, id);
 """
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}

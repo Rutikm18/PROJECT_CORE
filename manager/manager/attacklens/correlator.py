@@ -586,6 +586,144 @@ CORRELATION_RULES: list[dict] = [
             "Audit for reverse shell sessions that may be operating through the tunnel."
         ),
     },
+
+    # ── 22. Container Escape → Privilege Escalation ──────────────────────────
+    {
+        "id":          "corr:container_escape_privesc",
+        "title":       "Container Escape + Host Privilege Escalation",
+        "description": (
+            "A container escape technique (nsenter, docker --privileged, cgroup v1 release_agent) "
+            "detected alongside a host-level privilege escalation signal. Container breakout with "
+            "immediate host root access is one of the highest-severity cloud/container attack patterns."
+        ),
+        "required_categories": ["container", "process"],
+        "severity":    "critical",
+        "score":       9.6,
+        "confidence":  91,
+        "time_window_hours": 6,
+        "attack_chain": [
+            {"tactic": "Privilege Escalation", "technique": "T1611",  "label": "Container escape executed"},
+            {"tactic": "Privilege Escalation", "technique": "T1548",  "label": "Host root access obtained"},
+            {"tactic": "Execution",            "technique": "T1059",  "label": "Host-level command execution"},
+        ],
+        "recommendation": (
+            "Immediately isolate the compromised container AND the host. Container escapes give host root. "
+            "Capture container + host memory snapshots. Revoke all cloud API keys/service account tokens "
+            "accessible from that host. Rotate any secrets that were mounted into the container. "
+            "Audit all containers with --privileged or host PID/network namespace access."
+        ),
+    },
+
+    # ── 23. ARP Spoofing + Lateral Movement ──────────────────────────────────
+    {
+        "id":          "corr:arp_spoof_lateral",
+        "title":       "ARP Spoofing + Lateral Movement Signal",
+        "description": (
+            "ARP spoofing/cache poisoning detected (duplicate MAC-IP mapping or gratuitous ARP flood) "
+            "alongside lateral movement signals (connections to internal IPs on RDP/SSH/SMB). "
+            "Classic MitM attack setup — attacker intercepting adjacent host traffic before pivoting."
+        ),
+        "required_categories": ["arp", "connection"],
+        "severity":    "critical",
+        "score":       9.2,
+        "confidence":  87,
+        "time_window_hours": 12,
+        "attack_chain": [
+            {"tactic": "Collection",      "technique": "T1557.002", "label": "ARP poisoning / MitM"},
+            {"tactic": "Lateral Movement","technique": "T1021",      "label": "Adjacent host access"},
+            {"tactic": "Credential Access","technique": "T1557",     "label": "Credential interception"},
+        ],
+        "recommendation": (
+            "Enable Dynamic ARP Inspection (DAI) on managed switches. Isolate the spoofing host immediately. "
+            "Reset all sessions that transited through the MitM host (re-auth all users on the subnet). "
+            "Check for HTTPS stripping — assume all plaintext credentials in that window are compromised."
+        ),
+    },
+
+    # ── 24. Data Exfiltration Trifecta ───────────────────────────────────────
+    {
+        "id":          "corr:data_exfil_trifecta",
+        "title":       "Data Exfiltration Trifecta: High Egress + External Connection + Exfil Tool",
+        "description": (
+            "Three concurrent exfiltration signals: (1) sustained high outbound network throughput "
+            "(behavioral anomaly), (2) active connection to an external IP, and (3) a process matching "
+            "an exfiltration tool pattern (curl/wget/rclone/scp). This combination is a confirmed "
+            "data exfiltration event with active, measurable data movement."
+        ),
+        "required_categories": ["behavioral", "connection", "process"],
+        "required_sources":    ["behavioral_threshold", "rule:process_pattern"],
+        "severity":    "critical",
+        "score":       9.4,
+        "confidence":  89,
+        "time_window_hours": 4,
+        "attack_chain": [
+            {"tactic": "Collection",    "technique": "T1005",  "label": "Local data staged"},
+            {"tactic": "Exfiltration",  "technique": "T1048",  "label": "Exfil over alternative channel"},
+            {"tactic": "Exfiltration",  "technique": "T1041",  "label": "Exfil over command channel"},
+        ],
+        "recommendation": (
+            "Block the destination IP/domain at the firewall IMMEDIATELY — data is actively leaving. "
+            "Kill the exfiltration process and preserve memory for forensics. "
+            "Determine what was staged: check for archive files (.zip, .tar, .7z) in /tmp or ~/Desktop. "
+            "Notify DLP/legal and start incident response timeline. Scope data volume from netflow."
+        ),
+    },
+
+    # ── 25. Process Injection + Privilege Escalation ─────────────────────────
+    {
+        "id":          "corr:proc_injection_privesc",
+        "title":       "Process Injection + Privilege Escalation",
+        "description": (
+            "Process hollowing or library injection detected (in-memory image differs from disk, "
+            "or LD_PRELOAD/DYLD_INSERT_LIBRARIES set) alongside a privilege escalation signal "
+            "(SUID binary, new UID-0 account, or admin grant). This is the classic inject-and-escalate "
+            "pattern used by APT actors and ransomware pre-deployment."
+        ),
+        "required_categories": ["process", "binary"],
+        "severity":    "critical",
+        "score":       9.5,
+        "confidence":  90,
+        "time_window_hours": 12,
+        "attack_chain": [
+            {"tactic": "Defense Evasion",      "technique": "T1055.012", "label": "Process hollowing / injection"},
+            {"tactic": "Privilege Escalation", "technique": "T1548",     "label": "Escalation to root/admin"},
+            {"tactic": "Execution",            "technique": "T1059",     "label": "Privileged payload execution"},
+        ],
+        "recommendation": (
+            "This is a sophisticated attack. Isolate immediately. The hollowed process is running "
+            "attacker code under a trusted name (common AV evasion). Capture memory with a forensics "
+            "tool before killing processes. Identify what the injected code did — check for new files, "
+            "network connections, and plist modifications made by the injected process."
+        ),
+    },
+
+    # ── 26. File Integrity Chain ──────────────────────────────────────────────
+    {
+        "id":          "corr:file_integrity_chain",
+        "title":       "File Integrity Chain: SSH Keys + Sudoers + New Service",
+        "description": (
+            "Multiple file integrity signals detected together: SSH authorized_keys modified, "
+            "sudoers file changed, AND a new or modified service registered. This is the complete "
+            "attacker persistence playbook — backdoor key, privileged execution, and service "
+            "persistence all installed in the same window."
+        ),
+        "required_categories": ["config", "service"],
+        "severity":    "critical",
+        "score":       9.7,
+        "confidence":  93,
+        "time_window_hours": 12,
+        "attack_chain": [
+            {"tactic": "Persistence",          "technique": "T1098.004", "label": "SSH backdoor key added"},
+            {"tactic": "Privilege Escalation", "technique": "T1548.003", "label": "sudoers NOPASSWD inserted"},
+            {"tactic": "Persistence",          "technique": "T1543.004", "label": "Malicious service installed"},
+        ],
+        "recommendation": (
+            "Full post-compromise response required. Revoke all SSH keys on the host and rotate SSH CAs. "
+            "Restore /etc/sudoers from backup and audit /etc/sudoers.d/ for injected rules. "
+            "Remove the suspicious service and its binary. Change ALL passwords and API tokens on the host. "
+            "Assume the attacker has had long-term access — review the last 30 days of auth logs."
+        ),
+    },
 ]
 
 

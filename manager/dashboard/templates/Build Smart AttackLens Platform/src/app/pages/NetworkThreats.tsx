@@ -369,15 +369,8 @@ export default function NetworkThreats() {
       {/* ── Main detection table ──────────────────────────────────────────────── */}
       <TerrainDetectionPage
         key={pageKey}
-        title="Vector — Network Threats"
-        subtitle={
-          validatedOnly
-            ? "Auto-promoted by Detection Confidence — precision_score ≥ configured threshold"
-            : "Network connectivity · ports · interfaces · mounts · shares · IOC correlation"
-        }
         apiUrl={baseUrl}
         accent="red"
-        icon={<Globe className="w-5 h-5 text-blue-500" />}
         emptyMsg={
           validatedOnly
             ? "No validated findings in Vector."

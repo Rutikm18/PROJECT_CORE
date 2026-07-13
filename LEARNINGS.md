@@ -185,3 +185,31 @@
 ### Incidents page terrain-tab counts + severity distribution bar
 **What:** Incidents.tsx fetches the full dataset with a second `useDetectionData` call to compute per-terrain finding counts (shown as chip badges on terrain tabs) and a severity distribution bar (stacked proportional bar + count legend) that updates as the filter state changes.
 **Why:** Terrain tabs with counts let an analyst immediately see where incidents are concentrated without clicking each tab. The severity bar provides the same information as four separate count tiles but in a more visual, scannable format that's faster to parse under time pressure.
+
+## 2026-07-12
+
+### Shared-component bulk selection via `Set<number>` + `POST /api/v1/soc/bulk`
+**What:** Bulk selection state (`Set<number>` named `bulkSel`) with `toggleOne`, `toggleAll`, `clearBulkSel`, and `doBulk` lives inside `TerrainDetectionPage` in `DetectionShared.tsx`. `doBulk` posts `{ finding_ids, action, value, actor }` to `/api/v1/soc/bulk`, clears the set, and calls `refetch()`. The toolbar (6 actions: Triage/Investigate/Remediate/Close/FalsePos/AcceptRisk) is RBAC-gated via `can("bulk_action")` from `useRBAC`.
+**Why:** All four terrain pages (Origin/Vector/Citadels + Incidents list) use `TerrainDetectionPage` as their table host, so implementing bulk selection once in the shared component propagates it everywhere. Replicating ThreatQueue's standalone bulk pattern inside the shared component avoids copy-pasting across four page files.
+
+### `e.stopPropagation()` on a cell for dual-action row click
+**What:** The checkbox `<td>` has its own `onClick={e => { e.stopPropagation(); toggleOne(f.id); }}`, while the parent `<tr>` retains `onClick={() => setSelected(...)}` to open the detail drawer. The cell renders `CheckSquare` or `Square` and an orange row background when `bulkSel.has(f.id)`.
+**Why:** Without `stopPropagation`, clicking the checkbox both selects the row AND opens the drawer — conflicting intents. Stopping propagation on the cell is the minimal fix: checkbox-click stays a pure toggle, row-click-elsewhere still opens the drawer normally.
+
+## 2026-07-13
+
+### FastAPI 404 exception handler as SPA catch-all replacement
+**What:** Replace `@app.get("/{full_path:path}")` SPA catch-all with `@app.exception_handler(404)` that checks the request path — API/static paths return `JSONResponse(404)`, all other 404s return `index.html`. This means no route is registered that can shadow real API routes.
+**Why:** The catch-all GET route was intercepting `GET /api/v1/custom-correlations` despite being registered after the API router. The exception handler fires only when no route matches, so it can never shadow a real route — eliminating the route-ordering race entirely.
+
+### IntelDB write pattern: `_conn.execute()` + `_conn.commit()`
+**What:** `IntelDB` exposes `_fetchone(sql, args)` and `_fetchall(sql, args)` for reads. Writes must go through `await intel_db._conn.execute(sql, args)` followed by `await intel_db._conn.commit()`. There is no `_execute()` method.
+**Why:** The original Custom Correlation API used `intel_db._execute()` which does not exist, causing every write to raise `AttributeError` (surfaced as a 500 or 404 depending on which handler ran). Replacing all write calls with the correct pattern fixed the CRUD API.
+
+### SQL column names from `indexer._SCHEMA`: use `last_detected_at` / `first_detected_at`
+**What:** The `findings` table has `last_detected_at` and `first_detected_at` columns. There is no `detected_at` or `created_at` column on findings.
+**Why:** Multiple query strings in `custom_correlations.py` and `custom_correlator.py` ordered by `detected_at DESC` or filtered on `detected_at`, hitting "column does not exist" errors. Correcting to `last_detected_at` fixed ordering and time-window filtering.
+
+### Base `CREATE TABLE` must include migration columns
+**What:** Columns added later via `_SOC_MIGRATIONS` must also exist in the base `CREATE TABLE` statement in `_SCHEMA`; otherwise a fresh database (no prior migrations) initializes without those columns, causing runtime errors on any query that references them.
+**Why:** `consecutive_unchanged` and `content_changed_at` were only in `_SOC_MIGRATIONS`, so fresh Postgres DBs (e.g. in CI) failed `upsert_finding` with "column does not exist". Adding both to the base `CREATE TABLE findings` fixed fresh-start initialization.

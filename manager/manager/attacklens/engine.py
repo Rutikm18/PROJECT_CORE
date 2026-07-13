@@ -46,7 +46,8 @@ from .allowlist import (
 from .behavioral  import BehavioralAnalyzer
 from .feeds       import FeedManager
 from .nvd         import CVELookup
-from .correlator  import CorrelationEngine
+from .correlator        import CorrelationEngine
+from .custom_correlator import CustomCorrelator
 from .fleet_correlator import FleetCorrelator
 from .signals     import Signal, layer_for
 from .detections  import (
@@ -245,8 +246,9 @@ class AttackLensEngine:
         self._feeds   = FeedManager(intel_db)
         self._nvd     = CVELookup(intel_db)
         self._behav   = BehavioralAnalyzer(intel_db)
-        self._corr    = CorrelationEngine(intel_db)
-        self._fleet   = FleetCorrelator(intel_db, db)   # cross-host / global-threat layer
+        self._corr         = CorrelationEngine(intel_db)
+        self._custom_corr  = CustomCorrelator(intel_db)   # analyst-defined rules
+        self._fleet        = FleetCorrelator(intel_db, db)  # cross-host / global-threat layer
         # Optional AI analyst — used by the precision validator if set.
         # Server wiring assigns this after both objects are constructed.
         self._ai_analyst = ai_analyst
@@ -1165,7 +1167,7 @@ class AttackLensEngine:
             self._correlate_inflight.discard(agent_id)
 
     async def _run_correlations(self, agent_id: str) -> None:
-        """Evaluate cross-section correlation rules and store results."""
+        """Evaluate cross-section correlation rules (built-in + custom) and store results."""
         try:
             correlations = await self._corr.correlate(agent_id)
             ts = time.time()
@@ -1173,6 +1175,58 @@ class AttackLensEngine:
                 await self._idb.upsert_correlation(c, ts)
         except Exception as exc:
             log.warning("Correlation error agent=%s: %s", agent_id, exc)
+        # Custom analyst-defined rules — run independently so a bug here never
+        # suppresses built-in correlation results.
+        try:
+            custom_hits = await self._custom_corr.correlate(agent_id)
+            ts = time.time()
+            for c in custom_hits:
+                action = c.get("action", "alert")
+                if action == "suppress":
+                    # Suppress: find matching findings and mark false_positive
+                    for sig in (c.get("signals") or []):
+                        fid = sig.get("id")
+                        if fid:
+                            try:
+                                await self._idb._conn.execute(
+                                    "UPDATE findings SET status='false_positive', is_active=0 WHERE id=?",
+                                    (fid,),
+                                )
+                                await self._idb._conn.commit()
+                            except Exception:
+                                pass
+                elif action == "elevate":
+                    # Elevate: raise severity of matched findings
+                    for sig in (c.get("signals") or []):
+                        fid = sig.get("id")
+                        if fid:
+                            try:
+                                await self._idb._conn.execute(
+                                    "UPDATE findings SET severity='critical', score=9.5 WHERE id=? AND severity IN ('medium','low','info')",
+                                    (fid,),
+                                )
+                                await self._idb._conn.commit()
+                            except Exception:
+                                pass
+                elif action == "tag":
+                    # Tag: append custom tags to matched findings' tags field
+                    for sig in (c.get("signals") or []):
+                        fid = sig.get("id")
+                        if fid:
+                            try:
+                                extra = json.dumps(c.get("custom_tags") or [])
+                                await self._idb._conn.execute(
+                                    "UPDATE findings SET tags = json_array_extend(COALESCE(tags,'[]'), ?) WHERE id=?",
+                                    (extra, fid),
+                                )
+                                await self._idb._conn.commit()
+                            except Exception:
+                                pass
+                else:
+                    # alert (default): persist as a correlation finding
+                    await self._idb.upsert_correlation(c, ts)
+        except Exception as exc:
+            log.warning("Custom correlation error agent=%s: %s", agent_id, exc)
 
     async def run_fleet_correlations(self) -> None:
         """Public trigger for the cross-host sweep (e.g. a periodic scheduler)."""

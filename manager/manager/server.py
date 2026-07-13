@@ -399,7 +399,9 @@ def create_app() -> FastAPI:
     from .api.detection  import make_detection_router
     from .api.accuracy   import make_accuracy_router
     from .api.settings   import make_settings_router
-    from .api.allowlist  import make_allowlist_router
+    from .api.allowlist              import make_allowlist_router
+    from .api.custom_correlations   import make_custom_correlations_router
+    from .api.cases                 import make_cases_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
@@ -430,7 +432,9 @@ def create_app() -> FastAPI:
     detection_router  = make_detection_router(intel_db, db)
     accuracy_router   = make_accuracy_router(intel_db)
     settings_router   = make_settings_router(intel_db, store, db)
-    allowlist_router  = make_allowlist_router(intel_db)
+    allowlist_router          = make_allowlist_router(intel_db)
+    custom_correlations_router = make_custom_correlations_router(intel_db)
+    cases_router               = make_cases_router(intel_db)
 
     app.include_router(ingest_router,       prefix="/api/v1")
     app.include_router(agents_router,       prefix="/api/v1/agents")
@@ -445,7 +449,9 @@ def create_app() -> FastAPI:
     app.include_router(detection_router,  prefix="/api/v1/detection")
     app.include_router(accuracy_router,   prefix="/api/v1/accuracy")
     app.include_router(settings_router,   prefix="/api/v1/settings")
-    app.include_router(allowlist_router,  prefix="/api/v1/allowlist")
+    app.include_router(allowlist_router,          prefix="/api/v1/allowlist")
+    app.include_router(custom_correlations_router, prefix="/api/v1/custom-correlations")
+    app.include_router(cases_router,               prefix="/api/v1/cases")
     app.include_router(intel_router)              # prefix=/api/v1/intel defined inline
     app.include_router(finding_validation_router) # prefix=/api/v1/findings (POST /{id}/validate etc.)
     app.include_router(remediation_router)        # prefixes defined inline (actors, news, overview)
@@ -596,17 +602,17 @@ def create_app() -> FastAPI:
     async def dashboard():
         return _serve_index()
 
-    # SPA catch-all: any path that doesn't match an API route or /static/*
-    # must return index.html so React Router can handle client-side navigation.
-    # This is what makes direct URL access (/settings, /findings, etc.) work.
-    # Registered last so it never shadows API routes.
-    @app.get("/{full_path:path}", response_class=HTMLResponse)
-    async def spa_fallback(full_path: str):
-        # Let the static-files mount handle /static/* itself; only fall through
-        # for non-static, non-API paths that are purely client-side routes.
-        if full_path.startswith("api/") or full_path.startswith("static/"):
-            from fastapi import HTTPException
-            raise HTTPException(status_code=404)
+    # SPA 404 handler: any path that isn't handled by an API route or the
+    # static-files mount falls here.  API and static paths get a JSON 404;
+    # everything else (React client-side routes) gets index.html.
+    # Using an exception handler instead of a catch-all GET route avoids
+    # route-ordering races where /{full_path:path} can shadow specific API
+    # routes depending on FastAPI/Starlette version internals.
+    @app.exception_handler(404)
+    async def spa_not_found_handler(request: Request, exc):
+        path = request.url.path
+        if path.startswith("/api/") or path.startswith("/static/"):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
         return _serve_index()
 
     return app

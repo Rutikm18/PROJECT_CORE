@@ -16,6 +16,7 @@ import {
   Cpu, Eye, EyeOff, Zap, ExternalLink, TestTube2,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { setTimezone, tzAbbr, tzOffsetStr, TIMEZONE_LIST, TZ_DEFAULT, isValidTimezone, fmtTime } from "../context/timezoneStore";
 
 const API = "/api/v1/settings";
 
@@ -64,7 +65,7 @@ const EMPTY: OrgSettings = {
   org_industry: "", org_size: "", issue_date: "", valid_until: "",
   license_key: "", role_admin_label: "Administrator",
   role_analyst_label: "SOC Analyst", role_viewer_label: "Read-Only Viewer",
-  platform_refresh_secs: "30", platform_timezone: "UTC",
+  platform_refresh_secs: "30", platform_timezone: TZ_DEFAULT,
   platform_max_page: "50", notif_critical_email: "false",
   notif_sla_breach: "false", notif_digest_daily: "false",
   notif_email_recipient: "",
@@ -191,6 +192,8 @@ export default function Settings() {
       setLicense(d.license ?? null);
       setRoles(d.roles ?? {});
       setError(null);
+      // Seed the localStorage-backed timezone store from the authoritative backend value
+      if (d.settings?.platform_timezone) setTimezone(d.settings.platform_timezone);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); }
   }, []);
@@ -222,6 +225,8 @@ export default function Settings() {
       setDirty(false);
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
+      // Propagate timezone change to the header clock instantly (no page reload)
+      if (d.settings?.platform_timezone) setTimezone(d.settings.platform_timezone);
     } catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   };
@@ -646,14 +651,46 @@ export default function Settings() {
               </select>
             </Field>
 
-            <Field label="Timezone">
-              <select value={form.platform_timezone} onChange={e => set("platform_timezone", e.target.value)} className={selectCls}>
-                {["UTC","America/New_York","America/Chicago","America/Los_Angeles","America/Toronto",
-                  "Europe/London","Europe/Paris","Europe/Berlin","Asia/Dubai","Asia/Kolkata",
-                  "Asia/Singapore","Asia/Tokyo","Australia/Sydney"].map(tz => (
-                  <option key={tz} value={tz}>{tz}</option>
-                ))}
+            <Field label="Timezone" hint="Used for all clocks and timestamps across the platform">
+              {/* Grouped timezone select */}
+              <select
+                value={form.platform_timezone}
+                onChange={e => { set("platform_timezone", e.target.value); setTimezone(e.target.value); }}
+                className={selectCls}
+              >
+                {(["UTC", "Asia", "Europe", "Americas", "Pacific", "Africa"] as const).map(group => {
+                  const items = TIMEZONE_LIST.filter(t => t.group === group);
+                  return (
+                    <optgroup key={group} label={group}>
+                      {items.map(({ tz, label }) => (
+                        <option key={tz} value={tz}>{label}</option>
+                      ))}
+                    </optgroup>
+                  );
+                })}
               </select>
+
+              {/* Live preview */}
+              <div className="mt-2.5 flex items-center gap-2 px-3 py-2.5 rounded-xl bg-gray-50 border border-gray-100">
+                <Clock className="w-3.5 h-3.5 text-orange-500 flex-shrink-0" />
+                <div className="min-w-0">
+                  <span className="text-[10px] font-semibold text-gray-700">
+                    {fmtTime(form.platform_timezone)}
+                  </span>
+                  <span className="text-[10px] text-gray-400 mx-1.5">·</span>
+                  <span className="text-[10px] text-gray-500">
+                    {isValidTimezone(form.platform_timezone)
+                      ? new Date().toLocaleDateString("en-US", {
+                          weekday: "short", day: "numeric", month: "short", year: "numeric",
+                          timeZone: form.platform_timezone,
+                        })
+                      : "—"}
+                  </span>
+                  <span className="text-[9px] font-bold text-orange-600 ml-2 px-1.5 py-0.5 bg-orange-50 border border-orange-200 rounded-md">
+                    {tzAbbr(form.platform_timezone)} (UTC{tzOffsetStr(form.platform_timezone)})
+                  </span>
+                </div>
+              </div>
             </Field>
 
             <Field label="Findings per page">

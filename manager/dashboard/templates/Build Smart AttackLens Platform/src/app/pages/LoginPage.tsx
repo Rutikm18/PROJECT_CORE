@@ -142,7 +142,7 @@ export default function LoginPage({ onSuccess }: LoginPageProps) {
           />
           <h1 className="text-2xl font-bold text-white tracking-tight">AttackLens</h1>
           <p className="text-sm mt-1" style={{ color: "rgba(255,255,255,0.4)" }}>
-            Security Operations Platform
+            Agentic Exposure Management Platform
           </p>
         </div>
 

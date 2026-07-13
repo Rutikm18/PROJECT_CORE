@@ -13,7 +13,7 @@ import {
   Crosshair, BarChart3, Monitor, Database,
   ClipboardList, LayoutDashboard, Activity,
   Settings, Server, Building2, MapPin, Layers,
-  ShieldCheck,
+  ShieldCheck, GitMerge,
 } from "lucide-react";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 
@@ -104,8 +104,9 @@ const GROUPS: NavGroup[] = [
     label: "Inventory & Analysis",
     items: [
       { label: "Timeline & History", to: "/timeline",          icon: BarChart3 },
-      { label: "Deep Analysis",      to: "/analysis/deep",     icon: Database  },
-      { label: "Asset Registry",     to: "/assets",            icon: Monitor   },
+      { label: "Deep Analysis",      to: "/analysis/deep",         icon: Database  },
+      { label: "Correlation Rules",  to: "/analysis/custom-rules", icon: GitMerge  },
+      { label: "Asset Registry",     to: "/assets",                icon: Monitor   },
       // { label: "Detection Accuracy", to: "/analysis/accuracy", icon: Activity  },
       // { label: "Detection Coverage", to: "/analysis/coverage", icon: Layers    },
     ],

@@ -15,8 +15,11 @@ import {
   Radio, ChevronRight, ChevronDown,
   Plus, Trash2, SlidersHorizontal, Cpu, Clock, ArrowUpRight,
   MessageSquare, Lightbulb, TriangleAlert,
+  CheckSquare, Square,
+  Briefcase, Calendar, User, Send, ArrowRight, Layers, FileText,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { useRBAC } from "../context/RBACContext";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1490,9 +1493,349 @@ export function OSRemediationPanel({
 }
 
 
+// ── Case panel (Case tab inside FindingDetail) ────────────────────────────────
+
+interface FindingCase {
+  finding_id: number;
+  status:     string;
+  assignee:   string;
+  priority:   number;
+  due_date:   string;
+  notes:      string;
+  sla_due_at: string;
+  created_at: number;
+  updated_at: number;
+}
+
+interface TimelineEntry {
+  id:          number;
+  actor:       string;
+  action:      string;
+  from_status?: string | null;
+  to_status?:  string | null;
+  note?:       string | null;
+  elapsed:     string;
+}
+
+const CASE_FLOW   = ["new", "triaging", "investigating", "in_remediation", "closed"] as const;
+const CASE_LABELS: Record<string, string> = {
+  new: "New", triaging: "Triaging", investigating: "Investigating",
+  in_remediation: "In Remediation", closed: "Closed",
+};
+
+function CasePanel({ finding }: { finding: DetectionFinding }) {
+  const [caseData,        setCaseData]        = useState<FindingCase | null>(null);
+  const [timeline,        setTimeline]        = useState<TimelineEntry[]>([]);
+  const [loadingCase,     setLoadingCase]     = useState(true);
+  const [loadingTimeline, setLoadingTimeline] = useState(true);
+  const [saving,          setSaving]          = useState(false);
+  const [posting,         setPosting]         = useState(false);
+  const [err,             setErr]             = useState<string | null>(null);
+  const [saved,           setSaved]           = useState(false);
+
+  const [status,   setStatus]   = useState("triaging");
+  const [assignee, setAssignee] = useState("");
+  const [priority, setPriority] = useState(3);
+  const [dueDate,  setDueDate]  = useState("");
+  const [notes,    setNotes]    = useState("");
+  const [noteText, setNoteText] = useState("");
+
+  const fetchTimeline = useCallback(async () => {
+    setLoadingTimeline(true);
+    try {
+      const r = await fetch(`/api/v1/cases/${finding.id}/timeline`);
+      if (!r.ok) return;
+      const d = await r.json();
+      setTimeline(d.timeline ?? []);
+    } finally { setLoadingTimeline(false); }
+  }, [finding.id]);
+
+  const fetchCase = useCallback(async () => {
+    setLoadingCase(true);
+    try {
+      const r = await fetch(`/api/v1/cases/${finding.id}`);
+      if (r.status === 404) { setCaseData(null); return; }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d: FindingCase = await r.json();
+      setCaseData(d);
+      setStatus(d.status ?? "triaging");
+      setAssignee(d.assignee ?? "");
+      setPriority(d.priority ?? 3);
+      setDueDate(d.due_date ?? "");
+      setNotes(d.notes ?? "");
+    } finally { setLoadingCase(false); }
+  }, [finding.id]);
+
+  useEffect(() => { fetchCase(); fetchTimeline(); }, [fetchCase, fetchTimeline]);
+
+  const saveCase = async (override?: { status: string }) => {
+    setSaving(true); setErr(null);
+    try {
+      const r = await fetch(`/api/v1/cases/${finding.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          status: override?.status ?? status,
+          assignee, priority, due_date: dueDate, notes, actor: "analyst",
+        }),
+      });
+      if (!r.ok) { setErr(`Save failed (${r.status})`); return; }
+      const d: FindingCase = await r.json();
+      setCaseData(d);
+      if (override?.status) setStatus(override.status);
+      setSaved(true); setTimeout(() => setSaved(false), 2000);
+      fetchTimeline();
+    } catch { setErr("Network error"); }
+    finally { setSaving(false); }
+  };
+
+  const postNote = async () => {
+    if (!noteText.trim()) return;
+    setPosting(true); setErr(null);
+    try {
+      const r = await fetch(`/api/v1/cases/${finding.id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ actor: "analyst", note: noteText.trim() }),
+      });
+      if (!r.ok) { setErr(`Failed (${r.status})`); return; }
+      setNoteText(""); fetchTimeline();
+    } catch { setErr("Network error"); }
+    finally { setPosting(false); }
+  };
+
+  const slaColor = (() => {
+    if (!caseData?.sla_due_at) return "none";
+    const diff = new Date(caseData.sla_due_at).getTime() - Date.now();
+    if (isNaN(diff)) return "none";
+    return diff < 0 ? "red" : diff < 172_800_000 ? "amber" : "green";
+  })();
+
+  if (loadingCase) {
+    return (
+      <div className="flex items-center justify-center gap-2 py-16 text-[11px] text-gray-400">
+        <RefreshCw className="w-3.5 h-3.5 animate-spin" />Loading case…
+      </div>
+    );
+  }
+
+  if (!caseData) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 gap-3 px-6 text-center">
+        <div className="w-12 h-12 rounded-2xl bg-orange-50 border border-orange-200 flex items-center justify-center">
+          <Briefcase className="w-5 h-5 text-orange-400" />
+        </div>
+        <p className="text-[12px] font-bold text-gray-700">No case opened yet</p>
+        <p className="text-[10px] text-gray-400 max-w-xs leading-relaxed">Open a case to track triage workflow, assign an owner, set SLA deadlines, and log investigation notes.</p>
+        <button onClick={() => saveCase({ status: "triaging" })} disabled={saving}
+          className="flex items-center gap-2 px-5 py-2.5 bg-orange-500 hover:bg-orange-600 text-white text-[11px] font-bold rounded-xl transition-all shadow-sm hover:shadow-md disabled:opacity-60">
+          <Briefcase className="w-3.5 h-3.5" />Open Case
+        </button>
+      </div>
+    );
+  }
+
+  const flowIdx = CASE_FLOW.indexOf(status as typeof CASE_FLOW[number]);
+
+  return (
+    <div className="bg-gray-50/30">
+      <div className="space-y-px">
+
+        {/* ── Case Workflow ─────────────────────────────────────────────── */}
+        <div className="bg-white px-5 py-4">
+          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3">Case Workflow</div>
+          <div className="overflow-x-auto pb-1">
+            <div className="flex items-center gap-0">
+              {CASE_FLOW.map((s, i) => {
+                const done   = i < flowIdx;
+                const active = s === status;
+                return (
+                  <div key={s} className="flex items-center">
+                    <button
+                      onClick={() => saveCase({ status: s })}
+                      disabled={saving}
+                      className={cn(
+                        "px-2.5 py-1 text-[9px] font-bold rounded-full border transition-all hover:opacity-80",
+                        active ? "bg-orange-500 text-white border-orange-500 shadow-sm" :
+                        done   ? "bg-green-50 text-green-600 border-green-200" :
+                                 "bg-gray-50 text-gray-400 border-gray-200"
+                      )}>
+                      {done && <span className="mr-0.5">✓</span>}
+                      {CASE_LABELS[s]}
+                    </button>
+                    {i < CASE_FLOW.length - 1 && (
+                      <ArrowRight className={cn("w-3 h-3 mx-0.5 flex-shrink-0", done ? "text-green-400" : "text-gray-200")} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* ── Move To ──────────────────────────────────────────────────── */}
+        <div className="bg-white px-5 py-4">
+          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+            <GitBranch className="w-3.5 h-3.5 text-orange-500" />Move To
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {([
+              { label: "Investigating",  icon: <Search className="w-3.5 h-3.5" />,   s: "investigating",  cls: "bg-blue-50 text-blue-700 border-blue-300" },
+              { label: "False Positive", icon: <XCircle className="w-3.5 h-3.5" />,  s: "false_positive", cls: "bg-gray-100 text-gray-500 border-gray-300", note: "→ close" },
+              { label: "Accepted Risk",  icon: <Shield className="w-3.5 h-3.5" />,   s: "accepted_risk",  cls: "bg-amber-50 text-amber-600 border-amber-300", note: "→ close" },
+              { label: "Duplicate",      icon: <Layers className="w-3.5 h-3.5" />,   s: "duplicate",      cls: "bg-gray-100 text-gray-400 border-gray-200", note: "→ close" },
+            ] as { label: string; icon: React.ReactNode; s: string; cls: string; note?: string }[]).map(a => (
+              <button key={a.s}
+                onClick={() => saveCase({ status: a.s })}
+                disabled={saving || status === a.s}
+                className={cn("flex items-center gap-1.5 px-3.5 py-2 rounded-xl border text-[11px] font-bold transition-all hover:shadow-sm disabled:opacity-50", a.cls)}>
+                {a.icon}{a.label}
+                {a.note && <span className="text-[9px] opacity-50">{a.note}</span>}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ── Assignment ───────────────────────────────────────────────── */}
+        <div className="bg-white px-5 py-4 space-y-4">
+          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+            <User className="w-3.5 h-3.5 text-orange-500" />Assignment
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-[10px] text-gray-500 font-semibold block mb-1.5">Assignee</label>
+              <input type="text" placeholder="analyst@company.com" value={assignee}
+                onChange={e => setAssignee(e.target.value)}
+                className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 transition-all" />
+            </div>
+            <div>
+              <label className="text-[10px] text-gray-500 font-semibold block mb-1.5">Priority</label>
+              <select value={priority} onChange={e => setPriority(Number(e.target.value))}
+                className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 cursor-pointer">
+                <option value={1}>P1 · Critical</option>
+                <option value={2}>P2 · High</option>
+                <option value={3}>P3 · Medium</option>
+                <option value={4}>P4 · Low</option>
+                <option value={5}>P5 · Info</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="text-[10px] text-gray-500 font-semibold block mb-1.5 flex items-center gap-1">
+              <Calendar className="w-3.5 h-3.5" />Due Date
+            </label>
+            <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)}
+              className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 transition-all" />
+          </div>
+          <div>
+            <label className="text-[10px] text-gray-500 font-semibold block mb-1.5 flex items-center gap-1">
+              <FileText className="w-3.5 h-3.5" />Analyst Notes
+            </label>
+            <textarea rows={4} placeholder="Investigation notes, context, justification…"
+              value={notes} onChange={e => setNotes(e.target.value)}
+              className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none transition-all leading-relaxed" />
+          </div>
+          {err && <p className="text-[10px] text-red-600">{err}</p>}
+          <button onClick={() => saveCase()} disabled={saving}
+            className="flex items-center gap-2 px-5 py-2.5 bg-orange-500 hover:bg-orange-600 text-white text-[11px] font-bold rounded-xl transition-all shadow-sm hover:shadow-md w-full justify-center disabled:opacity-60">
+            {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+            {saved ? "Saved!" : "Save Case Updates"}
+          </button>
+        </div>
+
+        {/* ── SLA Status ───────────────────────────────────────────────── */}
+        {caseData.sla_due_at && slaColor !== "none" && (
+          <div className="bg-white px-5 py-4">
+            <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5" />SLA Status
+            </div>
+            <div className={cn(
+              "flex items-center gap-3 px-4 py-3 rounded-xl border text-[11px] font-semibold",
+              slaColor === "red"   ? "bg-red-50 border-red-200 text-red-700" :
+              slaColor === "amber" ? "bg-amber-50 border-amber-200 text-amber-700" :
+                                     "bg-green-50 border-green-200 text-green-700"
+            )}>
+              <Clock className={cn("w-4 h-4 flex-shrink-0", slaColor === "red" && "al-heartbeat")} />
+              {slaColor === "red" ? "SLA BREACHED" : slaColor === "amber" ? "SLA AT RISK" : "SLA On Track"}
+              <span className="ml-auto text-[10px] opacity-70">
+                Due {new Date(caseData.sla_due_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* ── Activity Log ─────────────────────────────────────────────── */}
+        <div className="bg-white px-5 py-4">
+          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4 flex items-center gap-1.5">
+            <Activity className="w-3.5 h-3.5 text-orange-500" />Activity Log
+          </div>
+          {loadingTimeline ? (
+            <div className="flex items-center gap-2 text-[10px] text-gray-400 py-4">
+              <RefreshCw className="w-3 h-3 animate-spin" />Loading…
+            </div>
+          ) : timeline.length === 0 ? (
+            <div className="py-6 text-center">
+              <Clock className="w-5 h-5 text-gray-200 mx-auto mb-1.5" />
+              <p className="text-[10px] text-gray-400">No activity yet.</p>
+            </div>
+          ) : (
+            <div className="relative space-y-4">
+              <div className="absolute left-4 top-0 bottom-0 w-0.5 bg-gray-100" />
+              {timeline.map((e, i) => (
+                <div key={e.id} className="flex items-start gap-4 al-row-in" style={{ animationDelay: `${i * 40}ms` }}>
+                  <div className="w-8 h-8 rounded-full bg-orange-50 border-2 border-white ring-1 ring-gray-100 flex items-center justify-center flex-shrink-0 z-10 shadow-sm">
+                    <span className="text-[10px] font-black text-orange-600">{(e.actor[0] ?? "?").toUpperCase()}</span>
+                  </div>
+                  <div className="flex-1 min-w-0 pb-1">
+                    <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                      <span className="text-[11px] font-bold text-gray-800">{e.actor}</span>
+                      <span className="text-[11px] text-gray-500">{e.action}</span>
+                      {e.from_status && e.to_status && (
+                        <span className="text-[10px] text-gray-400 font-mono bg-gray-50 px-1.5 py-0.5 rounded border border-gray-100">
+                          {e.from_status} → {e.to_status}
+                        </span>
+                      )}
+                      <span className="ml-auto text-[10px] text-gray-400 flex-shrink-0">{e.elapsed}</span>
+                    </div>
+                    {e.note && (
+                      <div className="mt-1 text-[10px] text-gray-600 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2 leading-relaxed">
+                        {e.note}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Add Investigation Note ────────────────────────────────────── */}
+        <div className="bg-white px-5 py-4">
+          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+            <MessageSquare className="w-3.5 h-3.5 text-blue-500" />Add Investigation Note
+          </div>
+          <div className="space-y-2.5">
+            <textarea rows={3}
+              placeholder="Add investigation note… (Ctrl+Enter to post)"
+              value={noteText} onChange={e => setNoteText(e.target.value)}
+              onKeyDown={ev => { if (ev.key === "Enter" && ev.ctrlKey) { ev.preventDefault(); postNote(); }}}
+              className="w-full px-3 py-2.5 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none transition-all leading-relaxed" />
+            <button onClick={postNote} disabled={posting || !noteText.trim()}
+              className="flex items-center gap-2 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white text-[11px] font-bold rounded-xl transition-all disabled:opacity-50">
+              {posting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+              Post Note
+            </button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
 // ── Detail panel — 4-tab ─────────────────────────────────────────────────────
 
-type DTab = "overview" | "validation" | "blueprint" | "hunt" | "ai";
+type DTab = "overview" | "validation" | "blueprint" | "hunt" | "ai" | "case";
 
 // One-line "why this matters" caption shown under each field group, so the
 // analyst understands the purpose of every value (customer-POV curation).
@@ -1527,10 +1870,11 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
 
   const TABS: { id: DTab; label: string; icon: React.ReactNode }[] = [
     { id: "overview",   label: "Overview",   icon: <Eye className="w-3 h-3" /> },
-    { id: "ai",         label: "AI Analysis",icon: <Cpu className="w-3 h-3" /> },
+    { id: "ai",         label: "AI",         icon: <Cpu className="w-3 h-3" /> },
     { id: "validation", label: "Validate",   icon: <CheckCircle2 className="w-3 h-3" /> },
     { id: "blueprint",  label: "Blueprint",  icon: <BookOpen className="w-3 h-3" /> },
     { id: "hunt",       label: "Hunt",       icon: <Crosshair className="w-3 h-3" /> },
+    { id: "case",       label: "Case",       icon: <Briefcase className="w-3 h-3" /> },
   ];
 
   return createPortal(
@@ -1786,6 +2130,9 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
 
         {/* ── AI ANALYSIS ─────────────────────────────────────────── */}
         {tab === "ai" && <AIAnalysisPanel finding={f} />}
+
+        {/* ── CASE — workflow, assignment, SLA, activity log ──────────── */}
+        {tab === "case" && <CasePanel finding={f} />}
 
       </div>
       </div>
@@ -3014,11 +3361,8 @@ function TerrainFilterBar({
 // ── Terrain detection page (replaces GenericDetectionPage for terrain views) ──
 
 export interface TerrainPageProps {
-  title:                 string;
-  subtitle:              string;
   apiUrl:                string;
   accent:                string;
-  icon:                  React.ReactNode;
   emptyMsg:              string;
   columns:               { key: string; label: string; render?: (f: DetectionFinding) => React.ReactNode }[];
   initialTerrainFilter?: string;
@@ -3030,7 +3374,7 @@ export interface TerrainPageProps {
 }
 
 export function TerrainDetectionPage({
-  title, subtitle, apiUrl, accent, icon, emptyMsg, columns,
+  apiUrl, accent, emptyMsg, columns,
   initialTerrainFilter, initialStatusFilter,
   initialKevOnly, initialExploitOnly, initialCategoryFilter, initialSearch,
 }: TerrainPageProps) {
@@ -3048,6 +3392,34 @@ export function TerrainDetectionPage({
   const [adv, setAdv] = useState<FilterCondition[]>([]);
   const [selected, setSelected] = useState<DetectionFinding | null>(null);
   const [page, setPage] = useState(1);
+
+  // ── Bulk selection ────────────────────────────────────────────────────────────
+  const [bulkSel,    setBulkSel]    = useState<Set<number>>(new Set());
+  const [bulkActing, setBulkActing] = useState(false);
+  const { can } = useRBAC();
+
+  const toggleOne = (id: number) =>
+    setBulkSel(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  // Selects / deselects ALL filtered findings (across all pages)
+  const toggleAll = () =>
+    setBulkSel(prev => prev.size === filtered.length ? new Set() : new Set(filtered.map(f => f.id)));
+
+  const clearBulkSel = () => setBulkSel(new Set());
+
+  const doBulk = async (action: string, value?: string) => {
+    if (!can("bulk_action") || bulkSel.size === 0) return;
+    setBulkActing(true);
+    try {
+      await fetch("/api/v1/soc/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ finding_ids: Array.from(bulkSel), action, value, actor: "analyst" }),
+      });
+      clearBulkSel();
+      refetch();
+    } finally { setBulkActing(false); }
+  };
 
   const qs = apiUrl.includes("?") ? `&limit=500` : `?limit=500`;
   const { findings: raw, loading, error, refetch } = useDetectionData(`${apiUrl}${qs}`);
@@ -3122,8 +3494,8 @@ export function TerrainDetectionPage({
     });
   }, [raw, filters, adv]);
 
-  // Reset page when filters change
-  useEffect(() => setPage(1), [
+  // Reset page + bulk selection when filters change
+  useEffect(() => { setPage(1); setBulkSel(new Set()); }, [
     filters.severity, filters.search, filters.mitreFilter,
     filters.categoryFilter, filters.kevOnly, filters.exploitOnly,
     filters.statusFilter, filters.terrainFilter, filters.agentId, adv,
@@ -3137,49 +3509,8 @@ export function TerrainDetectionPage({
   const kpiCritical = raw.filter(f => f.severity === "critical").length;
   const kpiHigh     = raw.filter(f => f.severity === "high").length;
   const kpiKev      = raw.filter(f => f.kev).length;
-  const kpiMitres   = [...new Set(raw.map(f => f.mitre_technique).filter(Boolean))].length;
-
   return (
     <div className="space-y-4 pb-6">
-      {/* Header card */}
-      <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
-        <div className="h-1 bg-gradient-to-r from-orange-400 via-amber-400 to-orange-500 relative overflow-hidden">
-          <div className="absolute inset-0 al-scan"
-            style={{ background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.6), transparent)", width: "40%" }} />
-        </div>
-        <div className="p-5">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-center flex-shrink-0">
-                {icon}
-              </div>
-              <div>
-                <h1 className="text-base font-bold text-gray-900">{title}</h1>
-                <p className="text-xs text-gray-500 mt-0.5">{subtitle}</p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <div className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl">
-                <span className="w-1.5 h-1.5 rounded-full bg-green-500 al-heartbeat flex-shrink-0" />
-                <ECGWave />
-                <span className="text-[9px] text-gray-500 font-semibold uppercase tracking-wide">LIVE</span>
-              </div>
-              <button onClick={refetch}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-gray-100 hover:bg-orange-50 hover:border-orange-200 border border-gray-200 text-gray-600 hover:text-orange-600 text-xs font-semibold transition-all">
-                <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} />
-              </button>
-            </div>
-          </div>
-          <div className="grid grid-cols-5 gap-2.5 mt-4 pt-4 border-t border-gray-100">
-            <KpiTile label="Total Findings"   value={kpiTotal}    color="info"                      delay={0}   icon={<Activity className="w-3 h-3" />} />
-            <KpiTile label="Critical"         value={kpiCritical} color="critical"                  delay={60}  icon={<AlertTriangle className="w-3 h-3" />} />
-            <KpiTile label="High"             value={kpiHigh}     color="high"                      delay={120} icon={<Zap className="w-3 h-3" />} />
-            <KpiTile label="KEV Listed"       value={kpiKev}      color={kpiKev > 0 ? "critical" : "info"} delay={180} icon={<Radio className="w-3 h-3" />} />
-            <KpiTile label="MITRE Techniques" value={kpiMitres}   color="medium"                    delay={240} icon={<Target className="w-3 h-3" />} />
-          </div>
-        </div>
-      </div>
-
       {error && (
         <div className="px-4 py-3 bg-red-50 border border-red-200 rounded-2xl text-xs text-red-700 flex items-center gap-2 al-row-in">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />{error}
@@ -3197,13 +3528,50 @@ export function TerrainDetectionPage({
             loading={loading} refetch={refetch}
           />
 
+          {/* ── Bulk action toolbar ── appears when rows are selected ──────────── */}
+          {bulkSel.size > 0 && can("bulk_action") && (
+            <div className="flex items-center gap-2 px-4 py-2.5 bg-orange-50 border-b border-orange-100 flex-wrap">
+              <span className="flex items-center gap-1.5 px-2.5 py-1 bg-orange-500 text-white text-[10px] font-black rounded-xl shrink-0">
+                <CheckSquare className="w-3 h-3" />
+                {bulkSel.size} selected
+              </span>
+              {([
+                { label: "Triage",      action: "triaging",       cls: "bg-amber-50 text-amber-700 border-amber-200",    icon: <AlertTriangle className="w-3 h-3" /> },
+                { label: "Investigate", action: "investigating",  cls: "bg-blue-50 text-blue-700 border-blue-200",       icon: <Activity className="w-3 h-3" /> },
+                { label: "Remediate",   action: "in_remediation", cls: "bg-purple-50 text-purple-700 border-purple-200", icon: <Shield className="w-3 h-3" /> },
+                { label: "Close",       action: "closed",         cls: "bg-green-50 text-green-700 border-green-200",    icon: <CheckCircle2 className="w-3 h-3" /> },
+                { label: "False Pos.",  action: "false_positive", cls: "bg-gray-100 text-gray-500 border-gray-300",      icon: <XCircle className="w-3 h-3" /> },
+                { label: "Accept Risk", action: "accepted_risk",  cls: "bg-amber-50 text-amber-600 border-amber-200",    icon: <Shield className="w-3 h-3" /> },
+              ] as { label: string; action: string; cls: string; icon: React.ReactNode }[]).map(b => (
+                <button key={b.action}
+                  onClick={() => doBulk("status", b.action)}
+                  disabled={bulkActing}
+                  className={cn("flex items-center gap-1 px-2.5 py-1.5 rounded-xl border text-[10px] font-bold transition-all hover:shadow-sm disabled:opacity-50", b.cls)}>
+                  {b.icon}{b.label}
+                </button>
+              ))}
+              <button onClick={clearBulkSel}
+                className="ml-auto p-1.5 rounded-xl hover:bg-orange-100 text-orange-400 hover:text-orange-600 transition-colors"
+                title="Clear selection">
+                <XCircle className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr className="bg-gray-50/80 border-b border-gray-100">
-                  <th className="pl-4 pr-2 py-2.5 w-10" />
-                  <th className="px-2 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">ID</th>
-                  <th className="px-3 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">Finding</th>
+                  <th className="pl-4 pr-2 py-2.5 w-14">
+                    <button onClick={toggleAll} className="flex items-center justify-center">
+                      {bulkSel.size > 0 && bulkSel.size >= filtered.length
+                        ? <CheckSquare className="w-3.5 h-3.5 text-orange-500" />
+                        : bulkSel.size > 0
+                        ? <CheckSquare className="w-3.5 h-3.5 text-orange-300" />
+                        : <Square className="w-3.5 h-3.5 text-gray-300 hover:text-gray-500 transition-colors" />}
+                    </button>
+                  </th>
+                  <th className="px-2 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider">ID / Finding</th>
                   {columns.map(c => (
                     <th key={c.key} className="px-3 py-2.5 text-left text-[9px] font-black text-gray-400 uppercase tracking-wider whitespace-nowrap">{c.label}</th>
                   ))}
@@ -3242,21 +3610,35 @@ export function TerrainDetectionPage({
                   </tr>
                 ) : (
                   paginated.map((f, idx) => {
-                    const s     = SEV[f.severity] ?? SEV.info;
-                    const isSel = selected?.id === f.id;
+                    const s      = SEV[f.severity] ?? SEV.info;
+                    const isSel  = selected?.id === f.id;
+                    const inBulk = bulkSel.has(f.id);
                     const isCrit = f.severity === "critical";
                     return (
                       <tr key={f.id}
                         onClick={() => setSelected(isSel ? null : f)}
                         className={cn(
-                          "border-b border-gray-100/80 cursor-pointer transition-all duration-150 al-row-in",
-                          isSel ? "row-selected" : [s.rowBase, s.rowHover],
-                          isCrit && !isSel && "al-glow-critical",
+                          "border-b border-gray-100/80 cursor-pointer transition-all duration-150 al-row-in group",
+                          inBulk ? "bg-orange-50 border-orange-100" : isSel ? "row-selected" : [s.rowBase, s.rowHover],
+                          isCrit && !isSel && !inBulk && "al-glow-critical",
                         )}
                         style={{ animationDelay: `${Math.min(idx * 30, 400)}ms` }}
                       >
-                        <td className="pl-4 pr-2 py-3 w-10"><SevDot sev={f.severity} /></td>
-                        <td className="px-3 py-3 max-w-[260px]">
+                        {/* Checkbox + severity dot */}
+                        <td className="pl-4 pr-2 py-3 w-14"
+                            onClick={e => { e.stopPropagation(); toggleOne(f.id); }}>
+                          <div className="flex items-center gap-1.5">
+                            {inBulk
+                              ? <CheckSquare className="w-3.5 h-3.5 text-orange-500 flex-shrink-0" />
+                              : <Square className="w-3.5 h-3.5 text-gray-300 group-hover:text-gray-400 flex-shrink-0 transition-colors" />}
+                            <SevDot sev={f.severity} />
+                          </div>
+                        </td>
+                        {/* Unique ID + title + badges */}
+                        <td className="px-3 py-3 max-w-[280px]">
+                          <span className="text-[8px] font-mono text-gray-400 select-all block mb-0.5 truncate">
+                            {f.external_id ?? `#${f.id}`}
+                          </span>
                           <div className="text-[11px] font-semibold text-gray-800 leading-tight truncate mb-1">{f.title}</div>
                           <div className="flex items-center gap-1 flex-wrap">
                             <SevBadge sev={f.severity} />
@@ -3314,7 +3696,11 @@ export function TerrainDetectionPage({
                   </button>
                 </div>
               )}
-              <span className="text-[10px] text-gray-400">Click row → detection detail</span>
+              <span className="text-[10px] text-gray-400">
+                {bulkSel.size > 0
+                  ? <span className="text-orange-600 font-bold">{bulkSel.size} selected · use bulk actions above</span>
+                  : "☐ to select · click row → case detail & activity log"}
+              </span>
             </div>
           )}
       </div>

@@ -194,6 +194,108 @@ _PROC_RULES_RAW: list[dict] = [
      "pattern": r"(?i)(dnscat|iodine|dns2tcp|dnscrypt.*tunnel)",
      "severity": "high", "confidence": 0.90, "dual_use": False,
      "desc": "DNS tunnelling tool (C2/exfil via DNS)", "mitre": "T1071.004"},
+    # ── SSH reverse tunnel / port-forward (living-off-the-land exfil/C2) ──────
+    {"id": "X-PROC-SSH-REVTUNNEL",
+     "layer": "execution", "data_point": "processes", "weight": 0.80,
+     "pattern": r"(?i)ssh\s+.*(-[Rr]\s+\d{1,5}:|-N\s+-[Rr]|-w\s+\d+:\d+)",
+     "severity": "high", "confidence": 0.85, "dual_use": True,
+     "desc": "SSH reverse tunnel / port-forward (covert channel)", "mitre": "T1572"},
+    # ── Socat relay / reverse shell ───────────────────────────────────────────
+    {"id": "X-PROC-SOCAT-REVSHELL",
+     "layer": "execution", "data_point": "processes", "weight": 0.88,
+     "pattern": r"(?i)socat\s+.*(exec:|system:|tcp.*listen|tcp.*back)",
+     "severity": "critical", "confidence": 0.92, "dual_use": False,
+     "desc": "Socat relay or reverse shell (T1059 LOLBin)", "mitre": "T1059"},
+    # ── mkfifo FIFO-based shell ───────────────────────────────────────────────
+    {"id": "X-PROC-MKFIFO-SHELL",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)mkfifo\s+/\w+.*&&.*cat\s+.*nc|nc.*<\s*/\w+\s*\|",
+     "severity": "critical", "confidence": 0.93, "dual_use": False,
+     "desc": "FIFO-based reverse shell (mkfifo + nc pattern)", "mitre": "T1059.004"},
+    # ── Netcat listener / reverse shell ─────────────────────────────────────
+    {"id": "X-PROC-NC-REVSHELL",
+     "layer": "execution", "data_point": "processes", "weight": 0.85,
+     "pattern": r"(?i)\b(nc|ncat|netcat)\b\s+.*(-e\s+/bin|-c\s+['\"]?(bash|sh|zsh)|-lvp?\s+\d{2,5})",
+     "severity": "critical", "confidence": 0.90, "dual_use": False,
+     "desc": "Netcat reverse shell or listener (-e shell, -c shell, -lvp)", "mitre": "T1059.004"},
+    # ── LD_PRELOAD / DYLD_INSERT_LIBRARIES injection ─────────────────────────
+    {"id": "X-PROC-LDPRELOAD-INJECT",
+     "layer": "execution", "data_point": "processes", "weight": 0.88,
+     "pattern": r"(?i)(LD_PRELOAD|DYLD_INSERT_LIBRARIES)=(/tmp/|/dev/shm/|/var/tmp/)",
+     "severity": "critical", "confidence": 0.94, "dual_use": False,
+     "desc": "Library injection via LD_PRELOAD/DYLD_INSERT_LIBRARIES from temp path", "mitre": "T1574.006"},
+    # ── Container escape via nsenter or docker privileged ────────────────────
+    {"id": "X-PROC-CONTAINER-ESCAPE",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)(nsenter\s+--mount=.*/proc/1|docker\s+run\s+.*--privileged.*--pid=host|unshare\s+--user\s+--pid)",
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "Container escape via nsenter/docker --privileged/unshare", "mitre": "T1611"},
+    # ── at/batch persistence scheduling ─────────────────────────────────────
+    {"id": "X-PROC-AT-SCHED",
+     "layer": "execution", "data_point": "processes", "weight": 0.70,
+     "pattern": r"(?i)\bat\b\s+now\s+\+|\batq\b\s+-c|\batrm\b\s+|\bbatch\b\s+.*</",
+     "severity": "medium", "confidence": 0.75, "dual_use": True,
+     "desc": "at/batch one-shot scheduled task (T1053.002 persistence)", "mitre": "T1053.002"},
+    # ── launchctl unload of security daemons ─────────────────────────────────
+    {"id": "X-PROC-LAUNCHCTL-UNLOAD-SEC",
+     "layer": "execution", "data_point": "processes", "weight": 0.88,
+     "pattern": r"(?i)launchctl\s+(unload|disable|kickstart\s+-k)\s+.*(security|gatekeeper|xprotect|mrt|santa|osquery)",
+     "severity": "critical", "confidence": 0.93, "dual_use": False,
+     "desc": "launchctl unloading/disabling a security daemon (defense evasion)", "mitre": "T1562.001"},
+    # ── defaults write security bypass ───────────────────────────────────────
+    {"id": "X-PROC-DEFAULTS-WRITE-BYPASS",
+     "layer": "execution", "data_point": "processes", "weight": 0.82,
+     "pattern": r"(?i)defaults\s+write\s+.*(LSFileQuarantineEnabled|AllowAllApps|GKAllowed|SecAssessment|GlobalPreferences.*Disabled)",
+     "severity": "high", "confidence": 0.88, "dual_use": False,
+     "desc": "defaults write disabling macOS security feature (Gatekeeper/quarantine bypass)", "mitre": "T1553.001"},
+    # ── dscl user account manipulation ───────────────────────────────────────
+    {"id": "X-PROC-DSCL-USER",
+     "layer": "execution", "data_point": "processes", "weight": 0.85,
+     "pattern": r"(?i)dscl\s+\.\s+(-create\s+/Users/|\s+-delete\s+/Users/|-append\s+/Groups/admin)",
+     "severity": "high", "confidence": 0.88, "dual_use": False,
+     "desc": "dscl creating/deleting user or adding user to admin group", "mitre": "T1136.001"},
+    # ── OpenSSL decrypt / payload staging ────────────────────────────────────
+    {"id": "X-PROC-OPENSSL-DECRYPT",
+     "layer": "execution", "data_point": "processes", "weight": 0.75,
+     "pattern": r"(?i)openssl\s+enc\s+-d\s+.*(-pass\s+|\|\s*(bash|sh|python))",
+     "severity": "high", "confidence": 0.82, "dual_use": False,
+     "desc": "OpenSSL decrypt piped to shell (encrypted payload staging)", "mitre": "T1027"},
+    # ── dd memory/disk dump (data staging, anti-forensics) ───────────────────
+    {"id": "X-PROC-DD-MEMDUMP",
+     "layer": "execution", "data_point": "processes", "weight": 0.80,
+     "pattern": r"(?i)dd\s+if=/dev/(mem|kmem|sda|nvme\d|disk\d)\s+of=",
+     "severity": "high", "confidence": 0.85, "dual_use": False,
+     "desc": "dd reading raw memory or disk (memory/disk dump for credential extraction)", "mitre": "T1003.007"},
+    # ── Python/Perl/Ruby interactive PTY (common post-exploitation shell stabilization)
+    {"id": "X-PROC-PTY-STABILIZE",
+     "layer": "execution", "data_point": "processes", "weight": 0.78,
+     "pattern": r"(?i)python[23]?\s+-c\s+['\"]import\s+pty|python[23]?\s+-c\s+['\"]import\s+os.*pty|script\s+-qc\s+/bin/bash",
+     "severity": "high", "confidence": 0.88, "dual_use": False,
+     "desc": "PTY stabilization (python -c 'import pty' / script) — common post-exploit shell upgrade", "mitre": "T1059.006"},
+    # ── xattr quarantine removal (Gatekeeper bypass) ─────────────────────────
+    {"id": "X-PROC-XATTR-QUARANTINE",
+     "layer": "execution", "data_point": "processes", "weight": 0.80,
+     "pattern": r"(?i)xattr\s+-r?\s*-d\s+(com\.apple\.quarantine|com\.apple\.macl)",
+     "severity": "high", "confidence": 0.88, "dual_use": False,
+     "desc": "xattr removing quarantine/MACL attribute (Gatekeeper bypass)", "mitre": "T1553.001"},
+    # ── spctl disable (Gatekeeper master switch off) ──────────────────────────
+    {"id": "X-PROC-SPCTL-DISABLE",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)spctl\s+--master-disable",
+     "severity": "critical", "confidence": 0.96, "dual_use": False,
+     "desc": "spctl --master-disable: Gatekeeper turned off system-wide", "mitre": "T1553.001"},
+    # ── csrutil disable (SIP deactivation — requires Recovery, but flag it) ──
+    {"id": "X-PROC-CSRUTIL-DISABLE",
+     "layer": "execution", "data_point": "processes", "weight": 0.90,
+     "pattern": r"(?i)csrutil\s+disable",
+     "severity": "critical", "confidence": 0.95, "dual_use": False,
+     "desc": "csrutil disable: System Integrity Protection being turned off", "mitre": "T1562.001"},
+    # ── DoH-based C2 (DNS over HTTPS covert channel) ─────────────────────────
+    {"id": "X-PROC-DOH-COVERT",
+     "layer": "execution", "data_point": "processes", "weight": 0.75,
+     "pattern": r"(?i)(curl|wget)\s+.*cloudflare-dns\.com/dns-query.*\?.*name=|dns-over-https\s+.*--type",
+     "severity": "high", "confidence": 0.80, "dual_use": False,
+     "desc": "DNS-over-HTTPS query with unusual name parameter (DoH covert channel)", "mitre": "T1071.004"},
 ]
 
 PROCESS_RULES: list[dict] = [
@@ -364,13 +466,26 @@ SUSPICIOUS_SERVICE_PATTERNS: list[dict] = [
 # ── MITRE ATT&CK technique → tactic lookup ───────────────────────────────────
 MITRE_TACTIC: dict[str, str] = {
     "T1059": "Execution",       "T1059.001": "Execution",   "T1059.002": "Execution",
-    "T1059.006": "Execution",   "T1496": "Impact",          "T1571": "C&C",
-    "T1090": "C&C",             "T1090.003": "C&C",         "T1071.003": "C&C",
+    "T1059.004": "Execution",   "T1059.006": "Execution",   "T1496": "Impact",
+    "T1571": "C&C",             "T1090": "C&C",             "T1090.003": "C&C",
+    "T1071.003": "C&C",         "T1071.004": "C&C",         "T1572": "C&C",
     "T1046": "Discovery",       "T1040": "Collection",      "T1003": "Credential Access",
+    "T1003.007": "Credential Access",
     "T1110": "Credential Access","T1110.001": "Credential Access","T1110.002": "Credential Access",
     "T1027": "Defense Evasion", "T1036": "Defense Evasion", "T1036.005": "Defense Evasion",
-    "T1543.004": "Persistence", "T1053.003": "Persistence", "T1587.001": "Resource Dev.",
-    "T1190": "Initial Access",  "T1222": "Defense Evasion", "T1049": "Discovery",
+    "T1553.001": "Defense Evasion", "T1562.001": "Defense Evasion",
+    "T1543.004": "Persistence", "T1053.002": "Persistence", "T1053.003": "Persistence",
+    "T1547.004": "Persistence", "T1546.004": "Persistence", "T1546.012": "Persistence",
+    "T1587.001": "Resource Dev.", "T1190": "Initial Access","T1222": "Defense Evasion",
+    "T1049": "Discovery",       "T1574.006": "Privilege Escalation",
+    "T1548.003": "Privilege Escalation", "T1548.001": "Privilege Escalation",
+    "T1055.012": "Defense Evasion", "T1014": "Defense Evasion",
+    "T1611": "Privilege Escalation", "T1098.004": "Persistence",
+    "T1584.007": "Resource Dev.", "T1136.001": "Persistence",
+    "T1078.003": "Defense Evasion", "T1215": "Persistence",
+    "T1056.001": "Collection",  "T1204.002": "Execution",
+    "T1098": "Persistence",     "T1189": "Initial Access",  "T1566.001": "Initial Access",
+    "T1566.002": "Initial Access",
 }
 
 SEVERITY_SCORE: dict[str, float] = {
@@ -485,6 +600,87 @@ STANDALONE_RULES: list[dict] = [
         "match": lambda item: (
             "winlogon" in (item.get("path") or item.get("key") or "").lower()
             and item.get("program", "") not in ("explorer.exe", "", None)
+        ),
+    },
+    # ── SSH authorized_keys modification ─────────────────────────────────────
+    {
+        "id":          "X-CFG-SSH-AUTHKEYS",
+        "layer":       "execution",
+        "data_point":  "configs",
+        "severity":    "high",
+        "weight":      0.88,
+        "stand_alone": True,
+        "desc":        "SSH authorized_keys file modified — backdoor SSH key may have been added",
+        "mitre":       "T1098.004",
+        "match": lambda item: (
+            "authorized_keys" in (item.get("path") or "").lower()
+            and item.get("content_changed", False)
+        ),
+    },
+    # ── sudoers file modification ─────────────────────────────────────────────
+    {
+        "id":          "X-CFG-SUDOERS-MOD",
+        "layer":       "execution",
+        "data_point":  "configs",
+        "severity":    "critical",
+        "weight":      0.93,
+        "stand_alone": True,
+        "desc":        "sudoers file modified — NOPASSWD or privilege escalation rule may have been inserted",
+        "mitre":       "T1548.003",
+        "match": lambda item: (
+            ("/etc/sudoers" in (item.get("path") or "") or "/etc/sudoers.d/" in (item.get("path") or ""))
+            and item.get("content_changed", False)
+        ),
+    },
+    # ── /etc/hosts domain redirect ────────────────────────────────────────────
+    {
+        "id":          "X-CFG-HOSTS-REDIRECT",
+        "layer":       "surface",
+        "data_point":  "configs",
+        "severity":    "high",
+        "weight":      0.85,
+        "stand_alone": True,
+        "desc":        "/etc/hosts modified with non-loopback redirect — DNS poisoning or C2 pivot",
+        "mitre":       "T1584.007",
+        "match": lambda item: (
+            (item.get("path") or "").endswith("/etc/hosts")
+            and item.get("content_changed", False)
+        ),
+    },
+    # ── LD_PRELOAD set in process environment ─────────────────────────────────
+    {
+        "id":          "X-PROC-LDPRELOAD-ENV",
+        "layer":       "execution",
+        "data_point":  "processes",
+        "severity":    "critical",
+        "weight":      0.90,
+        "stand_alone": True,
+        "desc":        "LD_PRELOAD or DYLD_INSERT_LIBRARIES set in process environment (library hijack)",
+        "mitre":       "T1574.006",
+        "match": lambda item: bool(
+            (item.get("env") or {}).get("LD_PRELOAD")
+            or (item.get("env") or {}).get("DYLD_INSERT_LIBRARIES")
+            or "LD_PRELOAD=" in (item.get("cmdline") or "")
+            or "DYLD_INSERT_LIBRARIES=" in (item.get("cmdline") or "")
+        ),
+    },
+    # ── Root crontab with suspicious command ─────────────────────────────────
+    {
+        "id":          "X-TASK-ROOT-CRON-MOD",
+        "layer":       "execution",
+        "data_point":  "tasks",
+        "severity":    "high",
+        "weight":      0.85,
+        "stand_alone": True,
+        "desc":        "Root crontab entry with suspicious command (download/exec/shell)",
+        "mitre":       "T1053.003",
+        "match": lambda item: (
+            str(item.get("user", "")).lower() in ("root", "0")
+            and item.get("is_new", False)
+            and any(
+                sus in (item.get("command") or "").lower()
+                for sus in ("/tmp/", "/dev/shm/", "curl ", "wget ", "python ", "bash -i", "nc ", "bash -c ")
+            )
         ),
     },
 ]

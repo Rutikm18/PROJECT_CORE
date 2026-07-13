@@ -49,7 +49,7 @@ DEFAULTS: dict[str, str] = {
     "role_analyst_label":     "SOC Analyst",
     "role_viewer_label":      "Read-Only Viewer",
     "platform_refresh_secs":  "30",
-    "platform_timezone":      "UTC",
+    "platform_timezone":      "Asia/Kolkata",
     "platform_max_page":      "50",
     "notif_critical_email":   "false",
     "notif_sla_breach":       "false",

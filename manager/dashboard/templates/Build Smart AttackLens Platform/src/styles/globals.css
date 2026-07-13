@@ -480,6 +480,15 @@
 }
 .al-dot-breathe { animation: al-dot-breathe 2.2s ease-in-out infinite; }
 
+/* Header logo ring — gentle radar-ring expand-and-fade, echoes the target ring
+   motif inside the logo-icon.svg. 3 s period keeps it subtle in the nav bar. */
+@keyframes al-ring-ping {
+  0%   { transform: scale(0.85); opacity: 0.55; }
+  70%  { transform: scale(1.9);  opacity: 0; }
+  100% { transform: scale(1.9);  opacity: 0; }
+}
+.al-ring-ping { animation: al-ring-ping 3s ease-out infinite; }
+
 /* Active top-bar accent stripe for pages */
 .al-page-stripe {
   height: 3px;

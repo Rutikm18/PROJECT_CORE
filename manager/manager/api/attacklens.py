@@ -32,6 +32,26 @@ def make_attacklens_router(intel_db, engine=None) -> APIRouter:
             log.exception("stats failed")
             raise HTTPException(500, f"Failed to load stats: {exc}")
 
+    # ── Header stats (lightweight — used by the TopHeader every 2 min) ────────
+    @router.get("/header-stats")
+    async def header_stats():
+        """Active finding counts by severity — lightweight poll for the header."""
+        _ACTIVE = ("new", "triaging", "investigating", "in_remediation")
+        ph = ",".join("?" * len(_ACTIVE))
+        try:
+            rows = await intel_db._fetchall(
+                f"SELECT severity, COUNT(*) AS n FROM findings WHERE status IN ({ph}) GROUP BY severity",
+                _ACTIVE,
+            )
+            counts = {r["severity"]: r["n"] for r in rows}
+            return {
+                "critical": counts.get("critical", 0),
+                "high":     counts.get("high",     0),
+                "medium":   counts.get("medium",   0),
+            }
+        except Exception:
+            return {"critical": 0, "high": 0, "medium": 0}
+
     # ── Summary ───────────────────────────────────────────────────────────────
     @router.get("/{agent_id}/summary")
     async def summary(agent_id: str):

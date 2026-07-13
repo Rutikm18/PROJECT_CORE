@@ -360,15 +360,8 @@ export default function ExecutionThreats() {
       {/* ── Main detection table ──────────────────────────────────────────────── */}
       <TerrainDetectionPage
         key={pageKey}
-        title={catFilter === "all" ? "Citadels — Execution Threats" : `Citadels — ${catFilter}`}
-        subtitle={
-          validatedOnly
-            ? "Auto-promoted by Detection Confidence — precision_score ≥ configured threshold"
-            : "Processes · execution paths · containers · scheduled tasks · persistence indicators"
-        }
         apiUrl={baseUrl}
         accent="red"
-        icon={<Terminal className="w-5 h-5 text-red-500" />}
         emptyMsg={
           validatedOnly
             ? "No validated findings in Citadels."

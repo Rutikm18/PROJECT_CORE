@@ -25,3 +25,4 @@ git pull origin main
 git stash pop      # re-apply if needed
 
 The rebuild is required because the Python source files are baked into the Docker image — git pull alone won't apply the new code until you docker compose build.
+

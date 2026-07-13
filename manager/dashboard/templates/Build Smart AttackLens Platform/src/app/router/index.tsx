@@ -58,8 +58,9 @@ const AssetRegistry      = lazy(() => import("../pages/AssetRegistry"));
 const Timeline           = lazy(() => import("../pages/Timeline"));
 const DeepAnalysis       = lazy(() => import("../pages/DeepAnalysis"));
 const Accuracy           = lazy(() => import("../pages/Accuracy"));
-const DetectionCoverage  = lazy(() => import("../pages/DetectionCoverage"));
-const Settings           = lazy(() => import("../pages/Settings"));
+const DetectionCoverage       = lazy(() => import("../pages/DetectionCoverage"));
+const CustomCorrelationRules  = lazy(() => import("../pages/CustomCorrelationRules"));
+const Settings                = lazy(() => import("../pages/Settings"));
 
 // ── Suspense wrapper ──────────────────────────────────────────────────────────
 function PageLoading() {
@@ -152,12 +153,13 @@ export const router = createBrowserRouter([
           { path: "assets",    element: <S><AssetRegistry /></S> },
           { path: "timeline",  element: <S><Timeline /></S> },
 
-          // ── Analysis (/analysis/deep|accuracy|coverage) ─────────────────────
+          // ── Analysis (/analysis/deep|accuracy|coverage|custom-rules) ──────────
           {
             path: "analysis",
             children: [
               { index: true,          element: <Navigate to="/analysis/deep" replace /> },
               { path: "deep",         element: <S><DeepAnalysis /></S> },
+              { path: "custom-rules", element: <S><CustomCorrelationRules /></S> },
               // { path: "accuracy",     element: <S><Accuracy /></S> },
               // { path: "coverage",     element: <S><DetectionCoverage /></S> },
             ],
