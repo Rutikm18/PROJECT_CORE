@@ -302,7 +302,7 @@ function FindingDetailPanel({
   // action_plan now rendered via shared OSRemediationPanel — see Overview tab.
   const findingId  = f.external_id ?? f.display_id ?? `AL-${f.id}`;
   const cat        = catCfg(f.category);
-  const score      = f.composite_score ?? f.score;
+  const score      = f.composite_score ?? f.score ?? 0;
   const stripe     = SEV_STRIPE[f.severity] ?? SEV_STRIPE.info;
   const iconBg     = SEV_ICON_BG[f.severity] ?? SEV_ICON_BG.info;
 

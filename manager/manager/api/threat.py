@@ -20,8 +20,11 @@ Existing endpoints:
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Optional
+
+log = logging.getLogger("manager")
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, Query
@@ -228,13 +231,21 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
     # ── Global stats ──────────────────────────────────────────────────────────
     @router.get("/stats")
     async def stats():
-        return await intel_db.stats()
+        try:
+            return await intel_db.stats()
+        except Exception as exc:
+            log.exception("threat stats failed")
+            raise HTTPException(500, "Failed to load threat stats")
 
     # ── NVD local mirror stats ────────────────────────────────────────────────
     @router.get("/nvd/stats")
     async def nvd_stats():
         """NVD local mirror: total CVE count, coverage by severity, last sync timestamps."""
-        return await intel_db.get_nvd_stats()
+        try:
+            return await intel_db.get_nvd_stats()
+        except Exception as exc:
+            log.exception("nvd_stats failed")
+            raise HTTPException(500, "Failed to load NVD stats")
 
     @router.get("/nvd/search")
     async def nvd_search(
@@ -335,7 +346,11 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
     # ── Resolve ───────────────────────────────────────────────────────────────
     @router.post("/{agent_id}/resolve/{finding_id}")
     async def resolve(agent_id: str, finding_id: int):
-        await intel_db.mark_resolved(agent_id, finding_id)
+        try:
+            await intel_db.mark_resolved(agent_id, finding_id)
+        except Exception as exc:
+            log.exception("resolve failed for finding=%s", finding_id)
+            raise HTTPException(500, "Failed to resolve finding")
         return {"status": "resolved", "finding_id": finding_id}
 
     return router

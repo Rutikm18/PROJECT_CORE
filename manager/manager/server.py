@@ -611,7 +611,9 @@ def create_app() -> FastAPI:
     @app.exception_handler(404)
     async def spa_not_found_handler(request: Request, exc):
         path = request.url.path
-        if path.startswith("/api/") or path.startswith("/static/"):
+        # Non-GET requests to unknown paths get a JSON 404, never HTML.
+        # Serving index.html for POST/PUT/DELETE would confuse API clients.
+        if request.method != "GET" or path.startswith("/api/") or path.startswith("/static/"):
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
         return _serve_index()
 

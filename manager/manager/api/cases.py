@@ -54,6 +54,8 @@ def make_cases_router(intel_db) -> APIRouter:
         await intel_db._conn.commit()
 
     def _row(row) -> dict:
+        if row is None:
+            return {}
         d = dict(row)
         d["created_at_iso"] = datetime.fromtimestamp(
             d.get("created_at") or 0, tz=timezone.utc
@@ -69,8 +71,8 @@ def make_cases_router(intel_db) -> APIRouter:
         row = await intel_db._fetchone(
             "SELECT * FROM finding_cases WHERE finding_id = ?", (finding_id,)
         )
-        if not row:
-            raise HTTPException(status_code=404, detail="No case opened for this finding")
+        # Return empty object (not 404) — the UI polls this on any finding view
+        # and should treat absence as "no case opened yet", not an error.
         return _row(row)
 
     # ── PUT /{finding_id} ────────────────────────────────────────────────────

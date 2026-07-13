@@ -351,7 +351,7 @@ function MonthlySparkline({ data }: { data: MonthlyPoint[] }) {
 
   const pts = (key: keyof MonthlyPoint) =>
     data.map((d, i) => {
-      const x = (i / (data.length - 1)) * (W - 20) + 10;
+      const x = (i / Math.max(data.length - 1, 1)) * (W - 20) + 10;
       const y = H - ((Number(d[key]) / maxT) * (H - 16)) - 8;
       return `${x},${y}`;
     }).join(" ");
@@ -378,7 +378,7 @@ function MonthlySparkline({ data }: { data: MonthlyPoint[] }) {
         <polyline points={pts("remediated")} fill="none" stroke="#22c55e" strokeWidth={1.5} strokeLinejoin="round" />
         {/* Month labels */}
         {data.map((d, i) => {
-          const x = (i / (data.length - 1)) * (W - 20) + 10;
+          const x = (i / Math.max(data.length - 1, 1)) * (W - 20) + 10;
           return (
             <text key={i} x={x} y={H + 18} textAnchor="middle" fontSize={9} fill="#94a3b8" fontWeight={600}>
               {d.month}

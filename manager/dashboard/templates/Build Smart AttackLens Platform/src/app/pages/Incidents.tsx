@@ -160,7 +160,7 @@ function CategoryCell({ f }: { f: DetectionFinding }) {
 }
 
 function RiskScore({ f }: { f: DetectionFinding }) {
-  const s   = f.composite_score ?? f.score;
+  const s   = f.composite_score ?? f.score ?? 0;
   const cls = s >= 8 ? "text-red-600 bg-red-50 border-red-200"
               : s >= 6 ? "text-amber-600 bg-amber-50 border-amber-200"
               :          "text-blue-600 bg-blue-50 border-blue-200";
@@ -261,7 +261,7 @@ function TimelineView({ findings }: { findings: DetectionFinding[] }) {
                   const ts = new Date(f.last_detected_at * 1000).toLocaleTimeString("en-US", {
                     hour: "2-digit", minute: "2-digit",
                   });
-                  const score = f.composite_score ?? f.score;
+                  const score = f.composite_score ?? f.score ?? 0;
                   return (
                     <div key={f.id} className="relative flex gap-3">
                       {/* Timeline dot */}

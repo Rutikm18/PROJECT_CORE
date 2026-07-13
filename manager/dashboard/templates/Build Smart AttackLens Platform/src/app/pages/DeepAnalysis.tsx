@@ -474,6 +474,7 @@ export default function DeepAnalysis() {
   // "all" = search across ALL telemetry sections (ignores selected section)
   // "section" = scope search to the currently selected section only
   const [searchScope, setSearchScope] = useState<"all" | "section">("all");
+  const [showSmartSearch, setShowSmartSearch] = useState(false);
   const PAGE_SIZE = 100;
   const deb = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -723,12 +724,12 @@ export default function DeepAnalysis() {
                               <span className="font-mono">{f.agent_id}</span>
                               {f.agent_hostname && <span>{f.agent_hostname}</span>}
                               {f.mitre_technique && <span className="flex items-center gap-1"><Target className="w-2.5 h-2.5" />{f.mitre_technique}</span>}
-                              <span className="font-semibold">relevance: {(f.relevance * 100).toFixed(0)}%</span>
+                              <span className="font-semibold">relevance: {((f.relevance ?? 0) * 100).toFixed(0)}%</span>
                             </div>
                           </div>
                           <div className="flex items-center gap-3 flex-shrink-0">
                             <div className="text-right">
-                              <div className="text-[10px] font-black tabular-nums text-gray-600">{(f.composite_score ?? f.relevance * 10).toFixed(1)}</div>
+                              <div className="text-[10px] font-black tabular-nums text-gray-600">{(f.composite_score ?? (f.relevance ?? 0) * 10).toFixed(1)}</div>
                               <div className="text-[8px] text-gray-400">score</div>
                             </div>
                             <a
