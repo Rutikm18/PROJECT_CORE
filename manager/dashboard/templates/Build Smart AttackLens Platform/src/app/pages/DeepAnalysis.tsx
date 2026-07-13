@@ -2,7 +2,8 @@
  * Deep Analysis — Raw Telemetry Explorer
  * Clean explorer: section nav · time filter · agent select · structured tables
  */
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useNavigate } from "react-router";
 import {
   Database, Search, RefreshCw, X, Clock, ChevronRight,
   ChevronDown, Cpu, Globe, Package, Activity, Users,
@@ -88,13 +89,21 @@ function useFetch<T>(url: string | null) {
   const [loading, setLoad]  = useState(false);
   const [error, setError]   = useState<string | null>(null);
   const [tick, setTick]     = useState(0);
+  const prevUrl             = useRef<string | null>(null);
   useEffect(() => {
-    if (!url) return;
+    if (!url) { setData(null); setLoad(false); setError(null); return; }
+    // Clear stale data immediately when the URL changes (e.g. section switch),
+    // but keep data during a same-URL refresh (tick bump) to avoid flash.
+    if (prevUrl.current !== url) {
+      setData(null);
+      setError(null);
+      prevUrl.current = url;
+    }
     let dead = false;
     setLoad(true);
-    fetch(url)
+    fetch(url, { credentials: "include" })
       .then(r => r.ok ? r.json() : Promise.reject(`${r.status}`))
-      .then(d  => { if (!dead) { setData(d); setLoad(false); setError(null); } })
+      .then(d  => { if (!dead) { setData(d); setLoad(false); } })
       .catch(e => { if (!dead) { setError(String(e)); setLoad(false); } });
     return () => { dead = true; };
   }, [url, tick]);
@@ -478,57 +487,82 @@ export default function DeepAnalysis() {
   const PAGE_SIZE = 100;
   const deb = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const navigate = useNavigate();
+
   const { data: agents, refetch: rfAgents } = useFetch<AgentInfo[]>(`${API}/agents`);
   const { data: secResp } = useFetch<{ sections: string[] }>(
     agentId ? `${API}/sections?agent_id=${agentId}` : `${API}/sections`
   );
   const sections = secResp?.sections ?? [];
 
-  useEffect(() => { if (sections.length && !section) setSection(sections[0]); }, [sections.join(",")]);
+  // Auto-select first section when section list first arrives
+  useEffect(() => {
+    if (sections.length > 0 && !section) setSection(sections[0]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sections.length]);
 
-  // Build the raw telemetry query URL.
-  // When search is active, the section filter is dropped by default (all-sections
-  // search).  If the user toggles searchScope to "section", we scope the search
-  // to the current section only.
-  const qUrl = useCallback(() => {
+  // Build the raw telemetry query URL (memoised — does NOT need to be called)
+  const queryUrl = useMemo(() => {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
-    // If we have a search query and scope is "all", drop the section filter
-    // so the backend searches across ALL telemetry sections.
-    if (section && !(search && searchScope === "all")) {
-      p.set("section",  section);
-    }
+    // Drop section filter for all-sections search
+    if (section && !(search && searchScope === "all")) p.set("section", section);
     p.set("window", window_);
     if (search) p.set("search", search);
-    p.set("limit", String(PAGE_SIZE)); p.set("offset", String(page * PAGE_SIZE));
+    p.set("limit", String(PAGE_SIZE));
+    p.set("offset", String(page * PAGE_SIZE));
     return `${API}/query?${p}`;
   }, [agentId, section, window_, search, searchScope, page]);
+
+  // Total-count URL (same filters, no pagination)
+  const totalCountUrl = useMemo(() => {
+    const p = new URLSearchParams();
+    if (agentId) p.set("agent_id", agentId);
+    if (section && !(search && searchScope === "all")) p.set("section", section);
+    p.set("window", window_);
+    if (search) p.set("search", search);
+    return `${API}/count?${p}`;
+  }, [agentId, section, window_, search, searchScope]);
 
   const countUrl = useCallback((s: string) => {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
-    p.set("section", s); p.set("window", window_);
+    p.set("section", s);
+    p.set("window", window_);
     return `${API}/count?${p}`;
   }, [agentId, window_]);
 
-  // ── Smart Search (findings) ─────────────────────────────────────────────────
-  const smartSearchUrl = useCallback(() => {
+  // Smart search — only active when query is ≥ 2 chars
+  const smartSearchUrl = useMemo(() => {
     if (!search || search.trim().length < 2) return null;
     const p = new URLSearchParams();
     p.set("q", search.trim());
     if (agentId) p.set("agent_id", agentId);
-    p.set("limit", "25"); p.set("offset", "0");
+    p.set("limit", "25");
+    p.set("offset", "0");
     return `/api/v1/soc/smart-search?${p}`;
   }, [search, agentId]);
 
   const { data: smartResult, loading: smartLoading, refetch: smartRefetch } = useFetch<{
     findings: FindingResult[]; total: number;
-  }>(smartSearchUrl());
+  }>(smartSearchUrl);
 
-  const { data: result, loading, error, refetch } = useFetch<{ rows: PayloadRow[] }>(qUrl());
-  useEffect(() => { const t = setInterval(() => refetch(), 30_000); return () => clearInterval(t); }, [refetch]);
-  useEffect(() => { const t = setInterval(() => rfAgents(), 30_000); return () => clearInterval(t); }, [rfAgents]);
-  useEffect(() => { const t = setInterval(() => smartRefetch(), 30_000); return () => clearInterval(t); }, [smartRefetch]);
+  const { data: countResp } = useFetch<{ count: number }>(totalCountUrl);
+  const totalCount = countResp?.count ?? null;
+
+  const { data: result, loading, error, refetch } = useFetch<{ rows: PayloadRow[] }>(queryUrl);
+
+  // Auto-refresh telemetry every 30 s
+  useEffect(() => { const t = setInterval(refetch, 30_000); return () => clearInterval(t); }, [refetch]);
+  useEffect(() => { const t = setInterval(rfAgents, 30_000); return () => clearInterval(t); }, [rfAgents]);
+  // Smart-search auto-refresh only when there is an active query
+  useEffect(() => {
+    if (!search || search.length < 2) return;
+    const t = setInterval(smartRefetch, 30_000);
+    return () => clearInterval(t);
+  }, [smartRefetch, search]);
+  // Debounce cleanup on unmount
+  useEffect(() => () => { if (deb.current) clearTimeout(deb.current); }, []);
 
   const rows   = result?.rows ?? [];
   const online = agents?.filter(a => a.status === "online").length ?? 0;
@@ -732,15 +766,13 @@ export default function DeepAnalysis() {
                               <div className="text-[10px] font-black tabular-nums text-gray-600">{(f.composite_score ?? (f.relevance ?? 0) * 10).toFixed(1)}</div>
                               <div className="text-[8px] text-gray-400">score</div>
                             </div>
-                            <a
-                              href={`/api/v1/soc/findings/${f.id}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
+                            <button
+                              title="View in Threat Queue"
                               className="p-1 hover:bg-orange-100 rounded transition-colors"
-                              onClick={e => e.stopPropagation()}
+                              onClick={e => { e.stopPropagation(); navigate("/findings"); }}
                             >
                               <ExternalLink className="w-3 h-3 text-gray-400 hover:text-orange-500" />
-                            </a>
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -769,11 +801,19 @@ export default function DeepAnalysis() {
             )}
 
             {loading && rows.length === 0 ? <Skeleton /> :
-             rows.length === 0 && !search ? (
-              <div className="flex flex-col items-center justify-center h-full gap-2 text-gray-300">
-                <Database className="w-10 h-10 opacity-30" />
-                <p className="text-[11px] text-gray-400">No records — try a wider time window</p>
-              </div>
+             rows.length === 0 ? (
+              search ? (
+                <div className="flex flex-col items-center justify-center h-40 gap-2">
+                  <Search className="w-8 h-8 text-gray-200" />
+                  <p className="text-[11px] text-gray-400">No telemetry matched <span className="font-mono text-gray-500">"{search}"</span></p>
+                  <p className="text-[10px] text-gray-300">Try a wider time window or switch to All Sections</p>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center h-full gap-2 text-gray-300">
+                  <Database className="w-10 h-10 opacity-30" />
+                  <p className="text-[11px] text-gray-400">No records — try a wider time window</p>
+                </div>
+              )
             ) : (
               rows.map(row => (
                 <RecordRow key={row.id} row={row} section={section}
@@ -788,11 +828,16 @@ export default function DeepAnalysis() {
           {/* Footer pagination */}
           {rows.length > 0 && (
             <div className="flex items-center justify-between px-4 py-2 border-t border-gray-100 bg-gray-50/50 flex-shrink-0">
-              <span className="text-[10px] text-gray-400">Page {page + 1} · {rows.length} records</span>
+              <span className="text-[10px] text-gray-400 tabular-nums">
+                Page {page + 1}
+                {totalCount !== null
+                  ? ` · ${page * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE + rows.length, totalCount)} of ${totalCount}`
+                  : ` · ${rows.length} records`}
+              </span>
               <div className="flex gap-1.5">
                 <button disabled={page === 0} onClick={() => { setPage(p => p-1); setExpandedId(null); }}
                   className="px-3 py-1 text-[10px] font-semibold border border-gray-200 rounded-lg bg-white text-gray-600 disabled:opacity-40 hover:bg-gray-50 transition-colors">← Prev</button>
-                {rows.length === PAGE_SIZE && (
+                {(totalCount !== null ? page * PAGE_SIZE + rows.length < totalCount : rows.length === PAGE_SIZE) && (
                   <button onClick={() => { setPage(p => p+1); setExpandedId(null); }}
                     className="px-3 py-1 text-[10px] font-semibold border border-gray-200 rounded-lg bg-white text-gray-600 hover:bg-gray-50 transition-colors">Next →</button>
                 )}
