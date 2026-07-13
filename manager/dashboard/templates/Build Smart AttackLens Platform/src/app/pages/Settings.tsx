@@ -194,7 +194,7 @@ export default function Settings() {
       setError(null);
       // Seed the localStorage-backed timezone store from the authoritative backend value
       if (d.settings?.platform_timezone) setTimezone(d.settings.platform_timezone);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setLoading(false); }
   }, []);
 
@@ -216,8 +216,14 @@ export default function Settings() {
         body: JSON.stringify(form),
       });
       if (!r.ok) {
-        const d = await r.json();
-        throw new Error(d.detail ?? `HTTP ${r.status}`);
+        const d = await r.json().catch(() => ({}));
+        const detail = d.detail;
+        const msg =
+          typeof detail === "string" ? detail
+          : Array.isArray(detail) ? detail.map((x: { msg?: string }) => x.msg ?? JSON.stringify(x)).join("; ")
+          : detail ? JSON.stringify(detail)
+          : `HTTP ${r.status}`;
+        throw new Error(msg);
       }
       const d = await r.json();
       setForm({ ...EMPTY, ...d.settings });
@@ -227,7 +233,7 @@ export default function Settings() {
       setTimeout(() => setSaved(false), 3000);
       // Propagate timezone change to the header clock instantly (no page reload)
       if (d.settings?.platform_timezone) setTimezone(d.settings.platform_timezone);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setSaving(false); }
   };
 
@@ -916,7 +922,7 @@ function ValidationSettingsPanel() {
       setData({ ...d, terrain_thresholds: tt });
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally { setLoading(false); }
   }, []);
 
@@ -942,7 +948,7 @@ function ValidationSettingsPanel() {
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
       setError(null);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setSaving(false); }
   };
 
@@ -1243,7 +1249,7 @@ function RetentionSettingsPanel() {
       setStats(d.stats);
       setLastUpdated(new Date());
       setError(null);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { if (!quiet) setRefreshing(false); }
   }, []);
 
@@ -1279,7 +1285,7 @@ function RetentionSettingsPanel() {
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
       setError(null);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setSaving(false); }
   };
 
