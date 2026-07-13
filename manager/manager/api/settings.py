@@ -279,8 +279,7 @@ class SettingsUpdate(BaseModel):
     @field_validator("org_name")
     @classmethod
     def org_name_not_blank(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.strip():
-            raise ValueError("org_name cannot be empty")
+        # Allow empty string — org_name is optional; empty means "not yet configured"
         return v.strip() if v else v
 
     @field_validator("contact_email", "notif_email_recipient")
