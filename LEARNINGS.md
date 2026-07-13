@@ -213,3 +213,19 @@
 ### Base `CREATE TABLE` must include migration columns
 **What:** Columns added later via `_SOC_MIGRATIONS` must also exist in the base `CREATE TABLE` statement in `_SCHEMA`; otherwise a fresh database (no prior migrations) initializes without those columns, causing runtime errors on any query that references them.
 **Why:** `consecutive_unchanged` and `content_changed_at` were only in `_SOC_MIGRATIONS`, so fresh Postgres DBs (e.g. in CI) failed `upsert_finding` with "column does not exist". Adding both to the base `CREATE TABLE findings` fixed fresh-start initialization.
+
+### React Router v6.4 data-router errorElement vs class ErrorBoundary
+**What:** `createBrowserRouter` has its own route-level error handling that intercepts render errors BEFORE they bubble to class-based `ErrorBoundary` components in the React tree. The default UI is the "Unexpected Application Error!" dev overlay. Fix: add `errorElement: <RouteErrorPage />` to each route object; `RouteErrorPage` uses `useRouteError()` and `isRouteErrorResponse()` to display a clean error UI with retry/dashboard buttons.
+**Why:** A `ReferenceError` in `DeepAnalysis.tsx` (`showSmartSearch` used before declaration) caused the entire page to show React Router's ugly dev error UI, not our custom `ErrorBoundary`. Class boundaries only work for errors that bubble past the router, not inside it.
+
+### `score ?? 0` guard before `.toFixed()` on API-supplied numeric fields
+**What:** Fields like `composite_score` and `score` from detection API payloads are typed as `number` but can be absent at runtime (API may not include them). Calling `.toFixed()` on `undefined` throws `TypeError: undefined has no method toFixed`. Guard with `?? 0` at the assignment site.
+**Why:** `ThreatQueue`, `Incidents`, and `DeepAnalysis` all showed blank pages (caught by ErrorBoundary) when findings lacked score fields, which is normal for findings in certain states (e.g. newly ingested, not yet scored).
+
+### FastAPI SPA 404 handler must check `request.method`
+**What:** The `@app.exception_handler(404)` SPA handler that serves `index.html` for unknown paths must also check `request.method == "GET"`. Without this, a `POST`/`PUT`/`DELETE` to an unknown path returns `200 OK` with HTML content instead of `404 JSON`, confusing API clients.
+**Why:** FastAPI exception handlers receive ALL 404s regardless of HTTP method. API clients sending a mutating request to a wrong path were silently receiving HTML and misinterpreting it as a success.
+
+### `cases.py` GET returning 404 for no-case-yet causes console noise
+**What:** `GET /api/v1/cases/{finding_id}` used to raise `HTTPException(404)` when no case had been opened. Changed to return `{}` (empty object). The frontend should treat an empty response as "no case yet" rather than an error.
+**Why:** The UI polls this endpoint whenever a finding detail drawer is opened, including for newly-ingested findings that have never had a case. 404-as-normal-flow generated console noise and required null-guards on every call site.
