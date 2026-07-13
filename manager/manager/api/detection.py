@@ -372,6 +372,41 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         paged, thr, below = await _apply_validated_filter(intel_db, paged, validated_only)
         return _validated_body({"findings": [_enrich(r) for r in paged], "count": len(paged), "offset": offset}, validated_only, thr, below)
 
+    # ── Identity & access findings ────────────────────────────────────────────
+    @router.get("/identity")
+    async def identity(
+        agent_id: Optional[str] = Query(None),
+        severity: Optional[str] = Query(None),
+        limit:    int           = Query(100, ge=1, le=500),
+        offset:   int           = Query(0, ge=0),
+        validated_only: bool    = Query(False),
+    ):
+        """Identity & access terrain — user, account, identity, and auth categories."""
+        live_ids = await _live_agent_ids()
+        cats = ["user", "identity", "account", "auth", "privilege", "credential"]
+        results = await asyncio.gather(*[
+            intel_db.get_soc_findings(
+                agent_id=agent_id, category=cat, severity=severity,
+                active_only=True, sort_by="composite_score",
+                limit=limit, offset=0, live_agent_ids=live_ids,
+            )
+            for cat in cats
+        ])
+        seen: set[int] = set()
+        all_rows: list[dict] = []
+        for batch in results:
+            for r in batch:
+                if r.get("id") not in seen:
+                    seen.add(r["id"])
+                    all_rows.append(r)
+        all_rows.sort(key=lambda r: r.get("composite_score") or r.get("score") or 0, reverse=True)
+        paged = all_rows[offset: offset + limit]
+        paged, thr, below = await _apply_validated_filter(intel_db, paged, validated_only)
+        return _validated_body(
+            {"findings": [_enrich(r) for r in paged], "count": len(paged), "total": len(all_rows), "offset": offset},
+            validated_only, thr, below,
+        )
+
     # ── All active findings ────────────────────────────────────────────────────
     @router.get("/all")
     async def all_findings(

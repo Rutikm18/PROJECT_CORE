@@ -3411,14 +3411,16 @@ export function TerrainDetectionPage({
     if (!can("bulk_action") || bulkSel.size === 0) return;
     setBulkActing(true);
     try {
-      await fetch("/api/v1/soc/bulk", {
+      const r = await fetch("/api/v1/soc/bulk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ finding_ids: Array.from(bulkSel), action, value, actor: "analyst" }),
       });
+      if (!r.ok) return; // keep selection intact so the user can retry
       clearBulkSel();
       refetch();
-    } finally { setBulkActing(false); }
+    } catch { /* network error — selection preserved for retry */ }
+    finally { setBulkActing(false); }
   };
 
   const qs = apiUrl.includes("?") ? `&limit=500` : `?limit=500`;

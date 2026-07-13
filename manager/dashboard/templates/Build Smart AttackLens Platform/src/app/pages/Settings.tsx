@@ -767,9 +767,12 @@ export default function Settings() {
               <button
                 onClick={async () => {
                   if (!confirm("Reset ALL settings to defaults? This cannot be undone.")) return;
-                  await fetch(`${API}/reset`, { method: "POST" });
-                  await load();
-                  setDirty(false);
+                  try {
+                    const r = await fetch(`${API}/reset`, { method: "POST" });
+                    if (!r.ok) throw new Error(`Reset failed: HTTP ${r.status}`);
+                    await load();
+                    setDirty(false);
+                  } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
                 }}
                 className="flex items-center gap-1.5 px-4 py-2 bg-white border border-red-300 text-red-700 text-[11px] font-bold rounded-xl hover:bg-red-100 transition-colors"
               >
@@ -1571,8 +1574,8 @@ function AIProviderPanel() {
         fetch("/api/v1/ai/provider"),
         fetch("/api/v1/ai/models"),
       ]);
-      const cfg = await cfgRes.json();
-      const mod = await modRes.json();
+      const cfg = cfgRes.ok ? await cfgRes.json() : {};
+      const mod = modRes.ok ? await modRes.json() : {};
       setConfig(cfg);
       setModels(mod.providers ?? {});
       if (cfg.configured && cfg.provider) {
@@ -1645,10 +1648,13 @@ function AIProviderPanel() {
 
   const handleDelete = async () => {
     if (!confirm("Remove the AI provider configuration?")) return;
-    await fetch("/api/v1/ai/provider", { method: "DELETE" });
-    setSuccess("Configuration removed");
-    setConfig(null);
-    await load();
+    try {
+      const r = await fetch("/api/v1/ai/provider", { method: "DELETE" });
+      if (!r.ok) throw new Error(`Delete failed: HTTP ${r.status}`);
+      setSuccess("Configuration removed");
+      setConfig(null);
+      await load();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   };
 
   if (loading) {

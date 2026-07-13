@@ -340,9 +340,13 @@ function FindingDetailPanel({
   const postComment = async () => {
     if (!newComment.trim()) return;
     setPosting(true);
-    await fetch(`${SOC}/findings/${f.id}/comments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ analyst: "analyst", comment: newComment }) });
-    setNewComment(""); setPosting(false);
-    fetch(`${SOC}/findings/${f.id}/activity`).then(r => r.json()).then(d => setActivity(d.activity ?? []));
+    try {
+      const r = await fetch(`${SOC}/findings/${f.id}/comments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ analyst: "analyst", comment: newComment }) });
+      if (!r.ok) return;
+      setNewComment("");
+      fetch(`${SOC}/findings/${f.id}/activity`).then(r => r.ok ? r.json() : { activity: [] }).then(d => setActivity(d.activity ?? [])).catch(() => {});
+    } catch { /* network error — posting state cleared in finally */ }
+    finally { setPosting(false); }
   };
 
   const copyId = () => { navigator.clipboard?.writeText(findingId); setCopied(true); setTimeout(() => setCopied(false), 1400); };
