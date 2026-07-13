@@ -158,7 +158,7 @@ export function TopHeader() {
 
   const fetchAgents = useCallback(async () => {
     try {
-      const r = await fetch("/api/v1/agents/");
+      const r = await fetch("/api/v1/agents");
       if (!r.ok) return;
       const list: { last_seen?: number; status?: string }[] = await r.json();
       const now = Date.now() / 1000;

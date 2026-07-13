@@ -29,16 +29,19 @@ import AppShell from "../layouts/AppShell";
 import LoginPage from "../pages/LoginPage";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 import { ComingSoon } from "../components/ComingSoon";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { ClipboardList } from "lucide-react";
 
 // ── Root layout: one Auth + RBAC context shared by ALL routes ─────────────────
 function RootLayout() {
   return (
-    <AuthProvider>
-      <RBACProvider>
-        <Outlet />
-      </RBACProvider>
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <RBACProvider>
+          <Outlet />
+        </RBACProvider>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }
 
@@ -71,7 +74,11 @@ function PageLoading() {
   );
 }
 function S({ children }: { children: React.ReactNode }) {
-  return <Suspense fallback={<PageLoading />}>{children}</Suspense>;
+  return (
+    <ErrorBoundary>
+      <Suspense fallback={<PageLoading />}>{children}</Suspense>
+    </ErrorBoundary>
+  );
 }
 
 const CompliancePage = CIS_COMPLIANCE_LIVE && CISCompliance
