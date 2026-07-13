@@ -150,12 +150,20 @@ NUMERIC_BOUNDS: dict[str, tuple[int, int]] = {
     "platform_max_page":     (10, 500),
 }
 
-VALID_TIMEZONES = {
-    "UTC","Asia/Kolkata","Asia/Singapore","Asia/Tokyo","Asia/Dubai",
-    "America/New_York","America/Chicago","America/Los_Angeles","America/Toronto",
-    "Europe/London","Europe/Paris","Europe/Berlin","Australia/Sydney",
-    "Africa/Lagos","America/Sao_Paulo",
-}
+def _is_valid_iana_timezone(tz: str) -> bool:
+    """Return True if tz is a timezone the Python runtime recognises."""
+    try:
+        from zoneinfo import ZoneInfo   # Python 3.9+
+        ZoneInfo(tz)
+        return True
+    except (KeyError, ImportError):
+        pass
+    try:
+        import pytz                     # fallback if zoneinfo unavailable
+        pytz.timezone(tz)
+        return True
+    except Exception:
+        return False
 
 # Mask sensitive value on read
 MASKED_FIELDS = {"license_key"}
@@ -300,8 +308,10 @@ class SettingsUpdate(BaseModel):
     @field_validator("platform_timezone")
     @classmethod
     def valid_timezone(cls, v: Optional[str]) -> Optional[str]:
-        if v and v.strip() not in VALID_TIMEZONES:
-            raise ValueError(f"Unknown timezone: {v!r}. Allowed: {sorted(VALID_TIMEZONES)}")
+        if v and v.strip():
+            tz = v.strip()
+            if not _is_valid_iana_timezone(tz):
+                raise ValueError(f"Unknown timezone: {tz!r}. Must be a valid IANA timezone string.")
         return v.strip() if v else v
 
     @field_validator("platform_refresh_secs", "platform_max_page")
