@@ -380,7 +380,9 @@ function shortDate(ts: number | string): string {
 }
 function daysUntil(dateStr: string): number | null {
   if (!dateStr) return null;
-  return Math.ceil((new Date(dateStr).getTime() - Date.now()) / 86400000);
+  const ms = new Date(dateStr).getTime();
+  if (isNaN(ms)) return null;
+  return Math.ceil((ms - Date.now()) / 86400000);
 }
 function parseArr(v: unknown): string[] {
   if (Array.isArray(v)) return v as string[];

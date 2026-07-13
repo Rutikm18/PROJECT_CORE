@@ -30,6 +30,7 @@ import LoginPage from "../pages/LoginPage";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 import { ComingSoon } from "../components/ComingSoon";
 import { ErrorBoundary } from "../components/ErrorBoundary";
+import { RouteErrorPage } from "../components/RouteErrorPage";
 import { ClipboardList } from "lucide-react";
 
 // ── Root layout: one Auth + RBAC context shared by ALL routes ─────────────────
@@ -96,12 +97,16 @@ export const router = createBrowserRouter([
   {
     // Root layout: provides shared auth + RBAC context
     element: <RootLayout />,
+    // Route-level error boundary — replaces React Router's default "Unexpected
+    // Application Error!" overlay. Catches render errors in any child route.
+    errorElement: <RouteErrorPage />,
     children: [
 
       // ── Public ─────────────────────────────────────────────────────────────
       {
         path: "login",
         element: <LoginPage onSuccess={() => {}} />,
+        errorElement: <RouteErrorPage />,
       },
 
       // ── Authenticated shell ─────────────────────────────────────────────────
@@ -112,6 +117,7 @@ export const router = createBrowserRouter([
             <AppShell />
           </ProtectedRoute>
         ),
+        errorElement: <RouteErrorPage />,
         children: [
 
           // Root redirect

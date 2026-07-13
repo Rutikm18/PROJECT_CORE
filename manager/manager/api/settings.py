@@ -705,15 +705,16 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
     async def export_settings():
         """
         Export current settings as a JSON snapshot (for backup / migration).
-        Sensitive fields are NOT masked in the export so it can be re-imported.
+        Sensitive fields (license_key etc.) are masked in the export.
         Treat the output as confidential.
         """
         try:
             raw = await _load()
+            safe = {k: (_mask(v) if k in MASKED_FIELDS else v) for k, v in raw.items()}
             return {
                 "export_version": "1",
                 "exported_at":    time.time(),
-                "settings":       raw,          # full unmasked export
+                "settings":       safe,
             }
         except Exception as exc:
             log.exception("export_settings failed")
