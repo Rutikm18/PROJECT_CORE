@@ -35,7 +35,7 @@ const SEG: Record<string, string> = {
   kev: "KEV Mandates", hunt: "Hunt Queries", feeds: "Feed Status",
   assets: "Asset Registry", timeline: "Timeline & History",
   analysis: "Analysis", deep: "Deep Analysis", accuracy: "Detection Accuracy",
-  coverage: "Detection Coverage", "custom-rules": "Correlation Rules",
+  coverage: "Detection Coverage", "custom-rules": "Custom Rules",
   settings: "Settings", org: "Organisation", license: "License",
   roles: "Roles", platform: "Platform", validation: "Validation",
   retention: "Data Retention", ai: "AI Configuration",
@@ -65,7 +65,7 @@ const CMD = [
   { label: "Deep Analysis",        path: "/analysis/deep",         group: "Analysis" },
   { label: "Detection Accuracy",   path: "/analysis/accuracy",     group: "Analysis" },
   { label: "Detection Coverage",   path: "/analysis/coverage",     group: "Analysis" },
-  { label: "Correlation Rules",    path: "/analysis/custom-rules", group: "Analysis" },
+  { label: "Custom Rules",          path: "/analysis/custom-rules", group: "Analysis" },
   { label: "Settings",             path: "/settings",              group: "Navigate" },
 ];
 

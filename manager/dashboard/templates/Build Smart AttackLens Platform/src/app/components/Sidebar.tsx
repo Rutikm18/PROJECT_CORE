@@ -105,7 +105,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { label: "Timeline & History", to: "/timeline",          icon: BarChart3 },
       { label: "Deep Analysis",      to: "/analysis/deep",         icon: Database  },
-      { label: "Correlation Rules",  to: "/analysis/custom-rules", icon: GitMerge  },
+      { label: "Custom Rules",  to: "/analysis/custom-rules", icon: GitMerge, comingSoon: true },
       { label: "Asset Registry",     to: "/assets",                icon: Monitor   },
       // { label: "Detection Accuracy", to: "/analysis/accuracy", icon: Activity  },
       // { label: "Detection Coverage", to: "/analysis/coverage", icon: Layers    },
