@@ -1,0 +1,104 @@
+category: Open Files
+description: >
+  Detects suspicious file-access patterns: credential-file access, mass
+  file operations consistent with ransomware, and anti-forensic behavior.
+rules:
+  - id: OPEN_FILES-001
+    title: Access to sensitive credential store files
+    description: A process accesses well-known credential storage files/paths outside of expected system processes.
+    mitre_attack: [T1003, T1552.001]
+    severity: high
+    data_source: file open events, path, accessing process
+    detection:
+      logic: file path matches known credential-store locations and accessing process is not in the expected reader allowlist
+      conditions:
+        - file_path matches '(?i)(/etc/shadow|/etc/passwd|\\config\\SAM|\\.ssh/id_rsa|\\.aws/credentials|Login Data)'
+        - accessing_process not in expected_reader_allowlist[file_path]
+      threshold: any occurrence
+    false_positives:
+      - legitimate backup/security-scanning tools reading these paths (add to allowlist)
+    enrichment_sources:
+      - hash reputation of accessing process
+    response_actions:
+      - investigate accessing process chain, rotate credentials if compromise suspected
+    status: stable
+
+  - id: OPEN_FILES-002
+    title: Mass sequential file open/rename activity
+    description: A single process opens and renames/rewrites a very high number of distinct files in a short window — core ransomware behavior signature.
+    mitre_attack: [T1486]
+    severity: critical
+    data_source: file open/rename/write events grouped by process
+    detection:
+      logic: single process performs open+rename on a large number of distinct files within a short window
+      conditions:
+        - distinct_files_touched_by_process(window=3m) > 50
+        - rename_pattern consistent (e.g., new uniform extension appended)
+      threshold: '>50 files/3min with uniform rename pattern'
+    false_positives:
+      - legitimate bulk file conversion/compression/backup tool
+    enrichment_sources:
+      - known backup/archival tool allowlist
+    response_actions:
+      - kill process immediately, isolate host, this is high-confidence ransomware
+    status: stable
+
+  - id: OPEN_FILES-003
+    title: Self-deleting process after file access (anti-forensics)
+    description: A process opens sensitive or numerous files, then deletes its own executable — common technique to hinder forensic recovery.
+    mitre_attack: [T1070.004]
+    severity: high
+    data_source: file access events + subsequent self-delete of the process's own binary
+    detection:
+      logic: process accesses sensitive/many files then its own binary path is deleted while process still running
+      conditions:
+        - process performed file access matching OPEN_FILES-001 or OPEN_FILES-002 pattern
+        - own_binary_path deleted while process_still_running == true
+      threshold: any occurrence
+    false_positives:
+      - legitimate self-updating software that deletes its old binary post-update
+    enrichment_sources:
+      - hash reputation of the process before deletion (capture hash prior to delete)
+    response_actions:
+      - preserve memory-resident image if possible, isolate host
+    status: experimental
+
+  - id: OPEN_FILES-004
+    title: Off-hours access to sensitive file categories
+    description: Sensitive-tagged files (PII, financial, source code) accessed by a user/process outside documented business hours for that asset/user.
+    mitre_attack: [T1005]
+    severity: medium
+    data_source: file open events on tagged-sensitive paths, timestamp, business-hours policy
+    detection:
+      logic: access to sensitive-tagged file occurs outside business_hours_for_user/host
+      conditions:
+        - file_path tagged 'sensitive'
+        - access_time outside business_hours_for_user
+        - user not on an approved off-hours access exception list
+      threshold: any occurrence
+    false_positives:
+      - legitimate off-hours work by employees in different time zones or on-call staff
+    enrichment_sources:
+      - HR/IAM system for work-schedule/timezone context
+    response_actions:
+      - verify with user/manager, escalate if unexplained
+    status: tuning
+
+  - id: OPEN_FILES-005
+    title: File opened by process with mismatched expected handler
+    description: A file type is opened by a process not normally associated with that file type (e.g., a document file opened directly by a scripting interpreter).
+    mitre_attack: [T1204.002]
+    severity: medium
+    data_source: file extension/type, opening process name
+    detection:
+      logic: file extension's expected handler process differs from actual opening process
+      conditions:
+        - file_extension in monitored_extension_handler_map
+        - opening_process not in monitored_extension_handler_map[file_extension]
+      threshold: any occurrence
+    false_positives:
+      - legitimate scripted/automation workflows opening files programmatically
+    enrichment_sources: []
+    response_actions:
+      - inspect process command line and parent chain for macro/script-based delivery
+    status: tuning

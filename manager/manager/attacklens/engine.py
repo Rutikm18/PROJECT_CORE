@@ -59,6 +59,7 @@ from .clustering  import cluster_signals
 from .confidence  import score_confidence
 from .validation  import validate_cluster
 from .config      import ENGINE_CONFIG
+from .rulepack    import RulePackDetector
 from .ai_validator import (
     validate_with_ai,
     ai_validation_enabled,
@@ -147,6 +148,8 @@ _SECTION_CATEGORY: dict[str, str] = {
     "security": "security", "configs": "config", "binaries": "binary",
     "metrics": "behavioral",
     "sysctl": "sysctl", "sbom": "sbom", "arp": "arp", "containers": "container",
+    "agent_health": "agent_health", "battery": "battery", "hardware": "hardware",
+    "mounts": "mount", "open_files": "open_file", "storage": "storage",
 }
 
 # Evidence keys that change every snapshot — excluded from the item_key hash so
@@ -249,6 +252,7 @@ class AttackLensEngine:
         self._corr         = CorrelationEngine(intel_db)
         self._custom_corr  = CustomCorrelator(intel_db)   # analyst-defined rules
         self._fleet        = FleetCorrelator(intel_db, db)  # cross-host / global-threat layer
+        self._rulepack     = RulePackDetector.load()        # manager-owned YAML rule packs
         # Optional AI analyst — used by the precision validator if set.
         # Server wiring assigns this after both objects are constructed.
         self._ai_analyst = ai_analyst
@@ -1268,9 +1272,12 @@ class AttackLensEngine:
         # carry baselines, allowlists, MITRE mapping + the FP fixes); fall back
         # to the inline analyzer for everything else. Each module's findings are
         # adapted to the engine finding format. Opt out via use_detection_modules.
+        findings: list[dict] = []
+        routed = False
         if ENGINE_CONFIG.get("use_detection_modules", True):
             routes = _DETECTION_MODULE_ROUTES.get(section)
             if routes:
+                routed = True
                 # The engine is the single dedup authority: upsert_finding dedups
                 # by fingerprint and WANTS every observation to re-upsert (so
                 # scan_count + last_detected_at refresh, which auto-resolve relies
@@ -1296,26 +1303,32 @@ class AttackLensEngine:
                         continue
                     for f in (res or []):
                         mod_findings.append(_adapt_module_finding(f, section))
-                return mod_findings
+                findings.extend(mod_findings)
 
-        fn = {
-            "ports":       self._ports,
-            "processes":   self._processes,
-            "connections": self._connections,
-            "services":    self._services,
-            "apps":        self._apps,
-            "packages":    self._packages,
-            "network":     self._network,
-            "users":       self._users,
-            "tasks":       self._tasks,
-            "security":    self._security,
-            "configs":     self._configs,
-            "binaries":    self._binaries,
-            "metrics":     self._metrics,
-        }.get(section)
-        if fn is None:
-            return []
-        return await fn(agent_id, data)
+        if not routed:
+            fn = {
+                "ports":       self._ports,
+                "processes":   self._processes,
+                "connections": self._connections,
+                "services":    self._services,
+                "apps":        self._apps,
+                "packages":    self._packages,
+                "network":     self._network,
+                "users":       self._users,
+                "tasks":       self._tasks,
+                "security":    self._security,
+                "configs":     self._configs,
+                "binaries":    self._binaries,
+                "metrics":     self._metrics,
+            }.get(section)
+            if fn is not None:
+                findings.extend(await fn(agent_id, data))
+
+        try:
+            findings.extend(await self._rulepack.analyze(agent_id, section, data, self._feeds))
+        except Exception as exc:
+            log.debug("rulepack analyze failed agent=%s section=%s: %s", agent_id, section, exc)
+        return findings
 
     # ── Section analyzers ─────────────────────────────────────────────────────
 

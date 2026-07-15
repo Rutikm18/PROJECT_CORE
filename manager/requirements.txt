@@ -19,6 +19,9 @@ cryptography>=42.0.0
 # Jinja2 templating (for dashboard HTML rendering)
 jinja2>=3.1.0
 
+# YAML rule-pack loader
+PyYAML>=6.0.0
+
 # For serving static files
 python-multipart>=0.0.9
 

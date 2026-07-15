@@ -1,0 +1,123 @@
+category: Processes
+description: >
+  Core endpoint behavioral detection: suspicious process lineage, command-line
+  obfuscation, injection, execution-path anomalies, and privilege escalation.
+rules:
+  - id: PROCESSES-001
+    title: Suspicious parent-child process relationship
+    description: An office/productivity application or browser spawns a shell or scripting interpreter — classic initial-execution pattern for malicious documents/macros.
+    mitre_attack: [T1204.002, T1059]
+    severity: high
+    data_source: process parent/child lineage
+    detection:
+      logic: parent process is an office/browser app and child process is a shell/scripting interpreter
+      conditions:
+        - parent_process_name in ['winword.exe','excel.exe','powerpnt.exe','outlook.exe','chrome.exe','firefox.exe','acrobat.exe']
+        - child_process_name in ['cmd.exe','powershell.exe','wscript.exe','cscript.exe','bash','sh','mshta.exe']
+      threshold: any occurrence
+    false_positives:
+      - legitimate macro-driven business workflows (should be documented/allowlisted per app)
+    enrichment_sources:
+      - hash reputation of child process command line
+    response_actions:
+      - kill child process, isolate host if beaconing follows
+    status: stable
+
+  - id: PROCESSES-002
+    title: Encoded or obfuscated command-line arguments
+    description: Process launched with base64-encoded, string-concatenated, or otherwise obfuscated command-line content, common in fileless malware/LOLBin abuse.
+    mitre_attack: [T1027, T1059.001]
+    severity: high
+    data_source: full process command line
+    detection:
+      logic: command line matches known obfuscation/encoding patterns
+      conditions:
+        - command_line matches '(?i)(-enc(odedcommand)?\s+[A-Za-z0-9+/=]{40,}|FromBase64String|-nop\s+-w\s+hidden|IEX\s*\()'
+      threshold: any match
+    false_positives:
+      - legitimate admin automation scripts using encoded commands (should be allowlisted by script hash)
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - decode and inspect payload, correlate with subsequent network activity
+    status: stable
+
+  - id: PROCESSES-003
+    title: Process injection indicators
+    description: Evidence of one process writing executable memory into or creating a remote thread in another process — core technique for defense evasion and privilege abuse.
+    mitre_attack: [T1055]
+    severity: critical
+    data_source: cross-process memory-write/remote-thread-creation events
+    detection:
+      logic: process A allocates RWX memory in process B and creates a remote thread pointing into that memory
+      conditions:
+        - remote_memory_allocation(source=A, target=B, protection='RWX') == true
+        - remote_thread_created(source=A, target=B) == true
+        - A and B are not both part of an approved debugger/EDR-agent relationship
+      threshold: any occurrence
+    false_positives:
+      - legitimate debuggers, EDR/AV agents themselves performing injection for monitoring purposes
+    enrichment_sources:
+      - EDR agent process allowlist
+    response_actions:
+      - isolate host, this is high-confidence malicious behavior
+    status: stable
+
+  - id: PROCESSES-004
+    title: Process execution from suspicious path
+    description: Process binary executes from a temp, recycle-bin, hidden, or otherwise atypical directory for its process type.
+    mitre_attack: [T1036.005, T1564.001]
+    severity: medium
+    data_source: process execution path
+    detection:
+      logic: exec_path matches suspicious-location patterns
+      conditions:
+        - exec_path matches '(?i)(\\Recycle\\.Bin\\|/\\.hidden|\\Temp\\|/tmp/|/dev/shm/|AppData\\Roaming\\[a-z0-9]{8,}\\)'
+      threshold: any occurrence
+    false_positives:
+      - legitimate portable/self-extracting apps staged in temp
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - inspect binary and parent chain
+    status: stable
+
+  - id: PROCESSES-005
+    title: Unexpected privilege escalation - process token elevated
+    description: A process's security token/UID transitions to a higher privilege level during execution without a corresponding legitimate elevation path (UAC prompt, sudo, service manager).
+    mitre_attack: [T1548]
+    severity: critical
+    data_source: process token/UID change events, elevation-mechanism correlation
+    detection:
+      logic: process effective UID/integrity level increases without a logged legitimate elevation mechanism
+      conditions:
+        - process_privilege_level(after) > process_privilege_level(before)
+        - no correlated UAC/sudo/service-manager elevation event
+      threshold: any occurrence
+    false_positives:
+      - legitimate elevation via mechanisms not yet instrumented in the correlation logic (tune false-positive source first)
+    enrichment_sources: []
+    response_actions:
+      - isolate host, investigate exploited elevation vector
+    status: experimental
+
+  - id: PROCESSES-006
+    title: LOLBin download-and-execute chain
+    description: A living-off-the-land binary is used to download content, followed shortly by execution of the downloaded artifact.
+    mitre_attack: [T1105, T1218]
+    severity: high
+    data_source: process command line + subsequent file execution correlation
+    detection:
+      logic: LOLBin process performs a download action, and a new executable appears/runs from the download target path shortly after
+      conditions:
+        - process_name in known_lolbin_set (see BINARIES-004)
+        - command_line indicates a download action (matches BINARIES-004 pattern)
+        - new_process_execution from download_target_path within 5 minutes
+      threshold: any occurrence
+    false_positives:
+      - legitimate software update mechanisms using these utilities
+    enrichment_sources:
+      - hash reputation of downloaded artifact
+    response_actions:
+      - isolate host, capture downloaded artifact for analysis
+    status: stable

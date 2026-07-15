@@ -1,0 +1,104 @@
+category: Network
+description: >
+  Detects link/network-layer anomalies distinct from individual connection
+  analysis: rogue wireless infrastructure, sniffing, and DNS/gateway
+  configuration manipulation.
+rules:
+  - id: NETWORK-001
+    title: Rogue wireless access point / evil twin detected
+    description: A wireless SSID matching a corporate network name is observed broadcast from a BSSID not in the approved AP inventory.
+    mitre_attack: [T1557]
+    severity: high
+    data_source: observed SSID/BSSID pairs, approved AP inventory
+    detection:
+      logic: SSID matches a corporate network name but BSSID is not in the approved AP list
+      conditions:
+        - ssid in corporate_ssid_list
+        - bssid not in approved_ap_bssid_list
+      threshold: any occurrence
+    false_positives:
+      - newly deployed legitimate AP not yet added to inventory
+      - guest/neighboring network with a similar SSID string coincidentally
+    enrichment_sources:
+      - wireless AP inventory/CMDB
+    response_actions:
+      - locate physical source via signal triangulation, warn users, disable if rogue
+    status: stable
+
+  - id: NETWORK-002
+    title: Network interface switched to promiscuous mode
+    description: A host's NIC is placed into promiscuous mode, enabling packet sniffing beyond its own traffic.
+    mitre_attack: [T1040]
+    severity: high
+    data_source: interface mode flag
+    detection:
+      logic: interface promiscuous flag transitions to true and host is not a known monitoring/IDS sensor
+      conditions:
+        - promiscuous_mode == true
+        - host_role != 'network_sensor'
+      threshold: any occurrence
+    false_positives:
+      - legitimate packet-capture troubleshooting by network engineering (should be ticketed)
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - verify authorization, revert interface mode, investigate initiating process
+    status: stable
+
+  - id: NETWORK-003
+    title: Unexpected default gateway or DNS server change
+    description: Host's configured default gateway or DNS server changes to a value outside the approved DHCP/network configuration.
+    mitre_attack: [T1557]
+    severity: high
+    data_source: host network config (gateway, DNS servers)
+    detection:
+      logic: gateway_ip or dns_servers differ from the values distributed by the approved DHCP scope
+      conditions:
+        - current_gateway != approved_dhcp_gateway_for_subnet
+        - OR current_dns_servers not subset of approved_dhcp_dns_for_subnet
+      threshold: any mismatch
+    false_positives:
+      - legitimate static network configuration for a specific device role
+    enrichment_sources:
+      - DHCP scope configuration reference
+    response_actions:
+      - revert configuration, investigate how it was changed (local admin? malware?)
+    status: stable
+
+  - id: NETWORK-004
+    title: DNS query to newly-registered or DGA-pattern domain
+    description: Host queries a domain registered very recently, or exhibiting algorithmically-generated-domain characteristics.
+    mitre_attack: [T1568.002]
+    severity: medium
+    data_source: DNS query logs, domain registration-date feed, entropy scoring
+    detection:
+      logic: queried domain's registration date is very recent, or domain name entropy/structure matches DGA patterns
+      conditions:
+        - domain_registration_age_days < 7
+        - OR domain_name_entropy > 3.5 with no dictionary-word substrings
+      threshold: any match, weighted by additional context (destination reputation, volume)
+    false_positives:
+      - legitimate new SaaS product/marketing domain
+    enrichment_sources:
+      - WHOIS/RDAP feed, NRD (newly-registered-domain) threat feed
+    response_actions:
+      - block at DNS resolver pending verification, monitor for follow-on connection
+    status: tuning
+
+  - id: NETWORK-005
+    title: High-volume DNS query spike
+    description: Abnormally high DNS query rate from a single host, consistent with tunneling, scanning, or malware C2 domain generation attempts.
+    mitre_attack: [T1071.004, T1568.002]
+    severity: medium
+    data_source: DNS query counts per host per minute
+    detection:
+      logic: DNS query rate from a host exceeds baseline by a large multiple
+      conditions:
+        - dns_query_count(window=1m) > baseline_p95_for_host * 5
+      threshold: '>5x baseline queries/min'
+    false_positives:
+      - legitimate bulk DNS resolution (e.g., mass mail client checking many domains)
+    enrichment_sources: []
+    response_actions:
+      - correlate with CONNECTIONS-004 (DNS tunneling), identify initiating process
+    status: tuning

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """
 tools/test_agent_send.py — End-to-end network send test for the Jarvis agent.
 
@@ -55,7 +56,6 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
 from agent.agent.crypto import derive_keys, encrypt
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
@@ -397,7 +397,7 @@ def main() -> int:
                         help="Enable TLS certificate verification (default: off)")
     args = parser.parse_args()
 
-    print(f"\nJarvis Agent — Network Send Test")
+    print("\nJarvis Agent — Network Send Test")
     print(f"  Manager : {args.manager_url}")
     print(f"  Agent ID: {args.agent_id}")
     print(f"  TLS     : {'strict' if args.tls_verify else 'lenient (self-signed ok)'}")
@@ -463,6 +463,20 @@ def _print_summary() -> int:
     else:
         print(" — all passed")
     return 0 if failed == 0 else 1
+
+
+# This file is a CLI smoke-test tool. Its network functions intentionally take
+# runtime arguments from argparse, not pytest fixtures.
+for _cli_entrypoint in (
+    test_health,
+    test_enrollment,
+    test_ingest,
+    test_ingest_all_sections,
+    test_spool_cycle,
+    test_tls_enforcement,
+    test_bad_hmac_rejected,
+):
+    _cli_entrypoint.__test__ = False
 
 
 if __name__ == "__main__":

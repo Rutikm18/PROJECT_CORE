@@ -52,10 +52,10 @@ log = logging.getLogger("manager.attacklens.terrain_validators")
 CATEGORY_TO_TERRAIN: dict[str, str] = {}
 for _t, _cats in {
     "citadels": ["execution","process","script","container","persistence","service","task","malware"],
-    "vector":   ["network","connection","port","arp","covert","lateral"],
-    "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app"],
+    "vector":   ["network","connection","port","arp","covert","lateral","mount"],
+    "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app","open_file","storage"],
     "identity": ["user","identity","account","credential"],
-    "posture":  ["security","posture","sip","firewall"],
+    "posture":  ["security","posture","sip","firewall","agent_health","battery","hardware"],
 }.items():
     for _c in _cats:
         CATEGORY_TO_TERRAIN[_c] = _t

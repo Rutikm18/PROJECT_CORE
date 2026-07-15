@@ -19,12 +19,10 @@ import asyncio
 import secrets
 import time
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from manager.manager.api.enroll import make_enroll_router
-
 
 # ── Mock DB ───────────────────────────────────────────────────────────────────
 
@@ -180,8 +178,7 @@ class TestKeyStorage:
         body = valid_body()
         c.post("/api/v1/enroll", json=body,
                headers={"X-Enrollment-Token": "tok"})
-        stored = asyncio.get_event_loop().run_until_complete(
-            db.get_agent_key("agent-001"))
+        stored = asyncio.run(db.get_agent_key("agent-001"))
         assert stored == body["api_key"].lower()
 
     def test_re_enrollment_rotates_key(self):
@@ -194,8 +191,7 @@ class TestKeyStorage:
         r = c.post("/api/v1/enroll", json=new_body,
                    headers={"X-Enrollment-Token": "tok"})
         assert r.json()["rotated"] is True
-        stored = asyncio.get_event_loop().run_until_complete(
-            db.get_agent_key("agent-001"))
+        stored = asyncio.run(db.get_agent_key("agent-001"))
         assert stored == new_body["api_key"].lower()
 
     def test_agent_registered_after_enrollment(self):

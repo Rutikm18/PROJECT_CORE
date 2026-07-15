@@ -1,0 +1,100 @@
+category: Ports
+description: >
+  Detects unauthorized listening services, port-scanning activity, and
+  covert-channel patterns at the transport layer.
+rules:
+  - id: PORTS-001
+    title: New unexpected listening port
+    description: A host begins listening on a port not present in its baseline of expected listening ports.
+    mitre_attack: [T1571, T1043]
+    severity: medium
+    data_source: listening port inventory per host, baseline
+    detection:
+      logic: currently listening port not in baseline_listening_ports_for_host and not a known ephemeral/dynamic port
+      conditions:
+        - listening_port not in baseline_listening_ports_for_host
+        - port not in ephemeral_port_range (typically 32768-60999)
+      threshold: any occurrence
+    false_positives:
+      - legitimate new service deployment not yet reflected in baseline
+    enrichment_sources:
+      - CMDB/service inventory
+    response_actions:
+      - identify owning process, verify legitimacy, update baseline or remediate
+    status: stable
+
+  - id: PORTS-002
+    title: Port scan detected against host
+    description: A single source contacts many distinct ports on the host in a short time window, consistent with reconnaissance.
+    mitre_attack: [T1046]
+    severity: medium
+    data_source: inbound connection attempts per source IP
+    detection:
+      logic: distinct destination ports contacted by one source IP exceeds threshold in a short window
+      conditions:
+        - distinct_ports_contacted(source_ip, window=1m) > 15
+      threshold: '>15 distinct ports/min from one source'
+    false_positives:
+      - legitimate vulnerability scanner or internal asset-discovery tool
+    enrichment_sources:
+      - approved vulnerability-scanner IP allowlist
+    response_actions:
+      - verify source against scanner allowlist, block/investigate if not approved
+    status: stable
+
+  - id: PORTS-003
+    title: Well-known port bound by unauthorized process
+    description: A well-known service port (80, 443, 22, 3389, etc.) is bound by a process other than the expected/approved service binary.
+    mitre_attack: [T1571]
+    severity: high
+    data_source: listening port to owning-process mapping
+    detection:
+      logic: process binding a well-known port does not match the approved binary for that port/service
+      conditions:
+        - listening_port in well_known_service_ports
+        - owning_process_path != approved_binary_for_port[listening_port]
+      threshold: any mismatch
+    false_positives:
+      - legitimate service migration to a new binary/version not yet reflected in baseline
+    enrichment_sources:
+      - approved service-to-binary mapping
+    response_actions:
+      - investigate owning process, kill if unauthorized, this may indicate a backdoor
+    status: stable
+
+  - id: PORTS-004
+    title: Port-knock sequence pattern detected
+    description: A source IP contacts a fixed, ordered sequence of closed ports in rapid succession followed by a connection to a normally-closed port opening — consistent with port-knocking-triggered covert access.
+    mitre_attack: [T1205.001]
+    severity: high
+    data_source: sequential connection attempts per source IP, subsequent port-open event
+    detection:
+      logic: source IP touches an ordered sequence of specific closed ports within a short window, followed shortly by a previously-closed port becoming open/reachable
+      conditions:
+        - ordered_port_sequence_match(source_ip, window=10s) == true
+        - followed_by port_state_change(target_port, 'closed' -> 'open') within 30s
+      threshold: any occurrence
+    false_positives:
+      - none expected in typical environments; validate no legitimate port-knock service is in intentional use
+    enrichment_sources: []
+    response_actions:
+      - block source IP, investigate the newly opened port/service
+    status: experimental
+
+  - id: PORTS-005
+    title: High port churn / rapid open-close cycling
+    description: A host rapidly opens and closes listening ports in a short window, potentially indicating evasive/ephemeral C2 listener behavior.
+    mitre_attack: [T1571]
+    severity: medium
+    data_source: listening port open/close event timeline per host
+    detection:
+      logic: count of distinct port open+close cycles on a host exceeds baseline within a short window
+      conditions:
+        - port_open_close_cycle_count(window=10m) > 10
+      threshold: '>10 cycles/10min'
+    false_positives:
+      - legitimate ephemeral service/test harness behavior in dev environments
+    enrichment_sources: []
+    response_actions:
+      - identify owning process pattern, correlate with PROCESSES/BINARIES rules
+    status: tuning

@@ -2341,7 +2341,7 @@ class IntelDB:
             WHERE {where}
             ORDER BY relevance DESC, f.composite_score DESC
             LIMIT ? OFFSET ?
-        """, (*args, query, limit, offset))
+        """, (query, *args, limit, offset))
 
         result = []
         for r in rows:
@@ -2349,6 +2349,16 @@ class IntelDB:
             d["relevance"] = round(float(d.get("relevance", 0)), 4)
             result.append(_shape_finding(d))
         return result
+
+    async def search_findings(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Compatibility wrapper for legacy AttackLens/threat search routes."""
+        return await self.smart_search_findings(query, agent_id=agent_id, limit=limit)
 
     async def smart_search_count(
         self,

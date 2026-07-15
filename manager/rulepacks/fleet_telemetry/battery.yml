@@ -1,0 +1,97 @@
+category: Battery
+description: >
+  Battery telemetry is a weak signal on its own but useful as corroborating
+  evidence for resource-abuse malware (cryptomining) and physical hardware
+  tampering when correlated with other categories (Metrics, Hardware).
+rules:
+  - id: BATTERY-001
+    title: Abnormal drain rate correlated with sustained high CPU
+    description: >
+      Battery discharging significantly faster than device/model baseline
+      while CPU utilization is sustained high — common secondary indicator
+      of cryptomining or other CPU-abusive malware on laptops.
+    mitre_attack: [T1496]
+    severity: low
+    data_source: battery discharge rate, CPU utilization metrics (correlate with metrics.yml METRICS-001)
+    detection:
+      logic: discharge_rate exceeds device-model baseline while CPU utilization sustained high with no user-facing heavy workload
+      conditions:
+        - discharge_rate_pct_per_hour > baseline_for_model * 1.5
+        - cpu_utilization_avg(window=30m) > 80
+        - no known legitimate heavy app (render/compile/video) active
+      threshold: sustained 30+ minutes
+    false_positives:
+      - legitimate heavy workloads (video export, ML training, compiling)
+      - aging battery with degraded capacity (check cycle_count/health first)
+    enrichment_sources:
+      - device model power-baseline reference table
+      - process metrics correlation (see METRICS-001, PROCESSES-006)
+    response_actions:
+      - identify top CPU-consuming process at time of drain
+      - treat as corroborating evidence only, not standalone alert
+    status: experimental
+
+  - id: BATTERY-002
+    title: Battery health/cycle-count anomaly suggesting hardware tampering
+    description: >
+      Sudden discontinuity in reported cycle count or battery serial/health
+      metrics inconsistent with prior history — may indicate unauthorized
+      hardware replacement (e.g., implanting modified hardware).
+    mitre_attack: [T1200]
+    severity: medium
+    data_source: battery serial number, cycle_count, health_percentage history
+    detection:
+      logic: battery serial number changes without an approved hardware-service ticket, or cycle_count decreases (impossible under normal operation)
+      conditions:
+        - battery_serial != previous_recorded_serial
+        - no matching depot/repair ticket for asset_id
+      threshold: any occurrence
+    false_positives:
+      - legitimate battery replacement under warranty/depot repair not yet logged
+    enrichment_sources:
+      - asset depot/repair ticketing system
+      - CMDB hardware history
+    response_actions:
+      - verify with IT asset management; physically inspect device
+    status: stable
+
+  - id: BATTERY-003
+    title: Rapid abnormal charge/discharge cycling
+    description: >
+      Unusually rapid, repeated charge/discharge cycling in a short window,
+      which is atypical for normal use and can correlate with certain
+      hardware-level attack/DoS attempts against power management, or a
+      failing/tampered battery controller.
+    mitre_attack: []
+    severity: low
+    data_source: charging_state transitions timeline
+    detection:
+      logic: charging state toggles far more frequently than baseline within a short window
+      conditions:
+        - charge_state_transition_count(window=1h) > 10
+      threshold: '>10 transitions/hour'
+    false_positives:
+      - loose/faulty charging cable or dock
+      - laptop on a poorly regulated power source
+    enrichment_sources: []
+    response_actions:
+      - treat as hardware-health ticket first; escalate only if paired with other anomalies
+    status: experimental
+
+  - id: BATTERY-004
+    title: Battery firmware version mismatch
+    description: Reported battery/embedded-controller firmware version differs from the fleet-approved baseline for the device model.
+    mitre_attack: [T1542]
+    severity: medium
+    data_source: battery/EC firmware version field
+    detection:
+      logic: firmware_version != approved_baseline_for_model
+      conditions:
+        - firmware_version not in approved_firmware_versions[model]
+    false_positives:
+      - staged firmware rollout not yet reflected in baseline table
+    enrichment_sources:
+      - vendor firmware release manifest
+    response_actions:
+      - validate against vendor's official firmware hash before treating as tampering
+    status: experimental

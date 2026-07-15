@@ -1,0 +1,105 @@
+category: Packages
+description: >
+  Detects supply-chain risk and tampering in installed OS/language packages:
+  untrusted sources, downgrades, integrity mismatches, and known
+  vulnerabilities.
+rules:
+  - id: PACKAGES-001
+    title: Package installed from untrusted or unofficial repository
+    description: A package's source repository is not in the organization's approved repository list.
+    mitre_attack: [T1195.001]
+    severity: medium
+    data_source: package manager install metadata (repo source URL)
+    detection:
+      logic: package source_repo not in approved_repo_list
+      conditions:
+        - source_repo not in approved_repo_list
+      threshold: any occurrence
+    false_positives:
+      - developer adding a legitimate third-party repo for a specific project need (should be reviewed/allowlisted)
+    enrichment_sources:
+      - approved package-repository allowlist
+    response_actions:
+      - verify legitimacy, remove package/repo if unapproved
+    status: stable
+
+  - id: PACKAGES-002
+    title: Package downgraded to a version with known vulnerabilities
+    description: An installed package's version decreases compared to the previously recorded version, and the new (older) version has known CVEs.
+    mitre_attack: [T1195.002]
+    severity: high
+    data_source: package version history, CVE database
+    detection:
+      logic: new_version < previous_version for the package AND new_version has associated CVEs in NVD
+      conditions:
+        - semver(new_version) < semver(previous_version)
+        - new_version in cve_affected_versions[package_name]
+      threshold: any occurrence
+    false_positives:
+      - intentional rollback for compatibility reasons, tracked via change ticket
+    enrichment_sources:
+      - NVD, CISA KEV, EPSS
+      - change-management system
+    response_actions:
+      - block/revert downgrade, patch to a non-vulnerable version
+    status: stable
+
+  - id: PACKAGES-003
+    title: Package hash/signature mismatch vs. registry
+    description: Installed package's hash does not match the hash published by the official package registry for that version — potential supply-chain tampering.
+    mitre_attack: [T1195.002]
+    severity: critical
+    data_source: installed package hash, registry-published hash
+    detection:
+      logic: sha256(installed_package) != registry_published_hash[package_name][version]
+      conditions:
+        - installed_hash != registry_hash
+      threshold: any mismatch
+    false_positives:
+      - registry mirror serving a legitimately repackaged build (rare; verify mirror trust)
+    enrichment_sources:
+      - official package registry hash manifest (npm, PyPI, apt, etc.)
+    response_actions:
+      - remove and reinstall from verified source, treat as potential compromise until proven otherwise
+    status: stable
+
+  - id: PACKAGES-004
+    title: Known-vulnerable package version installed
+    description: An installed package version matches a version with a published CVE, especially one in CISA's Known Exploited Vulnerabilities catalog.
+    mitre_attack: [T1190]
+    severity: high
+    data_source: package name+version, CVE/KEV feeds
+    detection:
+      logic: (package_name, version) present in CVE-affected-versions list, weighted by KEV/EPSS
+      conditions:
+        - (package_name, version) in cve_affected_versions
+        - severity_weight = 'critical' if in CISA_KEV else base_cvss_severity
+      threshold: any match; prioritize by KEV presence and EPSS score
+    false_positives:
+      - vendor-backported security patch applied without version bump (verify via patch metadata, not just version string)
+    enrichment_sources:
+      - NVD, CISA KEV, EPSS, vendor security advisories
+    response_actions:
+      - patch per vulnerability-management SLA, prioritized by KEV/EPSS
+    status: stable
+
+  - id: PACKAGES-005
+    title: Unexpected package removal
+    description: A security-relevant or monitoring package is removed from a host without a corresponding change record — possible defense-evasion prep.
+    mitre_attack: [T1562.001]
+    severity: high
+    data_source: package removal events, monitored-package list
+    detection:
+      logic: a package in the monitored_security_package_list is removed without a matching change ticket
+      conditions:
+        - package_name in monitored_security_package_list
+        - removal_event == true
+        - no matching change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate package replacement/upgrade path that temporarily removes and reinstalls
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - reinstall required package, investigate removing actor/process
+    status: stable

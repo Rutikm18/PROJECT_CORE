@@ -125,12 +125,13 @@ def test_tampered_hmac_returns_401(client):
     assert r.status_code == 401
 
 
-def test_replay_returns_401(client):
-    """Same nonce a second time must be rejected."""
+def test_replay_returns_duplicate_200(client):
+    """Same nonce a second time is acknowledged idempotently."""
     env = _envelope()
     client.post("/api/v1/ingest", json=env)     # first: OK
     r = client.post("/api/v1/ingest", json=env) # second: replay
-    assert r.status_code == 401
+    assert r.status_code == 200
+    assert r.json()["status"] == "duplicate"
 
 
 def test_unenrolled_agent_rejected(client):

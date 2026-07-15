@@ -1,0 +1,131 @@
+category: Agent Health
+description: >
+  Detects tampering, evasion, or failure conditions on the monitoring agent itself.
+  Agent-health telemetry is a prime target for defense evasion, so these rules
+  focus on integrity and availability of the collection pipeline.
+rules:
+  - id: AGENT-HEALTH-001
+    title: Agent heartbeat missed beyond tolerance
+    description: >
+      Host stops reporting telemetry, which can indicate agent kill, host
+      isolation by an attacker, network segmentation abuse, or a crash —
+      each requiring different follow-up.
+    mitre_attack: [T1489, T1562.001]
+    severity: high
+    data_source: agent last_checkin_timestamp, expected polling interval
+    detection:
+      logic: last successful check-in exceeds 3x the configured polling interval with no active maintenance window
+      conditions:
+        - now - last_checkin_timestamp > 3 * expected_interval_seconds
+        - host_id not in active_maintenance_window
+        - host_id was reporting normally in prior 24h (rules out brand-new/never-enrolled host)
+      threshold: 3x missed interval, sustained for >= 2 consecutive check windows
+    false_positives:
+      - host shut down for legitimate maintenance without a logged window
+      - network outage unrelated to the host
+      - laptop asleep/suspended
+    enrichment_sources:
+      - CMDB/asset inventory (expected uptime schedule)
+      - change-management/maintenance-window system
+    response_actions:
+      - attempt out-of-band reachability check (ping/SSH/MDM)
+      - flag host for physical/remote verification if unreachable > 24h
+    status: stable
+
+  - id: AGENT-HEALTH-002
+    title: Agent version downgrade
+    description: >
+      Agent binary reports a lower version than previously recorded for the
+      same host — classic pattern for reinstalling a weaker/vulnerable agent
+      to bypass newer detection logic.
+    mitre_attack: [T1562.001]
+    severity: critical
+    data_source: agent_version field, historical version records per host_id
+    detection:
+      logic: current reported agent_version is lower than max previously seen version for this host_id
+      conditions:
+        - semver(current_version) < semver(max_prior_version)
+        - change not attributable to an approved rollback ticket
+      threshold: any occurrence
+    false_positives:
+      - intentional rollback during agent troubleshooting by IT
+      - golden image re-imaging with an older approved build
+    enrichment_sources:
+      - change-management ticketing system
+      - approved agent version registry
+    response_actions:
+      - quarantine host from sensitive network segments pending validation
+      - force agent reinstall from trusted distribution point
+    status: stable
+
+  - id: AGENT-HEALTH-003
+    title: Agent process/binary tampering
+    description: >
+      Detects the agent binary hash diverging from the signed release hash,
+      or the agent process being repeatedly killed and restarted.
+    mitre_attack: [T1562.001, T1070]
+    severity: critical
+    data_source: agent binary hash, process start/stop events for agent PID
+    detection:
+      logic: on-disk agent binary hash does not match vendor-signed release hash, OR agent process restart count exceeds baseline in a short window
+      conditions:
+        - sha256(agent_binary_path) not in known_good_release_hashes
+        - agent process restart_count >= 3 within 10 minutes
+      threshold: any hash mismatch is critical; restart churn threshold as above
+    false_positives:
+      - agent auto-update in progress
+      - crash-looping due to a legitimate bug (not tampering)
+    enrichment_sources:
+      - vendor release hash manifest
+    response_actions:
+      - isolate host
+      - forensic capture of agent binary before remediation
+    status: stable
+
+  - id: AGENT-HEALTH-004
+    title: Agent-reported clock skew
+    description: >
+      Large deviation between host system clock and collector/NTP time can
+      indicate timestomping to defeat timeline-based forensics, or a broken
+      NTP config being exploited.
+    mitre_attack: [T1070.006]
+    severity: medium
+    data_source: host-reported system time vs. collector-side received timestamp
+    detection:
+      logic: absolute delta between host clock and trusted collector clock exceeds tolerance
+      conditions:
+        - abs(host_reported_time - collector_receive_time) > 300 seconds
+        - host is not in a documented disconnected/air-gapped environment
+      threshold: '>5 minutes skew, sustained across 2+ check-ins'
+    false_positives:
+      - misconfigured or blocked NTP
+      - VM snapshot/resume clock jump
+    enrichment_sources: []
+    response_actions:
+      - verify NTP configuration
+      - cross-check file-modification timestamps on host against other evidence
+    status: stable
+
+  - id: AGENT-HEALTH-005
+    title: Agent configuration drift
+    description: >
+      Agent's own configuration (log level, exclusions, upload endpoint)
+      diverges from the centrally managed baseline without a change record —
+      often used to blind specific telemetry collection.
+    mitre_attack: [T1562.001]
+    severity: high
+    data_source: agent config hash/content per host_id
+    detection:
+      logic: current agent config hash differs from fleet-managed baseline config hash for this policy group
+      conditions:
+        - config_hash != baseline_config_hash_for_policy_group
+        - no matching change ticket in change window
+      threshold: any unauthorized diff
+    false_positives:
+      - staged rollout of a new policy not yet reflected in baseline reference
+    enrichment_sources:
+      - change-management/config-management system
+    response_actions:
+      - revert to managed baseline
+      - review diff for scope-narrowing (e.g. excluded paths/processes added)
+    status: stable

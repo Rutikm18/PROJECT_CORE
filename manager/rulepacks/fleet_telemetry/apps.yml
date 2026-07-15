@@ -1,0 +1,109 @@
+category: Apps
+description: >
+  Detects unauthorized, unsigned, or suspicious application installations
+  and behavior on managed endpoints.
+rules:
+  - id: APPS-001
+    title: Application installed outside approved allowlist
+    description: New application observed that is not present in the org's approved software catalog.
+    mitre_attack: [T1204, T1072]
+    severity: medium
+    data_source: installed_applications inventory diff
+    detection:
+      logic: newly observed app bundle/package identifier not present in approved_app_catalog
+      conditions:
+        - app_id not in approved_app_catalog
+        - install_timestamp within last collection interval
+      threshold: any occurrence, triaged by app category (dev tool vs. unknown binary weighted higher)
+    false_positives:
+      - legitimate self-service software from an approved-but-unlisted vendor catalog
+      - developer workstation with sanctioned exception
+    enrichment_sources:
+      - internal software asset management (SAM) catalog
+      - VirusTotal / vendor reputation for the publisher
+    response_actions:
+      - verify with user/owner
+      - flag for SAM catalog review or removal
+    status: stable
+
+  - id: APPS-002
+    title: Unsigned or invalid-signature application execution
+    description: Application binary lacks a valid code signature or the signature fails verification.
+    mitre_attack: [T1553.002]
+    severity: high
+    data_source: application code-signing status field
+    detection:
+      logic: code_signature_valid == false for an executing/installed application
+      conditions:
+        - code_signature_valid == false
+        - app not in explicitly approved unsigned-app exception list
+      threshold: any occurrence
+    false_positives:
+      - internal/in-house tooling that is legitimately unsigned
+    enrichment_sources:
+      - VirusTotal hash lookup
+      - internal unsigned-app exception list
+    response_actions:
+      - hash lookup against threat intel
+      - quarantine if hash is unknown and behavior is suspicious
+    status: stable
+
+  - id: APPS-003
+    title: Application installed from non-standard location
+    description: App executable resides in a user-writable or temp directory rather than standard Program Files/Applications paths.
+    mitre_attack: [T1036.005]
+    severity: medium
+    data_source: application install path
+    detection:
+      logic: install_path matches known staging/temp/download directory patterns
+      conditions:
+        - install_path matches '(?i)(\\Temp\\|/tmp/|\\Downloads\\|/Downloads/|AppData\\Local\\Temp)'
+        - app not part of a known portable-app allowlist
+      threshold: any occurrence
+    false_positives:
+      - portable apps intentionally run from Downloads by power users
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - inspect binary, correlate with recent browser/download activity
+    status: stable
+
+  - id: APPS-004
+    title: Bulk application installation outside change window
+    description: Abnormally high number of new app installs on a single host in a short period, outside any scheduled deployment.
+    mitre_attack: [T1072]
+    severity: medium
+    data_source: installed_applications diff counts per host per hour
+    detection:
+      logic: count of new distinct app installs on one host exceeds baseline in a short window with no active deployment job
+      conditions:
+        - new_install_count_last_hour >= 5
+        - no active MDM/RMM deployment job_id correlated
+      threshold: '>=5 new apps/hour without deployment correlation'
+    false_positives:
+      - legitimate bulk push from an unlogged deployment tool
+    enrichment_sources:
+      - MDM/RMM deployment job log
+    response_actions:
+      - correlate against deployment tooling logs before escalating
+    status: tuning
+
+  - id: APPS-005
+    title: Known-malicious application hash
+    description: Installed or executing application hash matches a known-malicious indicator.
+    mitre_attack: [T1204.002]
+    severity: critical
+    data_source: application binary hash
+    detection:
+      logic: app binary hash present in threat-intel malicious hash feed
+      conditions:
+        - sha256(app_binary) in malicious_hash_feed
+      threshold: any match
+    false_positives:
+      - stale/incorrect TI feed entry (rare, but validate feed freshness)
+    enrichment_sources:
+      - VirusTotal, MalwareBazaar, internal malware hash repository
+    response_actions:
+      - isolate host immediately
+      - initiate incident response workflow
+    status: stable

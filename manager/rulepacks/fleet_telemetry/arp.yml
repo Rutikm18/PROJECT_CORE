@@ -1,0 +1,107 @@
+category: ARP
+description: >
+  Detects ARP-layer manipulation used for on-path (MITM) attacks, network
+  reconnaissance, and rogue device presence on local segments.
+rules:
+  - id: ARP-001
+    title: ARP spoofing - duplicate IP with conflicting MAC addresses
+    description: Same IP address observed mapped to multiple different MAC addresses within a short window, classic ARP cache poisoning signature.
+    mitre_attack: [T1557.002]
+    severity: critical
+    data_source: arp table snapshots (ip, mac, timestamp) per network segment
+    detection:
+      logic: a single IP resolves to more than one distinct MAC address within the correlation window
+      conditions:
+        - distinct_mac_count_for_ip(window=5m) > 1
+        - neither MAC is a known load-balancer/VRRP/HSRP virtual MAC
+      threshold: '>1 MAC for same IP within 5 minutes'
+    false_positives:
+      - legitimate HA/failover (VRRP, HSRP, keepalived) virtual MAC switching
+      - DHCP lease handoff during host replacement
+    enrichment_sources:
+      - known VRRP/HSRP virtual MAC allowlist
+      - NIC OUI vendor registry
+    response_actions:
+      - identify both MACs' physical switch ports (via CAM table) to locate rogue device
+      - isolate suspect port
+    status: stable
+
+  - id: ARP-002
+    title: Gratuitous ARP flood
+    description: Abnormally high rate of gratuitous ARP announcements from a single host, consistent with active poisoning tooling.
+    mitre_attack: [T1557.002]
+    severity: high
+    data_source: ARP packet capture/counters per source MAC
+    detection:
+      logic: gratuitous ARP packet rate from a single source exceeds baseline
+      conditions:
+        - gratuitous_arp_count(source_mac, window=1m) > 20
+      threshold: '>20 gratuitous ARP/min from one host'
+    false_positives:
+      - failover/clustering software performing legitimate gratuitous ARP on VIP takeover
+    enrichment_sources:
+      - known clustering software asset list
+    response_actions:
+      - correlate with ARP-001; isolate source if not an approved HA node
+    status: stable
+
+  - id: ARP-003
+    title: Default gateway MAC mismatch
+    description: The MAC address currently resolving for the known default-gateway IP differs from the baselined/trusted gateway MAC — potential MITM on the routing path.
+    mitre_attack: [T1557.002]
+    severity: critical
+    data_source: arp table entry for gateway_ip, baseline gateway MAC registry
+    detection:
+      logic: resolved MAC for gateway_ip != trusted_gateway_mac_baseline
+      conditions:
+        - resolved_mac(gateway_ip) != trusted_gateway_mac_baseline
+        - not within a documented network hardware change window
+      threshold: any mismatch
+    false_positives:
+      - planned router/firewall hardware replacement
+    enrichment_sources:
+      - network change-management log
+    response_actions:
+      - immediately verify gateway integrity out-of-band
+      - isolate affected segment if MITM confirmed
+    status: stable
+
+  - id: ARP-004
+    title: MAC address churn for a single IP over time
+    description: A given IP address is repeatedly reassigned to different MAC addresses over a longer window — could indicate spoofing tooling cycling MACs to evade detection, or unmanaged DHCP chaos.
+    mitre_attack: [T1557.002]
+    severity: medium
+    data_source: arp/DHCP lease history per IP
+    detection:
+      logic: count of distinct MACs observed for one IP over a rolling day exceeds threshold
+      conditions:
+        - distinct_mac_count_for_ip(window=24h) >= 4
+      threshold: '>=4 distinct MACs/24h for a single IP'
+    false_positives:
+      - misconfigured/overlapping DHCP scopes
+      - guest network with high device turnover
+    enrichment_sources:
+      - DHCP server lease logs
+    response_actions:
+      - review DHCP scope health before treating as malicious
+    status: tuning
+
+  - id: ARP-005
+    title: Unknown vendor OUI appearing on restricted segment
+    description: A device with a NIC vendor OUI not present in the approved-hardware list appears on a segment expected to contain only managed assets.
+    mitre_attack: [T1200]
+    severity: medium
+    data_source: arp table MAC OUI, segment asset policy
+    detection:
+      logic: OUI of a MAC seen on a restricted segment is not in the approved vendor/asset list
+      conditions:
+        - oui(mac) not in approved_oui_list_for_segment
+      threshold: any occurrence on segments flagged as restricted
+    false_positives:
+      - newly procured hardware not yet added to the approved list
+    enrichment_sources:
+      - NIC OUI vendor registry
+      - CMDB asset inventory
+    response_actions:
+      - locate switch port and physically verify device
+    status: stable

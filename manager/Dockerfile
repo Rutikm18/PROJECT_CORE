@@ -67,6 +67,7 @@ COPY --from=deps /install /usr/local
 # Copy compiled bytecode + stub __init__.py files (no .py source)
 COPY --chown=jarvis:jarvis --from=build /build/shared/   /app/shared/
 COPY --chown=jarvis:jarvis --from=build /build/manager/  /app/manager/
+COPY --chown=jarvis:jarvis manager/rulepacks/ /app/manager/rulepacks/
 
 # Copy entrypoint (this single shell script is the only plain text in the image)
 RUN chmod +x /app/manager/scripts/entrypoint.sh

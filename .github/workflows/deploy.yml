@@ -36,13 +36,12 @@ jobs:
       - name: Install deps
         run: |
           pip install -r manager/requirements.txt
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio httpx
 
       - name: Run unit tests
         run: python -m pytest tests/unit/ -v --tb=short
         env:
           PYTHONPATH: .
-        continue-on-error: true
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -109,24 +108,23 @@ jobs:
 
             cd /home/${{ secrets.EC2_USER || 'ubuntu' }}/attacklens
 
-            # Pull latest images from ECR
             aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
               docker login --username AWS --password-stdin \
               ${{ env.ECR_REGISTRY }}
 
-            docker compose -f docker-compose.yml pull
-
-            # Generate override file pointing to explicit images
+            # Generate override file pointing to the exact images built by this run.
             cat > docker-compose.override.yml << 'OVERRIDE'
             services:
               manager:
-                image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:manager-latest
+                image: ${{ needs.test-and-build.outputs.manager_image }}
               threat-intel:
-                image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:threat-intel-latest
+                image: ${{ needs.test-and-build.outputs.threat_intel_image }}
             OVERRIDE
 
+            docker compose -f docker-compose.yml -f docker-compose.override.yml pull manager threat-intel
+
             # Graceful restart — containers are replaced one at a time
-            docker compose -f docker-compose.yml up -d --remove-orphans --no-deps
+            docker compose -f docker-compose.yml -f docker-compose.override.yml up -d --remove-orphans --no-deps manager threat-intel
 
             # Clean up old images (keep last 3)
             docker image prune -af --filter "until=24h" 2>/dev/null || true
@@ -143,4 +141,4 @@ jobs:
             done
 
             # Print status
-            docker compose ps
+            docker compose -f docker-compose.yml -f docker-compose.override.yml ps

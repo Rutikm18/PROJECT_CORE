@@ -25,6 +25,12 @@ _DATA_POINT_LAYER: dict[str, Layer] = {
     "configs":        "surface",
     "security":       "surface",
     "sysctl":         "surface",
+    "agent_health":   "surface",
+    "battery":        "surface",
+    "hardware":       "surface",
+    "mounts":         "surface",
+    "open_files":     "surface",
+    "storage":        "surface",
     "containers":     "surface",
     "ports":          "exposure",
     "connections":    "exposure",
@@ -136,5 +142,26 @@ def entity_keys_for(signal: Signal) -> list[str]:
     elif dp == "configs":
         if path := ev.get("path"):
             keys.add(f"config:{path}@{aid}")
+    elif dp == "open_files":
+        if path := ev.get("file_path") or ev.get("path"):
+            keys.add(f"file:path:{path}@{aid}")
+        if proc := ev.get("process_name") or ev.get("process") or ev.get("name"):
+            keys.add(f"process:name:{proc}@{aid}")
+    elif dp == "mounts":
+        if mount := ev.get("mount_point") or ev.get("path"):
+            keys.add(f"mount:{mount}@{aid}")
+        if remote := ev.get("remote_host"):
+            keys.add(f"remote_host:{remote}")
+    elif dp == "hardware":
+        if serial := ev.get("serial") or ev.get("serial_number") or ev.get("device_serial"):
+            keys.add(f"hardware:serial:{serial}@{aid}")
+        if vid := ev.get("vendor_id"):
+            pid = ev.get("product_id", "")
+            keys.add(f"hardware:usb:{vid}:{pid}@{aid}")
+    elif dp == "storage":
+        if volume := ev.get("volume_id") or ev.get("device") or ev.get("mount_point"):
+            keys.add(f"storage:{volume}@{aid}")
+    elif dp == "agent_health":
+        keys.add(f"agent:{aid}")
 
     return list(keys)

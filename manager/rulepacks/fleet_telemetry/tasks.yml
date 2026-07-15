@@ -1,0 +1,105 @@
+category: Tasks
+description: >
+  Detects persistence and privilege abuse via scheduled tasks / cron jobs /
+  launch agents.
+rules:
+  - id: TASKS-001
+    title: New scheduled task/cron job created for persistence
+    description: A new scheduled task or cron entry is created pointing to an unsigned binary, script, or non-standard location.
+    mitre_attack: [T1053]
+    severity: high
+    data_source: scheduled task/cron creation events (action, trigger, target)
+    detection:
+      logic: newly created task target is unsigned or resides in a suspicious-location pattern (see BINARIES-003)
+      conditions:
+        - task_create_event == true
+        - (target_signature_valid == false OR target_path matches suspicious-location pattern)
+      threshold: any occurrence
+    false_positives:
+      - legitimate internal automation/maintenance task not yet signed through standard pipeline
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - disable task pending verification, inspect target binary/script
+    status: stable
+
+  - id: TASKS-002
+    title: Task configured with SYSTEM/root privileges targeting suspicious binary
+    description: A scheduled task/cron job runs with the highest local privilege and points to a first-seen or unsigned executable.
+    mitre_attack: [T1053, T1548]
+    severity: critical
+    data_source: task run-as account, target binary signature/first-seen status
+    detection:
+      logic: task run_as_account in ['SYSTEM','root'] and target binary is unsigned or newly seen
+      conditions:
+        - run_as_account in ['SYSTEM','root']
+        - (target_signature_valid == false OR target_first_seen_days < 1)
+      threshold: any occurrence
+    false_positives:
+      - legitimate new system-level maintenance task from an approved deployment
+    enrichment_sources:
+      - hash reputation, deployment tooling logs
+    response_actions:
+      - disable task immediately pending verification
+    status: stable
+
+  - id: TASKS-003
+    title: Previously disabled or hidden task re-enabled
+    description: A task that was disabled or configured with hidden attributes transitions back to enabled/visible without a corresponding change record.
+    mitre_attack: [T1053, T1564]
+    severity: high
+    data_source: task enabled/hidden state history
+    detection:
+      logic: task state transitions from disabled/hidden to enabled without a matching change ticket
+      conditions:
+        - task_state_new == 'enabled'
+        - task_state_old in ['disabled','hidden']
+        - no matching change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate re-enable by IT for a maintenance task not logged in the tracked system
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - verify legitimacy, disable if unauthorized
+    status: stable
+
+  - id: TASKS-004
+    title: Logon-trigger task pointing to non-standard executable
+    description: A task configured to trigger on user logon executes a binary/script outside standard application directories — potential persistence mechanism.
+    mitre_attack: [T1053.005, T1547]
+    severity: medium
+    data_source: task trigger type, target path
+    detection:
+      logic: task trigger_type == 'on_logon' and target_path matches suspicious-location pattern
+      conditions:
+        - trigger_type == 'on_logon'
+        - target_path matches suspicious-location pattern (see BINARIES-003)
+      threshold: any occurrence
+    false_positives:
+      - legitimate user-installed startup utility from a non-standard but benign location
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - inspect target, disable if unverified
+    status: tuning
+
+  - id: TASKS-005
+    title: Cron job modified to include obfuscated/encoded command
+    description: An existing cron job's command is altered to include base64-encoded or otherwise obfuscated payload execution.
+    mitre_attack: [T1053.003, T1027]
+    severity: high
+    data_source: cron entry content diff
+    detection:
+      logic: cron command content matches obfuscation patterns after a modification event
+      conditions:
+        - cron_entry_modified == true
+        - new_command matches '(?i)(base64\s+-d|curl.*\|\s*sh|wget.*\|\s*sh|python -c)'
+      threshold: any occurrence
+    false_positives:
+      - legitimate admin scripting using these same shell idioms
+    enrichment_sources:
+      - hash reputation of any downloaded/decoded payload
+    response_actions:
+      - revert cron entry, investigate the decoded payload
+    status: stable

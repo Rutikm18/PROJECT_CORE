@@ -1,0 +1,105 @@
+category: Storage
+description: >
+  Detects storage-layer anomalies: abnormal usage growth, unauthorized
+  volumes, unexpected encryption events, and hidden partitions.
+rules:
+  - id: STORAGE-001
+    title: Rapid abnormal disk usage growth
+    description: Disk consumption on a volume grows far faster than baseline in a short window — can indicate ransomware staging, data exfil staging, or log-based DoS.
+    mitre_attack: [T1486, T1074]
+    severity: medium
+    data_source: disk usage percentage time series per volume, baseline
+    detection:
+      logic: disk usage growth rate exceeds baseline growth rate significantly within a short window
+      conditions:
+        - disk_usage_growth_pct(window=1h) > baseline_growth_rate * 5
+      threshold: '>5x baseline growth rate/hour'
+    false_positives:
+      - legitimate large download, backup, or log-verbosity change
+    enrichment_sources:
+      - correlate with METRICS-003 (mass file write) and OPEN_FILES-002
+    response_actions:
+      - identify process/directory responsible, investigate before free-space exhaustion
+    status: tuning
+
+  - id: STORAGE-002
+    title: New unauthorized volume/partition attached
+    description: A new storage volume or partition appears on the host that is not part of its provisioned baseline configuration.
+    mitre_attack: [T1200]
+    severity: medium
+    data_source: volume/partition inventory, baseline provisioning record
+    detection:
+      logic: current volume list contains an entry not in the provisioned baseline for this asset
+      conditions:
+        - volume_id not in provisioned_baseline_volumes[asset_id]
+        - no correlated approved storage-provisioning ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate storage expansion not yet reflected in baseline records
+    enrichment_sources:
+      - CMDB / storage-provisioning system
+    response_actions:
+      - verify with infrastructure team, investigate if unapproved
+    status: stable
+
+  - id: STORAGE-003
+    title: Unexpected full-volume encryption event
+    description: An existing, previously unencrypted volume becomes encrypted (or its encryption key changes) without an approved encryption-rollout change record — potential ransomware full-disk encryption.
+    mitre_attack: [T1486]
+    severity: critical
+    data_source: volume encryption status/key-identifier changes
+    detection:
+      logic: volume encryption_status transitions to encrypted, or encryption key identifier changes, without a matching approved change ticket
+      conditions:
+        - encryption_status_new == 'encrypted' and encryption_status_old == 'unencrypted'
+        - OR key_identifier changed unexpectedly
+        - no matching approved encryption-rollout ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate organization-wide disk-encryption rollout (BitLocker/FileVault deployment) — should be ticketed
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - isolate host immediately, this is a strong ransomware indicator absent an approved change
+    status: stable
+
+  - id: STORAGE-004
+    title: Storage quota threshold breach correlated with unknown process
+    description: A monitored storage quota is breached, and the majority of recent growth is attributable to a process not previously observed on the host.
+    mitre_attack: [T1074]
+    severity: medium
+    data_source: quota usage, per-process disk-write attribution
+    detection:
+      logic: quota usage exceeds threshold and top disk-writing process in the growth window is a first-seen process
+      conditions:
+        - quota_usage_pct > 90
+        - top_writing_process.first_seen within last 24h
+      threshold: '>90% quota with new-process attribution'
+    false_positives:
+      - legitimate new application generating expected data volume
+    enrichment_sources:
+      - hash reputation of the writing process
+    response_actions:
+      - investigate writing process, correlate with BINARIES/PROCESSES rules
+    status: tuning
+
+  - id: STORAGE-005
+    title: Hidden partition or steganographic volume creation
+    description: A partition is created with attributes indicating it is deliberately hidden from normal OS volume enumeration (no mount point, no filesystem signature registered, hidden GPT attribute set).
+    mitre_attack: [T1564.005]
+    severity: high
+    data_source: partition table changes, GPT attribute flags
+    detection:
+      logic: new partition created with the hidden GPT attribute bit set, or lacking a registered filesystem type while consuming significant space
+      conditions:
+        - gpt_hidden_attribute == true
+        - OR (filesystem_type == 'unknown' and partition_size_gb > 1)
+        - no correlated approved storage-provisioning ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate recovery/OEM partitions present on new hardware (validate against known OEM partition GUIDs)
+    enrichment_sources:
+      - known OEM/recovery partition GUID reference list
+    response_actions:
+      - investigate partition contents via offline forensic imaging
+    status: experimental

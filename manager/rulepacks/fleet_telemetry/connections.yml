@@ -1,0 +1,128 @@
+category: Connections
+description: >
+  Detects command-and-control, exfiltration, and anomalous outbound/inbound
+  network connection patterns at the host level.
+rules:
+  - id: CONNECTIONS-001
+    title: Low-jitter beaconing pattern
+    description: >
+      A process makes periodic outbound connections to the same destination
+      with unusually consistent time intervals — classic C2 beacon behavior.
+    mitre_attack: [T1071, T1071.001]
+    severity: high
+    data_source: outbound connection timestamps grouped by (process, dest_ip, dest_port)
+    detection:
+      logic: coefficient of variation of inter-connection intervals to a single destination is very low over a sustained sample
+      conditions:
+        - connection_count(dest, window=24h) >= 20
+        - stddev(interval)/mean(interval) < 0.15
+        - dest_ip not in known_saas_polling_allowlist (e.g., telemetry/update services)
+      threshold: CoV < 0.15 across >=20 samples
+    false_positives:
+      - legitimate polling software (update checkers, monitoring agents, SaaS heartbeats)
+    enrichment_sources:
+      - IP/domain reputation (MISP, GreyNoise, AbuseIPDB)
+      - known SaaS polling-endpoint allowlist
+    response_actions:
+      - inspect destination reputation, capture pcap sample, isolate if confirmed
+    status: tuning
+
+  - id: CONNECTIONS-002
+    title: Connection to known-malicious IP or domain
+    description: Outbound or inbound connection to an address/domain present in threat-intelligence blocklists.
+    mitre_attack: [T1071]
+    severity: critical
+    data_source: connection dest_ip/dest_domain, TI feeds
+    detection:
+      logic: dest_ip or resolved_domain present in malicious-indicator feed
+      conditions:
+        - dest_ip in ti_malicious_ip_feed OR dest_domain in ti_malicious_domain_feed
+      threshold: any match
+    false_positives:
+      - shared/CDN IP ranges falsely flagged by a stale TI feed entry
+    enrichment_sources:
+      - MISP, AbuseIPDB, OTX, Spamhaus, VirusTotal
+    response_actions:
+      - block at firewall/proxy, isolate host, IR workflow
+    status: stable
+
+  - id: CONNECTIONS-003
+    title: Large outbound data transfer anomaly
+    description: A host transfers a volume of outbound data far exceeding its historical baseline, potential data exfiltration.
+    mitre_attack: [T1041, T1567]
+    severity: high
+    data_source: bytes_sent per host per connection/session, historical baseline
+    detection:
+      logic: outbound bytes in a session/day exceed host's historical baseline by a large multiple
+      conditions:
+        - bytes_sent(window=24h) > baseline_p95_for_host * 5
+        - destination is external (not internal corporate range)
+      threshold: '>5x the 95th-percentile historical baseline'
+    false_positives:
+      - legitimate large backup/sync job, bulk file share
+    enrichment_sources:
+      - approved backup/sync destination allowlist
+    response_actions:
+      - identify destination and initiating process, verify legitimacy before blocking
+    status: tuning
+
+  - id: CONNECTIONS-004
+    title: DNS tunneling indicators
+    description: DNS query patterns consistent with tunneling C2/exfil over DNS (high entropy, long labels, unusual record types, high volume to one domain).
+    mitre_attack: [T1071.004]
+    severity: high
+    data_source: DNS query logs (qname, qtype, source process)
+    detection:
+      logic: high volume of TXT/NULL queries to a single apex domain with high-entropy subdomain labels
+      conditions:
+        - qtype in ['TXT','NULL','CNAME']
+        - avg(subdomain_label_entropy) > 3.5
+        - distinct_query_count(apex_domain, window=1h) > 100
+      threshold: '>100 unique queries/hour to one apex domain with high entropy labels'
+    false_positives:
+      - legitimate DNS-based service discovery or CDN/anti-malware DNS-based lookups
+    enrichment_sources:
+      - domain reputation, NRD (newly-registered-domain) feed
+    response_actions:
+      - block domain at DNS resolver, isolate host, identify initiating process
+    status: tuning
+
+  - id: CONNECTIONS-005
+    title: Connection to Tor exit node or anonymization proxy
+    description: Host connects to an IP known to be a Tor exit node, open proxy, or commercial anonymization VPN endpoint outside approved use.
+    mitre_attack: [T1090.003]
+    severity: medium
+    data_source: dest_ip, Tor/proxy exit-node list
+    detection:
+      logic: dest_ip present in current Tor exit-node or anonymization-proxy list
+      conditions:
+        - dest_ip in tor_exit_node_feed OR dest_ip in known_anonymizer_feed
+        - host/user not in approved research/security-testing exception list
+      threshold: any occurrence
+    false_positives:
+      - authorized security research or privacy-tooling use by approved personnel
+    enrichment_sources:
+      - Tor Project exit-node list, commercial anonymizer IP feeds
+    response_actions:
+      - verify business justification, escalate if unapproved
+    status: stable
+
+  - id: CONNECTIONS-006
+    title: Unusual destination port for known protocol
+    description: Traffic matching a well-known application protocol's byte pattern is observed on a non-standard port, often used to evade port-based controls.
+    mitre_attack: [T1571]
+    severity: medium
+    data_source: connection payload protocol fingerprint vs. dest_port
+    detection:
+      logic: protocol fingerprint (e.g., TLS/HTTP) detected on a port not conventionally associated with it
+      conditions:
+        - fingerprinted_protocol == 'HTTP' and dest_port not in [80,8080,8000]
+        - OR fingerprinted_protocol == 'TLS' and dest_port not in [443,8443]
+      threshold: any occurrence outside allowlisted non-standard app ports
+    false_positives:
+      - legitimate internal services running HTTP/TLS on custom ports
+    enrichment_sources:
+      - internal service-port registry
+    response_actions:
+      - identify process/service, confirm legitimacy, add to allowlist or investigate
+    status: tuning
