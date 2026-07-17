@@ -37,6 +37,27 @@ log = logging.getLogger("manager.attacklens.rulepack")
 RuleFn = Callable[["RulePackDetector", str, dict, dict | None], dict | None]
 
 
+_AUTHORITATIVE_SIGNAL_TERMS = (
+    "malicious", "threat", "ioc", "feed", "kev", "cisa", "nvd", "epss",
+    "osv", "registry_hash", "signature_valid == false", "remote_thread",
+    "remote_memory", "log_cleared", "mfa_enforced transitions",
+)
+_CONTEXT_SIGNAL_TERMS = (
+    "baseline", "historical", "approved", "allowlist", "previous", "old_",
+    "transition", "transitions", "first_seen", "sla", "policy",
+)
+_INTEGRATION_TERMS: dict[str, tuple[str, ...]] = {
+    "threat_intel": ("threat", "ioc", "malicious", "feed", "abuseipdb", "urlhaus", "threatfox"),
+    "vulnerability_intel": ("kev", "cisa", "nvd", "epss", "osv", "cve", "vulnerability"),
+    "asset_policy": ("approved", "allowlist", "baseline", "policy", "inventory", "registry"),
+}
+_DEFAULT_TRUSTED_INTEGRATIONS = {
+    "abuseipdb", "virustotal", "urlhaus", "threatfox", "feodo", "cisa",
+    "nvd", "epss", "osv", "crowdstrike", "falcon", "sentinelone",
+    "defender", "mdatp", "carbonblack", "osquery", "santa",
+}
+
+
 @dataclass(frozen=True)
 class RulePackRule:
     id: str
@@ -385,6 +406,60 @@ def _list_contains_path_prefix(value: str, prefixes: set[str]) -> bool:
     return any(low.startswith(p.lower()) for p in prefixes)
 
 
+def _trusted_integrations() -> set[str]:
+    return _split_env("ATTACKLENS_TRUSTED_INTEGRATIONS", _DEFAULT_TRUSTED_INTEGRATIONS)
+
+
+def _integration_sources(item: dict) -> set[str]:
+    fields = (
+        "integration_source", "source_platform", "provider", "vendor",
+        "threat_source", "feed_source", "ioc_source", "scanner",
+    )
+    sources: set[str] = set()
+    for field in fields:
+        value = item.get(field)
+        if isinstance(value, str):
+            sources.add(_lower(value))
+        elif isinstance(value, list):
+            sources.update(_lower(x) for x in value if str(x).strip())
+    for nested in ("threat_meta", "ioc", "cve", "enrichment"):
+        value = item.get(nested)
+        if isinstance(value, dict):
+            for key in ("source", "provider", "vendor", "platform"):
+                if value.get(key):
+                    sources.add(_lower(value[key]))
+    return {s for s in sources if s}
+
+
+def _trusted_integration_sources(sources: set[str]) -> set[str]:
+    trusted = _trusted_integrations()
+    out: set[str] = set()
+    for source in sources:
+        normalized = re.sub(r"[^a-z0-9]+", "", source.lower())
+        for trust in trusted:
+            trust_norm = re.sub(r"[^a-z0-9]+", "", trust.lower())
+            if source == trust or normalized == trust_norm or trust_norm in normalized:
+                out.add(source)
+                break
+    return out
+
+
+def _item_has_threat_assertion(item: dict) -> bool:
+    return any(bool(item.get(k)) for k in (
+        "malicious_ip", "threat_ip_match", "malicious_hash_hit",
+        "threat_hash_match", "ioc_match", "threat_match",
+    ))
+
+
+def _item_has_vulnerability_assertion(item: dict) -> bool:
+    if item.get("kev") or item.get("cisa_kev") or item.get("epss_score"):
+        return True
+    if item.get("cve_id") or item.get("cve_ids") or item.get("cves"):
+        return True
+    cve = item.get("cve")
+    return isinstance(cve, dict) and bool(cve.get("cve_id") or cve.get("kev"))
+
+
 class RulePackDetector:
     def __init__(self, rules: dict[str, list[RulePackRule]]) -> None:
         self._rules = rules
@@ -485,7 +560,7 @@ class RulePackDetector:
                     log.debug("rulepack evaluator failed rule=%s: %s", rule.id, exc)
                     continue
                 if match:
-                    findings.append(self._finding(agent_id, rule, item, match))
+                    findings.append(self._finding(agent_id, rule, item, match, {"feeds": feeds}))
         return findings
 
     @staticmethod
@@ -502,11 +577,19 @@ class RulePackDetector:
             return [data]
         return []
 
-    def _finding(self, agent_id: str, rule: RulePackRule, item: dict, match: dict) -> dict:
+    def _finding(
+        self,
+        agent_id: str,
+        rule: RulePackRule,
+        item: dict,
+        match: dict,
+        ctx: dict | None = None,
+    ) -> dict:
         mitre = rule.mitre_attack[0] if rule.mitre_attack else ""
         stable_id = self._stable_item_id(item)
         item_key = f"rulepack:{rule.id}:{stable_id}"
         matched = match.get("matched_conditions") or []
+        quality = self._quality_profile(rule, item, match, ctx)
         evidence = dict(item)
         evidence["_rulepack"] = {
             "rule_id": rule.id,
@@ -520,9 +603,17 @@ class RulePackDetector:
             "enrichment_sources": rule.enrichment_sources,
             "response_actions": rule.response_actions,
             "match_reason": match.get("reason", ""),
+            "evidence_strength": quality["evidence_strength"],
+            "condition_coverage": quality["condition_coverage"],
+            "matched_condition_count": len(matched),
+            "rule_condition_count": quality["rule_condition_count"],
+            "authoritative_corroboration": quality["authoritative_corroboration"],
+            "contextual_corroboration": quality["contextual_corroboration"],
+            "integration_state": quality["integration_state"],
+            "calibration": quality["calibration"],
         }
         severity = match.get("severity") or rule.severity or "medium"
-        confidence = float(match.get("confidence") or self._confidence(rule))
+        confidence = quality["confidence"]
         return {
             "agent_id": agent_id,
             "category": _SECTION_CATEGORY.get(rule.section, rule.section),
@@ -539,6 +630,8 @@ class RulePackDetector:
             "tags": ["rulepack", rule.section, rule.id],
             "confidence": round(confidence, 3),
             "weight": float(match.get("weight") or self._weight(rule, confidence)),
+            "precision_score": round(quality["precision_score"], 3),
+            "precision_factors": quality["precision_factors"],
         }
 
     @staticmethod
@@ -579,6 +672,159 @@ class RulePackDetector:
         if rule.severity == "medium":
             return max(0.58, confidence)
         return max(0.45, confidence)
+
+    def _quality_profile(
+        self,
+        rule: RulePackRule,
+        item: dict,
+        match: dict,
+        ctx: dict | None,
+    ) -> dict[str, Any]:
+        matched = [str(x) for x in (match.get("matched_conditions") or []) if str(x)]
+        rule_conditions = rule.detection.get("conditions") or []
+        rule_condition_count = max(1, len(rule_conditions))
+        matched_count = len(matched)
+        condition_coverage = min(1.0, matched_count / rule_condition_count)
+
+        text = " ".join([
+            rule.title,
+            rule.description,
+            str(rule.detection.get("logic") or ""),
+            " ".join(map(str, rule_conditions)),
+            " ".join(map(str, rule.enrichment_sources)),
+            " ".join(matched),
+            str(match.get("reason") or ""),
+        ]).lower()
+        authoritative = any(term in text for term in _AUTHORITATIVE_SIGNAL_TERMS)
+        contextual = any(term in text for term in _CONTEXT_SIGNAL_TERMS)
+        integration_state = self._integration_state(rule, item, ctx)
+        integration_missing = bool(integration_state["missing"])
+        if integration_missing and set(integration_state["missing"]) & {
+            "threat_intel", "vulnerability_intel",
+        }:
+            authoritative = False
+
+        base = float(match.get("confidence") or self._confidence(rule))
+        adjustments: list[dict[str, Any]] = [{"factor": "base_rule_confidence", "delta": round(base, 3)}]
+
+        delta = 0.0
+        if matched_count >= 2:
+            delta += 0.04
+            adjustments.append({"factor": "multi_condition_match", "delta": 0.04})
+        if matched_count >= 3:
+            delta += 0.03
+            adjustments.append({"factor": "three_or_more_conditions", "delta": 0.03})
+        if authoritative:
+            delta += 0.05
+            adjustments.append({"factor": "authoritative_corroboration", "delta": 0.05})
+        if contextual:
+            delta += 0.03
+            adjustments.append({"factor": "contextual_baseline_or_policy", "delta": 0.03})
+        if integration_missing:
+            penalty = max(-0.12, -0.04 * len(integration_state["missing"]))
+            delta += penalty
+            adjustments.append({
+                "factor": "missing_required_integration",
+                "delta": penalty,
+                "missing": integration_state["missing"],
+            })
+
+        single_heuristic = matched_count <= 1 and not authoritative and not contextual
+        if single_heuristic:
+            penalty = -0.06 if rule.severity in {"critical", "high"} else -0.04
+            delta += penalty
+            adjustments.append({"factor": "single_uncorroborated_heuristic", "delta": penalty})
+        if rule.status == "experimental":
+            delta -= 0.06
+            adjustments.append({"factor": "experimental_rule", "delta": -0.06})
+        elif rule.status == "tuning":
+            delta -= 0.03
+            adjustments.append({"factor": "tuning_rule", "delta": -0.03})
+
+        confidence = max(0.30, min(0.99, base + delta))
+        if authoritative and rule.severity in {"critical", "high"}:
+            confidence = max(confidence, 0.90)
+
+        if confidence >= 0.93 and (authoritative or matched_count >= 2):
+            strength = "authoritative"
+        elif confidence >= 0.80:
+            strength = "strong"
+        elif confidence >= 0.65:
+            strength = "moderate"
+        else:
+            strength = "weak"
+
+        status_factor = {
+            "stable": 1.0,
+            "tuning": 0.72,
+            "experimental": 0.58,
+        }.get(rule.status, 0.70)
+        precision_factors = {
+            "rule_confidence": round(confidence, 3),
+            "condition_coverage": round(condition_coverage, 3),
+            "authoritative_corroboration": 1.0 if authoritative else 0.0,
+            "contextual_corroboration": 1.0 if contextual else 0.0,
+            "rule_maturity": status_factor,
+            "single_heuristic_penalty": 0.0 if single_heuristic else 1.0,
+        }
+        precision_score = (
+            0.58 * precision_factors["rule_confidence"]
+            + 0.14 * precision_factors["condition_coverage"]
+            + 0.12 * precision_factors["authoritative_corroboration"]
+            + 0.08 * precision_factors["contextual_corroboration"]
+            + 0.08 * precision_factors["rule_maturity"]
+        )
+        if single_heuristic:
+            precision_score *= 0.92
+
+        return {
+            "confidence": round(confidence, 3),
+            "precision_score": max(0.0, min(1.0, precision_score)),
+            "precision_factors": precision_factors,
+            "evidence_strength": strength,
+            "condition_coverage": round(condition_coverage, 3),
+            "rule_condition_count": rule_condition_count,
+            "authoritative_corroboration": authoritative,
+            "contextual_corroboration": contextual,
+            "integration_state": integration_state,
+            "calibration": adjustments,
+        }
+
+    @staticmethod
+    def _integration_state(rule: RulePackRule, item: dict, ctx: dict | None) -> dict[str, Any]:
+        text = " ".join([
+            str(rule.detection.get("logic") or ""),
+            " ".join(map(str, rule.detection.get("conditions") or [])),
+            " ".join(map(str, rule.enrichment_sources)),
+        ]).lower()
+        required = [
+            name for name, terms in _INTEGRATION_TERMS.items()
+            if any(term in text for term in terms)
+        ]
+        feeds = (ctx or {}).get("feeds")
+        source_values = _integration_sources(item)
+        trusted_sources = _trusted_integration_sources(source_values)
+        has_trusted_ti = bool(trusted_sources and _item_has_threat_assertion(item))
+        has_trusted_vuln = bool(trusted_sources and _item_has_vulnerability_assertion(item))
+        available = {
+            "threat_intel": bool(feeds and hasattr(feeds, "is_malicious_ip")) or has_trusted_ti,
+            "vulnerability_intel": bool(
+                feeds and (
+                    hasattr(feeds, "is_kev_cve")
+                    or hasattr(feeds, "bulk_epss")
+                    or hasattr(feeds, "get_epss")
+                )
+            ) or has_trusted_vuln,
+            "asset_policy": True,
+        }
+        missing = [name for name in required if not available.get(name, False)]
+        return {
+            "required": required,
+            "available": {name: available.get(name, False) for name in required},
+            "missing": missing,
+            "trusted_sources": sorted(trusted_sources),
+            "reported_sources": sorted(source_values),
+        }
 
 
 def _matched(*conditions: str, reason: str = "", **extra: Any) -> dict:

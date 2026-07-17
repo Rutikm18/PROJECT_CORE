@@ -38,6 +38,7 @@ import {
   OSRemediationPanel,
   TerrainValidationPanel,
   AdvancedFilter,
+  AgentSelect,
   applyAdvancedConditions,
   type FilterCondition,
 } from "./DetectionShared";
@@ -796,6 +797,7 @@ export default function ThreatQueue() {
   const [catTab,   setCatTab]     = useState("all");
   const [severity, setSeverity]   = useState("");
   const [status,   setStatus]     = useState("");
+  const [agentId,  setAgentId]    = useState("");
   const [slaOnly,  setSlaOnly]    = useState(false);
   const [kevOnly,  setKevOnly]    = useState(false);
   const [search,   setSearch]     = useState("");
@@ -810,12 +812,13 @@ export default function ThreatQueue() {
   const [page, setPage] = useState(0);
 
   // Reset to first page whenever any filter / sort / view changes
-  useEffect(() => { setPage(0); }, [catTab, severity, status, slaOnly, kevOnly, search, sortKey, sortAsc, viewMode, adv]);
+  useEffect(() => { setPage(0); }, [catTab, severity, status, agentId, slaOnly, kevOnly, search, sortKey, sortAsc, viewMode, adv]);
 
 
   const load = useCallback(async () => {
     const p = new URLSearchParams({ limit: "500", sort_by: sortKey, view: viewMode });
     if (severity) p.set("severity", severity);
+    if (agentId)  p.set("agent_id", agentId);
     // Don't send status param when view=closed (backend handles terminal states)
     if (status && viewMode !== "closed") p.set("status", status);
     if (slaOnly)  p.set("sla_breached", "true");
@@ -836,7 +839,7 @@ export default function ThreatQueue() {
       setError(null);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setLastSync(Math.floor(Date.now() / 1000)); }
-  }, [severity, status, slaOnly, search, sortKey, viewMode]);
+  }, [severity, status, agentId, slaOnly, search, sortKey, viewMode]);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
@@ -1214,6 +1217,7 @@ export default function ThreatQueue() {
               <option value="">All Severity</option>
               {["critical","high","medium","low"].map(s => <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>)}
             </select>
+            <AgentSelect value={agentId} onChange={setAgentId} compact />
             <select value={status} onChange={e => setStatus(e.target.value)}
               className="px-2 py-1.5 text-[10px] border border-gray-200 rounded-xl bg-white text-gray-700 focus:outline-none cursor-pointer">
               <option value="">All Status</option>

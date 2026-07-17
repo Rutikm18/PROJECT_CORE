@@ -1337,10 +1337,28 @@ class IntelDB:
         )
         return [dict(r) for r in rows]
 
-    async def search_by_external_id(self, id_term: str, *, active_only: bool = False, limit: int = 20) -> list[dict]:
+    async def search_by_external_id(
+        self,
+        id_term: str,
+        *,
+        active_only: bool = False,
+        agent_id: str | None = None,
+        terrain_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
         """Direct indexed lookup by external_id prefix or exact match.  Uses the
         UNIQUE index idx_find_external_id — O(log n), not a full scan.  Accepts
         partial prefixes like 'AL-F-000' so the analyst can type incrementally."""
+        parts = ["f.external_id LIKE ?"]
+        args: list = [id_term.replace("*", "%") + "%"]
+        if active_only:
+            parts.append("f.is_active=1")
+        if agent_id:
+            parts.append("f.agent_id=?")
+            args.append(agent_id)
+        if terrain_id:
+            parts.append("f.terrain_id=?")
+            args.append(terrain_id)
         rows = await self._fetchall(
             "SELECT f.*, "
             "       ar.os         AS agent_os, "
@@ -1348,11 +1366,10 @@ class IntelDB:
             "       ar.os_version AS agent_os_version "
             "FROM findings f "
             "LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
-            "WHERE f.external_id LIKE ? "
-            + ("AND f.is_active=1 " if active_only else "") +
+            f"WHERE {' AND '.join(parts)} "
             "ORDER BY f.external_id "
             "LIMIT ?",
-            (id_term.replace("*", "%") + "%", limit),
+            (*args, limit),
         )
         return [_shape_finding(dict(r)) for r in rows]
 
@@ -2172,7 +2189,12 @@ class IntelDB:
             "SELECT * FROM soc_activity WHERE finding_id=? ORDER BY created_at ASC",
             (finding_id,),
         )
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            _parse_activity_row(d)
+            out.append(d)
+        return out
 
     async def get_actions(self, finding_id: int) -> list[dict]:
         rows = await self._fetchall(
@@ -2180,6 +2202,89 @@ class IntelDB:
             (finding_id,),
         )
         return [dict(r) for r in rows]
+
+    async def get_finding_timeline(self, finding_id: int) -> list[dict]:
+        """
+        Unified per-finding analyst timeline.
+
+        `finding_timeline` stores case-specific notes/workflow events. The
+        authoritative SOC audit stream is `soc_activity`; merge both so the
+        case tab, All Incidents, and Attack Terrain detail panels show every
+        analyst action on the finding without depending on one table only.
+        """
+        case_rows = await self._fetchall(
+            """SELECT id, finding_id, actor, action, from_status, to_status,
+                      note, created_at
+               FROM finding_timeline
+               WHERE finding_id=?
+               ORDER BY created_at ASC, id ASC""",
+            (finding_id,),
+        )
+        activity_rows = await self._fetchall(
+            """SELECT id, finding_id, agent_id, action, actor, old_value,
+                      new_value, detail, created_at, finding_uid,
+                      changed_fields, metadata
+               FROM soc_activity
+               WHERE finding_id=?
+               ORDER BY created_at ASC, id ASC""",
+            (finding_id,),
+        )
+
+        events: list[dict] = []
+        for r in case_rows:
+            d = dict(r)
+            created = float(d.get("created_at") or 0)
+            events.append({
+                "id": d.get("id"),
+                "source": "case",
+                "finding_id": d.get("finding_id"),
+                "actor": d.get("actor") or "system",
+                "action": d.get("action") or "",
+                "from_status": d.get("from_status"),
+                "to_status": d.get("to_status"),
+                "note": d.get("note") or "",
+                "created_at": created,
+                "elapsed": _elapsed_label(created),
+            })
+
+        for r in activity_rows:
+            d = dict(r)
+            _parse_activity_row(d)
+            created = float(d.get("created_at") or 0)
+            action = str(d.get("action") or "")
+            if action in {"case_opened", "case_status_change", "case_note"}:
+                continue
+            old_value = d.get("old_value") or ""
+            new_value = d.get("new_value") or ""
+            from_status = old_value if action in ("status_change", "case_status_change") else None
+            to_status = new_value if action in ("status_change", "case_status_change") else None
+
+            detail = d.get("detail") or ""
+            if action in ("assigned", "case_assigned") and (old_value or new_value):
+                prev = old_value or "unassigned"
+                nxt = new_value or "unassigned"
+                detail = detail or f"{prev} -> {nxt}"
+
+            events.append({
+                "id": 1_000_000_000 + int(d.get("id") or 0),
+                "source": "soc_activity",
+                "finding_id": d.get("finding_id"),
+                "agent_id": d.get("agent_id"),
+                "finding_uid": d.get("finding_uid") or "",
+                "actor": d.get("actor") or "system",
+                "action": action.replace("_", " "),
+                "raw_action": action,
+                "from_status": from_status,
+                "to_status": to_status,
+                "note": detail,
+                "changed_fields": d.get("changed_fields") or {},
+                "metadata": d.get("metadata") or {},
+                "created_at": created,
+                "elapsed": _elapsed_label(created),
+            })
+
+        events.sort(key=lambda e: (e.get("created_at") or 0, e.get("id") or 0))
+        return events
 
     async def _log_activity(
         self, finding_id: int, agent_id: str, action: str,
@@ -3534,6 +3639,17 @@ def _sla_status(sla_due: float, status: str) -> str:
     if remaining < 7200:
         return "warning"
     return "ok"
+
+
+def _elapsed_label(ts: float) -> str:
+    sec = max(0, int(time.time() - float(ts or 0)))
+    if sec < 60:
+        return f"{sec}s ago"
+    if sec < 3600:
+        return f"{sec // 60}m ago"
+    if sec < 86400:
+        return f"{sec // 3600}h ago"
+    return f"{sec // 86400}d ago"
 
 
 def _fingerprint(f: dict) -> str:

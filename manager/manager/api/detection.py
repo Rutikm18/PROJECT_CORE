@@ -441,7 +441,13 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             term = id_search.strip().upper()
             if not term.startswith("AL-F-"):
                 term = "AL-F-" + term
-            rows = await intel_db.search_by_external_id(term, active_only=True, limit=limit)
+            rows = await intel_db.search_by_external_id(
+                term,
+                active_only=True,
+                agent_id=agent_id,
+                terrain_id=terrain_id,
+                limit=limit,
+            )
             return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": 0, "id_search": id_search}
 
         rows = await intel_db.get_soc_findings(

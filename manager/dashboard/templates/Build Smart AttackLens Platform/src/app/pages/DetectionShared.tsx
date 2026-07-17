@@ -9,7 +9,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import {
   RefreshCw, X, Search, Filter, AlertTriangle, Shield,
-  Zap, Target, BookOpen, Activity, CheckCircle2, XCircle,
+  Zap, Target, Activity, CheckCircle2, XCircle,
   ExternalLink, Copy, Info, Eye, Crosshair, Database,
   GitBranch, Brain, TrendingUp, FileCode, Network,
   Radio, ChevronRight, ChevronDown,
@@ -533,6 +533,65 @@ export function useDetectionData(url: string, refreshMs = 30_000) {
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const t = setInterval(() => setRev(v => v + 1), refreshMs); return () => clearInterval(t); }, [refreshMs]);
   return { findings, loading, error, refetch: () => setRev(v => v + 1) };
+}
+
+interface AgentOption {
+  agent_id: string;
+  name?: string;
+  hostname?: string;
+  online?: boolean;
+}
+
+export function useAgentOptions() {
+  const [agents, setAgents] = useState<AgentOption[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/v1/agents");
+        if (!r.ok) return;
+        const list: AgentOption[] = await r.json();
+        if (!cancelled) setAgents(list);
+      } catch { /* best-effort filter options */ }
+      finally { if (!cancelled) setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  return { agents, loading };
+}
+
+export function AgentSelect({
+  value, onChange, compact = false,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  compact?: boolean;
+}) {
+  const { agents, loading } = useAgentOptions();
+  return (
+    <select
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      className={cn(
+        "px-2 py-1.5 text-[10px] border border-gray-200 rounded-xl bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer",
+        compact ? "max-w-[150px]" : "max-w-[190px]",
+      )}
+      title="Filter by reporting agent"
+    >
+      <option value="">{loading ? "Loading Agents…" : "All Agents"}</option>
+      {agents.map(a => {
+        const label = a.name || a.hostname || a.agent_id;
+        return (
+          <option key={a.agent_id} value={a.agent_id}>
+            {a.online ? "* " : "- "}{label}
+          </option>
+        );
+      })}
+    </select>
+  );
 }
 
 // ── ECG Waveform SVG ─────────────────────────────────────────────────────────
@@ -1509,12 +1568,17 @@ interface FindingCase {
 
 interface TimelineEntry {
   id:          number;
+  source?:     string;
   actor:       string;
   action:      string;
+  raw_action?: string;
   from_status?: string | null;
   to_status?:  string | null;
   note?:       string | null;
+  created_at?: number;
   elapsed:     string;
+  changed_fields?: Record<string, unknown>;
+  metadata?:       Record<string, unknown>;
 }
 
 const CASE_FLOW   = ["new", "triaging", "investigating", "in_remediation", "closed"] as const;
@@ -1557,6 +1621,10 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
       if (r.status === 404) { setCaseData(null); return; }
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d: FindingCase = await r.json();
+      if (!d?.finding_id) {
+        setCaseData(null);
+        return;
+      }
       setCaseData(d);
       setStatus(d.status ?? "triaging");
       setAssignee(d.assignee ?? "");
@@ -1833,9 +1901,113 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
   );
 }
 
-// ── Detail panel — 4-tab ─────────────────────────────────────────────────────
+function timelineActionLabel(action?: string | null): string {
+  return (action || "activity")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, ch => ch.toUpperCase());
+}
 
-type DTab = "overview" | "validation" | "blueprint" | "hunt" | "ai" | "case";
+function FindingTimelinePanel({ finding }: { finding: DetectionFinding }) {
+  const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
+  const [loading, setLoading]   = useState(true);
+  const [err, setErr]           = useState<string | null>(null);
+
+  const fetchTimeline = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const r = await fetch(`/api/v1/soc/findings/${finding.id}/timeline`);
+      if (!r.ok) { setErr(`Timeline failed (${r.status})`); return; }
+      const d = await r.json();
+      setTimeline(d.timeline ?? []);
+    } catch {
+      setErr("Network error");
+    } finally {
+      setLoading(false);
+    }
+  }, [finding.id]);
+
+  useEffect(() => { fetchTimeline(); }, [fetchTimeline]);
+
+  return (
+    <div className="bg-gray-50/30">
+      <div className="bg-white px-5 py-4 border-b border-gray-100 flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+            <Activity className="w-3.5 h-3.5 text-orange-500" />Analyst Timeline
+          </div>
+          <div className="text-[10px] text-gray-400 mt-1 font-mono">{finding.external_id ?? `#${finding.id}`}</div>
+        </div>
+        <button onClick={fetchTimeline} disabled={loading}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 text-[10px] font-bold text-gray-500 hover:text-orange-600 hover:border-orange-200 transition-all disabled:opacity-60">
+          <RefreshCw className={cn("w-3 h-3", loading && "animate-spin")} />Refresh
+        </button>
+      </div>
+
+      <div className="bg-white px-5 py-4">
+        {err && (
+          <div className="mb-3 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-[10px] font-semibold text-red-600">
+            {err}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 py-16 text-[11px] text-gray-400">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />Loading timeline…
+          </div>
+        ) : timeline.length === 0 ? (
+          <div className="py-16 text-center">
+            <Clock className="w-6 h-6 text-gray-200 mx-auto mb-2" />
+            <p className="text-[11px] text-gray-400">No analyst actions yet.</p>
+          </div>
+        ) : (
+          <div className="relative space-y-4">
+            <div className="absolute left-4 top-0 bottom-0 w-0.5 bg-gray-100" />
+            {timeline.map((e, i) => {
+              const source = e.source === "soc_activity" ? "SOC" : e.source === "case" ? "Case" : "Audit";
+              const sourceCls = e.source === "soc_activity"
+                ? "bg-blue-50 text-blue-600 border-blue-100"
+                : "bg-orange-50 text-orange-600 border-orange-100";
+              return (
+                <div key={e.id} className="flex items-start gap-4 al-row-in" style={{ animationDelay: `${i * 40}ms` }}>
+                  <div className="w-8 h-8 rounded-full bg-orange-50 border-2 border-white ring-1 ring-gray-100 flex items-center justify-center flex-shrink-0 z-10 shadow-sm">
+                    <span className="text-[10px] font-black text-orange-600">{(e.actor?.[0] ?? "?").toUpperCase()}</span>
+                  </div>
+                  <div className="flex-1 min-w-0 pb-1">
+                    <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                      <span className="text-[11px] font-bold text-gray-800">{e.actor || "system"}</span>
+                      <span className="text-[11px] text-gray-600">{timelineActionLabel(e.action || e.raw_action)}</span>
+                      <span className={cn("text-[8px] uppercase tracking-wide font-bold px-1.5 py-0.5 rounded border", sourceCls)}>
+                        {source}
+                      </span>
+                      {e.from_status && e.to_status && (
+                        <span className="text-[10px] text-gray-400 font-mono bg-gray-50 px-1.5 py-0.5 rounded border border-gray-100">
+                          {e.from_status} → {e.to_status}
+                        </span>
+                      )}
+                      <span className="ml-auto text-[10px] text-gray-400 flex-shrink-0">{e.elapsed}</span>
+                    </div>
+                    <div className="text-[9px] text-gray-400 font-mono">
+                      {e.created_at ? fmtTs(e.created_at) : ""}
+                    </div>
+                    {e.note && (
+                      <div className="mt-1.5 text-[10px] text-gray-600 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2 leading-relaxed">
+                        {e.note}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Detail panel — finding workflow tabs ─────────────────────────────────────
+
+type DTab = "overview" | "validation" | "ai" | "case" | "timeline";
 
 // One-line "why this matters" caption shown under each field group, so the
 // analyst understands the purpose of every value (customer-POV curation).
@@ -1851,7 +2023,6 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
   const exploitSrcs = _parseJson(f.exploit_sources, []) as string[];
   const tags        = _parseJson(f.tags, []) as string[];
   const score       = f.composite_score ?? f.score;
-  const bp          = BLUEPRINT[getBlueprintKey(f.category, f.source, f.mitre_tactic)];
   const s           = SEV[f.severity] ?? SEV.info;
 
   // Escape key to close
@@ -1870,11 +2041,10 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
 
   const TABS: { id: DTab; label: string; icon: React.ReactNode }[] = [
     { id: "overview",   label: "Overview",   icon: <Eye className="w-3 h-3" /> },
+    { id: "validation", label: "Validation", icon: <CheckCircle2 className="w-3 h-3" /> },
     { id: "ai",         label: "AI",         icon: <Cpu className="w-3 h-3" /> },
-    { id: "validation", label: "Validate",   icon: <CheckCircle2 className="w-3 h-3" /> },
-    { id: "blueprint",  label: "Blueprint",  icon: <BookOpen className="w-3 h-3" /> },
-    { id: "hunt",       label: "Hunt",       icon: <Crosshair className="w-3 h-3" /> },
     { id: "case",       label: "Case",       icon: <Briefcase className="w-3 h-3" /> },
+    { id: "timeline",   label: "Timeline",   icon: <Clock className="w-3 h-3" /> },
   ];
 
   return createPortal(
@@ -2066,73 +2236,14 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
           </div>
         )}
 
-        {/* ── BLUEPRINT — how we detected it + where it sits in ATT&CK ─────── */}
-        {tab === "blueprint" && bp && (
-          <div className="divide-y divide-gray-50">
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-2 flex items-center gap-1.5"><Brain className="w-3 h-3 text-indigo-500" />Detection Logic</div>
-              <p className="text-[10px] text-gray-700 leading-relaxed">{bp.detection_logic}</p>
-              {bp.telemetry?.length > 0 && (
-                <div className="flex flex-wrap gap-1 mt-2">
-                  {bp.telemetry.map(t => <span key={t} className="px-2 py-0.5 bg-orange-50 border border-orange-200 text-orange-700 rounded text-[9px] font-mono font-semibold">{t}</span>)}
-                </div>
-              )}
-              <Why>How AttackLens decided this is a finding, and which agent telemetry it used — so you can trust (or challenge) the detection.</Why>
-            </div>
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-2 flex items-center gap-1.5"><Target className="w-3 h-3 text-red-500" />MITRE ATT&CK</div>
-              <p className="text-[10px] text-gray-700 bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2">{bp.attack_chain}</p>
-              {f.mitre_technique && (
-                <a href={`https://attack.mitre.org/techniques/${f.mitre_technique.replace(".","/")}`} target="_blank" rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 mt-2 text-[9px] text-indigo-600 hover:text-indigo-800 font-semibold">
-                  <ExternalLink className="w-2.5 h-2.5" />View {f.mitre_technique} on MITRE ATT&CK
-                </a>
-              )}
-              <Why>The adversary technique this maps to — gives you the standard playbook for what the attacker is trying to achieve.</Why>
-            </div>
-          </div>
-        )}
-
-        {/* ── HUNT — find the same activity elsewhere + what comes next ────── */}
-        {tab === "hunt" && bp && (
-          <div className="divide-y divide-gray-50">
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-3 flex items-center gap-1.5"><Crosshair className="w-3 h-3 text-orange-500" />Threat Hunting Queries</div>
-              <div className="space-y-2">
-                {bp.hunting_queries.map((q, i) => (
-                  <div key={i} className="group relative al-row-in" style={{ animationDelay: `${i*60}ms` }}>
-                    <pre className="text-[9px] font-mono text-green-400 bg-gray-900 rounded-xl px-3 py-2.5 overflow-x-auto whitespace-pre-wrap border border-gray-700">{q}</pre>
-                    <button onClick={() => navigator.clipboard?.writeText(q)}
-                      className="absolute top-1.5 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded bg-gray-700 hover:bg-gray-600">
-                      <Copy className="w-2.5 h-2.5 text-gray-300" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-              <Why>Copy-paste queries to check whether the same activity is present on other hosts — turns one finding into a fleet-wide sweep.</Why>
-            </div>
-            <div className="px-4 py-3">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-2 flex items-center gap-1.5"><GitBranch className="w-3 h-3 text-red-500" />What Comes Next</div>
-              <div className="bg-gradient-to-r from-red-50 to-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
-                <p className="text-[10px] text-gray-800 font-medium">{bp.attack_chain}</p>
-              </div>
-              <Why>The likely next step in the attack — tells you what follow-on activity to hunt for before the attacker gets there.</Why>
-            </div>
-          </div>
-        )}
-
-        {(tab === "blueprint" || tab === "hunt") && !bp && (
-          <div className="px-4 py-16 text-center">
-            <Info className="w-6 h-6 text-gray-200 mx-auto mb-2" />
-            <p className="text-[11px] text-gray-400">Detection blueprint not yet mapped for this category.</p>
-          </div>
-        )}
-
         {/* ── AI ANALYSIS ─────────────────────────────────────────── */}
         {tab === "ai" && <AIAnalysisPanel finding={f} />}
 
         {/* ── CASE — workflow, assignment, SLA, activity log ──────────── */}
         {tab === "case" && <CasePanel finding={f} />}
+
+        {/* ── TIMELINE — unified analyst action history ──────────────── */}
+        {tab === "timeline" && <FindingTimelinePanel finding={f} />}
 
       </div>
       </div>
@@ -2714,6 +2825,7 @@ export function DetectionFilters({
           <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>
         ))}
       </select>
+      <AgentSelect value={agentId} onChange={onAgent} />
       <div className="ml-auto flex items-center gap-2">
         <div className="flex items-center gap-1.5 text-[10px] text-gray-400">
           <span className={cn("w-1.5 h-1.5 rounded-full", loading ? "bg-amber-400 animate-pulse" : "bg-green-500 al-heartbeat")} />
@@ -3090,11 +3202,11 @@ export function AdvancedFilter({
   const add = () => setConditions(prev => [...prev, newCondition()]);
 
   return (
-    <div className="relative">
+    <>
       <button
         onClick={() => { if (!open && conditions.length === 0) add(); setOpen(o => !o); }}
         className={cn(
-          "flex items-center gap-1 px-2.5 py-1.5 text-[10px] font-bold rounded-xl border transition-all",
+          "flex items-center gap-1 px-2.5 py-1.5 text-[10px] font-bold rounded-xl border transition-all flex-shrink-0",
           activeCount > 0
             ? "bg-orange-600 text-white border-orange-600 shadow-sm"
             : "bg-white text-gray-600 border-gray-200 hover:border-orange-300 hover:text-orange-600",
@@ -3108,26 +3220,28 @@ export function AdvancedFilter({
       </button>
 
       {open && (
-        <div className="absolute z-30 mt-1.5 left-0 w-[420px] max-w-[88vw] bg-white border border-gray-200 rounded-2xl shadow-xl p-3">
-          <div className="flex items-center justify-between mb-2">
+        <div className="order-last basis-full w-full min-w-0 bg-white border border-gray-200 rounded-xl shadow-sm p-3 mt-1">
+          <div className="flex items-center justify-between gap-3 mb-3">
             <span className="text-[10px] font-black text-gray-500 uppercase tracking-wider">Advanced filter · all conditions match</span>
-            <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700"><X className="w-3.5 h-3.5" /></button>
+            <button onClick={() => setOpen(false)} className="p-1 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-50 transition-colors">
+              <X className="w-3.5 h-3.5" />
+            </button>
           </div>
 
-          <div className="space-y-1.5 max-h-[40vh] overflow-y-auto">
+          <div className="space-y-2 max-h-[42vh] overflow-y-auto pr-1">
             {conditions.length === 0 && (
               <p className="text-[10px] text-gray-400 py-2 text-center">No conditions. Add one to filter precisely.</p>
             )}
             {conditions.map(c => {
               const needsValue = opNeedsValue(c.op);
               return (
-                <div key={c.id} className="flex items-center gap-1.5">
+                <div key={c.id} className="grid grid-cols-1 md:grid-cols-[minmax(140px,1fr)_minmax(120px,0.75fr)_minmax(160px,1.2fr)_32px] gap-2 items-center">
                   <select value={c.field} onChange={e => update(c.id, { field: e.target.value })}
-                    className="px-2 py-1.5 text-[10px] border border-gray-200 rounded-lg bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer w-[34%]">
+                    className="w-full px-2 py-1.5 text-[10px] border border-gray-200 rounded-lg bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer">
                     {FILTER_FIELDS.map(f => <option key={f.key} value={f.key}>{f.label}</option>)}
                   </select>
                   <select value={c.op} onChange={e => update(c.id, { op: e.target.value as FilterOp })}
-                    className="px-2 py-1.5 text-[10px] border border-gray-200 rounded-lg bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer w-[30%]">
+                    className="w-full px-2 py-1.5 text-[10px] border border-gray-200 rounded-lg bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-orange-200 cursor-pointer">
                     {FILTER_OPS.map(o => <option key={o.op} value={o.op}>{o.label}</option>)}
                   </select>
                   <input
@@ -3135,8 +3249,8 @@ export function AdvancedFilter({
                     onChange={e => update(c.id, { value: e.target.value })}
                     disabled={!needsValue}
                     placeholder={needsValue ? "value…" : "—"}
-                    className="flex-1 min-w-0 px-2 py-1.5 text-[10px] border border-gray-200 rounded-lg bg-white text-gray-800 placeholder-gray-300 focus:outline-none focus:ring-1 focus:ring-orange-200 disabled:bg-gray-50 disabled:text-gray-300" />
-                  <button onClick={() => remove(c.id)} className="p-1 text-gray-300 hover:text-red-500 transition-colors flex-shrink-0">
+                    className="w-full min-w-0 px-2 py-1.5 text-[10px] border border-gray-200 rounded-lg bg-white text-gray-800 placeholder-gray-300 focus:outline-none focus:ring-1 focus:ring-orange-200 disabled:bg-gray-50 disabled:text-gray-300" />
+                  <button onClick={() => remove(c.id)} className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors justify-self-start md:justify-self-center">
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -3156,7 +3270,7 @@ export function AdvancedFilter({
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -3255,6 +3369,9 @@ function TerrainFilterBar({
             <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>
           ))}
         </select>
+
+        {/* Agent */}
+        <AgentSelect value={filters.agentId} onChange={v => set("agentId", v)} compact />
 
         {/* MITRE Tactic */}
         {mitreTactics.length > 0 && (
@@ -3423,8 +3540,14 @@ export function TerrainDetectionPage({
     finally { setBulkActing(false); }
   };
 
-  const qs = apiUrl.includes("?") ? `&limit=500` : `?limit=500`;
-  const { findings: raw, loading, error, refetch } = useDetectionData(`${apiUrl}${qs}`);
+  const dataUrl = useMemo(() => {
+    const params = new URLSearchParams({ limit: "500" });
+    if (filters.agentId) params.set("agent_id", filters.agentId);
+    if (filters.severity) params.set("severity", filters.severity);
+    const sep = apiUrl.includes("?") ? "&" : "?";
+    return `${apiUrl}${sep}${params.toString()}`;
+  }, [apiUrl, filters.agentId, filters.severity]);
+  const { findings: raw, loading, error, refetch } = useDetectionData(dataUrl);
 
   // Dynamic dropdown options built from live data
   const mitreTactics = useMemo(() =>
@@ -3445,7 +3568,7 @@ export function TerrainDetectionPage({
     if (filters.categoryFilter) r = r.filter(f => f.category === filters.categoryFilter);
     if (filters.statusFilter)   r = r.filter(f => f.status === filters.statusFilter);
     if (filters.terrainFilter)  r = r.filter(f => (f as any).terrain === filters.terrainFilter);
-    if (filters.agentId)        r = r.filter(f => f.agent_id?.toLowerCase().includes(filters.agentId.toLowerCase()));
+    if (filters.agentId)        r = r.filter(f => f.agent_id === filters.agentId);
     if (filters.search) {
       const q = filters.search.toLowerCase().trim();
       // ID Search: when the analyst types an ID pattern (AL-F-00000515 or 00000515),

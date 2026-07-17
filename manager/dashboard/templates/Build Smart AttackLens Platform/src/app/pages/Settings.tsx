@@ -1218,7 +1218,14 @@ interface RetentionStats {
 }
 
 const RETENTION_PERIOD_LABELS: Record<number, string> = {
-  0: "1 day", 1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year", 24: "2 years",
+  0: "1 day",
+  7: "7 days",
+  15: "15 days",
+  1: "1 month",
+  3: "3 months",
+  6: "6 months",
+  12: "1 year",
+  24: "2 years",
 };
 
 const STORAGE_REFRESH_INTERVAL_MS = 60_000; // refresh storage stats every 60 s
@@ -1308,7 +1315,8 @@ function RetentionSettingsPanel() {
         <SectionLabel icon={Clock}>Retention Period</SectionLabel>
         <p className="text-[10px] text-[--gray-500] leading-relaxed">
           How long raw telemetry stays in the live, queryable store before the action below applies.
-          Default is 1 day — the smallest, freshest dataset and lowest disk usage.
+          Short windows keep storage tight; longer windows make historical investigations easier.
+          Default is 1 day.
         </p>
 
         <Field label="Keep data for" hint="default: 1 day">

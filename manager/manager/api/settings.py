@@ -59,7 +59,9 @@ DEFAULTS: dict[str, str] = {
     # happens to it past that point. See manager/store.py (cold tier doubles
     # as the archive when retention_action="archive") and server.py's
     # _cleanup_store (reads these live, so a change here takes effect on the
-    # next hourly sweep with no restart).
+    # next hourly sweep with no restart). The setting name is kept for
+    # backwards compatibility; values 0/7/15 are day presets, values 1+
+    # below are month presets.
     "retention_period_months": "0",        # default: 1 day — keeps the smallest hot dataset
     "retention_action":        "delete",  # default: delete — "archive" keeps a
                                           # compressed copy instead (see /retention)
@@ -74,27 +76,45 @@ REQUIRED_FIELDS   = {"org_name", "issue_date", "valid_until"}
 BOOLEAN_FIELDS    = {"notif_critical_email", "notif_sla_breach", "notif_digest_daily"}
 DATE_FIELDS       = {"issue_date", "valid_until"}
 
-# Allowed retention periods, in "months" — 0 is the sentinel for 7 days, 1+
-# are actual months (30 days/month). 12/24-month windows are flagged "slow"
-# — Deep Analysis queries scan a proportionally larger payloads table.
-RETENTION_PERIODS_MONTHS: tuple[int, ...] = (0, 1, 3, 6, 12, 24)
+# Allowed retention period codes. The persisted key remains
+# `retention_period_months` for API/storage compatibility, but short windows
+# use sentinel codes:
+#   0  -> 1 day
+#   7  -> 7 days
+#   15 -> 15 days
+# Month windows are actual month counts (30 days/month).
+RETENTION_DAY_SENTINELS: dict[int, int] = {0: 1, 7: 7, 15: 15}
+RETENTION_MONTH_PERIODS: tuple[int, ...] = (1, 3, 6, 12, 24)
+RETENTION_PERIODS_MONTHS: tuple[int, ...] = (
+    *RETENTION_DAY_SENTINELS.keys(),
+    *RETENTION_MONTH_PERIODS,
+)
 RETENTION_SLOW_FETCH_MONTHS: frozenset[int] = frozenset({12, 24})
 RETENTION_ACTIONS = ("delete", "archive")
 
 
-def retention_period_days(months_str: str) -> int:
-    """Convert a retention_period_months setting value to days. 0 → 1 day,
-    1+ → months × 30. Falls back to the 1-day default for an unset/invalid
-    value rather than raising — retention enforcement must never crash the
-    cleanup job over a bad setting."""
+def retention_period_code(months_str: str) -> int:
+    """Return a valid retention period code from a stored setting value."""
     try:
         months = int(months_str)
     except (TypeError, ValueError):
         months = 0
     if months not in RETENTION_PERIODS_MONTHS:
         months = min(RETENTION_PERIODS_MONTHS, key=lambda m: abs(m - months))
-    if months == 0:
-        return 1
+    return months
+
+
+def retention_period_days(months_str: str) -> int:
+    """Convert a retention_period_months setting value to days.
+
+    The legacy setting stores period codes, not strictly months:
+    0/7/15 are day presets, and 1/3/6/12/24 are month presets. Falls back to
+    the 1-day default for unset/invalid values rather than raising — retention
+    enforcement must never crash the cleanup job over a bad setting.
+    """
+    months = retention_period_code(months_str)
+    if months in RETENTION_DAY_SENTINELS:
+        return RETENTION_DAY_SENTINELS[months]
     return months * 30
 
 # ── Validation / Confidence Scoring keys ──────────────────────────────────────
@@ -574,7 +594,9 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         """Current data-retention config + live size stats for the dashboard.
 
         config.period_months / .action come straight from org_settings (same
-        store as every other setting — no new table). stats are computed live:
+        store as every other setting — no new table). period_months is a
+        legacy field name: 0/7/15 are day presets, 1+ values are month presets.
+        stats are computed live:
         - live_payloads: row count + estimated bytes in manager.db's `payloads`
           table — the table Deep Analysis (/api/v1/raw/*) actually queries.
         - archive: only meaningful when action="archive" — size/location/file
@@ -583,12 +605,13 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         """
         try:
             raw = await _load()
-            months = int(raw.get("retention_period_months", "1"))
+            period_raw = raw.get("retention_period_months", "0")
+            months = retention_period_code(period_raw)
             action = raw.get("retention_action", "delete")
             auto_resolve_days = int(raw.get("auto_resolve_stale_days", "2"))
             config = {
                 "period_months": months,
-                "period_days":   retention_period_days(raw.get("retention_period_months", "1")),
+                "period_days":   retention_period_days(period_raw),
                 "action":        action,
                 "slow_fetch_warning": months in RETENTION_SLOW_FETCH_MONTHS,
                 "auto_resolve_stale_days": auto_resolve_days,

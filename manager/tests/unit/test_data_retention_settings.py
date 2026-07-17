@@ -1,6 +1,7 @@
 """
 manager/tests/unit/test_data_retention_settings.py — configurable data
-retention: period (1/3/6/12/24 months) + action (delete | archive).
+retention: period (1/7/15 days or 1/3/6/12/24 months) + action
+(delete | archive).
 
 Covers:
   - retention_period_days() conversion + safe fallback on bad input
@@ -30,7 +31,7 @@ from pydantic import ValidationError
 
 from manager.manager.api.settings import (
     RETENTION_ACTIONS, RETENTION_PERIODS_MONTHS, RETENTION_SLOW_FETCH_MONTHS,
-    SettingsUpdate, retention_period_days,
+    SettingsUpdate, retention_period_code, retention_period_days,
 )
 from manager.manager.store import TelemetryStore
 
@@ -51,8 +52,16 @@ def _run(coro):
 
 # ── retention_period_days() ───────────────────────────────────────────────────
 
-@pytest.mark.parametrize("months,days", [("0", 1), ("1", 30), ("3", 90),
-                                         ("6", 180), ("12", 360), ("24", 720)])
+@pytest.mark.parametrize("months,days", [
+    ("0", 1),
+    ("7", 7),
+    ("15", 15),
+    ("1", 30),
+    ("3", 90),
+    ("6", 180),
+    ("12", 360),
+    ("24", 720),
+])
 def test_retention_period_days_conversion(months, days):
     assert retention_period_days(months) == days
 
@@ -65,15 +74,22 @@ def test_retention_period_days_bad_input_falls_back_to_default():
         "an out-of-range month count must clamp to the nearest valid period, not crash"
 
 
+def test_retention_period_code_normalizes_bad_values():
+    assert retention_period_code("not-a-number") == 0
+    assert retention_period_code("999") == 24
+
+
 def test_slow_fetch_months_are_exactly_twelve_and_twentyfour():
     assert RETENTION_SLOW_FETCH_MONTHS == frozenset({12, 24})
+    assert 7 not in RETENTION_SLOW_FETCH_MONTHS
+    assert 15 not in RETENTION_SLOW_FETCH_MONTHS
     assert 1 not in RETENTION_SLOW_FETCH_MONTHS
     assert 6 not in RETENTION_SLOW_FETCH_MONTHS
 
 
 # ── SettingsUpdate validators ─────────────────────────────────────────────────
 
-@pytest.mark.parametrize("months", ["1", "3", "6", "12", "24"])
+@pytest.mark.parametrize("months", ["0", "7", "15", "1", "3", "6", "12", "24"])
 def test_settings_update_accepts_valid_period(months):
     u = SettingsUpdate(retention_period_months=months)
     assert u.retention_period_months == months
@@ -270,6 +286,22 @@ def test_put_retention_settings_round_trips(client):
     # Persisted, not just echoed — a fresh GET must see the same values.
     r2 = client.get("/api/v1/settings")
     assert r2.json()["settings"]["retention_period_months"] == "6"
+
+
+@pytest.mark.parametrize("period,days", [("7", 7), ("15", 15)])
+def test_put_short_day_retention_settings_round_trip(client, period, days):
+    r = client.put("/api/v1/settings", json={
+        "retention_period_months": period, "retention_action": "delete",
+    })
+    assert r.status_code == 200
+    assert r.json()["settings"]["retention_period_months"] == period
+
+    rr = client.get("/api/v1/settings/retention")
+    assert rr.status_code == 200
+    body = rr.json()
+    assert body["config"]["period_months"] == int(period)
+    assert body["config"]["period_days"] == days
+    assert body["config"]["slow_fetch_warning"] is False
 
 
 def test_put_rejects_invalid_retention_period(client):

@@ -205,7 +205,7 @@ def create_app() -> FastAPI:
             row_action = await intel_db._fetchone(
                 "SELECT value FROM org_settings WHERE key='retention_action'", ()
             )
-            months_val = row_months["value"] if row_months else "1"
+            months_val = row_months["value"] if row_months else "0"
             action     = row_action["value"] if row_action else "delete"
             return retention_period_days(months_val), action
         except Exception as exc:
@@ -215,7 +215,7 @@ def create_app() -> FastAPI:
     async def _cleanup_store():
         """Hourly retention sweep — file-tier archive AND the manager.db rows
         Deep Analysis actually queries, on the SAME cutoff (Settings → Data
-        Retention, default 1 month / delete — see api/settings.py). Before
+        Retention, default 1 day / delete — see api/settings.py). Before
         this, `payloads` and `agent_sessions` had no retention at all and grew
         unbounded forever."""
         while True:

@@ -402,9 +402,28 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             # When the filter drops everything, the analyst should not be left
             # guessing why.  Surface the total active-finding count and the top
             # below-threshold scores so the UI can render a helpful banner.
+            stats_clauses = ["is_active=1"]
+            stats_args: list = []
+            if agent_id:
+                stats_clauses.append("agent_id=?")
+                stats_args.append(agent_id)
+            if terrain_id:
+                stats_clauses.append("terrain_id=?")
+                stats_args.append(terrain_id)
+            if severity:
+                stats_clauses.append("severity=?")
+                stats_args.append(severity)
+            if category:
+                stats_clauses.append("category=?")
+                stats_args.append(category)
+            if assignee:
+                stats_clauses.append("assignee=?")
+                stats_args.append(assignee)
+            stats_where = " AND ".join(stats_clauses)
             try:
                 stats_row = await intel_db._fetchone(
-                    "SELECT COUNT(*) AS n FROM findings WHERE is_active=1", (),
+                    f"SELECT COUNT(*) AS n FROM findings WHERE {stats_where}",
+                    tuple(stats_args),
                 )
                 active_total = int(stats_row["n"] if stats_row else 0)
             except Exception:
@@ -416,9 +435,9 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
                 near_rows = await intel_db._fetchall(
                     "SELECT id, agent_id, category, title, precision_score "
                     "FROM findings "
-                    "WHERE is_active=1 AND precision_score > 0 "
+                    f"WHERE {stats_where} AND precision_score > 0 "
                     "ORDER BY precision_score DESC LIMIT 5",
-                    (),
+                    tuple(stats_args),
                 )
                 top5 = [
                     {
@@ -442,8 +461,8 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             try:
                 all_rows = await intel_db._fetchall(
                     "SELECT agent_id, category, precision_score, terrain_validation "
-                    "FROM findings WHERE is_active=1 LIMIT 100000",
-                    (),
+                    f"FROM findings WHERE {stats_where} LIMIT 100000",
+                    tuple(stats_args),
                 )
                 for r in all_rows:
                     f_lite = {"agent_id": r["agent_id"], "category": r["category"]}
@@ -589,6 +608,15 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             raise HTTPException(404, "Finding not found")
         activity = await intel_db.get_activity(finding_id)
         return {"activity": activity, "count": len(activity)}
+
+    @router.get("/findings/{finding_id}/timeline")
+    async def get_finding_timeline(finding_id: int):
+        """Unified analyst timeline for a finding: case events + SOC activity."""
+        finding = await intel_db.get_finding_by_id(finding_id)
+        if not finding:
+            raise HTTPException(404, "Finding not found")
+        timeline = await intel_db.get_finding_timeline(finding_id)
+        return {"timeline": timeline, "count": len(timeline)}
 
     # ── Finding by UUID ───────────────────────────────────────────────────────
     @router.get("/findings/by-uid/{finding_uid}")
