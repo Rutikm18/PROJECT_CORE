@@ -23,13 +23,41 @@ router = APIRouter(prefix="/api/v1/integrations", tags=["integrations"])
 
 
 @router.get("/health")
-async def integrations_health() -> JSONResponse:
+async def integrations_health(request: Request) -> JSONResponse:
     """
     Return the reliability snapshot for every external integration that has
     been exercised this process lifetime. `overall` is 'healthy' unless any
     breaker is open ('down') or error rate is elevated ('degraded').
     """
     snap = registry.snapshot()
+    services: dict[str, dict] = {}
+    notifier = getattr(request.app.state, "email_notifier", None)
+    if notifier and hasattr(notifier, "health_status"):
+        services["email"] = notifier.health_status()
+    dispatcher = getattr(request.app.state, "finding_notification_dispatcher", None)
+    if dispatcher and hasattr(dispatcher, "health_status"):
+        services["finding_notifications"] = await dispatcher.health_status()
+
+    if services:
+        counts = {"healthy": 0, "degraded": 0, "down": 0, "disabled": 0}
+        for svc in services.values():
+            status = str(svc.get("status") or "healthy")
+            if status == "down":
+                counts["down"] += 1
+            elif status == "degraded" or (status == "not_configured" and svc.get("enabled")):
+                counts["degraded"] += 1
+            elif status == "not_configured":
+                counts["disabled"] += 1
+            elif status == "disabled":
+                counts["disabled"] += 1
+            else:
+                counts["healthy"] += 1
+        snap["platform_services"] = services
+        snap["service_counts"] = counts
+        if counts["down"]:
+            snap["overall"] = "down"
+        elif counts["degraded"] and snap["overall"] == "healthy":
+            snap["overall"] = "degraded"
     # Map overall status to an HTTP code so uptime probes can alert on it.
     code = 200 if snap["overall"] == "healthy" else 207 if snap["overall"] == "degraded" else 503
     return JSONResponse(status_code=code, content=snap)

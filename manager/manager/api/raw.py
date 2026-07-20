@@ -159,13 +159,15 @@ def make_raw_router(db: "Database") -> APIRouter:
 
     # ── First-layer data checkpoint ─────────────────────────────────────────
     # Every section a macOS agent is expected to report, and whether it feeds
-    # the detection engine (the input surface for the 14 detection modules).
+    # executable detection logic (inline analyzers, rich modules, or rule-pack
+    # evaluators). Battery is kept non-feeding until its rule-pack conditions
+    # have the required historical/CMDB inputs.
     _EXPECTED_SECTIONS: dict[str, bool] = {
         # section: feeds_detection?
-        "metrics": False, "connections": True, "processes": True, "ports": True,
-        "network": True,  "arp": True,         "mounts": False,   "battery": False,
-        "openfiles": False, "services": True,  "users": True,     "hardware": False,
-        "containers": True, "storage": False,  "tasks": True,     "security": True,
+        "metrics": True,  "connections": True, "processes": True, "ports": True,
+        "network": True,  "arp": True,         "mounts": True,    "battery": False,
+        "openfiles": True, "services": True,   "users": True,     "hardware": True,
+        "containers": True, "storage": True,   "tasks": True,     "security": True,
         "sysctl": True,   "configs": True,     "apps": True,      "packages": True,
         "binaries": True, "sbom": True,
     }

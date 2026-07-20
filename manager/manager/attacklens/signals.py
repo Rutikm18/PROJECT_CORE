@@ -29,6 +29,7 @@ _DATA_POINT_LAYER: dict[str, Layer] = {
     "battery":        "surface",
     "hardware":       "surface",
     "mounts":         "surface",
+    "openfiles":      "surface",
     "open_files":     "surface",
     "storage":        "surface",
     "containers":     "surface",
@@ -142,7 +143,7 @@ def entity_keys_for(signal: Signal) -> list[str]:
     elif dp == "configs":
         if path := ev.get("path"):
             keys.add(f"config:{path}@{aid}")
-    elif dp == "open_files":
+    elif dp in ("openfiles", "open_files"):
         if path := ev.get("file_path") or ev.get("path"):
             keys.add(f"file:path:{path}@{aid}")
         if proc := ev.get("process_name") or ev.get("process") or ev.get("name"):

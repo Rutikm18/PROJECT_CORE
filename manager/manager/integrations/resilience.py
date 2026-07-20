@@ -218,6 +218,11 @@ class IntegrationRegistry:
             self._metrics[name] = IntegrationMetrics(name)
         return self._metrics[name]
 
+    def reset(self) -> None:
+        """Clear in-memory breakers and metrics. Intended for isolated tests."""
+        self._breakers.clear()
+        self._metrics.clear()
+
     def snapshot(self) -> dict:
         integrations = []
         healthy = degraded = down = 0

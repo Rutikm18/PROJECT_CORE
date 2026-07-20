@@ -660,11 +660,30 @@ EOF
 _write_minimal_caddyfile() {
   cat > Caddyfile <<-CADDY
 {
-    auto_https off
+    local_certs
     admin off
 }
+
 :80 {
-    reverse_proxy manager:8080
+    redir https://{host}:8443{uri} permanent
+}
+
+:8443 {
+    tls internal
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    reverse_proxy manager:8080 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
 }
 CADDY
 }

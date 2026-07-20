@@ -74,6 +74,16 @@ class RulePackRule:
     source_file: str
 
 
+_SECTION_ALIASES: dict[str, str] = {
+    # Agent collector key. Rule-pack filenames use the analyst-facing category.
+    "openfiles": "open_files",
+}
+
+
+def _canonical_section(section: str) -> str:
+    return _SECTION_ALIASES.get(str(section or ""), str(section or ""))
+
+
 _SECTION_CATEGORY: dict[str, str] = {
     "agent_health": "agent_health",
     "apps": "app",
@@ -87,6 +97,7 @@ _SECTION_CATEGORY: dict[str, str] = {
     "metrics": "behavioral",
     "mounts": "mount",
     "network": "network",
+    "openfiles": "open_file",
     "open_files": "open_file",
     "packages": "package",
     "ports": "port",
@@ -161,8 +172,9 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "log_channel": ("log_channel", "channel"),
     "logon_type": ("logon_type", "login_type"),
     "mfa_enforced": ("mfa_enforced", "mfa_enabled"),
+    "filesystem_type": ("filesystem_type", "fstype", "filesystem", "type"),
     "mount_options": ("mount_options", "options"),
-    "mount_point": ("mount_point", "path"),
+    "mount_point": ("mount_point", "mountpoint", "path"),
     "mount_source": ("mount_source", "source", "host_path"),
     "mount_type": ("mount_type", "type", "fstype", "filesystem"),
     "new_command": ("new_command", "command", "cmd", "cmdline"),
@@ -180,7 +192,8 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "process_name": ("process_name", "name", "process", "binary"),
     "process_uid": ("process_uid", "uid", "user_id"),
     "qtype": ("qtype", "query_type", "dns_qtype"),
-    "quota_usage_pct": ("quota_usage_pct", "usage_pct", "used_pct"),
+    "partition_size_gb": ("partition_size_gb", "total_gb", "size_gb"),
+    "quota_usage_pct": ("quota_usage_pct", "usage_pct", "used_pct", "pct"),
     "registry_hash": ("registry_hash", "expected_hash"),
     "registry_hostname": ("registry_hostname", "registry", "image_registry"),
     "remote_host": ("remote_host", "host", "server"),
@@ -535,7 +548,7 @@ class RulePackDetector:
         return cls(rules)
 
     def rules_for(self, section: str) -> list[RulePackRule]:
-        return self._rules.get(section, [])
+        return self._rules.get(_canonical_section(section), [])
 
     async def analyze(
         self,
@@ -544,6 +557,7 @@ class RulePackDetector:
         data: Any,
         feeds: Any | None = None,
     ) -> list[dict]:
+        section = _canonical_section(section)
         rules = self.rules_for(section)
         if not rules:
             return []
@@ -991,8 +1005,37 @@ def _containers_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict 
     return None
 
 
+_MASS_STORAGE_HINT_RE = re.compile(
+    r"(?i)(mass\s*storage|flash|thumb|usb\s*(disk|drive)|external\s*(disk|drive)|"
+    r"storage|sd\s*card|card\s*reader)"
+)
+
+
+def _is_mass_storage_device(item: dict) -> bool:
+    device_class = _lower(_get(item, "device_class"))
+    if device_class in {"mass_storage", "mass storage", "removable_storage", "disk", "storage"}:
+        return True
+    bus = _lower(item.get("bus"))
+    label = " ".join(
+        _lower(item.get(k)) for k in ("name", "vendor", "product_id") if item.get(k)
+    )
+    return bus == "usb" and bool(_MASS_STORAGE_HINT_RE.search(label))
+
+
+def _remote_host_from_mount(item: dict) -> str:
+    remote = _lower(_get(item, "remote_host"))
+    if remote:
+        return remote
+    device = str(item.get("device") or _get(item, "mount_source") or "").strip()
+    if device.startswith("//"):
+        return _lower(device[2:].split("/", 1)[0])
+    if ":" in device and not device.startswith(("/", "\\")):
+        return _lower(device.split(":", 1)[0])
+    return ""
+
+
 def _hardware_001(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
-    if _lower(_get(item, "device_class")) != "mass_storage":
+    if not _is_mass_storage_device(item):
         return None
     ident = ":".join(_lower(item.get(k)) for k in ("vendor_id", "product_id", "serial"))
     if det._approved_usb and ident not in det._approved_usb:
@@ -1024,7 +1067,7 @@ def _mounts_001(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | No
 
 def _mounts_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
     if _lower(_get(item, "mount_type")) in {"nfs", "smb", "cifs"}:
-        remote = _lower(_get(item, "remote_host"))
+        remote = _remote_host_from_mount(item)
         if remote and det._approved_file_servers and remote not in det._approved_file_servers:
             return _matched("mount_type in ['nfs','smb','cifs']",
                             "remote_host not in approved_file_server_list")
@@ -1298,8 +1341,8 @@ def _storage_004(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | N
 
 
 def _storage_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
-    fs = _lower(item.get("filesystem_type"))
-    size = _as_float(item.get("partition_size_gb")) or 0.0
+    fs = _lower(_get(item, "filesystem_type"))
+    size = _as_float(_get(item, "partition_size_gb")) or 0.0
     if _bool_true(item, "gpt_hidden_attribute") or (fs == "unknown" and size > 1):
         return _matched("gpt_hidden_attribute == true OR unknown filesystem with partition_size_gb > 1")
     return None

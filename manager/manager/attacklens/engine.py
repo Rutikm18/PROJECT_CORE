@@ -16,6 +16,7 @@ Analyzers:
   apps        — unsigned / quarantined apps
   packages    — CVE lookup, risky tool detection
   network     — new/changed interfaces
+  openfiles   — abnormal file-handle volume by suspicious utilities
   users       — new admin accounts, locked-out users
   tasks       — suspicious cron / launchd tasks
   security    — SIP/GK/FV posture changes
@@ -106,6 +107,7 @@ _RECONCILE_SECTIONS: dict[str, tuple[str, ...]] = {
     "tasks":       ("task",),
     "network":     ("network",),
     "containers":  ("container",),
+    "openfiles":   ("open_file",),
     # Origin — supply-chain / config inventories (clears removed packages,
     # uninstalled apps, fixed sysctl, dropped SBOM components, removed configs/binaries)
     "packages":    ("package",),
@@ -149,7 +151,8 @@ _SECTION_CATEGORY: dict[str, str] = {
     "metrics": "behavioral",
     "sysctl": "sysctl", "sbom": "sbom", "arp": "arp", "containers": "container",
     "agent_health": "agent_health", "battery": "battery", "hardware": "hardware",
-    "mounts": "mount", "open_files": "open_file", "storage": "storage",
+    "mounts": "mount", "openfiles": "open_file", "open_files": "open_file",
+    "storage": "storage",
 }
 
 # Evidence keys that change every snapshot — excluded from the item_key hash so
@@ -233,6 +236,22 @@ _PRIVATE_RE = re.compile(
 _SAFE_LISTEN: set[int] = {22, 25, 53, 80, 443, 587, 993, 995,
                            3389, 5985, 5986, 27017, 5432, 3306,
                            6379, 5672, 8080, 8443, 8000, 8001, 2375}
+
+_OPENFILES_SUSPECT_FD_THRESHOLD = int(os.getenv("ATTACKLENS_OPENFILES_SUSPECT_FD", "800"))
+_OPENFILES_EXTREME_FD_THRESHOLD = int(os.getenv("ATTACKLENS_OPENFILES_EXTREME_FD", "2500"))
+_OPENFILES_BENIGN_HIGH_FD_RE = re.compile(
+    r"(?i)(chrome|chromium|safari|firefox|brave|arc|slack|teams|"
+    r"code helper|visual studio code|electron|docker|com\.docker|backupd|"
+    r"mds|mdworker|spotlight|windowserver|kernel_task|launchd)"
+)
+_OPENFILES_SUSPECT_PROCESS_RE = re.compile(
+    r"(?i)(^|[/\\])("
+    r"python(\d+(\.\d+)?)?|perl|ruby|node|bash|sh|zsh|osascript|"
+    r"powershell|pwsh|curl|wget|rclone|rsync|scp|sftp|nc|ncat|socat|"
+    r"openssl|gpg|7z|zip|tar|find|grep|rg|sqlite3|sqlcmd|mysql|psql|"
+    r".*crypt.*|.*encrypt.*|.*locker.*"
+    r")$"
+)
 
 
 class AttackLensEngine:
@@ -1320,6 +1339,7 @@ class AttackLensEngine:
                 "configs":     self._configs,
                 "binaries":    self._binaries,
                 "metrics":     self._metrics,
+                "openfiles":   self._openfiles,
             }.get(section)
             if fn is not None:
                 findings.extend(await fn(agent_id, data))
@@ -1480,6 +1500,80 @@ class AttackLensEngine:
                 tags=["metrics", "ransomware", "disk"],
                 confidence=0.78,
                 weight=0.85,
+            ))
+
+        return findings
+
+    async def _openfiles(self, agent_id: str, data: list) -> list[dict]:
+        """Detect live open-file telemetry anomalies from the current agent schema.
+
+        The current agent sends process, PID, user, and fd_count. It does not send
+        file paths, so this analyzer stays conservative: alert only on suspicious
+        utility/script processes with very high file-handle volume, or on extreme
+        non-benign volume that should be investigated for collection, staging, or
+        encryption behavior.
+        """
+        findings: list[dict] = []
+        if not isinstance(data, list):
+            return findings
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                fd_count = int(item.get("fd_count") or item.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if fd_count < _OPENFILES_SUSPECT_FD_THRESHOLD:
+                continue
+
+            proc = str(
+                item.get("process") or item.get("process_name") or item.get("name") or ""
+            ).strip()
+            if not proc:
+                continue
+
+            benign_high_fd = bool(_OPENFILES_BENIGN_HIGH_FD_RE.search(proc))
+            suspect_proc = bool(_OPENFILES_SUSPECT_PROCESS_RE.search(proc))
+            reason = ""
+            if suspect_proc:
+                reason = "suspicious_process_high_fd_count"
+            elif fd_count >= _OPENFILES_EXTREME_FD_THRESHOLD and not benign_high_fd:
+                reason = "extreme_fd_count_non_benign_process"
+            else:
+                continue
+
+            severity = "high" if fd_count >= _OPENFILES_EXTREME_FD_THRESHOLD else "medium"
+            score = 7.2 if severity == "high" else 5.8
+            confidence = 0.76 if suspect_proc else 0.68
+            evidence = {
+                **item,
+                "match_reason": reason,
+                "fd_count": fd_count,
+                "suspect_fd_threshold": _OPENFILES_SUSPECT_FD_THRESHOLD,
+                "extreme_fd_threshold": _OPENFILES_EXTREME_FD_THRESHOLD,
+                "live_schema_limitation": "agent openfiles telemetry has fd_count but no file_path",
+            }
+            user = str(item.get("user") or "")
+            stable = _fp(f"{proc.lower()}:{user.lower()}")
+            findings.append(self._finding(
+                category="open_file",
+                item_key=f"openfiles:fd_anomaly:{stable}",
+                severity=severity,
+                score=score,
+                title=f"Abnormal open-file volume by {proc}",
+                desc=(
+                    f"Process '{proc}' has {fd_count} open file descriptors. "
+                    "This is above the live telemetry threshold and can indicate "
+                    "bulk file collection, staging, or encryption behavior when "
+                    "seen in script, transfer, archive, or unknown utility processes."
+                ),
+                evidence=evidence,
+                source="rule:openfiles_fd_anomaly",
+                mitre="T1005",
+                tags=["openfiles", "file_access", "collection", "needs_correlation"],
+                confidence=confidence,
+                weight=0.72,
             ))
 
         return findings

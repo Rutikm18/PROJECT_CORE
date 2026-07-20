@@ -181,6 +181,7 @@ export default function Settings() {
   const [saved,   setSaved]   = useState(false);
   const [error,   setError]   = useState<string | null>(null);
   const [dirty,   setDirty]   = useState(false);
+  const [dirtyFields, setDirtyFields] = useState<Set<keyof OrgSettings>>(() => new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -192,6 +193,8 @@ export default function Settings() {
       setLicense(d.license ?? null);
       setRoles(d.roles ?? {});
       setError(null);
+      setDirty(false);
+      setDirtyFields(new Set());
       // Seed the localStorage-backed timezone store from the authoritative backend value
       if (d.settings?.platform_timezone) setTimezone(d.settings.platform_timezone);
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
@@ -202,18 +205,28 @@ export default function Settings() {
 
   const set = (k: keyof OrgSettings, v: string) => {
     setForm(f => ({ ...f, [k]: v }));
+    setDirtyFields(fields => {
+      const next = new Set(fields);
+      next.add(k);
+      return next;
+    });
     setDirty(true);
     setSaved(false);
   };
 
   const save = async () => {
+    if (dirtyFields.size === 0) return;
     setSaving(true);
     setError(null);
     try {
+      const patch = Array.from(dirtyFields).reduce((acc, key) => {
+        acc[key] = form[key];
+        return acc;
+      }, {} as Partial<OrgSettings>);
       const r = await fetch(API, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify(patch),
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
@@ -229,6 +242,7 @@ export default function Settings() {
       setForm({ ...EMPTY, ...d.settings });
       setLicense(d.license ?? null);
       setDirty(false);
+      setDirtyFields(new Set());
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
       // Propagate timezone change to the header clock instantly (no page reload)
@@ -661,7 +675,7 @@ export default function Settings() {
               {/* Grouped timezone select */}
               <select
                 value={form.platform_timezone}
-                onChange={e => { set("platform_timezone", e.target.value); setTimezone(e.target.value); }}
+                onChange={e => set("platform_timezone", e.target.value)}
                 className={selectCls}
               >
                 {(["UTC", "Asia", "Europe", "Americas", "Pacific", "Africa"] as const).map(group => {
@@ -772,6 +786,7 @@ export default function Settings() {
                     if (!r.ok) throw new Error(`Reset failed: HTTP ${r.status}`);
                     await load();
                     setDirty(false);
+                    setDirtyFields(new Set());
                   } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
                 }}
                 className="flex items-center gap-1.5 px-4 py-2 bg-white border border-red-300 text-red-700 text-[11px] font-bold rounded-xl hover:bg-red-100 transition-colors"
@@ -1290,7 +1305,16 @@ function RetentionSettingsPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error(`${r.status}`);
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        const detail = d.detail;
+        const msg =
+          typeof detail === "string" ? detail
+          : Array.isArray(detail) ? detail.map((x: { msg?: string }) => x.msg ?? JSON.stringify(x)).join("; ")
+          : detail ? JSON.stringify(detail)
+          : `HTTP ${r.status}`;
+        throw new Error(msg);
+      }
       await load();
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);

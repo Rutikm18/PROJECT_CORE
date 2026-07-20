@@ -11,7 +11,7 @@ expected relative priority; the harness asserts:
   4. No inversion          — no benign finding outranks a critical one
 
 Run:  python3 -m pytest tests/validation/test_detection_accuracy.py -v
-   or standalone:  python3 tests/validation/test_detection_accuracy.py
+   or standalone:  PYTHONPATH=. python3 tests/validation/test_detection_accuracy.py
 """
 from __future__ import annotations
 
@@ -43,16 +43,37 @@ SCENARIOS = [
       "asset_tier": "endpoint"},
      900, "critical", 5),
 
+    ("MOVEit Transfer SQLi mass exploitation (KEV+EPSS)",
+     {"cvss_score": 9.8, "epss_score": 0.94, "kev": True, "exploit_available": True,
+      "exploit_sources": ["CISA KEV", "Metasploit", "VulnCheck exploited"],
+      "asset_tier": "server"},
+     30, "critical", 5),
+
+    ("Citrix Bleed internet gateway (KEV, crown jewel)",
+     {"cvss_score": 9.4, "epss_score": 0.86, "kev": True, "exploit_available": True,
+      "exploit_sources": ["CISA KEV", "Nuclei template"], "asset_tier": "crown_jewel"},
+     90, "critical", 5),
+
     # ---- Weaponized but not yet KEV (high tier) ----
     ("Public exploit, CVSS 8.1, server, moderate EPSS",
      {"cvss_score": 8.1, "epss_score": 0.35, "kev": False, "exploit_available": True,
       "exploit_sources": ["ExploitDB:51234"], "asset_tier": "server"},
      60, "high", 4),
 
+    ("Atlassian Confluence OGNL RCE, verified exploit",
+     {"cvss_score": 9.8, "epss_score": 0.75, "kev": False, "exploit_available": True,
+      "exploit_sources": ["Metasploit", "ExploitDB:verified"], "asset_tier": "server"},
+     15, "high", 4),
+
     ("High EPSS (0.72), no public exploit yet, workstation",
      {"cvss_score": 6.5, "epss_score": 0.72, "kev": False, "exploit_available": False,
       "asset_tier": "workstation"},
      30, "high", 4),
+
+    ("High EPSS, no exploit yet, crown-jewel identity system",
+     {"cvss_score": 7.2, "epss_score": 0.66, "kev": False, "exploit_available": False,
+      "asset_tier": "crown_jewel"},
+     10, "high", 4),
 
     # ---- Moderate ----
     ("Single public exploit, low CVSS 5.0, endpoint",
@@ -60,11 +81,21 @@ SCENARIOS = [
       "exploit_sources": ["PoC reference"], "asset_tier": "endpoint"},
      200, "moderate", 3),
 
+    ("Weak blog PoC, high CVSS, low EPSS endpoint",
+     {"cvss_score": 8.8, "epss_score": 0.08, "kev": False, "exploit_available": True,
+      "exploit_sources": ["blog PoC reference"], "asset_tier": "endpoint"},
+     20, "moderate", 3),
+
     # ---- Low / theoretical (must NOT outrank exploited) ----
     ("High CVSS 9.8 but NO exploit / NO KEV / negligible EPSS",
      {"cvss_score": 9.8, "epss_score": 0.02, "kev": False, "exploit_available": False,
       "asset_tier": "endpoint"},
      800, "low", 2),
+
+    ("Crown-jewel high CVSS but no exploitation signal",
+     {"cvss_score": 9.6, "epss_score": 0.04, "kev": False, "exploit_available": False,
+      "asset_tier": "crown_jewel"},
+     15, "low", 2),
 
     ("Medium CVSS 5.5, no exploit signals, laptop",
      {"cvss_score": 5.5, "epss_score": 0.03, "kev": False, "exploit_available": False,
@@ -108,6 +139,7 @@ def test_active_exploitation_outranks_theoretical():
     exploited = [_score(s).score for s in SCENARIOS if s[1].get("kev") or s[1].get("exploit_available")]
     theoretical = [_score(s).score for s in SCENARIOS
                    if not s[1].get("kev") and not s[1].get("exploit_available")
+                   and s[1].get("epss_score", 0) < 0.50
                    and s[1].get("cvss_score", 0) >= 7.0]
     assert exploited and theoretical
     assert min(exploited) > max(theoretical), (
@@ -140,6 +172,27 @@ def test_no_benign_outranks_critical():
     crit = [_score(s).score for s in SCENARIOS if s[3] == "critical"]
     benign = [_score(s).score for s in SCENARIOS if s[3] in ("minimal", "low")]
     assert min(crit) > max(benign)
+
+
+def test_exploit_source_quality_calibration():
+    """Verified/weaponized sources must outrank a weak PoC-only reference."""
+    base = {
+        "cvss_score": 8.8,
+        "epss_score": 0.08,
+        "kev": False,
+        "exploit_available": True,
+        "asset_tier": "endpoint",
+    }
+    weak = S.compute({**base, "exploit_sources": ["blog PoC reference"]}, now=NOW)
+    strong = S.compute({**base, "exploit_sources": ["Metasploit"]}, now=NOW)
+
+    weak_factor = next(f for f in weak.factors if f.factor == "exploit_available")
+    strong_factor = next(f for f in strong.factors if f.factor == "exploit_available")
+
+    assert strong_factor.value > weak_factor.value
+    assert strong.score > weak.score
+    assert "Weaponized + CVSS" not in weak.escalations
+    assert "Weaponized + CVSS≥7 floor (78)" in strong.escalations
 
 
 # ── Standalone accuracy report ─────────────────────────────────────────────────
@@ -177,6 +230,7 @@ def run_report() -> int:
         ("KEV always critical",                      _check(test_kev_floor_always_critical)),
         ("tier ranking monotonic",                   _check(test_expected_tier_ranking_monotonic)),
         ("no benign outranks critical",              _check(test_no_benign_outranks_critical)),
+        ("exploit source quality calibrated",         _check(test_exploit_source_quality_calibration)),
     ]
     print("\nRanking-integrity checks:")
     for label, passed in checks:

@@ -31,7 +31,18 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
+from ..integrations.client import ResilientHTTPClient
+from ..integrations.resilience import (
+    PermanentError,
+    RateLimitedError,
+    RetryPolicy,
+    TransientError,
+    registry,
+)
+
 log = logging.getLogger("manager.notifications.email")
+
+EMAIL_RETRY = RetryPolicy(max_attempts=3, base_delay=0.5, max_delay=8.0)
 
 _SEVERITY_COLOR = {
     "critical": "#c0392b",
@@ -58,6 +69,15 @@ def _recipients(key: str) -> list[str]:
     return [r.strip() for r in raw.split(",") if r.strip()] if raw else []
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class EmailNotifier:
     """
     Async email notifier. Use `send_critical_alert`, `send_digest`, or
@@ -82,8 +102,25 @@ class EmailNotifier:
 
         self._use_graph = bool(self._graph_client_id and
                                self._graph_client_secret and
-                               self._graph_tenant_id)
+                               self._graph_tenant_id and
+                               self._graph_sender)
         self._enabled = _env("EMAIL_ENABLED", "true").lower() not in ("false", "0", "no")
+        self._smtp_client = ResilientHTTPClient(
+            "email.smtp",
+            retry=EMAIL_RETRY,
+            timeout_s=20.0,
+            connect_timeout_s=5.0,
+            breaker_threshold=3,
+            breaker_reset_s=120.0,
+        ) if self._smtp_host else None
+        self._graph_client = ResilientHTTPClient(
+            "email.graph",
+            retry=EMAIL_RETRY,
+            timeout_s=20.0,
+            connect_timeout_s=5.0,
+            breaker_threshold=3,
+            breaker_reset_s=120.0,
+        ) if self._use_graph else None
         if not self._enabled:
             log.info("Email notifications disabled (EMAIL_ENABLED=false)")
         elif not self._smtp_host and not self._use_graph:
@@ -92,6 +129,53 @@ class EmailNotifier:
     @property
     def enabled(self) -> bool:
         return self._enabled and (bool(self._smtp_host) or self._use_graph)
+
+    @property
+    def transport(self) -> str:
+        if self._use_graph:
+            return "graph"
+        if self._smtp_host:
+            return "smtp"
+        return "none"
+
+    @property
+    def integration_name(self) -> str:
+        if self._use_graph:
+            return "email.graph"
+        if self._smtp_host:
+            return "email.smtp"
+        return "email"
+
+    def default_alert_recipients(self) -> list[str]:
+        return list(self._alert_recipients)
+
+    def health_status(self) -> dict:
+        snap = registry.snapshot()
+        integration = next(
+            (i for i in snap.get("integrations", []) if i.get("name") == self.integration_name),
+            None,
+        )
+        configured = self.transport != "none"
+        recipients = len(self._alert_recipients)
+        if not self._enabled:
+            status = "disabled"
+        elif not configured:
+            status = "not_configured"
+        elif integration:
+            status = integration.get("status", "healthy")
+        else:
+            status = "healthy"
+        return {
+            "status": status,
+            "enabled": self.enabled,
+            "configured": configured,
+            "transport": self.transport,
+            "integration_name": self.integration_name,
+            "sender_configured": bool(self._graph_sender or self._smtp_from),
+            "alert_recipients": recipients,
+            "digest_recipients": len(self._digest_recipients),
+            "metrics": integration,
+        }
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -147,11 +231,25 @@ class EmailNotifier:
     # ── Send dispatch ─────────────────────────────────────────────────────────
 
     async def _send(self, to: list[str], subject: str, html_body: str) -> bool:
+        if self._use_graph and self._graph_client:
+            client = self._graph_client
+            send_fn = self._send_graph
+        elif self._smtp_host and self._smtp_client:
+            client = self._smtp_client
+            send_fn = self._send_smtp
+        else:
+            return False
+
+        async def _attempt() -> bool:
+            ok = await send_fn(to, subject, html_body)
+            if not ok:
+                raise TransientError(client.name, "transport returned no-success response")
+            return True
+
         try:
-            if self._use_graph:
-                return await self._send_graph(to, subject, html_body)
-            elif self._smtp_host:
-                return await self._send_smtp(to, subject, html_body)
+            return bool(await client.call(_attempt))
+        except PermanentError as exc:
+            log.error("Email permanent failure (%s): %s", subject[:60], exc)
             return False
         except Exception as exc:
             log.error("Email send failed (%s): %s", subject[:60], exc)
@@ -161,8 +259,7 @@ class EmailNotifier:
         try:
             import aiosmtplib
         except ImportError:
-            log.warning("aiosmtplib not installed — install with: pip install aiosmtplib")
-            return False
+            raise PermanentError("email.smtp", "aiosmtplib not installed")
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -190,12 +287,11 @@ class EmailNotifier:
         try:
             import aiohttp
         except ImportError:
-            log.warning("aiohttp not installed")
-            return False
+            raise PermanentError("email.graph", "aiohttp not installed")
 
         token = await self._get_graph_token()
         if not token:
-            return False
+            raise TransientError("email.graph", "Graph token unavailable")
 
         payload = {
             "message": {
@@ -215,8 +311,24 @@ class EmailNotifier:
                     log.info("Email sent via Graph API: %s → %s", subject[:60], to)
                     return True
                 text = await r.text()
-                log.error("Graph API send failed %d: %s", r.status, text[:200])
-                return False
+                if r.status == 429:
+                    retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+                    raise RateLimitedError(
+                        "email.graph",
+                        f"Graph API rate limited: {text[:200]}",
+                        retry_after=retry_after,
+                    )
+                if r.status >= 500:
+                    raise TransientError(
+                        "email.graph",
+                        f"Graph API send failed {r.status}: {text[:200]}",
+                        status=r.status,
+                    )
+                raise PermanentError(
+                    "email.graph",
+                    f"Graph API send failed {r.status}: {text[:200]}",
+                    status=r.status,
+                )
 
     _graph_token:    Optional[str]  = None
     _graph_token_exp: float         = 0.0
@@ -235,13 +347,36 @@ class EmailNotifier:
             }
             async with aiohttp.ClientSession() as s:
                 async with s.post(url, data=data) as r:
+                    if r.status == 429:
+                        retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+                        raise RateLimitedError(
+                            "email.graph",
+                            "Graph token endpoint rate limited",
+                            retry_after=retry_after,
+                        )
+                    if r.status >= 500:
+                        text = await r.text()
+                        raise TransientError(
+                            "email.graph",
+                            f"Graph token fetch failed {r.status}: {text[:200]}",
+                            status=r.status,
+                        )
+                    if r.status >= 400:
+                        text = await r.text()
+                        raise PermanentError(
+                            "email.graph",
+                            f"Graph token fetch failed {r.status}: {text[:200]}",
+                            status=r.status,
+                        )
                     j = await r.json()
             self._graph_token     = j.get("access_token")
             self._graph_token_exp = time.time() + int(j.get("expires_in", 3600))
             return self._graph_token
+        except (PermanentError, TransientError):
+            raise
         except Exception as exc:
             log.error("Graph token fetch failed: %s", exc)
-            return None
+            raise TransientError("email.graph", f"Graph token fetch failed: {exc}")
 
     # ── HTML Templates ────────────────────────────────────────────────────────
 

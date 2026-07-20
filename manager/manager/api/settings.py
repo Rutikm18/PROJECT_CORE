@@ -91,6 +91,8 @@ RETENTION_PERIODS_MONTHS: tuple[int, ...] = (
 )
 RETENTION_SLOW_FETCH_MONTHS: frozenset[int] = frozenset({12, 24})
 RETENTION_ACTIONS = ("delete", "archive")
+AUTO_RESOLVE_STALE_DAY_BOUNDS = (1, 14)
+AUTO_RESOLVE_STALE_DAY_DEFAULT = 2
 
 
 def retention_period_code(months_str: str) -> int:
@@ -116,6 +118,22 @@ def retention_period_days(months_str: str) -> int:
     if months in RETENTION_DAY_SENTINELS:
         return RETENTION_DAY_SENTINELS[months]
     return months * 30
+
+
+def retention_action_value(action: str) -> str:
+    """Return a safe retention action from a stored setting value."""
+    value = str(action or "").strip().lower()
+    return value if value in RETENTION_ACTIONS else "delete"
+
+
+def auto_resolve_stale_days_value(value: str) -> int:
+    """Return a safe auto-resolve day count from a stored setting value."""
+    try:
+        days = int(str(value).strip())
+    except (TypeError, ValueError):
+        return AUTO_RESOLVE_STALE_DAY_DEFAULT
+    lo, hi = AUTO_RESOLVE_STALE_DAY_BOUNDS
+    return max(lo, min(hi, days))
 
 # ── Validation / Confidence Scoring keys ──────────────────────────────────────
 # All persisted in the same org_settings table. JSON-encoded keys hold maps.
@@ -394,8 +412,9 @@ class SettingsUpdate(BaseModel):
             days = int(v.strip())
         except ValueError:
             raise ValueError(f"auto_resolve_stale_days must be an integer, got {v!r}")
-        if days < 1 or days > 14:
-            raise ValueError(f"auto_resolve_stale_days must be 1–14, got {days}")
+        lo, hi = AUTO_RESOLVE_STALE_DAY_BOUNDS
+        if days < lo or days > hi:
+            raise ValueError(f"auto_resolve_stale_days must be {lo}–{hi}, got {days}")
         return str(days)
 
     @model_validator(mode="after")
@@ -607,8 +626,10 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             raw = await _load()
             period_raw = raw.get("retention_period_months", "0")
             months = retention_period_code(period_raw)
-            action = raw.get("retention_action", "delete")
-            auto_resolve_days = int(raw.get("auto_resolve_stale_days", "2"))
+            action = retention_action_value(raw.get("retention_action", "delete"))
+            auto_resolve_days = auto_resolve_stale_days_value(
+                raw.get("auto_resolve_stale_days", str(AUTO_RESOLVE_STALE_DAY_DEFAULT))
+            )
             config = {
                 "period_months": months,
                 "period_days":   retention_period_days(period_raw),

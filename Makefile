@@ -20,7 +20,7 @@
 #    make build-pkg       build arm64 .pkg installer
 #    make build           build all Docker images
 #    make up              start full stack (docker compose up -d)
-#    make down            stop all containers
+#    make down            stop all containerslo
 #    make logs            tail all service logs
 #    make ps              show container status
 #    make restart         restart manager container

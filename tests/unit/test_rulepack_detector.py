@@ -15,6 +15,7 @@ def test_rulepack_loads_yaml_categories() -> None:
     assert len(detector.rules_for("processes")) == 6
     assert len(detector.rules_for("security")) == 5
     assert len(detector.rules_for("open_files")) == 5
+    assert len(detector.rules_for("openfiles")) == 5
 
 
 def test_process_obfuscation_rule_emits_finding() -> None:
@@ -43,6 +44,61 @@ def test_config_secret_rule_handles_dict_payload() -> None:
     assert [f["rule_id"] for f in findings] == ["rulepack:CONFIGS-003"]
     assert findings[0]["category"] == "config"
     assert findings[0]["evidence"]["path"] == "/etc/example.conf"
+
+
+def test_openfiles_agent_section_alias_reaches_open_files_rules() -> None:
+    detector = RulePackDetector.load()
+
+    findings = _run(detector.analyze("agent-1", "openfiles", [{
+        "pid": 42,
+        "process": "python3",
+        "file_path": "/Users/alice/.ssh/id_rsa",
+    }]))
+
+    assert [f["rule_id"] for f in findings] == ["rulepack:OPEN_FILES-001"]
+    assert findings[0]["category"] == "open_file"
+
+
+def test_mount_rule_accepts_live_agent_mountpoint_alias() -> None:
+    detector = RulePackDetector.load()
+
+    findings = _run(detector.analyze("agent-1", "mounts", [{
+        "device": "tmpfs",
+        "mountpoint": "/etc",
+        "fstype": "apfs",
+        "options": "rw,o+w",
+    }]))
+
+    assert [f["rule_id"] for f in findings] == ["rulepack:MOUNTS-003"]
+
+
+def test_storage_rule_accepts_live_agent_storage_aliases() -> None:
+    detector = RulePackDetector.load()
+
+    findings = _run(detector.analyze("agent-1", "storage", [{
+        "device": "disk9",
+        "mountpoint": "",
+        "fstype": "unknown",
+        "total_gb": 2.5,
+        "pct": 0,
+    }]))
+
+    assert [f["rule_id"] for f in findings] == ["rulepack:STORAGE-005"]
+
+
+def test_hardware_mass_storage_rule_infers_live_usb_schema(monkeypatch) -> None:
+    monkeypatch.setenv("ATTACKLENS_APPROVED_USB_IDS", "0x1234:0xabcd:approved")
+    detector = RulePackDetector.load()
+
+    findings = _run(detector.analyze("agent-1", "hardware", [{
+        "bus": "usb",
+        "name": "SanDisk Ultra USB Flash Drive",
+        "vendor_id": "0x0781",
+        "product_id": "0x5581",
+        "serial": "A1B2C3",
+    }]))
+
+    assert [f["rule_id"] for f in findings] == ["rulepack:HARDWARE-001"]
 
 
 def test_container_privileged_and_socket_mount_rules_emit_findings() -> None:

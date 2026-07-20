@@ -27,12 +27,14 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .pg_pool import PgPool
 from . import finding_lifecycle as _lc
 
 log = logging.getLogger("manager.indexer")
+
+FindingNotificationHandler = Callable[[dict, str], Awaitable[None]]
 
 # Reserved pseudo-agent under which fleet-wide / global-threat correlations are
 # stored (correlations table is keyed UNIQUE(agent_id, rule_id)). A real agent
@@ -897,6 +899,34 @@ class IntelDB:
         self._conn = None
         self._lock = asyncio.Lock()  # kept for write-serialisation within Python
         self._dedup = IngestDeduplicator()
+        self._finding_notification_handler: Optional[FindingNotificationHandler] = None
+
+    def set_finding_notification_handler(
+        self, handler: Optional[FindingNotificationHandler],
+    ) -> None:
+        """Register an async background callback for material finding events."""
+        self._finding_notification_handler = handler
+
+    def _schedule_finding_notification(self, finding: dict, event: str) -> None:
+        handler = self._finding_notification_handler
+        if handler is None:
+            return
+        payload = dict(finding)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(handler(payload, event))
+
+        def _done(t) -> None:
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.debug("finding notification handler failed: %s", exc)
+
+        task.add_done_callback(_done)
 
     async def init(self) -> None:
         self._pool = PgPool(self._dsn, readers=3)
@@ -1148,7 +1178,8 @@ class IntelDB:
                 return "unchanged"
 
             row = await self._fetchone(
-                "SELECT id, fingerprint, first_detected_at, consecutive_unchanged "
+                "SELECT id, external_id, fingerprint, first_detected_at, "
+                "severity, exploitability_band, exploitability_score, consecutive_unchanged "
                 "FROM findings WHERE agent_id=? AND category=? AND item_key=?",
                 (agent_id, category, item_key),
             )
@@ -1206,6 +1237,15 @@ class IntelDB:
                         "", sev, f.get("title",""), ts,
                         finding_uid=finding_uid,
                     )
+                    notify_payload = {
+                        **f,
+                        "id": new_row["id"],
+                        "external_id": external_id,
+                        "exploitability_score": exploitability_score,
+                        "exploitability_band": exploitability_band,
+                    }
+                    if _finding_is_alertable(notify_payload):
+                        self._schedule_finding_notification(notify_payload, "created")
                 await self._append_timeline(agent_id, category, "added",
                                             item_key, f.get("title",""),
                                             evidence_j, None, ts)
@@ -1249,6 +1289,21 @@ class IntelDB:
                 await self._append_timeline(agent_id, category, "modified",
                                             item_key, f.get("title",""),
                                             evidence_j, row["fingerprint"], ts)
+                previous_alertable = _finding_is_alertable(row)
+                current_alertable = _finding_is_alertable({
+                    **f,
+                    "exploitability_score": exploitability_score,
+                    "exploitability_band": exploitability_band,
+                })
+                if current_alertable and not previous_alertable:
+                    notify_payload = {
+                        **f,
+                        "id": row["id"],
+                        "external_id": row["external_id"],
+                        "exploitability_score": exploitability_score,
+                        "exploitability_band": exploitability_band,
+                    }
+                    self._schedule_finding_notification(notify_payload, "escalated")
                 self._dedup.put(agent_id, category, item_key, fp, ts,
                                 consecutive_unchanged=0)
                 return "updated"
@@ -3669,6 +3724,24 @@ def _fingerprint(f: dict) -> str:
 
 def _external_id(finding_id: int) -> str:
     return f"AL-F-{int(finding_id):08d}"
+
+
+def _finding_is_alertable(f: Any) -> bool:
+    def _field(key: str, default: Any = None) -> Any:
+        if hasattr(f, "get"):
+            return f.get(key, default)
+        try:
+            return f[key]
+        except Exception:
+            return default
+
+    severity = str(_field("severity") or "").lower()
+    band = str(_field("exploitability_band") or "").lower()
+    try:
+        exploitability = float(_field("exploitability_score") or 0.0)
+    except (TypeError, ValueError):
+        exploitability = 0.0
+    return severity == "critical" or band == "critical" or exploitability >= 90.0
 
 
 def _json_value(v: Any, default: Any) -> Any:

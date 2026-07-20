@@ -53,6 +53,7 @@ from .workers.consumer    import TelemetryConsumer
 from .threat.nvd_sync     import NVDSyncWorker
 from .ai_analyst          import AIAnalyst
 from .notifications.email import EmailNotifier
+from .notifications.dispatcher import FindingNotificationDispatcher
 from .api.remediation     import router as remediation_router
 from .intel               import IntelPipeline
 from .api.intel              import router as intel_router
@@ -198,7 +199,7 @@ def create_app() -> FastAPI:
         default (delete mode) if settings are unreadable for any reason —
         retention enforcement must degrade safely, never crash the job."""
         try:
-            from .api.settings import retention_period_days
+            from .api.settings import retention_action_value, retention_period_days
             row_months = await intel_db._fetchone(
                 "SELECT value FROM org_settings WHERE key='retention_period_months'", ()
             )
@@ -207,7 +208,7 @@ def create_app() -> FastAPI:
             )
             months_val = row_months["value"] if row_months else "0"
             action     = row_action["value"] if row_action else "delete"
-            return retention_period_days(months_val), action
+            return retention_period_days(months_val), retention_action_value(action)
         except Exception as exc:
             log.debug("Retention settings unreadable, using default: %s", exc)
             return RAW_TELEMETRY_RETENTION_DAYS, "delete"
@@ -343,11 +344,14 @@ def create_app() -> FastAPI:
         # AI analyst + email notifier — attach to app.state for route access
         ai_analyst     = AIAnalyst(intel_db, engine.feeds)
         email_notifier = EmailNotifier()
+        finding_notifications = FindingNotificationDispatcher(intel_db, email_notifier)
+        intel_db.set_finding_notification_handler(finding_notifications.handle_finding_event)
         # Make the AI analyst available to the AttackLens precision validator
         # (the engine looks for this on its own attribute to call validate_with_ai).
         engine.attach_ai_analyst(ai_analyst)
         app.state.ai_analyst    = ai_analyst
         app.state.email_notifier = email_notifier
+        app.state.finding_notification_dispatcher = finding_notifications
         log.info("AI Analyst enabled=%s  Email enabled=%s",
                  ai_analyst.enabled, email_notifier.enabled)
 

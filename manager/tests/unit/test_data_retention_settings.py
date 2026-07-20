@@ -31,7 +31,8 @@ from pydantic import ValidationError
 
 from manager.manager.api.settings import (
     RETENTION_ACTIONS, RETENTION_PERIODS_MONTHS, RETENTION_SLOW_FETCH_MONTHS,
-    SettingsUpdate, retention_period_code, retention_period_days,
+    SettingsUpdate, auto_resolve_stale_days_value, retention_action_value,
+    retention_period_code, retention_period_days,
 )
 from manager.manager.store import TelemetryStore
 
@@ -79,6 +80,22 @@ def test_retention_period_code_normalizes_bad_values():
     assert retention_period_code("999") == 24
 
 
+def test_retention_action_value_normalizes_bad_values():
+    assert retention_action_value("archive") == "archive"
+    assert retention_action_value("DELETE") == "delete"
+    assert retention_action_value("shred") == "delete"
+    assert retention_action_value(None) == "delete"
+
+
+def test_auto_resolve_stale_days_value_normalizes_bad_values():
+    assert auto_resolve_stale_days_value("1") == 1
+    assert auto_resolve_stale_days_value("7") == 7
+    assert auto_resolve_stale_days_value("99") == 14
+    assert auto_resolve_stale_days_value("0") == 1
+    assert auto_resolve_stale_days_value("bad") == 2
+    assert auto_resolve_stale_days_value(None) == 2
+
+
 def test_slow_fetch_months_are_exactly_twelve_and_twentyfour():
     assert RETENTION_SLOW_FETCH_MONTHS == frozenset({12, 24})
     assert 7 not in RETENTION_SLOW_FETCH_MONTHS
@@ -113,6 +130,28 @@ def test_settings_update_rejects_invalid_action():
 
 def test_settings_update_action_case_insensitive():
     assert SettingsUpdate(retention_action="ARCHIVE").retention_action == "archive"
+
+
+def test_settings_update_accepts_valid_timezone():
+    u = SettingsUpdate(platform_timezone="America/New_York")
+    assert u.platform_timezone == "America/New_York"
+
+
+def test_settings_update_rejects_invalid_timezone():
+    with pytest.raises(ValidationError):
+        SettingsUpdate(platform_timezone="Mars/Olympus_Mons")
+
+
+@pytest.mark.parametrize("days", ["1", "2", "7", "14"])
+def test_settings_update_accepts_valid_auto_resolve_days(days):
+    u = SettingsUpdate(auto_resolve_stale_days=days)
+    assert u.auto_resolve_stale_days == days
+
+
+@pytest.mark.parametrize("days", ["0", "15", "bad"])
+def test_settings_update_rejects_invalid_auto_resolve_days(days):
+    with pytest.raises(ValidationError):
+        SettingsUpdate(auto_resolve_stale_days=days)
 
 
 # ── TelemetryStore.cleanup(prune_cold=False) / archive_stats() ──────────────
@@ -311,6 +350,34 @@ def test_put_rejects_invalid_retention_period(client):
 
 def test_put_rejects_invalid_retention_action(client):
     r = client.put("/api/v1/settings", json={"retention_action": "shred"})
+    assert r.status_code == 422
+
+
+def test_put_timezone_round_trips_without_clobbering_retention(client):
+    r0 = client.put("/api/v1/settings", json={
+        "retention_period_months": "7",
+        "retention_action": "archive",
+        "auto_resolve_stale_days": "5",
+    })
+    assert r0.status_code == 200
+
+    r = client.put("/api/v1/settings", json={"platform_timezone": "America/New_York"})
+    assert r.status_code == 200
+    settings = r.json()["settings"]
+    assert settings["platform_timezone"] == "America/New_York"
+    assert settings["retention_period_months"] == "7"
+    assert settings["retention_action"] == "archive"
+    assert settings["auto_resolve_stale_days"] == "5"
+
+    r2 = client.get("/api/v1/settings/retention")
+    assert r2.status_code == 200
+    assert r2.json()["config"]["period_months"] == 7
+    assert r2.json()["config"]["action"] == "archive"
+    assert r2.json()["config"]["auto_resolve_stale_days"] == 5
+
+
+def test_put_rejects_invalid_timezone(client):
+    r = client.put("/api/v1/settings", json={"platform_timezone": "Mars/Olympus_Mons"})
     assert r.status_code == 422
 
 

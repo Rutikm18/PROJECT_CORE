@@ -235,6 +235,7 @@ ${DOMAIN} {
     reverse_proxy manager:8080 {
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
     }
 
     # Access logs
@@ -277,6 +278,7 @@ else
     reverse_proxy manager:8080 {
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
     }
 
     # Access logs
