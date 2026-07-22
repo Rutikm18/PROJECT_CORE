@@ -78,6 +78,15 @@ RUN mkdir -p /app/data /app/logs && \
 
 USER jarvis
 
+# Build metadata — passed by docker-compose / deploy.yml (git-derived).
+# Version scheme is 1.0.<commit-count>, so it advances on every push.
+ARG APP_VERSION=1.0.0-dev
+ARG APP_COMMIT=unknown
+ARG APP_BUILT_AT=
+ENV APP_VERSION=${APP_VERSION}
+ENV APP_COMMIT=${APP_COMMIT}
+ENV APP_BUILT_AT=${APP_BUILT_AT}
+
 ENV PYTHONPATH=/app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

@@ -454,6 +454,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             agent_id=agent_id, terrain_id=terrain_id, category=category,
             severity=severity, status=status, sla_breached=sla_only, search=search,
             active_only=True, sort_by=sort_by, limit=limit, offset=offset,
+            min_precision=await _validated_prefilter(intel_db, validated_only),
             live_agent_ids=await _live_agent_ids(),
         )
         rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
@@ -463,6 +464,27 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
 
 
 # ── Validated-only helper ──────────────────────────────────────────────────────
+
+async def _validated_prefilter(intel_db, validated_only: bool) -> float | None:
+    """
+    Coarse SQL floor used before pagination when a validated-only view is
+    requested. The precise per-agent/per-terrain threshold is still enforced
+    by `_apply_validated_filter`; this only prevents low-precision rows from
+    consuming the page window before eligible findings are checked.
+    """
+    if not validated_only:
+        return None
+
+    try:
+        from ..attacklens.ai_validator import _load_validation_settings
+        vs = await _load_validation_settings(intel_db)
+        candidates: list[float] = [float(vs.get("global", 0.90))]
+        candidates.extend(float(v) for v in (vs.get("terrain") or {}).values())
+        candidates.extend(float(v) for v in (vs.get("agent") or {}).values())
+        return max(0.0, min(1.0, min(candidates)))
+    except Exception as exc:
+        log.warning("validated_only prefilter load failed — defaulting to 0.90: %s", exc)
+        return 0.90
 
 async def _apply_validated_filter(intel_db, rows: list[dict], validated_only: bool) -> tuple[list[dict], float | None, int]:
     """

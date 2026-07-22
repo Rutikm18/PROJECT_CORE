@@ -628,7 +628,8 @@ export default function Incidents() {
   const statsUrl  = validatedOnly
     ? "/api/v1/detection/all?validated_only=true"
     : "/api/v1/detection/all";
-  const { findings: allRaw } = useDetectionData(`${statsUrl}&limit=1000`);
+  const statsSep = statsUrl.includes("?") ? "&" : "?";
+  const { findings: allRaw } = useDetectionData(`${statsUrl}${statsSep}limit=1000`);
 
   // Domain-level stats
   const stats = useMemo(() => ({

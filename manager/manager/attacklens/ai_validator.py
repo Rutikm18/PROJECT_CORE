@@ -512,8 +512,8 @@ def ai_validation_enabled() -> bool:
 #
 # The settings live in the org_settings table (api/settings.py keys
 # validation_global_threshold, validation_terrain_thresholds,
-# validation_agent_thresholds).  We cache them in-memory for 30s so the engine
-# doesn't hit SQLite on every cluster.
+# validation_agent_thresholds, validation_agent_priorities).  We cache them
+# in-memory for 30s so the engine doesn't hit SQLite on every cluster.
 
 _SETTINGS_TTL_SEC  = 30.0
 _settings_cache: dict = {"loaded_at": 0.0, "data": None}
@@ -545,6 +545,7 @@ async def _load_validation_settings(idb) -> dict:
             "WHERE key IN ('validation_global_threshold',"
             "              'validation_terrain_thresholds',"
             "              'validation_agent_thresholds',"
+            "              'validation_agent_priorities',"
             "              'validation_use_ai_verdict',"
             "              'validation_min_strength')",
             (),
@@ -562,6 +563,15 @@ async def _load_validation_settings(idb) -> dict:
         agent_thr = _json.loads(kv.get("validation_agent_thresholds") or "{}")
     except _json.JSONDecodeError:
         agent_thr = {}
+    try:
+        agent_priorities_raw = _json.loads(kv.get("validation_agent_priorities") or "{}")
+    except _json.JSONDecodeError:
+        agent_priorities_raw = {}
+    try:
+        from .asset_priority import normalize_agent_priorities
+        agent_priorities = normalize_agent_priorities(agent_priorities_raw)
+    except Exception:
+        agent_priorities = {}
 
     try:
         global_thr = float(kv.get("validation_global_threshold")
@@ -575,6 +585,7 @@ async def _load_validation_settings(idb) -> dict:
         "global":  global_thr,
         "terrain": {str(k): float(v) for k, v in terrain_thr.items()},
         "agent":   {str(k): float(v) for k, v in agent_thr.items()},
+        "agent_priorities": agent_priorities,
         "use_ai":  use_ai,
     }
     _settings_cache["loaded_at"] = now
@@ -604,6 +615,13 @@ async def resolve_threshold(idb, agent_id: str, category: str) -> float:
         return max(0.0, min(1.0, settings["terrain"][terrain]))
     # 3. global
     return max(0.0, min(1.0, float(settings["global"])))
+
+
+async def resolve_agent_priority(idb, agent_id: str):
+    """Return the configured AssetPriorityProfile for an agent."""
+    from .asset_priority import priority_for_agent
+    settings = await _load_validation_settings(idb)
+    return priority_for_agent(agent_id, settings.get("agent_priorities") or {})
 
 
 async def use_ai_verdict_for(idb) -> bool:

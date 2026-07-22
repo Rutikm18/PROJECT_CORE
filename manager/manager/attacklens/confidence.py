@@ -6,13 +6,15 @@ This is SEPARATE from composite_score (which answers "if real, how bad is it?").
 
 Formula:
   base  = weighted-average of (signal.weight × signal.strength)
-  raw   = base × layer_mult × kev_mult × epss_mult × ti_mult × crit_mult / fp_pen
+  raw   = base × layer_mult × kev_mult × epss_mult × ti_mult × crit_mult
+          × agent_priority_mult / fp_pen
   final = max(raw, cross_layer_floor)   clamped to [0, 1]
 """
 from __future__ import annotations
 
 from .cross_matrix import matched_floor
 from .config import ENGINE_CONFIG
+from .asset_priority import priority_profile
 
 
 async def score_confidence(
@@ -47,6 +49,13 @@ async def score_confidence(
 
     asset_num = _asset_tier_number(enriched.get("asset_tier", "endpoint"))
     crit_mult = ENGINE_CONFIG["multipliers"]["asset_criticality"].get(asset_num, 1.0)
+    priority_level = enriched.get("asset_priority_level", "standard")
+    try:
+        priority_mult = float(enriched.get("asset_priority_confidence_multiplier") or 0.0)
+    except (TypeError, ValueError):
+        priority_mult = 0.0
+    if priority_mult <= 0:
+        priority_mult = priority_profile(priority_level).confidence_multiplier
 
     # 3. FP penalty from recent history
     rule_ids = [s.rule_id for s in sigs]
@@ -62,7 +71,15 @@ async def score_confidence(
     else:
         fp_pen = 1.0
 
-    raw = (base * layer_mult * kev_mult * epss_mult * ti_mult * crit_mult) / fp_pen
+    raw = (
+        base
+        * layer_mult
+        * kev_mult
+        * epss_mult
+        * ti_mult
+        * crit_mult
+        * priority_mult
+    ) / fp_pen
 
     # 4. Cross-layer floor (never lower than the floor for this pattern combination)
     floor = matched_floor(cluster)

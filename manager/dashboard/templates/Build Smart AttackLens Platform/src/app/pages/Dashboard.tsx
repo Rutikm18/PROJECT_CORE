@@ -31,6 +31,7 @@ import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 const SOC     = "/api/v1/soc";
 const POSTURE = "/api/v1/posture";
 const DETECT  = "/api/v1/detection";
+const META    = "/api/v1/meta";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -269,6 +270,15 @@ export default function SecurityDashboard() {
   const [netThreats,setNetThreats] = useState<DetectionFinding[]>([]);
   const [loading,  setLoading]  = useState(true);
   const [lastSync, setLastSync] = useState(0);
+  const [build,    setBuild]    = useState<{ version: string; commit?: string; built_at?: string } | null>(null);
+
+  // App version/build — fetched once; refreshes when a new build is deployed.
+  useEffect(() => {
+    fetch(META)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (d?.version) setBuild(d); })
+      .catch(() => {});
+  }, []);
 
   const load = useCallback(async () => {
     const [socR, metrR, posR, pkgR, netR] = await Promise.allSettled([
@@ -408,6 +418,18 @@ export default function SecurityDashboard() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            {build?.version && (
+              <div
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-50 border border-orange-100 rounded-xl text-[9px] text-orange-600 font-semibold tabular-nums"
+                title={[
+                  build.commit  ? `commit ${build.commit}` : null,
+                  build.built_at ? `built ${build.built_at}` : null,
+                ].filter(Boolean).join(" · ") || undefined}
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-orange-400" />
+                v{build.version}
+              </div>
+            )}
             <div className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-[9px] text-gray-500 font-medium">
               <span className="w-1.5 h-1.5 rounded-full bg-green-500 al-heartbeat" />
               {lastSync ? `Updated ${relTime(lastSync)}` : "Loading…"}

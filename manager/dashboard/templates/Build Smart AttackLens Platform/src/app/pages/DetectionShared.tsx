@@ -3541,12 +3541,15 @@ export function TerrainDetectionPage({
   };
 
   const dataUrl = useMemo(() => {
-    const params = new URLSearchParams({ limit: "500" });
+    const url = new URL(apiUrl, window.location.origin);
+    const params = url.searchParams;
+    params.set("limit", "500");
     if (filters.agentId) params.set("agent_id", filters.agentId);
     if (filters.severity) params.set("severity", filters.severity);
-    const sep = apiUrl.includes("?") ? "&" : "?";
-    return `${apiUrl}${sep}${params.toString()}`;
-  }, [apiUrl, filters.agentId, filters.severity]);
+    if (filters.terrainFilter) params.set("terrain_id", filters.terrainFilter);
+    if (filters.statusFilter) params.set("status", filters.statusFilter);
+    return `${url.pathname}?${params.toString()}`;
+  }, [apiUrl, filters.agentId, filters.severity, filters.terrainFilter, filters.statusFilter]);
   const { findings: raw, loading, error, refetch } = useDetectionData(dataUrl);
 
   // Dynamic dropdown options built from live data

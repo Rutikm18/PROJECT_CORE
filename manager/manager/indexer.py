@@ -3551,8 +3551,18 @@ class IntelDB:
         """
         try:
             from .attacklens.terrain_validators import evaluate_finding
+            from .attacklens.ai_validator import resolve_agent_priority
+            from .attacklens.asset_priority import (
+                apply_priority_to_enriched,
+                apply_priority_to_finding,
+            )
         except ImportError:
             from manager.attacklens.terrain_validators import evaluate_finding
+            from manager.attacklens.ai_validator import resolve_agent_priority
+            from manager.attacklens.asset_priority import (
+                apply_priority_to_enriched,
+                apply_priority_to_finding,
+            )
         rows = await self._fetchall(
             "SELECT id, agent_id, category, item_key, severity, score, "
             "       evidence, source, rule_id, cve_ids, cvss_score, kev, "
@@ -3630,9 +3640,30 @@ class IntelDB:
                     "controls_disabled_count": controls_off,
                     "threat_intel_source_count": (1 if str(f.get("source","")).startswith("feed:") or f.get("source") == "abuseipdb" else 0) + (1 if kev else 0),
                 }
+                try:
+                    priority = await resolve_agent_priority(self, agent_id)
+                    enriched = apply_priority_to_enriched(enriched, priority)
+                    f["asset_tier"] = enriched.get("asset_tier", f.get("asset_tier") or "endpoint")
+                    f["asset_importance"] = enriched.get(
+                        "asset_importance", f.get("asset_importance") or 0,
+                    )
+                except Exception:
+                    priority = None
                 ai_dict = f.get("ai_verdict") if isinstance(f.get("ai_verdict"), dict) else None
 
                 tv = evaluate_finding(f, enriched, ai_dict)
+                if priority is not None:
+                    f["precision_score"] = tv["score"]
+                    f["precision_factors"] = {}
+                    apply_priority_to_finding(f, priority)
+                    tv["score"] = f["precision_score"]
+                    tv["percentage"] = round(float(f["precision_score"]) * 100, 1)
+                    tv["asset_priority_level"] = priority.level
+                    tv["summary"] = (
+                        f"{tv.get('summary', '')} · {priority.label} calibration"
+                        if priority.level not in {"standard", "low"}
+                        else tv.get("summary", "")
+                    )
                 new_score = float(tv["score"])
 
                 await self._conn.execute(

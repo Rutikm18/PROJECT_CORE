@@ -31,6 +31,12 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ..attacklens.asset_priority import (
+    ASSET_PRIORITY_LEVELS,
+    normalize_agent_priorities,
+    priority_options,
+)
+
 log = logging.getLogger("manager.settings")
 
 # ── Canonical defaults ────────────────────────────────────────────────────────
@@ -145,10 +151,12 @@ VALIDATION_DEFAULTS: dict[str, str] = {
     "validation_global_threshold":   "0.80",
     "validation_terrain_thresholds": "{}",     # JSON: {terrain: float}
     "validation_agent_thresholds":   "{}",     # JSON: {agent_id: float}
+    "validation_agent_priorities":   "{}",     # JSON: {agent_id: top|high|standard|low}
     "validation_use_ai_verdict":     "true",   # bool — whether to call the LLM
     "validation_min_strength":       "0.6",    # float — quality floor (G7)
 }
 VALIDATION_KEYS = set(VALIDATION_DEFAULTS.keys())
+ALL_DEFAULTS: dict[str, str] = {**DEFAULTS, **VALIDATION_DEFAULTS}
 
 # Terrains shown in the dashboard sidebar. Order matters — UI renders them
 # in the same order.  Each maps to one or more finding categories.
@@ -268,6 +276,7 @@ class ValidationUpdate(BaseModel):
     global_threshold:   Optional[float] = Field(None, ge=0.0, le=1.0)
     terrain_thresholds: Optional[dict[str, float]] = None
     agent_thresholds:   Optional[dict[str, float]] = None
+    agent_priorities:   Optional[dict[str, str]] = None
     use_ai_verdict:     Optional[bool] = None
     min_strength:       Optional[float] = Field(None, ge=0.0, le=1.0)
 
@@ -288,6 +297,13 @@ class ValidationUpdate(BaseModel):
         if v is None:
             return v
         return {k: _clamp_threshold(float(val)) for k, val in v.items() if k}
+
+    @field_validator("agent_priorities")
+    @classmethod
+    def _validate_agent_priorities(cls, v):
+        if v is None:
+            return v
+        return normalize_agent_priorities(v)
 
 
 class SettingsUpdate(BaseModel):
@@ -497,7 +513,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         rows = await intel_db._fetchall(
             "SELECT key, value FROM org_settings ORDER BY key", ()
         )
-        return {**DEFAULTS, **{r["key"]: r["value"] for r in rows}}
+        return {**ALL_DEFAULTS, **{r["key"]: r["value"] for r in rows}}
 
     async def _write(key: str, value: str, actor: str, ip: str) -> None:
         """Write a single key and append an audit row inside the caller's transaction."""
@@ -505,7 +521,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         old_row = await intel_db._fetchone(
             "SELECT value FROM org_settings WHERE key=?", (key,)
         )
-        old_val = old_row["value"] if old_row else DEFAULTS.get(key, "")
+        old_val = old_row["value"] if old_row else ALL_DEFAULTS.get(key, "")
 
         await intel_db._conn.execute(
             "INSERT INTO org_settings(key,value,updated_at) VALUES(?,?,?) "
@@ -720,7 +736,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 raw = await _load()
                 await intel_db._conn.execute("DELETE FROM org_settings", ())
                 ts = time.time()
-                for key, value in DEFAULTS.items():
+                for key, value in ALL_DEFAULTS.items():
                     old_val = raw.get(key, "")
                     await intel_db._conn.execute(
                         "INSERT INTO org_settings(key,value,updated_at) VALUES(?,?,?)",
@@ -736,7 +752,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
 
             return {
                 "reset":    True,
-                "settings": _redact(DEFAULTS),
+                "settings": _redact(ALL_DEFAULTS),
                 "actor":    actor,
             }
         except Exception as exc:
@@ -775,7 +791,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         if not isinstance(src, dict):
             raise HTTPException(400, "Payload must be a JSON object or export envelope with 'settings' key")
 
-        valid_keys = set(DEFAULTS.keys())
+        valid_keys = set(ALL_DEFAULTS.keys())
         to_write   = {k: str(v).strip() for k, v in src.items() if k in valid_keys and v is not None}
         if not to_write:
             raise HTTPException(400, "No recognisable settings keys in payload")
@@ -817,6 +833,12 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 agent_thr = json.loads(raw.get("validation_agent_thresholds") or "{}")
             except json.JSONDecodeError:
                 agent_thr = {}
+            try:
+                agent_priorities = normalize_agent_priorities(
+                    raw.get("validation_agent_priorities") or "{}"
+                )
+            except ValueError:
+                agent_priorities = {}
 
             use_ai = (raw.get("validation_use_ai_verdict")
                       or VALIDATION_DEFAULTS["validation_use_ai_verdict"]).lower() == "true"
@@ -846,6 +868,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                         "os":         r["os"] or "",
                         "asset_tier": r["asset_tier"] or "endpoint",
                         "threshold":  float(agent_thr.get(aid)) if aid in agent_thr else None,
+                        "priority":   agent_priorities.get(aid, "standard"),
                     })
             except Exception as exc:
                 log.debug("agent enumeration failed: %s", exc)
@@ -857,8 +880,11 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                     if t in terrain_thr
                 },
                 "agent_thresholds":    {k: float(v) for k, v in agent_thr.items()},
+                "agent_priorities":    agent_priorities,
                 "use_ai_verdict":      use_ai,
                 "min_strength":        max(0.0, min(1.0, min_strength)),
+                "priority_levels":      list(ASSET_PRIORITY_LEVELS),
+                "priority_options":     priority_options(),
                 "terrains":            [
                     {
                         "id":          t,
@@ -899,6 +925,9 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         if "agent_thresholds" in payload:
             at = {k: float(v) for k, v in (payload["agent_thresholds"] or {}).items() if v is not None}
             updates["validation_agent_thresholds"] = json.dumps(at, sort_keys=True)
+        if "agent_priorities" in payload:
+            ap = normalize_agent_priorities(payload["agent_priorities"] or {})
+            updates["validation_agent_priorities"] = json.dumps(ap, sort_keys=True)
         if "use_ai_verdict" in payload:
             updates["validation_use_ai_verdict"] = "true" if payload["use_ai_verdict"] else "false"
         if "min_strength" in payload:
@@ -928,7 +957,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         # refresh and caused "I configured it but nothing shows up" reports.
         rescore_report = None
         if "global_threshold" in payload or "terrain_thresholds" in payload \
-                or "agent_thresholds" in payload:
+                or "agent_thresholds" in payload or "agent_priorities" in payload:
             try:
                 rescore_report = await intel_db.recompute_terrain_validation_all()
             except Exception as exc:
@@ -1033,6 +1062,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         global_thr   = 0.90
         terrain_n    = 0
         agent_n      = 0
+        priority_n   = 0
         try:
             raw = await _load()
             global_thr = float(raw.get("validation_global_threshold")
@@ -1045,6 +1075,12 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 agent_n = len(json.loads(raw.get("validation_agent_thresholds") or "{}"))
             except Exception:
                 agent_n = 0
+            try:
+                priority_n = len(normalize_agent_priorities(
+                    raw.get("validation_agent_priorities") or "{}"
+                ))
+            except Exception:
+                priority_n = 0
         except Exception:
             pass
 
@@ -1088,6 +1124,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 "global":  global_thr,
                 "terrain_overrides": terrain_n,
                 "agent_overrides":   agent_n,
+                "priority_overrides": priority_n,
             },
             "last_rejection_reason": last_error,
             "banner": {"status": banner_status, "message": banner_msg},

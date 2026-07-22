@@ -65,9 +65,11 @@ from .ai_validator import (
     validate_with_ai,
     ai_validation_enabled,
     resolve_threshold,
+    resolve_agent_priority,
     use_ai_verdict_for,
     PrecisionResult,
 )
+from .asset_priority import apply_priority_to_enriched, apply_priority_to_finding
 from ..threat.scoring import score_matrix
 
 log = logging.getLogger("manager.attacklens.engine")
@@ -512,6 +514,10 @@ class AttackLensEngine:
                 beh_old  = await self._behav.analyze(agent_id, section, data)
                 findings.extend(beh_old)
                 ts = time.time()
+                try:
+                    agent_priority = await resolve_agent_priority(self._idb, agent_id)
+                except Exception:
+                    agent_priority = None
                 for f in findings:
                     f["agent_id"] = agent_id
                     # Provenance → verifiable against the raw payload in Deep Analysis.
@@ -521,6 +527,8 @@ class AttackLensEngine:
                         await self._attach_legacy_precision(f)
                     except Exception as exc:
                         log.debug("legacy precision attach failed: %s", exc)
+                    if agent_priority is not None:
+                        apply_priority_to_finding(f, agent_priority)
                     await self._idb.upsert_finding(f, ts)
             else:
                 # ── Stage 3: cluster → confidence → validate → emit ────────────
@@ -878,6 +886,15 @@ class AttackLensEngine:
             "controls_disabled_count": controls_off,
             "threat_intel_source_count": (1 if str(f.get("source","")).startswith("feed:") or f.get("source") == "abuseipdb" else 0) + (1 if kev else 0),
         }
+        try:
+            priority_profile = await resolve_agent_priority(self._idb, agent_id)
+            enriched = apply_priority_to_enriched(enriched, priority_profile)
+            f["asset_tier"] = enriched.get("asset_tier", f.get("asset_tier") or "endpoint")
+            f["asset_importance"] = enriched.get(
+                "asset_importance", f.get("asset_importance") or 0,
+            )
+        except Exception as exc:
+            log.debug("legacy priority enrichment error: %s", exc)
         ti_score    = _ti_corroboration_score(enriched)
         asset_score = _asset_criticality_score(enriched)
 
@@ -1046,7 +1063,7 @@ class AttackLensEngine:
         host_class = await self._idb.get_host_class(cluster.agent_id) or asset_tier
         controls   = await self._idb.get_compensating_controls(cluster.agent_id)
 
-        return {
+        enriched = {
             "kev_hit":                   kev_hit,
             "epss_scores":               epss_scores,
             "malicious_ip_hit":          mal_ip,
@@ -1060,6 +1077,14 @@ class AttackLensEngine:
             "malicious_ips":             sorted(ips) if mal_ip else [],
             "malicious_hashes":          sorted(hashes) if mal_hash else [],
         }
+        try:
+            priority = await resolve_agent_priority(self._idb, cluster.agent_id)
+            enriched = apply_priority_to_enriched(enriched, priority)
+            if enriched.get("asset_tier") and enriched["asset_tier"] != asset_tier:
+                enriched["host_class"] = host_class or enriched["asset_tier"]
+        except Exception as exc:
+            log.debug("asset priority enrichment failed agent=%s: %s", cluster.agent_id, exc)
+        return enriched
 
     async def _emit_finding_from_cluster(
         self,
@@ -1100,15 +1125,32 @@ class AttackLensEngine:
             "validation_gates_passed": "[]",
             "layers_involved":       f'[{",".join(repr(l) for l in layers)}]',
             "host_class":            enriched.get("host_class", ""),
+            "asset_tier":            enriched.get("asset_tier", ""),
+            "asset_importance":      enriched.get("asset_importance", 0),
             "kev":                   enriched.get("kev_hit", False),
             "epss_score":            max(enriched.get("epss_scores") or [0]),
         }
+        if enriched.get("asset_priority_level"):
+            f["precision_factors"] = {
+                "asset_priority_level": enriched.get("asset_priority_level"),
+                "asset_priority_confidence_multiplier": enriched.get(
+                    "asset_priority_confidence_multiplier",
+                ),
+            }
 
         # Stamp the AI precision verdict and per-factor breakdown so analysts
         # and the dashboard can audit *why* this finding was promoted.
         if precision is not None:
             f["precision_score"]   = precision.score
-            f["precision_factors"] = precision.factors
+            factors = dict(precision.factors)
+            if enriched.get("asset_priority_level"):
+                factors.update({
+                    "asset_priority_level": enriched.get("asset_priority_level"),
+                    "asset_priority_confidence_multiplier": enriched.get(
+                        "asset_priority_confidence_multiplier",
+                    ),
+                })
+            f["precision_factors"] = factors
             if precision.ai is not None:
                 f["ai_verdict"] = {
                     "label":        precision.ai.label,
@@ -1123,7 +1165,15 @@ class AttackLensEngine:
             # Surface precision in the analyst-visible evidence too.
             ev = dict(f.get("evidence") or {})
             ev["precision_score"]   = precision.score
-            ev["precision_factors"] = precision.factors
+            ev["precision_factors"] = f["precision_factors"]
+            if enriched.get("asset_priority_level"):
+                ev["_confidence_calibration"] = {
+                    "asset_priority_level": enriched.get("asset_priority_level"),
+                    "asset_priority_label": enriched.get("asset_priority_label"),
+                    "confidence_multiplier": enriched.get(
+                        "asset_priority_confidence_multiplier",
+                    ),
+                }
             f["evidence"] = ev
 
         # ── Terrain validation — the analyst-facing per-criterion checklist.

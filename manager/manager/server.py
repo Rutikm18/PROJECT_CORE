@@ -150,7 +150,14 @@ def create_app() -> FastAPI:
     _intel_pipeline:  IntelPipeline | None = None
 
     # ── App ───────────────────────────────────────────────────────────────────
-    app = FastAPI(title="mac_intel Manager", version="1.0.0", docs_url=None)
+    from .version import get_version_info
+
+    _version_info = get_version_info()
+    app = FastAPI(
+        title="mac_intel Manager",
+        version=_version_info["version"],
+        docs_url=None,
+    )
 
     # ── Security headers middleware ────────────────────────────────────────────
     from .security_policy import SECURITY_HEADERS
@@ -489,11 +496,17 @@ def create_app() -> FastAPI:
             intel_stats = {}
         status = "ok" if ok else "degraded"
         return {
-            "status": status,
-            "db":     "ok" if ok else "error",
-            "store":  idx_stats,
-            "intel":  intel_stats,
+            "status":  status,
+            "version": _version_info["version"],
+            "db":      "ok" if ok else "error",
+            "store":   idx_stats,
+            "intel":   intel_stats,
         }
+
+    # ── Build / version metadata (public — surfaced on the dashboard) ─────────
+    @app.get("/api/v1/meta")
+    async def meta():
+        return _version_info
 
     # ── Enrichment ────────────────────────────────────────────────────────────
     @app.post("/api/v1/enrich/{finding_id}")

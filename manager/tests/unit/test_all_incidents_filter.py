@@ -1,11 +1,10 @@
 """
-manager/tests/unit/test_all_incidents_filter.py — All Incidents threshold filter.
+manager/tests/unit/test_all_incidents_filter.py — precision floor contract.
 
-The All Incidents page (GET /api/v1/detection/all) now applies the configured
-Settings → Validation threshold: only findings whose precision_score ≥ threshold
-are shown. This pins the data-layer contract that endpoint relies on — a
-below-threshold finding is excluded by the precision floor, and dropping the
-floor (validated_only=false) brings it back.
+All Incidents and terrain pages must show every active finding by default.
+Validated Findings is the opt-in thresholded view. This pins the data-layer
+contract both views rely on: adding a precision floor excludes below-threshold
+findings, and dropping the floor brings them back.
 
 Uses pg_intel_dsn (conftest.py) — a freshly CREATEd, then DROPped, real
 Postgres database per test.

@@ -139,11 +139,12 @@ export default function ExecutionThreats() {
 
   // Build base API URL
   const baseUrl = validatedOnly
-    ? "/api/v1/detection/processes?validated_only=true"
-    : "/api/v1/detection/processes";
+    ? "/api/v1/detection/all?terrain_id=citadels&validated_only=true"
+    : "/api/v1/detection/all?terrain_id=citadels";
+  const statsUrl = `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}limit=500`;
 
   // Fetch for domain KPIs
-  const { findings: raw } = useDetectionData(`${baseUrl}&limit=500`);
+  const { findings: raw } = useDetectionData(statsUrl);
 
   const stats = useMemo(() => {
     const cat = (f: DetectionFinding) => (f.category ?? "").toLowerCase();

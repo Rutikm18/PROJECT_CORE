@@ -200,7 +200,7 @@ attacklens/
 │   │   ├── workers/               # Async background task workers
 │   │   ├── ai_analyst.py          # Claude API integration
 │   │   ├── indexer.py             # IntelDB — findings, baselines, AI cache
-│   │   ├── server.py              # FastAPI app factory + startup wiring
+│   │   ├── server.py              # FastAPI app factory + startup wiringle
 │   │   └── threat_intel_service.py # Central threat intel microservice
 │   ├── dashboard/                 # Static SOC dashboard (HTML/CSS/JS)
 │   ├── Dockerfile

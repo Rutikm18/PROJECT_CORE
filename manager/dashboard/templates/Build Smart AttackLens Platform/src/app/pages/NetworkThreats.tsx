@@ -140,11 +140,12 @@ export default function NetworkThreats() {
 
   // Build base API URL
   const baseUrl = validatedOnly
-    ? "/api/v1/detection/network?validated_only=true"
-    : "/api/v1/detection/network";
+    ? "/api/v1/detection/all?terrain_id=vector&validated_only=true"
+    : "/api/v1/detection/all?terrain_id=vector";
+  const statsUrl = `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}limit=500`;
 
   // Fetch for domain KPIs
-  const { findings: raw } = useDetectionData(`${baseUrl}&limit=500`);
+  const { findings: raw } = useDetectionData(statsUrl);
 
   // Extract distinct feed sources from live data
   const activeFeedKeys = useMemo(() => {
