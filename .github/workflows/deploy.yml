@@ -20,24 +20,51 @@ jobs:
   test-and-build:
     name: Test, Build & Push
     runs-on: ubuntu-latest
+
+    # Give the runner write access to the repo so it can push the version bump.
+    permissions:
+      contents: write
+
     outputs:
-      manager_image: ${{ steps.push.outputs.manager_image }}
+      manager_image:      ${{ steps.push.outputs.manager_image }}
       threat_intel_image: ${{ steps.push.outputs.threat_intel_image }}
+      app_version:        ${{ steps.bump.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history so `git rev-list --count` reflects the true commit
-          # count — a shallow clone would always report 1.
+          # Needed so the version-bump commit can be pushed back.
+          token: ${{ github.token }}
           fetch-depth: 0
 
-      - name: Compute app version
+      # ── Bump patch version ─────────────────────────────────────────────────
+      # Reads the VERSION file (e.g. "1.1.0"), increments the patch number to
+      # "1.1.1", writes it back, commits with [skip ci] so this workflow does
+      # not re-trigger, then pushes.  The new version is passed as a build-arg
+      # to the Docker image so it appears in /api/v1/meta and the dashboard.
+      - name: Bump patch version
+        id: bump
         run: |
-          # Version scheme: 1.0.<commit-count> — advances on every push.
-          echo "APP_VERSION=1.0.$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
-          echo "APP_COMMIT=$(git rev-parse --short HEAD)"      >> "$GITHUB_ENV"
-          echo "APP_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"   >> "$GITHUB_ENV"
-          echo "Building version 1.0.$(git rev-list --count HEAD) ($(git rev-parse --short HEAD))"
+          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+
+          echo "$NEW_VERSION" > VERSION
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
+          git push
+
+          echo "version=${NEW_VERSION}"       >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=${NEW_VERSION}"   >> "$GITHUB_ENV"
+          echo "APP_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "APP_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "Bumped $CURRENT → $NEW_VERSION"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -58,9 +85,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -69,19 +96,17 @@ jobs:
       - name: Build and push Docker images
         id: push
         run: |
-          # Build images
           docker compose -f docker-compose.yml build manager
           docker compose -f docker-compose.yml build threat-intel
 
-          # Tag with commit SHA
           MANAGER_IMAGE="$ECR_REGISTRY/$ECR_REPO:manager-$IMAGE_TAG"
           THREAT_IMAGE="$ECR_REGISTRY/$ECR_REPO:threat-intel-$IMAGE_TAG"
           MANAGER_LATEST="$ECR_REGISTRY/$ECR_REPO:manager-latest"
           THREAT_LATEST="$ECR_REGISTRY/$ECR_REPO:threat-intel-latest"
 
-          docker tag attacklens-manager:latest  "$MANAGER_IMAGE"
+          docker tag attacklens-manager:latest     "$MANAGER_IMAGE"
           docker tag attacklens-threat-intel:latest "$THREAT_IMAGE"
-          docker tag attacklens-manager:latest  "$MANAGER_LATEST"
+          docker tag attacklens-manager:latest     "$MANAGER_LATEST"
           docker tag attacklens-threat-intel:latest "$THREAT_LATEST"
 
           docker push "$MANAGER_IMAGE"
@@ -89,8 +114,8 @@ jobs:
           docker push "$MANAGER_LATEST"
           docker push "$THREAT_LATEST"
 
-          echo "manager_image=$MANAGER_IMAGE" >> "$GITHUB_OUTPUT"
-          echo "threat_intel_image=$THREAT_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "manager_image=$MANAGER_IMAGE"           >> "$GITHUB_OUTPUT"
+          echo "threat_intel_image=$THREAT_IMAGE"       >> "$GITHUB_OUTPUT"
 
   deploy:
     name: Deploy to EC2
@@ -104,17 +129,17 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host:     ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER || 'ubuntu' }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          timeout: 120s
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          timeout:  120s
           script: |
             set -e
 
@@ -124,7 +149,6 @@ jobs:
               docker login --username AWS --password-stdin \
               ${{ env.ECR_REGISTRY }}
 
-            # Generate override file pointing to the exact images built by this run.
             cat > docker-compose.override.yml << 'OVERRIDE'
             services:
               manager:
@@ -135,13 +159,13 @@ jobs:
 
             docker compose -f docker-compose.yml -f docker-compose.override.yml pull manager threat-intel
 
-            # Graceful restart — containers are replaced one at a time
-            docker compose -f docker-compose.yml -f docker-compose.override.yml up -d --remove-orphans --no-deps manager threat-intel
+            docker compose -f docker-compose.yml -f docker-compose.override.yml \
+              up -d --remove-orphans --no-deps manager threat-intel
 
-            # Clean up old images (keep last 3)
             docker image prune -af --filter "until=24h" 2>/dev/null || true
 
-            # Health check
+            echo "Deployed version ${{ needs.test-and-build.outputs.app_version }}"
+
             echo "Waiting for manager to become healthy..."
             for i in $(seq 1 15); do
               if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
@@ -152,5 +176,4 @@ jobs:
               sleep 4
             done
 
-            # Print status
             docker compose -f docker-compose.yml -f docker-compose.override.yml ps

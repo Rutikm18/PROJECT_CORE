@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main, dev]
+    # Skip the auto-version-bump commits so CI doesn't run on its own commits.
+    paths-ignore:
+      - VERSION
   pull_request:
     branches: [main]
 
