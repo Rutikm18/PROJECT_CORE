@@ -376,19 +376,68 @@ if [[ -L /usr/local/bin/attacklens-control && ! -e /usr/local/bin/attacklens-con
   rm -f /usr/local/bin/attacklens-control
 fi
 
-# ── Load LaunchDaemons (bootout stale copy first, then bootstrap) ─────────────
-for LABEL in com.attacklens.agent com.attacklens.watchdog; do
-  PLIST="${LAUNCHDAEMON_DIR}/${LABEL}.plist"
-  launchctl bootout "system/${LABEL}" 2>/dev/null || true
-  launchctl enable  "system/${LABEL}" 2>/dev/null || true
-  if ! launchctl bootstrap system "${PLIST}" 2>/dev/null; then
-    # already loaded (error 5) or transient — kick it, fall back to legacy load
-    launchctl kickstart -k "system/${LABEL}" 2>/dev/null \
-      || launchctl load -w "${PLIST}" 2>/dev/null || true
-  fi
-done
+# ── Pre-flight: the agent binary must actually be runnable ────────────────────
+# A quarantined or arch-mismatched binary would exit-loop under launchd and only
+# be discovered AFTER a reboot. Catch it now, at install time, with a clear fix.
+if ! "${INSTALL_DIR}/bin/attacklens-agent" --help >/dev/null 2>&1; then
+  echo "  ⚠️  WARNING: ${INSTALL_DIR}/bin/attacklens-agent failed to run (--help)." >&2
+  echo "     Likely Gatekeeper quarantine or an arch mismatch. Try:" >&2
+  echo "       sudo xattr -dr com.apple.quarantine ${INSTALL_DIR}/bin/" >&2
+  echo "     then: sudo attacklens-service restart" >&2
+fi
 
-echo "  AttackLens agent installed and started."
+# ── Ensure the boot-safe key directory is root-only (file keystore lives here) ─
+mkdir -p "${SECURITY_DIR}"
+chown root:wheel "${SECURITY_DIR}" 2>/dev/null || true
+chmod 700 "${SECURITY_DIR}" 2>/dev/null || true
+
+# ── SINGLE-SUPERVISOR topology ────────────────────────────────────────────────
+# CRITICAL: only ONE launchd job may start the agent. The agent LaunchDaemon runs
+# the agent directly; the watchdog LaunchDaemon *also* spawns an agent as a child
+# (watchdog.py subprocess.Popen). Bootstrapping BOTH — as older builds did — runs
+# TWO agent processes that race on the shared disk spool (unsent.ndjson),
+# duplicating telemetry and burning CPU. launchd's own KeepAlive already provides
+# crash recovery, so the agent daemon alone is the supported topology.
+#
+# We therefore START the agent and explicitly DISABLE + bootout the watchdog. To
+# opt into the watchdog supervision model instead, disable the agent daemon and
+# bootstrap ONLY the watchdog (they must never both be loaded).
+
+# Stop + disable the watchdog so it can't spawn a second agent (idempotent).
+launchctl bootout "system/com.attacklens.watchdog" 2>/dev/null || true
+launchctl disable "system/com.attacklens.watchdog" 2>/dev/null || true
+# Kill any orphaned watchdog-spawned agent from a previous (dual-daemon) install.
+pkill -f "attacklens-agent run" 2>/dev/null || true
+
+# Start the single agent daemon (bootout stale copy first, then bootstrap).
+launchctl bootout  "system/com.attacklens.agent" 2>/dev/null || true
+launchctl enable   "system/com.attacklens.agent" 2>/dev/null || true
+if ! launchctl bootstrap system "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" 2>/dev/null; then
+  # already loaded (error 5) or transient — kick it, fall back to legacy load
+  launchctl kickstart -k "system/com.attacklens.agent" 2>/dev/null \
+    || launchctl load -w "${LAUNCHDAEMON_DIR}/com.attacklens.agent.plist" 2>/dev/null || true
+fi
+
+# ── Verify the agent daemon actually reached 'running' ────────────────────────
+# Poll for a PID for a few seconds instead of assuming success — surfaces a
+# crash-loop (exit 2/78, missing key, bad config) here rather than silently
+# after the next reboot. Non-fatal: the watchdog + self-heal still recover, but
+# the operator gets an immediate, actionable signal.
+AGENT_UP=0
+for _ in 1 2 3 4 5; do
+  if launchctl print "system/com.attacklens.agent" 2>/dev/null | grep -q "pid = "; then
+    AGENT_UP=1; break
+  fi
+  sleep 1
+done
+if [[ "${AGENT_UP}" == "1" ]]; then
+  echo "  ✓ AttackLens agent installed and running."
+else
+  echo "  ⚠️  Agent installed but did NOT reach 'running' within 5s." >&2
+  echo "     Last agent stderr:" >&2
+  tail -n 15 "${LOG_DIR}/agent-stderr.log" 2>/dev/null | sed 's/^/       /' >&2 || true
+  echo "     Diagnose with: sudo attacklens-service diagnose" >&2
+fi
 echo "  Manage it with: sudo attacklens-service status|start|stop|diagnose"
 exit 0
 SCRIPT_BODY

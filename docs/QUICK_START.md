@@ -1,5 +1,8 @@
 # AttackLens — Quick Start Reference
 
+> 🧭 New here? Start at **[docs/INSTALL.md](INSTALL.md)** (the canonical install router).
+> This page is the **credentials + ADMIN_TOKEN** reference it links to.
+
 ## Default Dashboard Credentials
 
 | Field | Value |

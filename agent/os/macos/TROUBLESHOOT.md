@@ -543,6 +543,55 @@ in `ProgramArguments`, then `sudo attacklens-service restart`.
 
 ---
 
+### Issue 5c — Agent process runs after reboot but delivers NO telemetry (keychain locked at boot)
+
+**What you'd see:**
+```
+$ sudo attacklens-service status
+Agent:         running            # process is up — launchd/KeepAlive happy
+```
+…but the dashboard shows the agent offline / no fresh data, and
+`/Library/AttackLens/logs/agent.log` repeats lines like:
+```
+No API key in keystore or config — starting first-run enrollment...
+Enrollment failed (manager unreachable?) ... Starting with temporary key
+```
+or repeated `401` / re-enrollment churn. The agent is alive but can't authenticate.
+
+**Root cause (fixed 2026-07-23):**
+The pkg config used `keystore = "keychain"`. The agent runs as a **root
+LaunchDaemon that starts at boot with no user login session**, so the macOS
+**login keychain is locked** and the `keyring` library can't read the key back.
+On interactive install the key went into the login keychain; after a reboot the
+root daemon `load_key()` finds nothing (login keychain locked, System keychain +
+file backend empty) → no key → enrollment loop / silent non-delivery. The
+process stays up (nothing crashes, so KeepAlive never fires) while delivering
+zero telemetry.
+
+**Fix (in this build):**
+- Fresh installs now generate `keystore = "file"` — the ACL-restricted file
+  (`/Library/AttackLens/security/<agent-id>.key`, 0600, root-only) is the only
+  storage guaranteed readable by a root daemon at boot.
+- `store_key()` now **always mirrors the key to that file** even when the
+  configured backend is `keychain` (defensive backstop).
+- On startup, a key loaded from the Keychain is mirrored to the file too, so
+  **upgrades from older keychain-only installs self-heal on the first run**.
+- The pkg postinstall now verifies the daemon reached `running` and prints the
+  last agent stderr lines if it didn't — so this surfaces at install time.
+
+**If you're on an older install (recover now):**
+```bash
+# Point the keystore at the boot-safe file backend and re-run:
+sudo sed -i '' 's/keystore = "keychain"/keystore = "file"/' /Library/AttackLens/agent.toml
+sudo attacklens-service restart          # loads key from keychain, mirrors to file
+sudo attacklens-service status
+# verify the boot-safe key file now exists (root-only, 0600):
+sudo ls -l /Library/AttackLens/security/
+```
+Then reboot to confirm the agent comes back delivering data.
+
+---
+
 ### Issue 5 — `✗ TOML library — run: pip3 install tomli` (diagnose false-fail)
 
 **What you saw:**

@@ -101,11 +101,17 @@ if run_as_group: extras.append(f'run_as_group = "{run_as_group}"')
 if run_as_uid:   extras.append(f'run_as_uid   = {run_as_uid}')
 identity_extras = ('\n' + '\n'.join(extras)) if extras else ''
 
-# Build enrollment block
+# Build enrollment block.
+# keystore = "file": the agent runs as a root LaunchDaemon that starts at boot
+# with NO user login session, so the macOS login keychain is locked and
+# unreadable — a "keychain" backend would lose the key on every reboot. The
+# ACL-restricted file (0600, root-only under /Library/AttackLens/security) is
+# the boot-safe choice for a system daemon. (store_key still mirrors to file
+# even if this is set back to "keychain", as a defensive backstop.)
 if enroll_token:
-    enroll_block = f'\n[enrollment]\ntoken    = "{enroll_token}"\nkeystore = "keychain"\n'
+    enroll_block = f'\n[enrollment]\ntoken    = "{enroll_token}"\nkeystore = "file"\n'
 else:
-    enroll_block = '\n[enrollment]\n# token = ""\nkeystore = "keychain"\n'
+    enroll_block = '\n[enrollment]\n# token = ""\nkeystore = "file"\n'
 
 content = f"""# AttackLens Agent Configuration
 # Generated: {ts}

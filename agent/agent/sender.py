@@ -9,6 +9,7 @@ Features:
   - TLS 1.3 minimum
 """
 
+import errno
 import json
 import logging
 import os
@@ -34,6 +35,12 @@ _SPOOL_RETRY_MAX = 30
 _PROBE_TIMEOUT = 5
 # Consecutive 401s from an "online" manager before triggering re-enrollment
 _AUTH_FAIL_THRESHOLD = 3
+# Wake-from-sleep detection: the drain loop cycles ~once per second, so if the
+# monotonic clock jumps far beyond that between iterations the process was
+# suspended (the machine slept/hibernated). On resume, cached sockets are dead
+# and the network may have changed, so we re-verify the manager immediately
+# instead of waiting out the offline backoff (up to _SPOOL_RETRY_MAX seconds).
+_WAKE_GAP_SEC = 30
 
 
 class DiskSpool:
@@ -53,8 +60,23 @@ class DiskSpool:
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def write(self, envelope: dict) -> None:
-        """Append one envelope to the spool."""
-        line = json.dumps(envelope, separators=(",", ":")) + "\n"
+        """Append one envelope to the spool. Best-effort — NEVER raises.
+
+        The spool is the delivery path's last resort and write() is called on the
+        sender thread AND from the orchestrator's overflow sink. A full disk
+        (ENOSPC), a read-only filesystem, or a permission error must not crash
+        either — an unhandled OSError here would kill the sender thread and stop
+        ALL delivery silently. On a full disk we trim aggressively to free room
+        for later writes; the current datum is counted as dropped, not lost
+        silently.
+        """
+        try:
+            line = json.dumps(envelope, separators=(",", ":")) + "\n"
+        except (TypeError, ValueError) as exc:
+            # A non-serialisable envelope should never reach here, but if it does
+            # it must not take the whole spool write down.
+            log.error("Spool write: envelope not JSON-serialisable (%s) — dropped", exc)
+            return
         with self._lock:
             # Trim spool if too large (drop first ~10 % of lines = oldest)
             try:
@@ -62,8 +84,21 @@ class DiskSpool:
                     self._trim()
             except FileNotFoundError:
                 pass
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line)
+            except OSError as exc:
+                log.debug("Spool size check failed: %s", exc)
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError as exc:
+                self._dropped_trim += 1
+                log.error("Spool write failed (%s) — datum dropped (cumulative=%d)",
+                          exc, self._dropped_trim)
+                # On a full disk / quota, make room so subsequent writes can land.
+                if getattr(exc, "errno", None) in (errno.ENOSPC, errno.EDQUOT):
+                    try:
+                        self._trim()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def drain(self) -> list[dict]:
         """Read and clear all spooled envelopes.  Returns list of dicts."""
@@ -245,7 +280,23 @@ class Sender:
     def _drain_loop(self):
         spool_check = 0.0
         probe_delay = _SPOOL_RETRY_MIN
+        last_tick = time.monotonic()
         while not self._stop.is_set():
+            # ── Wake-from-sleep resume ────────────────────────────────────────
+            # A monotonic jump far past our ~1s cadence means the process was
+            # suspended (system slept). Force an immediate manager reprobe so a
+            # spool built up while offline drains right after wake, rather than
+            # sitting for up to _SPOOL_RETRY_MAX seconds. Marking offline is
+            # cheap: if the link is actually fine the reprobe restores it in ~2s.
+            mono = time.monotonic()
+            if mono - last_tick > _WAKE_GAP_SEC:
+                log.info("Resume-from-sleep detected (%.0fs gap) — forcing manager "
+                         "reprobe + spool drain", mono - last_tick)
+                self._online = False
+                probe_delay = _SPOOL_RETRY_MIN
+                spool_check = 0.0
+            last_tick = mono
+
             # Reprobe when offline, with fast-first backoff (2s → 30s) so a
             # transient blip recovers in ~2s instead of waiting a flat 30s.
             # Guarded: a probe/drain/spool error must never kill the sender
@@ -289,37 +340,48 @@ class Sender:
             except queue.Empty:
                 continue
 
-            # When manager is known unreachable, spool directly — skip the
-            # full retry cycle (3 × backoff) that wastes time and queue capacity.
-            if not self._online:
-                self._spool.write(envelope)
-                continue
+            # The whole send path is guarded: an unexpected error (a malformed
+            # envelope, an SSL/urllib edge case _send_with_retry didn't catch)
+            # must NOT kill the sender thread — that would silently stop ALL
+            # delivery. On any surprise we spool the datum and carry on.
+            try:
+                # When manager is known unreachable, spool directly — skip the
+                # full retry cycle (3 × backoff) that wastes time and queue capacity.
+                if not self._online:
+                    self._spool.write(envelope)
+                    continue
 
-            success = self._send_with_retry(envelope)
-            if not success:
-                log.warning("Spooling %s to disk", envelope.get("section"))
-                self._spool.write(envelope)
-                self._online = False
-                # Just went offline — reprobe quickly (fast-first backoff).
-                probe_delay = _SPOOL_RETRY_MIN
-                spool_check = 0.0
-                # If auth failures crossed the threshold and manager is reachable,
-                # the key is invalid — trigger re-enrollment and clear bad spool.
-                if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
-                    if self._probe():
-                        log.warning(
-                            "Persistent 401 after %d attempts — manager online but key rejected; "
-                            "clearing spool and triggering re-enrollment",
-                            self._auth_fail_count,
-                        )
-                        self._auth_fail_count = 0
-                        self._spool.drain()   # old encrypted data can't be re-keyed
-                        if self.on_auth_error:
-                            threading.Thread(
-                                target=self.on_auth_error,
-                                daemon=True,
-                                name="re-enroll",
-                            ).start()
+                success = self._send_with_retry(envelope)
+                if not success:
+                    log.warning("Spooling %s to disk", envelope.get("section"))
+                    self._spool.write(envelope)
+                    self._online = False
+                    # Just went offline — reprobe quickly (fast-first backoff).
+                    probe_delay = _SPOOL_RETRY_MIN
+                    spool_check = 0.0
+                    # If auth failures crossed the threshold and manager is reachable,
+                    # the key is invalid — trigger re-enrollment and clear bad spool.
+                    if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
+                        if self._probe():
+                            log.warning(
+                                "Persistent 401 after %d attempts — manager online but key rejected; "
+                                "clearing spool and triggering re-enrollment",
+                                self._auth_fail_count,
+                            )
+                            self._auth_fail_count = 0
+                            self._spool.drain()   # old encrypted data can't be re-keyed
+                            if self.on_auth_error:
+                                threading.Thread(
+                                    target=self.on_auth_error,
+                                    daemon=True,
+                                    name="re-enroll",
+                                ).start()
+            except Exception as exc:
+                log.error("sender send-loop error (continuing): %s", exc)
+                try:
+                    self._spool.write(envelope)   # don't lose the datum
+                except Exception:
+                    pass
 
     # ── Send with retry ───────────────────────────────────────────────────────
 

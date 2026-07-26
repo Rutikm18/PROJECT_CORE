@@ -2,7 +2,7 @@
 
 **Module:** `agent/os/macos/` &nbsp;·&nbsp; **Target:** macOS 12+ (Apple Silicon / ARM64, x86_64 compatible)
 **Status legend:** ✅ implemented & active · 🟡 implemented but not wired/active · 🔴 gap / to build
-**Last updated:** 2026-06-08
+**Last updated:** 2026-07-23
 
 > **Why this file exists.** Each OS needs a *different* agent — macOS uses `launchd`,
 > Windows uses the SCM (`service.py`), Linux uses `systemd`. The collectors, persistence
@@ -18,19 +18,79 @@
 
 | # | Capability | Status | Owner module |
 |---|---|---|---|
-| 1 | **Auto-launch on boot / restart** (survives reboot) | 🟡 loader ready + `activate.sh`; awaiting root bootstrap | `launchd.py`, `installer/activate.sh` |
-| 2 | **Always-on background operation** (binaries run behind, headless) | 🟡 configured; activates with #1 | `launchd.py` |
-| 3 | **Crash recovery / self-healing** (restart on death) | ✅ via launchd `KeepAlive` (watchdog daemon disabled — see §3) | `launchd.py` |
-| 4 | **Continuous data transfer** (never silently drop telemetry) | ✅ active & verified (zero-loss replay test) | `agent/sender.py` |
-| 5 | **Connection checking** (probe before send, drain on reconnect) | ✅ active + surfaced in `agent_health` → dashboard | `agent/sender.py`, `manager/api/assets.py` |
+| 1 | **Auto-launch on boot / restart** (survives reboot) | ✅ active — pkg bootstraps at install; `RunAtLoad`+`KeepAlive`; self-repairs a deleted/disabled/tampered plist | `launchd.py`, `boot_persistence.py` |
+| 2 | **Always-on background operation** (binaries run behind, headless) | ✅ active — system LaunchDaemon, `Background`/`LowPriorityIO` | `launchd.py` |
+| 3 | **Crash recovery / self-healing** (restart on death) | ✅ launchd `KeepAlive` + periodic `self_heal` (daemon-loaded + boot-persistence + delivery probe) | `launchd.py`, `self_heal.py`, `boot_persistence.py` |
+| 4 | **Continuous data transfer** (never silently drop telemetry) | ✅ active & verified (zero-loss replay); disk-full-safe spool | `agent/sender.py` |
+| 5 | **Connection checking** (probe before send, drain on reconnect) | ✅ active + surfaced in `agent_health` → dashboard; wake-from-sleep reprobe | `agent/sender.py`, `manager/api/assets.py` |
 | 6 | **CIS benchmark data collection** | ✅ active — 23 checks, pipeline fixed + expanded | `os/macos/collectors/posture.py` (dispatched) |
 | 7 | **Health heartbeat** (agent reports its own state) | ✅ active | `agent/core.py` |
-| 8 | **Secure enrollment + payload encryption** | ✅ active | `agent/enrollment.py`, `crypto.py` |
+| 8 | **Secure enrollment + payload encryption** | ✅ active — boot-safe file keystore (root daemon can't read login keychain at boot) | `agent/enrollment.py`, `crypto.py`, `keystore.py` |
 | 9 | **Dynamic signed config** (signature-verified manager policies, fail-closed) | ✅ active — `ConfigEngine` + signed-policy verify/cache/reload; heartbeat carries `policy_versions` | `agent/policy.py`, `agent/config_engine.py`, `agent/core.py` |
+| 10 | **Reboot / boot-transition telemetry** (detect unexpected reboots) | ✅ active — `system_boot` event with downtime + clean/unexpected verdict | `boot_persistence.py`, `agent/core.py` |
+| 11 | **Single-instance guard** (no duplicate agents racing on the spool) | ✅ active — advisory `flock`, duplicate exits cleanly | `agent/single_instance.py` |
+| 12 | **Edge-case resilience** (config / disk-full / clock-skew) | ✅ active — `ConfigError` fail-fast, non-raising spool, backward-clock re-seed | `agent/core.py`, `agent/sender.py` |
 
 ---
 
-## 1. Auto-launch on boot / restart  🟡
+## 0a. Telemetry collection coverage (what the agent observes)
+
+The agent ships **23 collection sections** plus the synthetic **Agent Health** heartbeat. Each
+section is an independent collector in the macOS registry (`collectors/__init__.py`), scheduled
+on its own cadence by the `Orchestrator`, guarded by a per-section circuit breaker + wall-clock
+budget (§3, §4), normalised to a canonical schema (`normalizer.py`), then encrypted and shipped.
+Intervals below are the fresh-install defaults (`installer/generate_config.sh`) and are
+**config-tunable** and **policy-controllable** at runtime (§9).
+
+| Section | Supplies | Producer (`collectors/…`) | Default cadence |
+|---|---|---|---|
+| **Agent Health** | agent's own state: circuit-breaker snapshot (CLOSED/OPEN/HALF-OPEN), queue depth, uptime, manager link state, `policy_versions`, `response_enabled` | `agent/core.py` `_emit_health` (synthetic) | 60 s |
+| **Metrics** | CPU %, RAM, swap, disk I/O, network I/O, load average | `volatile.py` `MetricsCollector` | 10 s |
+| **Connections** | established TCP/UDP connections with owning process + private/public flag | `volatile.py` `ConnectionsCollector` | 10 s |
+| **Processes** | running processes (top by CPU) with code-signing / trust status | `volatile.py` `ProcessesCollector` | 10 s |
+| **Ports** | listening ports with owning process | `network.py` `PortsCollector` | 30 s |
+| **Network** | interfaces, IP addresses, routes, DNS config | `network.py` `NetworkCollector` | 120 s |
+| **ARP** | ARP / neighbor table (L2 ↔ L3 mappings) | `network.py` `ArpCollector` | 120 s |
+| **Mounts** | mounted filesystems + mount options | `network.py` `MountsCollector` | 120 s |
+| **Battery** | power source, battery charge / health state | `system.py` `BatteryCollector` | 120 s |
+| **Open Files** | open file handles / descriptors by process | `system.py` `OpenFilesCollector` | 120 s |
+| **Services** | `launchd` services & daemons (LaunchDaemons/Agents) | `system.py` `ServicesCollector` | 120 s |
+| **Users** | local accounts, group/admin membership, login/session state | `system.py` `UsersCollector` | 120 s |
+| **Hardware** | model, CPU, memory, serial, hardware UUID | `system.py` `HardwareCollector` | 120 s |
+| **Containers** | Docker / container runtime presence + running containers | `system.py` `ContainersCollector` | 120 s |
+| **Storage** | physical disks, APFS volumes, capacity, FileVault state | `inventory.py` `StorageCollector` | 600 s |
+| **Tasks** | scheduled tasks: cron, `launchd` periodic, `at` jobs | `inventory.py` `TasksCollector` | 600 s |
+| **Security** | SIP, Gatekeeper, FileVault, Firewall, XProtect, remote login/sharing, screensaver lock … (drives 23 CIS checks — §6) | `posture.py` `SecurityCollector` | 3600 s |
+| **Sysctl** | security-relevant kernel params (`kern.*`, `net.inet.*`, `security.*`) | `posture.py` `SysctlCollector` | 3600 s |
+| **Configs** | shell rc, `~/.ssh/config`, `authorized_keys`, `/etc/hosts`, `sshd_config`, `sudoers` (4 KiB cap) | `posture.py` `ConfigsCollector` | 3600 s |
+| **SBOM** | software bill of materials — components / dependencies for supply-chain risk | `inventory.py` `SbomCollector` | 3600 s |
+| **Apps** | installed applications inventory | `inventory.py` `AppsCollector` | 3600 s |
+| **Packages** | package-manager inventory (brew / pip / gem / npm / cargo …) | `inventory.py` `PackagesCollector` | 3600 s |
+| **Binaries** | Mach-O binary inventory with signing / trust verdict | `inventory.py` `BinariesCollector` | 3600 s |
+| **SCA** | CIS macOS Benchmark compliance scan (dedicated) | `sca.py` `ScaCollector` | 12 h *(in-code default only — see note)* |
+
+> Resilience per section: a hung/erroring collector is converted to a circuit-breaker failure
+> (skipped + probed on cooldown) and **never** overwrites the last good snapshot with an error
+> blob; a slow collector degrades to *partial* data within its wall-clock budget rather than
+> timing the whole section out (§3, `collectors/base.py`). Missing privileged fields score
+> **unknown**, never a false FAIL (§6).
+
+> ⚠️ **Config divergence (flag for reconciliation).** The two schedule sources disagree, so the
+> effective cadence depends on which config a host runs:
+> - the in-code fallback `agent/agent/core.py::_DEFAULT_SECTIONS` (used only when the config has
+>   no `[collection.sections]`) — includes **sca @ 12 h**, runs metrics/connections/processes at
+>   **60 s**, apps/packages/sbom at **24 h**, and has **binaries disabled**;
+> - the fresh-install `installer/generate_config.sh` (what a pkg install actually runs) — **omits
+>   `sca`**, runs metrics/connections/processes at **10 s**, and apps/packages/binaries/sbom at
+>   **1 h** with binaries **enabled**.
+>
+> Net: a default pkg install currently does **not** schedule the SCA compliance scan (the CIS
+> data still comes from the `security`/`sysctl`/`configs` sections — §6). Reconciling the two so
+> they agree (and adding `sca` to the generated config) is an open item.
+
+---
+
+## 1. Auto-launch on boot / restart  ✅
 
 **Requirement:** when the machine reboots, the agent must come back up on its own — no
 human login, no manual start.
@@ -49,31 +109,35 @@ launchd  (OS init, PID 1)
 - `ThrottleInterval=10` → 10 s floor between relaunches (prevents crash-loop spin).
 - Runs as `UserName=root` so collectors that need privilege (csrutil, fdesetup, sysctl) work.
 
-**Current deployment (verified 2026-06-08):** the installed daemon runs Python, not a
-PyInstaller binary:
-`python3.13 /Library/AttackLens/bin/run_agent.py --config /Library/AttackLens/agent.toml`.
-Both plists are present; `launchctl list | grep attacklens` is **empty** → not yet loaded.
+**Activation:** the pkg postinstall bootstraps both daemons at install
+(`pkg/build_pkg.sh` → `launchctl enable`/`bootstrap` with legacy `load -w` fallback) and
+now **verifies the agent reached `running`**, dumping `agent-stderr.log` if it didn't — so
+a crash-loop surfaces at install time, not after a reboot.
 
-**Work done this pass:**
-- `launchd.py` modernised: `install_plist`/`start`/`stop`/`uninstall_plist` now use
-  `launchctl bootstrap|bootout|enable` (macOS 10.10+) with a `load -w` legacy fallback,
-  and are idempotent (boot out any stale instance before bootstrapping).
-- `installer/activate.sh` added — preflights interpreter/entry/plist/config, loads the
-  **agent** daemon, and verifies it is actually running (prints PID).
+**Boot-persistence self-repair (`boot_persistence.py`, 2026-07-23).** `RunAtLoad` alone
+does NOT survive a reboot if the plist is deleted or `launchctl disable`d (a tamper /
+botched-uninstall / persistence-defeat vector — KeepAlive can't save a job that no longer
+exists at boot). `ensure_boot_persistence()` runs at agent startup **and** on every
+`self_heal` cycle to verify + repair:
 
-**Remaining (needs root, one command):**
-```
-sudo bash agent/os/macos/installer/activate.sh
-```
-After this the agent auto-starts at every boot (`RunAtLoad`) and auto-restarts on exit
-(`KeepAlive`). To-do after activation: confirm survival across a real reboot.
+- plist present and structurally correct (`RunAtLoad` + `KeepAlive` + right binary + label),
+- owned `root:wheel`, mode `0644`,
+- **enabled** in launchd (`is_enabled`/`enable` added to `launchd.py`, parses both
+  `print-disabled` formats),
+- loaded — re-bootstraps if not (throttled so the 5-min self_heal cadence can't thrash launchctl).
+
+Repair requires root and is verify-only otherwise; it never raises into startup. Ops entry:
+`python -m agent.os.macos.boot_persistence [--verify|--repair]`.
 
 **Helpers available:** `install_plist()`, `uninstall_plist()`, `start()`, `stop()`,
-`restart()`, `reload_config()` (SIGHUP — change intervals without a full restart).
+`restart()`, `reload_config()` (SIGHUP), `is_enabled()`, `enable()`.
+
+**Tests:** `agent/tests/unit/test_boot_persistence.py` (plist-drift analysis, launchctl
+`print-disabled` parsing, enable/verify logic).
 
 ---
 
-## 2. Always-on background operation  🟡
+## 2. Always-on background operation  ✅
 
 **Requirement:** the binaries run silently behind the system, with no UI, no Dock icon,
 low resource footprint, surviving user logout.
@@ -90,7 +154,7 @@ low resource footprint, surviving user logout.
 with a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`). The agent injects
 `/usr/local/bin:/opt/homebrew/bin` so brew/docker/pip-based collectors still resolve.
 
-**Status:** configured correctly; **inactive** until capability #1 is bootstrapped.
+**Status:** ✅ active — runs as a headless system LaunchDaemon (activates with #1).
 
 ---
 
@@ -115,6 +179,21 @@ layer is now just a launchd switch in `activate.sh` (load `com.attacklens.watchd
 the bare agent). Left **opt-in** 🟡 because launchd `KeepAlive` already satisfies crash recovery;
 the watchdog adds rate-limited back-off on top.
 
+**Third layer — periodic `self_heal` (`self_heal.py`).** A one-shot LaunchDaemon
+(`StartInterval` 300 s) that closes the gaps `KeepAlive` cannot see:
+- `ensure_daemon_loaded()` re-bootstraps the agent if launchd dropped the job,
+- `ensure_boot_persistence()` re-asserts the plist/enable/ownership so the NEXT reboot
+  still auto-starts even after tampering (see §1),
+- a manager **delivery probe** catches *silent non-delivery* (agent alive + launchd-happy
+  but shipping zero telemetry: manager down, rogue server on the port, persistent 401) and
+  escalates by cause — never a blind restart that would trigger a spool-replay storm.
+
+> ⚠️ **Topology note (2026-07-23):** both `com.attacklens.agent` (runs the agent directly)
+> and `com.attacklens.watchdog` (spawns the agent via `subprocess.Popen`) ship with
+> `RunAtLoad`/`KeepAlive`, so two agent processes can run at once. The single-instance
+> guard (§11) now prevents the resulting spool race, but the clean fix is to pick ONE
+> supervision model (drop the direct agent daemon, or the watchdog). Tracked in `friction.md`.
+
 ---
 
 ## 4. Continuous data transfer  ✅
@@ -130,6 +209,10 @@ even across manager outages, network drops, or reboots.
   - **Replayed on startup** (`Sender.start()` drains the spool from the previous run) → survives reboot.
   - **Auto-drained** back into the queue the moment the manager is reachable again.
   - 50 MB cap; on overflow drops the **oldest** 10 % (newest data preferred) and logs it.
+  - **Disk-full safe (2026-07-23):** `DiskSpool.write` never raises — ENOSPC / read-only FS /
+    non-serialisable envelope are counted as dropped (not silently lost) and an ENOSPC write
+    trims the spool to free room. The sender send-path is fully try-wrapped so no surprise can
+    kill the delivery thread. Tests: `agent/tests/unit/test_spool_disk_full.py`.
 - **Exponential backoff + jitter** (`retry_delay` × 2ⁿ, capped 60 s) on transient errors.
 - **HTTP status awareness:** `200` ok · `401` → spool + re-enroll after 3 strikes ·
   `429` honoured as transient · `503` (manager couldn't persist) → spool · other `4xx` → dropped
@@ -161,6 +244,10 @@ obviously isn't; resume the instant it returns.
   every 30 s.
 - On a successful probe the spool is drained and normal sending resumes; `"Manager connection
   restored"` is logged on the first 200 after an outage.
+- **Wake-from-sleep resume (2026-07-23):** the drain loop measures `time.monotonic()` between
+  its ~1 s iterations; a jump past `_WAKE_GAP_SEC` (30 s) means the Mac slept/hibernated, so
+  cached sockets are dead — it forces an immediate reprobe + spool drain rather than waiting
+  out the offline backoff (up to 30 s).
 
 **Dashboard surfacing (2026-06-08):** `Sender.link_state()` snapshots manager connectivity
 (`manager_online`, `spool_bytes`, `auth_failures`, `last_contact_ts`, `seconds_since_contact`)
@@ -259,6 +346,15 @@ manager distinguishes "agent online but a collector is failing" from "agent gone
 - `agent/crypto.py` + `keystore.py` (macOS keystore at `os/macos/keystore.py`) — per-agent key
   (`security/agent-001.key`), envelopes encrypted before they ever hit the queue/spool.
 - Re-enrollment is triggered automatically after 3 consecutive `401`s (stale key) — see §4.
+- **Boot-safe key storage (2026-07-23).** A root LaunchDaemon starts at boot with **no user
+  login session**, so the macOS *login* keychain is locked and `keyring` can't read the key
+  back — a `keystore = "keychain"` config lost the key on every reboot and churned on
+  enrollment. Fixes: fresh installs generate `keystore = "file"` (ACL-restricted
+  `/Library/AttackLens/security/<id>.key`, `0600` root-only — the only storage a root daemon
+  can read at boot); `store_key()` always **mirrors** the key to that file even for the
+  `keychain` backend; and a keychain-loaded key is mirrored on startup so older keychain-only
+  installs self-heal. Tests: `agent/tests/unit/test_keystore.py::TestKeychainBootSafeMirror`.
+  See TROUBLESHOOT.md Issue 5c.
 
 ---
 
@@ -382,17 +478,73 @@ atomic hot-reload under concurrent readers, clock-skew). Hermetic via
 
 ---
 
-## 10. Build / packaging anchors
+## 10. Reboot / boot-transition telemetry  ✅
+
+**Requirement:** an EDR agent should record and report reboots — an unexpected reboot is a
+security signal (attackers reboot to clear volatile state or apply persistence).
+
+**Mechanism (`boot_persistence.py`, 2026-07-23):** a marker
+(`/Library/AttackLens/boot_state.json`: kernel `boot_time`, `last_seen`, `clean_stop`) is
+compared against the live kernel boot time on startup (psutil `boot_time()`, falling back to
+`sysctl -n kern.boottime`). A change ⇒ the box rebooted since the agent last ran, so it emits
+a `system_boot` telemetry event (`Orchestrator.emit_event()`) with:
+
+- `downtime_sec` — new boot minus the last heartbeat,
+- `clean_shutdown` — `True` only if the agent got a graceful `SIGTERM` (`mark_clean_stop()` in
+  `core._shutdown`); a power loss / panic / `SIGKILL` leaves it `False` → reported **unexpected**.
+
+A 60 s daemon thread (`touch_heartbeat()`) keeps `last_seen` fresh for an accurate downtime
+estimate. Best-effort throughout — never raises into startup.
+**Tests:** `agent/tests/unit/test_boot_persistence.py` (first-run / reboot / clean-vs-unexpected
+state machine, downtime math).
+
+---
+
+## 11. Single-instance guard  ✅
+
+**Requirement:** exactly one agent process delivers telemetry — two would race on the shared
+`unsent.ndjson` spool (duplicate sends, and `DiskSpool.drain()`'s read-then-remove corrupts
+across processes).
+
+**Mechanism (`agent/single_instance.py`, 2026-07-23):** `core.main` acquires an exclusive
+advisory lock (`fcntl.flock`) on `attacklens-agent.lock`. A 5 s wait covers the normal
+old→new overlap during a launchd restart; a persistent duplicate logs and exits `0`. The
+holder PID is written for diagnostics. POSIX-only (no-op elsewhere — Windows has service-level
+single-instance). Motivated by the two-daemon topology in §3.
+**Tests:** `agent/tests/unit/test_single_instance.py`.
+
+---
+
+## 12. Edge-case resilience (config / disk-full / clock-skew)  ✅
+
+Hardening for the failure modes that silently take a long-running agent down (2026-07-23):
+
+- **Config (`core.load_config`):** was a raw `tomllib.load` with no handling — a missing file /
+  malformed TOML / missing `[manager].url` crashed the daemon into a launchd restart-loop. Now
+  raises `ConfigError` with an operator-actionable message and `main` exits `78` (EX_CONFIG)
+  once instead of looping; `--status` uses a raw parse so it still works on a broken config.
+  Tests: `agent/tests/unit/test_config_robustness.py`.
+- **Disk-full:** see §4 — non-raising spool write, trim-on-ENOSPC, guarded send loop.
+- **Clock-skew:** the collector scheduler runs on `time.time()`, so a backward NTP correction
+  after boot would stall all collection. `Orchestrator._maybe_reseed_on_skew` re-seeds the
+  schedule on a backward jump > `_CLOCK_SKEW_BACKWARD_SEC` (60 s); forward jumps and jitter are
+  ignored. Tests: `agent/tests/unit/test_clock_skew.py`.
+
+---
+
+## 13. Build / packaging anchors
 
 - `pkg/build_pkg.sh` + `pkg/entitlements.plist` — signed ARM64 `.pkg` that installs to
-  `/Library/AttackLens/`, drops both plists, and bootstraps the daemons.
+  `/Library/AttackLens/`, drops both plists, and bootstraps the daemons. Postinstall now
+  verifies the binary runs (`--help`), polls launchd for the agent PID, and dumps
+  `agent-stderr.log` if it didn't reach `running` — install-time failure surfacing.
 - `installer/install.sh` / `uninstall.sh` — script-based install path.
 - `requirements.txt` — runtime deps (PyInstaller target).
 - Repo `Makefile`: `make build-binaries` (agent + watchdog), `make build-pkg`.
 
 ---
 
-## 11. Work queue (gaps → tasks)
+## 14. Work queue (gaps → tasks)
 
 Derived from the status flags above; all scoped to `agent/os/macos/`:
 
@@ -415,5 +567,7 @@ Derived from the status flags above; all scoped to `agent/os/macos/`:
    `link.status` (healthy/degraded/auth_failed). Tests: `agent/tests/unit/test_link_state.py`,
    `manager/tests/unit/test_link_status_api.py`.
 
-> Remaining open items: **#1/#2 root bootstrap** (run `activate.sh` + reboot check) and the
-> optional **#3 watchdog** re-enable. Everything else in this manifest is implemented + tested.
+> Remaining open items: the optional **#3 watchdog** re-enable and resolving the **two-daemon
+> topology** (§3 note) so only one supervisor starts the agent. **#1/#2 auto-launch are now
+> active** (pkg bootstraps + boot-persistence self-repair). Everything else in this manifest is
+> implemented + tested.

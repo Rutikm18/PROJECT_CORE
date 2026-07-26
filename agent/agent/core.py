@@ -150,6 +150,13 @@ _HOSTNAME  = socket.gethostname()
 _HEALTH_INTERVAL_SEC = 60
 _START_TIME          = time.time()
 
+# A backward wall-clock jump larger than this (seconds) is treated as real clock
+# skew — an NTP correction after boot, a VM snapshot restore, or a manual date
+# change — rather than scheduler jitter. The scheduler runs on time.time(), so a
+# backward jump would push every section's next-fire time into the future and
+# stall ALL collection until the clock caught up; when detected we re-seed.
+_CLOCK_SKEW_BACKWARD_SEC = 60
+
 # Hard wall-clock deadline for a single collector call. Without this, a
 # hung subprocess (a stuck system_profiler/mdfind call, a stalled read on a
 # slow disk) blocks its ThreadPoolExecutor worker FOREVER — the circuit
@@ -231,6 +238,7 @@ class Orchestrator:
         self._stop      = threading.Event()
         self._last_run: dict[str, float] = {}
         self._last_health = 0.0
+        self._last_wall   = 0.0     # clock-skew detector baseline (wall clock)
         self._executor  = None
         self._cbr       = CircuitBreakerRegistry(fail_threshold=3, cooldown_sec=60)
         # Optional callable -> dict: manager connectivity snapshot from the
@@ -252,6 +260,7 @@ class Orchestrator:
         self._stop.clear()
         self._last_run    = {}
         self._last_health = 0.0
+        self._last_wall   = 0.0
         self._seed_phase()
         self._executor    = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(4, len(COLLECTORS)),
@@ -299,6 +308,29 @@ class Orchestrator:
         # No [collection.sections] in config — use built-in defaults
         return _DEFAULT_SECTIONS
 
+    def _maybe_reseed_on_skew(self, now: float) -> bool:
+        """Re-seed the schedule when the wall clock jumps BACKWARD past the skew
+        threshold, so collection doesn't stall until the clock catches up.
+
+        A backward jump (NTP correction after boot, VM snapshot restore, manual
+        date change) leaves every section's _last_run in the future; without this
+        no section would fire for the duration of the jump. Returns True if a
+        re-seed happened. (Forward jumps are harmless — they just fire sections
+        promptly — so they're ignored.) Extracted for unit testing.
+        """
+        reseeded = False
+        if self._last_wall and now < self._last_wall - _CLOCK_SKEW_BACKWARD_SEC:
+            log.warning(
+                "Wall clock jumped backward %.0fs (was %.0f, now %.0f) — "
+                "re-seeding collection schedule to avoid a stall",
+                self._last_wall - now, self._last_wall, now,
+            )
+            self._seed_phase()
+            self._last_health = 0.0   # let the heartbeat fire promptly too
+            reseeded = True
+        self._last_wall = now
+        return reseeded
+
     def _tick_loop(self):
         # The orchestrator thread MUST NOT die — if it does, all collection
         # stops silently. Every iteration is guarded so one unexpected error
@@ -306,6 +338,9 @@ class Orchestrator:
         while not self._stop.is_set():
             try:
                 now = time.time()
+
+                # ── Clock-skew guard ──────────────────────────────────────────
+                self._maybe_reseed_on_skew(now)
 
                 # ── Health heartbeat ──────────────────────────────────────────
                 if now - self._last_health >= _HEALTH_INTERVAL_SEC:
@@ -438,6 +473,15 @@ class Orchestrator:
                     section,
                 )
 
+    def emit_event(self, section: str, data: dict) -> None:
+        """Emit a single ad-hoc event (e.g. a macOS `system_boot` record) through
+        the same encrypt → enqueue → spool path as scheduled sections. Public and
+        guarded so a one-shot emit can never crash the caller."""
+        try:
+            self._enqueue(section, data)
+        except Exception as exc:
+            log.error("emit_event(%s) failed: %s", section, exc)
+
     def _emit_health(self) -> None:
         """Emit a synthetic agent_health section with diagnostics."""
         health_data = {
@@ -565,9 +609,62 @@ def _auto_agent_id() -> str:
     return f"host-{h}"
 
 
+class ConfigError(Exception):
+    """Raised when agent.toml is missing, malformed, or lacks required keys.
+    Carries an operator-actionable message (printed once, no stack-trace loop)."""
+
+
 def load_config(path: str) -> dict:
-    with open(path, "rb") as f:
-        return tomllib.load(f)
+    """Load + minimally validate agent.toml.
+
+    Turns the three config failure modes a boot daemon actually hits — file
+    missing, malformed TOML, missing required keys — into a single clear
+    ConfigError instead of a cryptic traceback that launchd would restart-loop
+    on every 10 s forever. Fail-fast is correct (we can't invent a manager URL),
+    but the operator gets a message that names the file and the exact problem.
+    """
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        raise ConfigError(
+            f"config file not found: {path}\n"
+            f"  The installer generates it; regenerate with: "
+            f"sudo attacklens-service repair"
+        )
+    except IsADirectoryError:
+        raise ConfigError(f"config path is a directory, not a file: {path}")
+    except PermissionError as exc:
+        raise ConfigError(f"config file not readable ({exc}): {path}")
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(
+            f"config file is not valid TOML ({exc}): {path}\n"
+            f"  A partial write or hand-edit likely corrupted it; restore from "
+            f"backup or run: sudo attacklens-service repair"
+        )
+
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"config file did not parse to a table: {path}")
+
+    # Minimal structural validation of the keys the agent dereferences at startup.
+    mgr = cfg.get("manager")
+    if not isinstance(mgr, dict) or not str(mgr.get("url", "")).strip():
+        raise ConfigError(
+            f"[manager] url is missing or empty in {path}\n"
+            f"  Set it to your manager, e.g.  url = \"http://MANAGER_IP:8080\""
+        )
+    url = str(mgr["url"]).strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ConfigError(
+            f"[manager] url must start with http:// or https:// (got {url!r}) in {path}"
+        )
+    if not isinstance(cfg.get("agent"), dict):
+        # Not fatal — id is auto-derived later — but normalise so callers can
+        # setdefault safely without a TypeError on a non-dict.
+        cfg["agent"] = {} if cfg.get("agent") is None else cfg["agent"]
+        if not isinstance(cfg["agent"], dict):
+            raise ConfigError(f"[agent] section must be a table in {path}")
+    return cfg
 
 
 def _resolve_security_dir(cfg: dict, config_path: str) -> str:
@@ -617,6 +714,16 @@ def _obtain_api_key(cfg: dict, config_path: str) -> str:
 
     k = load_key(agent_id, backend=backend, security_dir=security_dir)
     if k:
+        # Reboot-safety migration: a key that came from the Keychain (older
+        # installs stored keychain-only) must ALSO exist as the ACL-restricted
+        # file, because a root LaunchDaemon at boot has no login session and
+        # can't read the login keychain. Ensure the boot-safe file mirror exists.
+        # Idempotent + best-effort — never block startup on it.
+        if backend == "keychain":
+            try:
+                store_key(agent_id, k, backend="file", security_dir=security_dir)
+            except Exception as exc:
+                log.debug("Boot-safe key mirror refresh failed: %s", exc)
         return k
 
     if isinstance(raw, str):
@@ -645,9 +752,14 @@ def _print_status(config_path: str) -> None:
     no network call — reads whatever the running agent last wrote to disk.
     """
     status_file = _DEFAULT_STATUS_FILE
+    # Use a RAW parse here, not the validating load_config(): --status is a
+    # read-only diagnostic that must work even when the config is incomplete or
+    # invalid (that's often exactly when an operator runs it). We only need the
+    # status_file path; a bad [manager] url must not send us to the default.
     try:
-        cfg = load_config(config_path)
-        status_file = cfg.get("paths", {}).get("status_file", _DEFAULT_STATUS_FILE)
+        with open(config_path, "rb") as f:
+            cfg = tomllib.load(f)
+        status_file = (cfg.get("paths") or {}).get("status_file", _DEFAULT_STATUS_FILE)
     except Exception:
         pass   # fall back to the default path; config may not exist yet
 
@@ -684,8 +796,36 @@ def main():
         _print_status(args.config)
         return
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        # One clear line to stderr (launchd captures it) then exit non-zero.
+        # Better than a raw traceback restart-looping every ThrottleInterval.
+        print(f"FATAL: {exc}", file=sys.stderr)
+        sys.exit(78)   # EX_CONFIG — signals a configuration problem to launchd
     setup_logging(cfg)
+
+    # ── Single-instance guard ────────────────────────────────────────────────
+    # Prevent two agent processes (e.g. the agent LaunchDaemon AND the
+    # watchdog-spawned child) from racing on the shared disk spool, which would
+    # duplicate telemetry and corrupt unsent.ndjson. A brief wait covers the
+    # normal old→new overlap during a launchd restart; a persistent duplicate
+    # exits cleanly. POSIX-only (no-op elsewhere) and never fatal to construct.
+    _instance_lock = None
+    try:
+        from .single_instance import acquire as _acquire_lock, AlreadyRunning
+        _lock_path = cfg.get("paths", {}).get("lock_file") or os.path.join(
+            os.path.dirname(_DEFAULT_SPOOL_DIR), "attacklens-agent.lock")
+        try:
+            _instance_lock = _acquire_lock(_lock_path)
+        except AlreadyRunning as exc:
+            print(f"Another agent instance is already running ({exc}); exiting to "
+                  f"avoid duplicate telemetry / spool corruption.", file=sys.stderr)
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - lock is best-effort, never block startup
+        log.warning("single-instance guard unavailable (%s) — continuing", exc)
 
     # ── Auto-populate agent ID from hardware if not set in config ─────────────
     cfg.setdefault("agent", {})
@@ -793,6 +933,18 @@ def main():
                         overflow_sink=sender.spool_envelope)
     orch_thread  = orch.start()
 
+    # ── Boot persistence + reboot detection (macOS) ──────────────────────────
+    # Guarantees the LaunchDaemon still auto-starts after the next shutdown even
+    # if the plist was deleted/disabled/tampered, and emits a `system_boot` event
+    # when the box rebooted since the agent last ran. Best-effort — a failure
+    # here must never abort startup, so it is fully guarded.
+    if sys.platform == "darwin":
+        try:
+            from agent.os.macos.boot_persistence import on_agent_startup
+            on_agent_startup(orch, args.config)
+        except Exception as exc:
+            log.debug("boot-persistence/reboot-detect skipped: %s", exc)
+
     # Re-enrollment callback: called by sender when persistent 401 detected.
     # Obtains a new key, derives new crypto keys, updates the orchestrator in-place.
     _security_dir = _resolve_security_dir(cfg, args.config)
@@ -837,6 +989,15 @@ def main():
 
     def _shutdown(signum, frame):
         log.info("Shutting down (signal %d)", signum)
+        # Record a GRACEFUL stop so the next boot classifies this shutdown as
+        # clean. If the box instead loses power / panics / is SIGKILLed, this
+        # never runs and the marker stays "unclean" → reported as unexpected.
+        if sys.platform == "darwin":
+            try:
+                from agent.os.macos.boot_persistence import mark_clean_stop
+                mark_clean_stop()
+            except Exception as exc:
+                log.debug("clean-stop marker failed: %s", exc)
         orch.stop()
         sender.stop()
         if config_engine is not None:

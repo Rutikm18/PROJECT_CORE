@@ -39,6 +39,15 @@ dist/
 build/
 *.spec.bak
 
+# macOS agent packaging: the staging root under pkg_build is regenerated at
+# build time (installer/build_pkg.sh rsyncs src into it), so it must never be
+# tracked — it previously committed a recursive copy of the whole repo.
+**/pkg_build/root/
+*.pkg
+
+# Node deps for the dashboard frontend source (Vite build inputs)
+node_modules/
+
 # ── Dev tool artifacts ────────────────────────────────
 .commandcode/
 .qodo/

@@ -93,6 +93,18 @@ function relTime(ts: number): string {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
+// Relative age of an ISO timestamp (e.g. build time) — handles up to days.
+function buildAge(iso?: string): string | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60)     return "just now";
+  if (s < 3600)   return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400)  return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 // ── Colour palette ────────────────────────────────────────────────────────────
 
 const C = {
@@ -420,14 +432,25 @@ export default function SecurityDashboard() {
           <div className="flex items-center gap-3">
             {build?.version && (
               <div
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-50 border border-orange-100 rounded-xl text-[9px] text-orange-600 font-semibold tabular-nums"
+                className="flex items-center gap-2 pl-2.5 pr-3 py-1.5 bg-orange-50 border border-orange-200 rounded-xl cursor-default"
                 title={[
-                  build.commit  ? `commit ${build.commit}` : null,
+                  `Version ${build.version}`,
+                  build.commit   ? `commit ${build.commit}` : null,
                   build.built_at ? `built ${build.built_at}` : null,
-                ].filter(Boolean).join(" · ") || undefined}
+                ].filter(Boolean).join(" · ")}
               >
-                <span className="w-1.5 h-1.5 rounded-full bg-orange-400" />
-                v{build.version}
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-60 animate-ping" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-orange-500" />
+                </span>
+                <span className="text-sm font-bold text-orange-700 tabular-nums leading-none">
+                  v{build.version}
+                </span>
+                {buildAge(build.built_at) && (
+                  <span className="text-[10px] text-orange-500/80 font-medium leading-none border-l border-orange-200 pl-2">
+                    built {buildAge(build.built_at)}
+                  </span>
+                )}
               </div>
             )}
             <div className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-[9px] text-gray-500 font-medium">

@@ -109,8 +109,12 @@ class TestInterpreterMode:
         cfg = make_cfg(tmp_path, agent_bin=str(script), python=sys.executable,
                        config_path="/Library/AttackLens/agent.toml")
         w = Watchdog(cfg)
+        # The 'run' subcommand is inserted by default (Issue 5b fix): the agent
+        # CLI is subcommand-based, so a bare '--config' without 'run' exits 2 and
+        # crash-loops. Interpreter mode inserts it just like native-binary mode.
         assert w._build_cmd() == [
-            sys.executable, str(script), "--config", "/Library/AttackLens/agent.toml",
+            sys.executable, str(script), "run", "--config",
+            "/Library/AttackLens/agent.toml",
         ]
 
     def test_py_target_defaults_to_running_interpreter(self, tmp_path):

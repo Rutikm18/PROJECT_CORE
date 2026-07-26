@@ -134,6 +134,19 @@ def _restart_agent() -> None:
 def check_and_heal() -> dict:
     """One self-heal cycle. Returns a result dict (also persisted to the
     diagnosis file). Never raises."""
+    # 0. Guarantee boot persistence: the plist must stay present, enabled, and
+    #    root:wheel so the agent STILL auto-starts after the next reboot even if
+    #    it was deleted/disabled/tampered while running (KeepAlive can't help a
+    #    job that no longer exists at boot). Best-effort; never fatal.
+    boot_persist = None
+    try:
+        from .boot_persistence import ensure_boot_persistence
+        boot_persist = ensure_boot_persistence()
+        if boot_persist.get("actions"):
+            log.warning("self_heal: boot-persistence repaired %s", boot_persist["actions"])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("self_heal: boot-persistence check failed: %s", exc)
+
     # 1. Make sure the agent is even up (boot/crash/launchd-drop recovery).
     loaded = ensure_daemon_loaded()
 
@@ -187,6 +200,7 @@ def check_and_heal() -> dict:
     result = {
         "verdict": verdict,
         "daemon_loaded": loaded,
+        "boot_persistence": boot_persist,
         "consecutive_failures": fails,
         "action": action,
         "manager": probe,

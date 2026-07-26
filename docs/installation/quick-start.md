@@ -1,5 +1,8 @@
 # Quick Start Guide — End-to-End Setup
 
+> 🧭 New here? Start at **[docs/INSTALL.md](../INSTALL.md)** (the canonical install router).
+> This page is the **end-to-end verification** walkthrough it links to.
+
 Get the full mac_intel stack running in under 10 minutes.
 
 ```

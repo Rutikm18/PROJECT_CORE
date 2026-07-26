@@ -1,5 +1,10 @@
 # AttackLens Agent — Quick Start
 
+> ⛔ **DEPRECATED.** This documents the older `installer/` packaging path (v2.0.0).
+> The current, supported macOS agent is the binary PKG under `agent/os/macos/pkg/`.
+> **Start here instead → [docs/INSTALL.md](../../../../docs/INSTALL.md)** ·
+> agent details → [pkg/INSTALL_GUIDE.md](../pkg/INSTALL_GUIDE.md).
+
 **Version:** 2.0.0  
 **Platform:** macOS 13+ (Ventura / Sonoma / Sequoia / Tahoe), arm64
 

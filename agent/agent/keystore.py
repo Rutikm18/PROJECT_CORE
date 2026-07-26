@@ -36,18 +36,41 @@ def store_key(
     key_hex: str,
     backend: str = "keychain",
     security_dir: str = "/Library/AttackLens/security",
+    mirror_to_file: bool = True,
 ) -> None:
-    """Persist the API key. Raises on failure."""
+    """Persist the API key. Raises on total failure (nothing persisted anywhere).
+
+    Reboot safety (macOS): the agent runs as a root LaunchDaemon that starts at
+    boot with NO user login session. The macOS *login* keychain is locked in that
+    state, so `keyring` cannot read the key back — the agent would lose its key on
+    every reboot and churn on re-enrollment. To prevent that, a keychain store
+    ALWAYS also writes the ACL-restricted file copy (0600, root-only under
+    security_dir), which is the only storage guaranteed readable by the daemon at
+    boot. Set mirror_to_file=False to opt out (not recommended for the daemon).
+    """
+    keychain_ok = False
     if backend == "keychain":
         try:
             import keyring  # type: ignore[import]
             keyring.set_password(_KEYRING_SERVICE, agent_id, key_hex)
+            keychain_ok = True
             log.info("API key stored in macOS Keychain (service=%s account=%s)",
                      _KEYRING_SERVICE, agent_id)
-            return
         except Exception as exc:
-            log.warning("Keychain store failed (%s) — falling back to file", exc)
-    _store_key_file(agent_id, key_hex, security_dir)
+            log.warning("Keychain store failed (%s) — using file backend", exc)
+
+    # Write the file backend when: it's the chosen backend, the boot-safe mirror
+    # is enabled (default), OR the keychain write failed (never silently lose it).
+    if backend != "keychain" or mirror_to_file or not keychain_ok:
+        try:
+            _store_key_file(agent_id, key_hex, security_dir)
+        except Exception as exc:
+            if not keychain_ok:
+                raise   # key was persisted NOWHERE — must surface, don't swallow
+            log.warning(
+                "Boot-safe key file mirror failed (%s); keychain copy only — the "
+                "agent may fail to authenticate after a reboot", exc,
+            )
 
 
 def load_key(

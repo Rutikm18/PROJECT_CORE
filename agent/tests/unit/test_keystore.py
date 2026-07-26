@@ -112,3 +112,58 @@ class TestFileBackend:
         loaded = load_key("agent-001", backend="file", security_dir=str(tmp_path))
         assert len(loaded) == 64
         assert all(c in "0123456789abcdef" for c in loaded)
+
+
+class TestKeychainBootSafeMirror:
+    """A root LaunchDaemon has no user login session at boot, so the macOS
+    *login* keychain is locked and `keyring` can't read the key back. A keychain
+    store MUST therefore also write the ACL-restricted file mirror so the agent
+    recovers its key after a reboot instead of churning on enrollment."""
+
+    def test_keychain_store_also_writes_file_mirror(self, tmp_path, monkeypatch):
+        import sys
+        from unittest.mock import MagicMock
+        mock_kr = MagicMock()
+        monkeypatch.setitem(sys.modules, "keyring", mock_kr)
+
+        key = secrets.token_hex(32)
+        store_key("agent-001", key, backend="keychain", security_dir=str(tmp_path))
+
+        mock_kr.set_password.assert_called_once()          # keychain written
+        assert _load_key_file("agent-001", str(tmp_path)) == key   # file mirror too
+
+    def test_load_recovers_from_mirror_when_keychain_empty_at_boot(self, tmp_path, monkeypatch):
+        import sys
+        from unittest.mock import MagicMock
+        mock_kr = MagicMock()
+        monkeypatch.setitem(sys.modules, "keyring", mock_kr)
+
+        key = secrets.token_hex(32)
+        # Interactive install: keychain store succeeds and mirrors to file.
+        store_key("agent-001", key, backend="keychain", security_dir=str(tmp_path))
+
+        # Reboot: root daemon, login keychain locked → get_password returns None.
+        mock_kr.get_password.return_value = None
+        loaded = load_key("agent-001", backend="keychain", security_dir=str(tmp_path))
+        assert loaded == key   # recovered from the boot-safe file mirror
+
+    def test_keychain_store_persists_when_keyring_unavailable(self, tmp_path, monkeypatch):
+        import sys
+        # `import keyring` raises when the module is None → keychain path fails,
+        # file backend must still persist the key (no silent loss).
+        monkeypatch.setitem(sys.modules, "keyring", None)
+        key = secrets.token_hex(32)
+        store_key("agent-001", key, backend="keychain", security_dir=str(tmp_path))
+        assert _load_key_file("agent-001", str(tmp_path)) == key
+
+    def test_mirror_can_be_disabled(self, tmp_path, monkeypatch):
+        import sys
+        from unittest.mock import MagicMock
+        mock_kr = MagicMock()
+        monkeypatch.setitem(sys.modules, "keyring", mock_kr)
+        key = secrets.token_hex(32)
+        store_key("agent-001", key, backend="keychain", security_dir=str(tmp_path),
+                  mirror_to_file=False)
+        # Opt-out honoured: keychain written, no file mirror.
+        mock_kr.set_password.assert_called_once()
+        assert _load_key_file("agent-001", str(tmp_path)) is None

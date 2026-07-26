@@ -54,6 +54,30 @@ def is_running(label: str = _AGENT_LABEL) -> bool:
     return r.returncode == 0 and '"PID"' in r.stdout
 
 
+def is_enabled(label: str = _AGENT_LABEL) -> bool:
+    """True if `label` is NOT in launchd's disabled set.
+
+    A daemon can be `launchctl disable`d while its plist still sits in
+    /Library/LaunchDaemons — in that state RunAtLoad never fires at boot, so the
+    agent silently fails to auto-start (a classic tamper/persistence-defeat).
+    If launchctl can't be queried we assume enabled, to avoid thrashing an
+    `enable` on every check.
+    """
+    r = _lctl("print-disabled", "system")
+    if r.returncode != 0:
+        return True
+    for line in (r.stdout or "").splitlines():
+        if f'"{label}"' in line:
+            low = line.lower()
+            return not ("=> true" in low or "disabled" in low)
+    return True
+
+
+def enable(label: str = _AGENT_LABEL) -> bool:
+    """Clear a `disable` override so RunAtLoad can start the job at boot again."""
+    return _lctl("enable", f"system/{label}").returncode == 0
+
+
 def _plist_for(label: str) -> str:
     return _WATCHDOG_PLIST if label == _WATCHDOG_LABEL else _AGENT_PLIST
 
