@@ -55,6 +55,14 @@ from .detections  import (
     analyze_port_listener, analyze_user_account,
     analyze_sysctl_monitor, analyze_arp_spoofing,
     analyze_container_security, analyze_sbom_posture,
+    # Previously-dormant modules — imported in detections/__init__ but never
+    # wired into a route (0 references), so they never ran. Now activated below
+    # so every security-relevant section is analyzed by its rich module.
+    analyze_lateral_movement, analyze_exfiltration, analyze_covert_channel,
+    analyze_persistence, analyze_service_monitor, analyze_scheduled_task,
+    analyze_privilege_escalation, analyze_binary_integrity,
+    analyze_defense_evasion, analyze_app_vulnerability,
+    analyze_package_vulnerability, analyze_mount_monitor,
 )
 from .clustering  import cluster_signals
 from .confidence  import score_confidence
@@ -126,21 +134,41 @@ _RECONCILE_SECTIONS: dict[str, tuple[str, ...]] = {
 # engine's inline analyzer. GROW this map one module at a time — only after the
 # module is confirmed to fire on live telemetry (many modules guard on section
 # names that differ from what the agent sends, so a blind add emits nothing).
+# Section → ordered list of rich detection modules. When a section is routed,
+# its modules run (each guards internally on `section`) IN PLACE OF the inline
+# `_dispatch` analyzer — the modules are the richer implementations (baselines,
+# allowlists, MITRE mapping, first-run FP seeding). `_rulepack` + behavioral run
+# for EVERY section regardless, so routing only upgrades a section, never removes
+# coverage. Every module below was verified against its own section guard:
+#   lateral_movement    → connections, users        exfiltration → connections, network, processes
+#   covert_channel      → processes, connections     persistence → services, tasks, configs
+#   service_monitor     → SERVICE_SECTIONS(services) scheduled_task → TASK_SECTIONS(tasks)
+#   privilege_escalation→ binaries, processes, configs  binary_integrity → binaries
+#   defense_evasion     → security, processes, sysctl   app_vulnerability → apps, packages
+#   package_vulnerability→ PACKAGE_SECTIONS(packages)
 _DETECTION_MODULE_ROUTES: dict[str, list] = {
-    "ports": [analyze_port_listener],
-    "users": [analyze_user_account],
-    # Confirmed against agent/os/macos/collectors/__init__.py's COLLECTORS
-    # registry — each of these sections has NO inline analyzer today (not in
-    # AttackLensEngine._dispatch()'s `fn` map), so routing them here is purely
-    # additive. Module-internal section guards verified to match exactly:
-    #   sysctl_monitor.SYSCTL_SECTIONS    ⊇ {"sysctl"}
-    #   arp_spoofing.analyze()            guards on section == "arp"
-    #   container_security.analyze()      guards on section in {"containers", ...}
-    #   sbom_posture.SBOM_SECTIONS        ⊇ {"sbom"}
-    "sysctl":     [analyze_sysctl_monitor],
+    # already active
+    "ports":      [analyze_port_listener],
     "arp":        [analyze_arp_spoofing],
     "containers": [analyze_container_security],
     "sbom":       [analyze_sbom_posture],
+    # newly wired — activate the previously-dormant rich modules
+    "users":      [analyze_user_account, analyze_lateral_movement],
+    "connections":[analyze_lateral_movement, analyze_exfiltration, analyze_covert_channel],
+    "network":    [analyze_exfiltration, analyze_covert_channel],
+    "processes":  [analyze_covert_channel, analyze_exfiltration,
+                   analyze_privilege_escalation, analyze_defense_evasion],
+    "services":   [analyze_persistence, analyze_service_monitor],
+    "tasks":      [analyze_persistence, analyze_scheduled_task],
+    "configs":    [analyze_persistence, analyze_privilege_escalation],
+    "binaries":   [analyze_privilege_escalation, analyze_binary_integrity],
+    "security":   [analyze_defense_evasion],
+    "sysctl":     [analyze_sysctl_monitor, analyze_defense_evasion],
+    "apps":       [analyze_app_vulnerability],
+    "packages":   [analyze_app_vulnerability, analyze_package_vulnerability],
+    # previously undetected sections — new-mount / removable-media / share
+    "mounts":     [analyze_mount_monitor],
+    "storage":    [analyze_mount_monitor],
 }
 
 # Map an agent section → the engine's finding `category` (keeps terrain mapping

@@ -21,8 +21,10 @@ from .service_monitor       import analyze as analyze_service_monitor
 from .sysctl_monitor        import analyze as analyze_sysctl_monitor
 from .scheduled_task        import analyze as analyze_scheduled_task
 from .user_account          import analyze as analyze_user_account
+from .mount_monitor         import analyze as analyze_mount_monitor
 
 __all__ = [
+    "analyze_mount_monitor",
     "analyze_lateral_movement",
     "analyze_persistence",
     "analyze_exfiltration",

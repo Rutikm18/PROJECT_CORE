@@ -35,6 +35,33 @@ _SPOOL_RETRY_MAX = 30
 _PROBE_TIMEOUT = 5
 # Consecutive 401s from an "online" manager before triggering re-enrollment
 _AUTH_FAIL_THRESHOLD = 3
+# Upper bound on how long we'll honor a server-supplied Retry-After (matrix R12):
+# respect the manager's rate-limit hint, but a pathological value must not park a
+# send for hours — cap it and let normal backoff + spooling take over.
+_RETRY_AFTER_MAX_SEC = 120
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date) → seconds from now,
+    or None if absent/unparseable. Negative/zero clamps to 0."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        import datetime as _dt
+        dt = parsedate_to_datetime(value)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, (dt - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
 # Wake-from-sleep detection: the drain loop cycles ~once per second, so if the
 # monotonic clock jumps far beyond that between iterations the process was
 # suspended (the machine slept/hibernated). On resume, cached sockets are dead
@@ -156,12 +183,17 @@ class DiskSpool:
 
 
 class Sender:
-    def __init__(self, config: dict, send_queue: queue.Queue, mac_key: bytes | None = None):
+    def __init__(self, config: dict, send_queue: queue.Queue, mac_key: bytes | None = None,
+                 heartbeat=None):
         # mac_key lets the sender RE-STAMP each envelope's transport timestamp +
         # HMAC at actual send time, so data spooled during an outage is still
         # within the manager's replay window on reconnect (no store-and-forward
         # data loss). None → legacy behaviour (send the sealed envelope as-is).
         self._mac_key   = mac_key
+        # Optional callable(success: bool=False) — liveness heartbeat for the
+        # Supervisor (matrix R6): pulsed each drain-loop iteration (alive) and on
+        # a delivered payload (success), so a wedged sender is detectable.
+        self.heartbeat  = heartbeat
         self.mgr        = config["manager"]
         self.url        = self.mgr["url"].rstrip("/") + "/api/v1/ingest"
         self.probe_url  = self.mgr["url"].rstrip("/") + "/health"
@@ -282,6 +314,14 @@ class Sender:
         probe_delay = _SPOOL_RETRY_MIN
         last_tick = time.monotonic()
         while not self._stop.is_set():
+            # Liveness heartbeat (R6): prove the drain loop is ticking even while
+            # the manager is offline (no successful sends to pulse on).
+            if self.heartbeat is not None:
+                try:
+                    self.heartbeat()
+                except Exception:
+                    pass
+
             # ── Wake-from-sleep resume ────────────────────────────────────────
             # A monotonic jump far past our ~1s cadence means the process was
             # suspended (system slept). Force an immediate manager reprobe so a
@@ -352,6 +392,13 @@ class Sender:
                     continue
 
                 success = self._send_with_retry(envelope)
+                if success:
+                    # Delivered (or cleanly handled) → sender is making progress (R6).
+                    if self.heartbeat is not None:
+                        try:
+                            self.heartbeat(success=True)
+                        except Exception:
+                            pass
                 if not success:
                     log.warning("Spooling %s to disk", envelope.get("section"))
                     self._spool.write(envelope)
@@ -431,6 +478,7 @@ class Sender:
         agent   = envelope.get("agent_id", "unknown")
 
         for attempt in range(1, self.max_retry + 1):
+            retry_after_sec: float | None = None    # server-supplied backoff hint (R12)
             try:
                 req = urllib.request.Request(
                     self.url,
@@ -472,13 +520,15 @@ class Sender:
                         return False
                     elif resp.status == 429:
                         retry_after = resp.headers.get("Retry-After", "?")
+                        retry_after_sec = _parse_retry_after(resp.headers.get("Retry-After"))
                         log.warning(
                             "HTTP 429 rate-limited agent=%s section=%s "
                             "retry-after=%ss (attempt %d/%d)",
                             agent, section, retry_after, attempt, self.max_retry,
                         )
-                        # treat as transient — fall through to backoff
+                        # treat as transient — honor Retry-After, then backoff
                     elif resp.status == 503:
+                        retry_after_sec = _parse_retry_after(resp.headers.get("Retry-After"))
                         log.warning(
                             "HTTP 503 storage unavailable agent=%s section=%s "
                             "(attempt %d/%d) — will spool",
@@ -525,12 +575,14 @@ class Sender:
                     return False
                 if exc.code == 429:
                     retry_after = exc.headers.get("Retry-After", "?")
+                    retry_after_sec = _parse_retry_after(exc.headers.get("Retry-After"))
                     log.warning(
                         "HTTP 429 rate-limited agent=%s section=%s "
                         "retry-after=%ss (attempt %d/%d): %r",
                         agent, section, retry_after, attempt, self.max_retry, body_text,
                     )
                 elif exc.code == 503:
+                    retry_after_sec = _parse_retry_after(exc.headers.get("Retry-After"))
                     log.warning(
                         "HTTP 503 storage unavailable agent=%s section=%s "
                         "(attempt %d/%d): %r — will spool",
@@ -574,7 +626,13 @@ class Sender:
 
             if attempt < self.max_retry:
                 jitter = random.uniform(0, delay * 0.3)
-                time.sleep(min(delay + jitter, 60))
+                wait = min(delay + jitter, 60)
+                # Honor a server-supplied Retry-After (429/503) — respect it over
+                # our own backoff, capped so a pathological value can't park us.
+                if retry_after_sec is not None:
+                    wait = min(max(wait, retry_after_sec), _RETRY_AFTER_MAX_SEC)
+                # Interruptible so shutdown doesn't block on a long Retry-After.
+                self._stop.wait(wait)
                 delay *= 2
 
         log.warning(

@@ -228,7 +228,7 @@ class Orchestrator:
 
     def __init__(self, config: dict, enc_key: bytes, mac_key: bytes,
                  send_queue: "queue.Queue", link_state=None, policy_state=None,
-                 overflow_sink=None):
+                 overflow_sink=None, heartbeat=None):
         self.config     = config
         self.enc_key    = enc_key
         self.mac_key    = mac_key
@@ -241,6 +241,17 @@ class Orchestrator:
         self._last_wall   = 0.0     # clock-skew detector baseline (wall clock)
         self._executor  = None
         self._cbr       = CircuitBreakerRegistry(fail_threshold=3, cooldown_sec=60)
+        # Per-collector overlap guard (matrix R9): a section whose run takes
+        # LONGER than its interval must not be submitted again while the prior
+        # run is still executing (it would double-run, duplicate work, and burn a
+        # pool slot). Names in _inflight are skipped until they complete.
+        self._inflight: set[str] = set()
+        self._inflight_lock = threading.Lock()
+        self._skipped_overlap = 0
+        # Optional callable(success: bool=False) -> None: liveness heartbeat for
+        # the Supervisor (matrix R6). Called each tick (alive) and on a successful
+        # collection (success), so a wedged orchestrator is detectable.
+        self.heartbeat = heartbeat
         # Optional callable -> dict: manager connectivity snapshot from the
         # Sender, surfaced in the agent_health heartbeat for dashboard link
         # status. Kept as an attribute so it survives SIGHUP __init__ re-runs.
@@ -339,6 +350,13 @@ class Orchestrator:
             try:
                 now = time.time()
 
+                # Liveness heartbeat (matrix R6): prove the tick loop is running.
+                if self.heartbeat is not None:
+                    try:
+                        self.heartbeat()
+                    except Exception:
+                        pass
+
                 # ── Clock-skew guard ──────────────────────────────────────────
                 self._maybe_reseed_on_skew(now)
 
@@ -361,10 +379,18 @@ class Orchestrator:
                         if self._cbr.state(name) != "CLOSED":
                             interval = min(interval, self._cbr.cooldown_for(name))
                         if now - self._last_run.get(name, 0) >= interval:
+                            # Overlap guard (R9): skip if the prior run of this
+                            # section is still in flight (slower than its interval).
+                            if not self._try_mark_inflight(name):
+                                self._skipped_overlap += 1
+                                log.debug("[%s] previous run still in flight — "
+                                          "skipping this tick (overlap)", name)
+                                continue
                             self._last_run[name] = now
                             if self._cbr.allow(name):
                                 self._executor.submit(self._run_section, name, cfg)  # type: ignore
                             else:
+                                self._clear_inflight(name)   # not submitted
                                 log.debug("[%s] circuit open — skipping", name)
                     except Exception as exc:
                         log.error("tick scheduling error for section %s: %s", name, exc)
@@ -373,43 +399,67 @@ class Orchestrator:
 
             self._stop.wait(timeout=self.tick)
 
+    def _try_mark_inflight(self, name: str) -> bool:
+        """Atomically claim a section slot. Returns False if already running."""
+        with self._inflight_lock:
+            if name in self._inflight:
+                return False
+            self._inflight.add(name)
+            return True
+
+    def _clear_inflight(self, name: str) -> None:
+        with self._inflight_lock:
+            self._inflight.discard(name)
+
     def _run_section(self, name: str, cfg: dict):
-        fn = COLLECTORS.get(name)
-        if not fn:
-            return
-        timeout = cfg.get("timeout_sec") or self.config.get("collection", {}).get(
-            "section_timeout_sec", _DEFAULT_SECTION_TIMEOUT_SEC)
+        # try/finally guarantees the overlap slot (R9) is released on EVERY path
+        # (success, timeout, error, early-return) — a leaked slot would freeze the
+        # section forever.
         try:
-            raw = _call_with_timeout(fn, timeout)
-            # Normalize raw output to canonical schema
-            data = raw
-            if _HAS_NORMALIZER:
-                try:
-                    data = _normalize(name, raw)
-                except Exception as exc:
-                    log.debug("Normalizer skipped for %s: %s", name, exc)
-            self._cbr.success(name)
-            log.debug("Collected %s: %s items", name,
-                      len(data) if isinstance(data, (list, dict)) else "—")
-        except TimeoutError as exc:
-            self._cbr.failure(name, str(exc))
-            log.error("Collector %s timed out (limit=%ss) — %s", name, timeout, exc)
-            # Do NOT enqueue an {"error": …} blob: it would overwrite the last
-            # good snapshot for this section in the manager's store with an
-            # error placeholder (and pollute detection). The failure is already
-            # recorded on the circuit breaker and surfaced per-section in the
-            # agent_health heartbeat — that is the failure channel. Skip the
-            # send; the previous good data stays until a later cycle succeeds.
-            return
-        except Exception as exc:
-            self._cbr.failure(name, str(exc))
-            log.warning("Collector %s failed: %s", name, exc)
-            return
+            fn = COLLECTORS.get(name)
+            if not fn:
+                return
+            timeout = cfg.get("timeout_sec") or self.config.get("collection", {}).get(
+                "section_timeout_sec", _DEFAULT_SECTION_TIMEOUT_SEC)
+            try:
+                raw = _call_with_timeout(fn, timeout)
+                # Normalize raw output to canonical schema
+                data = raw
+                if _HAS_NORMALIZER:
+                    try:
+                        data = _normalize(name, raw)
+                    except Exception as exc:
+                        log.debug("Normalizer skipped for %s: %s", name, exc)
+                self._cbr.success(name)
+                # Successful collection → orchestrator is making progress (R6).
+                if self.heartbeat is not None:
+                    try:
+                        self.heartbeat(success=True)
+                    except Exception:
+                        pass
+                log.debug("Collected %s: %s items", name,
+                          len(data) if isinstance(data, (list, dict)) else "—")
+            except TimeoutError as exc:
+                self._cbr.failure(name, str(exc))
+                log.error("Collector %s timed out (limit=%ss) — %s", name, timeout, exc)
+                # Do NOT enqueue an {"error": …} blob: it would overwrite the last
+                # good snapshot for this section in the manager's store with an
+                # error placeholder (and pollute detection). The failure is already
+                # recorded on the circuit breaker and surfaced per-section in the
+                # agent_health heartbeat — that is the failure channel. Skip the
+                # send; the previous good data stays until a later cycle succeeds.
+                return
+            except Exception as exc:
+                self._cbr.failure(name, str(exc))
+                log.warning("Collector %s failed: %s", name, exc)
+                return
 
-        if not cfg.get("send", True):
-            return
+            if not cfg.get("send", True):
+                return
 
-        self._enqueue(name, data)
+            self._enqueue(name, data)
+        finally:
+            self._clear_inflight(name)
 
     def _enqueue(self, section: str, data) -> None:
         payload = {
@@ -492,6 +542,7 @@ class Orchestrator:
             "uptime_sec":   int(time.time() - _START_TIME),
             "queue_depth":  self.send_queue.qsize(),
             "sections":     self._cbr.snapshot(),
+            "skipped_overlap": self._skipped_overlap,   # R9 visibility
             "generated_at": int(time.time()),
         }
         # Manager link health (probe state / spool backlog / auth failures).
@@ -878,11 +929,34 @@ def main():
 
     send_queue: queue.Queue = queue.Queue()
 
+    # ── Supervision tree (matrix R6) ──────────────────────────────────────────
+    # Workers publish liveness heartbeats; a supervisor thread escalates a dead/
+    # wedged worker to a clean process exit so launchd (the single lifecycle
+    # owner) restarts the whole agent deterministically — never a competing
+    # in-process supervisor. Best-effort: if supervision is unavailable, the
+    # agent still runs (KeepAlive remains the crash-recovery backstop).
+    _hb = None
+    try:
+        from .supervision import HeartbeatRegistry
+        _hb = HeartbeatRegistry()
+        _hb.register("sender")
+        _hb.register("orchestrator")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("supervision unavailable (%s) — continuing without it", exc)
+
+    def _sender_beat(success: bool = False):
+        if _hb is not None:
+            _hb.beat("sender", success)
+
+    def _orch_beat(success: bool = False):
+        if _hb is not None:
+            _hb.beat("orchestrator", success)
+
     # Import sender here (avoids circular import)
     from .sender import Sender
     # Pass mac_key so the sender re-stamps transport freshness at send time —
     # spooled data survives outages > the manager's replay window (no loss).
-    sender = Sender(cfg, send_queue, mac_key=mac_key)
+    sender = Sender(cfg, send_queue, mac_key=mac_key, heartbeat=_sender_beat)
     sender_thread = sender.start()
 
     # ── Signed-policy control plane ───────────────────────────────────────────
@@ -930,8 +1004,54 @@ def main():
     orch = Orchestrator(cfg, enc_key, mac_key, send_queue,
                         link_state=sender.link_state,
                         policy_state=_policy_state,
-                        overflow_sink=sender.spool_envelope)
+                        overflow_sink=sender.spool_envelope,
+                        heartbeat=_orch_beat)
     orch_thread  = orch.start()
+
+    # ── Supervisor loop (matrix R6) ───────────────────────────────────────────
+    # Periodically evaluate worker liveness. A worker that is ALIVE but not
+    # succeeding (e.g. manager unreachable) only ESCALATEs (logged, throttled) —
+    # never a restart. A worker that stops ticking (dead/hung thread) is escalated
+    # to a clean process exit so launchd restarts the whole agent; the restart
+    # budget bounds the rate (launchd's ThrottleInterval provides the floor).
+    if _hb is not None:
+        def _supervise():
+            import time as _t
+            from .supervision import Supervisor, RESTART, TERMINATE, ESCALATE
+            from .obs import log_throttled
+            # alive_stale generously exceeds the worst-case send cycle
+            # (max_retry × timeout + backoff ≈ 105 s) so a busy-but-alive sender
+            # is never falsely killed; a truly wedged thread is caught in ≤5 min.
+            sup = Supervisor(_hb, alive_stale=300.0, success_stale=900.0,
+                             grace=120.0, max_restarts=3, window_sec=600.0)
+            while not orch._stop.is_set():          # noqa: SLF001 - shared stop
+                orch._stop.wait(timeout=30.0)
+                if orch._stop.is_set():
+                    break
+                try:
+                    for name, verdict in sup.check():
+                        if verdict == ESCALATE:
+                            log_throttled(
+                                log, f"supervise:{name}", logging.WARNING,
+                                "component alive but not succeeding",
+                                interval=300.0, component=name,
+                                snapshot=_hb.snapshot(),
+                                recovery_action="monitoring",
+                            )
+                        elif verdict in (RESTART, TERMINATE):
+                            log.error(
+                                "SUPERVISOR: component %s is unresponsive (%s) — "
+                                "exiting for a clean launchd restart. snapshot=%s",
+                                name, verdict, _hb.snapshot(),
+                            )
+                            try:
+                                orch.stop(); sender.stop()
+                            except Exception:
+                                pass
+                            os._exit(70)   # EX_SOFTWARE — launchd KeepAlive restarts
+                except Exception as exc:      # noqa: BLE001 - supervisor must not die
+                    log.debug("supervisor cycle error: %s", exc)
+        threading.Thread(target=_supervise, daemon=True, name="supervisor").start()
 
     # ── Boot persistence + reboot detection (macOS) ──────────────────────────
     # Guarantees the LaunchDaemon still auto-starts after the next shutdown even
@@ -1028,7 +1148,8 @@ def main():
                 orch.__init__(cfg, orch.enc_key, orch.mac_key, send_queue,
                               link_state=orch.link_state,
                               policy_state=orch.policy_state,
-                              overflow_sink=orch.overflow_sink)
+                              overflow_sink=orch.overflow_sink,
+                              heartbeat=orch.heartbeat)
                 orch.start()
             except Exception as exc:
                 log.error("Config reload failed: %s", exc)
