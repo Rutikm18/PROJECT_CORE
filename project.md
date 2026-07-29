@@ -1,7 +1,7 @@
 # AttackLens — Project Technical Overview
 
 **A self-hosted, multi-tenant endpoint detection & response (EDR) platform.**
-Version `1.1.0` · Agent (macOS / Windows / Linux) → Manager (async ingest + detection + AI) → real-time SOC dashboard.
+Version `1.0.x` (Git commit-count patch) · Agent (macOS / Windows / Linux) → Manager (async ingest + detection + AI) → real-time SOC dashboard.
 
 ---
 
@@ -47,7 +47,7 @@ macOS / Windows / Linux endpoint
   │                          │                               │
   │            RabbitMQ  agent.telemetry ──► TelemetryWorker │
   │              │  three-tier file store (NDJSON+gzip)      │
-  │              │  SQLite payload index · WS broadcast      │
+  │              │  PostgreSQL payload index · WS broadcast  │
   │              └─ publish jarvis.work ──► JarvisWorker     │
   │                   allowlist → rules → behavioral →       │
   │                   NVD CVE → composite score → correlator │
@@ -110,7 +110,7 @@ macOS / Windows / Linux endpoint
 
 **AI analysis** (`ai_analyst.py`) — Claude-powered finding analysis + step-by-step remediation plans, cached in `ai_analysis` / `remediation_plans` tables (keyed by finding) so a finding is analyzed once.
 
-**Storage — three-tier file store** (`store.py`): `hot` (<7 d, SQLite-indexed) → `warm` (7–90 d, streamed, promote-on-access) → `cold` (>90 d, gzip-9 archive). Findings/baselines/entity-state/AI-cache live in SQLite (`intel.db`), deduplicated by `agent+category+item_key`.
+**Storage — three-tier file store** (`store.py`): `hot` (<7 d, PostgreSQL-indexed) → `warm` (7–90 d, streamed, promote-on-access) → `cold` (>90 d, gzip-9 archive). Findings, baselines, entity state, AI cache, feed health, and the local NVD mirror are persisted in PostgreSQL and deduplicated by stable finding identity.
 
 ---
 
@@ -132,7 +132,7 @@ macOS / Windows / Linux endpoint
 | Transport | TLS 1.3, AES-256-GCM, HMAC-SHA256, gzip, NDJSON |
 | Manager API | FastAPI + Uvicorn, async workers |
 | Messaging | RabbitMQ (`agent.telemetry`, `jarvis.work`) |
-| Storage | Three-tier NDJSON+gzip file store, SQLite (payload index, `intel.db`), optional Postgres |
+| Storage | Three-tier NDJSON+gzip file store plus PostgreSQL for payload indexes, findings, baselines, feed state, and the local NVD mirror |
 | Detection | Custom rules engine, Welford statistics, MITRE ATT&CK correlator, NVD/EPSS/KEV |
 | AI | Claude (Anthropic) — finding analysis + remediation |
 | Frontend | React + Vite + Tailwind/shadcn, WebSocket live updates |
@@ -167,18 +167,59 @@ Focused on **agent reliability and operational trustworthiness** — the edges w
 - ~40 new unit tests across boot-persistence, keystore boot-safety, single-instance, config robustness, disk-full spool, and clock-skew; full agent suite green (**476 passing**).
 - `CAPABILITIES.md` rewritten to reflect active auto-launch + all new resilience capabilities and a full 23-section telemetry coverage matrix.
 
+**Deep Analysis search and data integrity (July 2026)**
+- Reworked raw telemetry search to use one literal, case-insensitive predicate for both result and count queries. It searches JSON payload text, agent ID, and section name; `%`, `_`, and backslash are treated as user text rather than SQL wildcards.
+- Corrected global-vs-section behavior in the React page. Global results retain their real section renderer and label, section counts respect the active query, selecting a section changes the scope explicitly, and changing the agent cannot leave an invalid section selected.
+- Added PostgreSQL integration coverage for cross-section search, same-section filtering, metadata search, count parity, case handling, and wildcard escaping.
+- Fixed a validation bypass where ordinary high-confidence clusters were incorrectly treated as deterministic cross-matrix floor matches. Only a real `matched_floor()` result can now bypass the weighted precision threshold.
+- Replaced string-based network exposure scoring with `ipaddress` semantics so public IPv4/IPv6, private addresses, and wildcard listeners are scored correctly.
+- Made feed and NVD refresh failures observable: failed pages no longer advance sync checkpoints or report zero-entry success. Full sync establishes the delta baseline at sync start, delta sync uses an idempotent overlap, and rejected CVEs are excluded.
+- Preserved NVD vulnerability status in the local mirror and fixed multi-word package lookup (`apache httpd` is now two required search lexemes rather than the invalid token `apachehttpd`).
+
+**Versioning and release visibility**
+- `VERSION` stores the manually controlled `major.minor` series (`1.0`); the patch is derived from `git rev-list --count HEAD`, producing a monotonically increasing `1.0.x` for each commit pushed to a repository with full history.
+- CI and the deployment script inject the resolved version, commit SHA, and build timestamp into the manager image. `/api/v1/meta` exposes those values and the dashboard displays the version in the lower-left sidebar.
+- This avoids a version-bump commit that recursively triggers CI. A shallow clone must be unshallowed before deriving the count; the deployment workflow uses `fetch-depth: 0`.
+
 ---
 
-## 9. Known open items (honest state)
+## 9. Detection architecture direction
+
+**Keep the detection and promotion path deterministic.** Telemetry normalization, rule evaluation, behavioral statistics, correlation, validation gates, threat-intel enrichment, and risk scoring must remain ordinary testable code. An LLM should add analyst context, generate hypotheses, summarize evidence, and draft remediation; it must not be the only reason a finding is promoted, suppressed, or actively remediated.
+
+**Use LangGraph only for post-detection investigation orchestration.** It becomes useful when an investigation has persistent state, several tool calls, retries, branching hypotheses, and human approval. A suitable graph is:
+
+```
+validated finding
+  → freeze evidence snapshot
+  → retrieve asset history + related findings + threat intel
+  → generate bounded hypotheses
+  → run read-only verification tools
+  → produce structured verdict with citations
+  → analyst approve / reject / request more evidence
+  → draft remediation and case notes
+```
+
+LangChain is optional for model and tool adapters. The current direct SDK plus strict schemas is simpler for single-call analysis. Adopt LangGraph when the workflow genuinely needs resumability and human-in-the-loop state, not as a replacement for the detector.
+
+**Evaluation must come first.** Maintain a versioned replay corpus with known benign and malicious outcomes. Track precision, recall, false-positive rate, false-negative rate, calibration/Brier score, results by rule and terrain, stale/unavailable feed behavior, evidence-grounding failures, tool errors, latency, and cost. Run new detection logic and agentic analysis in shadow mode before allowing it to influence production findings.
+
+---
+
+## 10. Known open items (honest state)
 
 - **Two-daemon topology:** both the agent and watchdog LaunchDaemons start an agent; the single-instance lock prevents damage, but one supervision model should be chosen.
 - **Config divergence:** the in-code `_DEFAULT_SECTIONS` and the pkg-generated config disagree (SCA not scheduled on a default pkg install; metrics 10 s vs 60 s; inventory 1 h vs 24 h; binaries enabled vs disabled) — needs reconciling.
 - **P0 onboarding:** the one-command installer ships placeholder `REPO_URL`/server-IP values; fresh installs default to plain HTTP + `tls_verify=false`.
-- **Dashboard build:** static assets are tracked in git because CI doesn't run `npm run build`; add the build step, then untrack.
+- **Validation provenance:** gate names and cluster metadata exist in the schema but are not fully persisted by the finding upsert path. Promotion score and terrain score also share one `precision_score` field and should be split.
+- **Validation degradation policy:** allowlist, deduplication, and false-positive-history database errors currently fail open. Define an explicit `verified / degraded / unavailable` state instead of treating infrastructure failure as clean evidence.
+- **Threat-intel freshness:** manager-side in-memory IOC sets can become stale when a separate central feed service performs refreshes. Define a `ThreatIntelProvider` contract with freshness metadata, stale-while-revalidate caching, and persisted/bulk-loaded Spamhaus CIDRs.
+- **CVE identity accuracy:** package-keyword matching is not enough for production vulnerability attribution. Normalize inventory to package URL/ecosystem, prefer OSV and vendor advisories for ecosystem-aware matching, and use curated package-to-CPE mappings for NVD. Account for distro backports before declaring an installed version vulnerable.
+- **NVD client duplication:** consolidate the two `CVELookup` implementations and make the active detection path query the local mirror before rate-limited live NVD lookup.
 
 ---
 
-## 10. Repo map
+## 11. Repo map
 
 ```
 agent/

@@ -76,7 +76,7 @@ def make_raw_router(db: "Database") -> APIRouter:
         window:   Optional[str] = Query(None, description="5m|1h|6h|24h|7d"),
         start:    Optional[int] = Query(None, description="Unix timestamp"),
         end:      Optional[int] = Query(None, description="Unix timestamp"),
-        search:   Optional[str] = Query(None),
+        search:   Optional[str] = Query(None, max_length=256),
     ):
         """Row count matching the current filter set (for pagination UI)."""
         now = int(time.time())
@@ -98,7 +98,7 @@ def make_raw_router(db: "Database") -> APIRouter:
         window:   Optional[str] = Query(None, description="5m|1h|6h|24h|7d"),
         start:    Optional[int] = Query(None, description="Unix timestamp"),
         end:      Optional[int] = Query(None, description="Unix timestamp"),
-        search:   Optional[str] = Query(None),
+        search:   Optional[str] = Query(None, max_length=256),
         limit:    int = Query(200, ge=1, le=1000),
         offset:   int = Query(0, ge=0),
     ):

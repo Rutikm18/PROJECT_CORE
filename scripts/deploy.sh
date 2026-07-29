@@ -40,6 +40,19 @@ info() { echo -e "${CYN}[info]${NC}  $*"; }
 ok()   { echo -e "${GRN}[ok]${NC}    $*"; }
 err()  { echo -e "${RED}[err]${NC}   $*"; }
 
+resolve_app_version() {
+  local base major minor patch
+  base=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo "1.0.0")
+  major=$(echo "$base" | cut -d. -f1)
+  minor=$(echo "$base" | cut -d. -f2)
+  if ! [[ "${major}.${minor}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    major=1
+    minor=0
+  fi
+  patch=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+  echo "${major}.${minor}.${patch}"
+}
+
 info "Deploying to ${HOST}..."
 
 if [ "$RESTART_ONLY" = true ]; then
@@ -75,6 +88,11 @@ rsync -az --delete --progress \
 
 ok "Files synced"
 
+APP_VERSION="${APP_VERSION:-$(resolve_app_version)}"
+APP_COMMIT="${APP_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+APP_BUILT_AT="${APP_BUILT_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+info "Build version: ${APP_VERSION} (${APP_COMMIT})"
+
 # Deploy via SSH
 info "Building and starting containers..."
 ssh "$HOST" -- "
@@ -85,6 +103,9 @@ ssh "$HOST" -- "
   docker compose pull
 
   # Build and start
+  APP_VERSION='${APP_VERSION}' \
+  APP_COMMIT='${APP_COMMIT}' \
+  APP_BUILT_AT='${APP_BUILT_AT}' \
   docker compose up -d --build --remove-orphans
 
   # Wait for health check

@@ -213,7 +213,7 @@ class ThreatIntelWorker:
             raise
         except Exception as exc:
             log.warning("Offline index refresh failed: %s", exc)
-            return 0
+            raise
 
     # ── Proactive CVE scanner ─────────────────────────────────────────────────
 
@@ -230,7 +230,7 @@ class ThreatIntelWorker:
             agent_packages = await self._db.get_latest_packages_per_agent()
         except Exception as exc:
             log.warning("Proactive CVE scan: DB query failed: %s", exc)
-            return 0
+            raise
 
         for agent_id, packages in agent_packages:
             if not isinstance(packages, list):
@@ -307,4 +307,4 @@ class ThreatIntelWorker:
             raise
         except Exception as exc:
             log.warning("NVD recent sync failed: %s", exc)
-            return 0
+            raise

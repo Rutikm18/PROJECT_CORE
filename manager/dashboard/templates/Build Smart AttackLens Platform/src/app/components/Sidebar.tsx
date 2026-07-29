@@ -116,6 +116,11 @@ const GROUPS: NavGroup[] = [
 // ── Sidebar component ─────────────────────────────────────────────────────────
 
 type NewCounts = Record<string, number>;
+type AppMeta = {
+  version?: string;
+  commit?: string | null;
+  built_at?: string | null;
+};
 
 export function Sidebar() {
   const navigate = useNavigate();
@@ -126,6 +131,7 @@ export function Sidebar() {
   const [totalCritical, setTotalCritical] = useState(0);
   const [orgName,      setOrgName]      = useState("");
   const [orgLocation,  setOrgLocation]  = useState("");
+  const [appMeta,      setAppMeta]      = useState<AppMeta | null>(null);
 
   const fetchOrgSettings = useCallback(async () => {
     try {
@@ -166,12 +172,21 @@ export function Sidebar() {
     } catch { /* silent */ }
   }, []);
 
+  const fetchAppMeta = useCallback(async () => {
+    try {
+      const r = await fetch("/api/v1/meta");
+      if (!r.ok) return;
+      const d: AppMeta = await r.json();
+      setAppMeta(d);
+    } catch { /* silent */ }
+  }, []);
+
   useEffect(() => {
     const t = setTimeout(() => setReady(true), 60);
-    fetchAgents(); fetchNewCounts(); fetchOrgSettings();
+    fetchAgents(); fetchNewCounts(); fetchOrgSettings(); fetchAppMeta();
     const iv = setInterval(() => { fetchAgents(); fetchNewCounts(); }, 30_000);
     return () => { clearTimeout(t); clearInterval(iv); };
-  }, [fetchAgents, fetchNewCounts, fetchOrgSettings]);
+  }, [fetchAgents, fetchNewCounts, fetchOrgSettings, fetchAppMeta]);
 
   return (
     <aside
@@ -407,6 +422,20 @@ export function Sidebar() {
               </div>
             )}
           </div>
+        </div>
+
+        <div
+          className="mt-2 flex items-center justify-between gap-2 px-1 text-[9px]"
+          title={[
+            appMeta?.commit ? `commit ${appMeta.commit}` : "",
+            appMeta?.built_at ? `built ${appMeta.built_at}` : "",
+          ].filter(Boolean).join(" | ") || undefined}
+          style={{ color: "rgba(255,255,255,0.34)" }}
+        >
+          <span className="font-semibold uppercase" style={{ letterSpacing: "0.08em" }}>Version</span>
+          <span className="font-mono font-bold tabular-nums truncate" style={{ color: "rgba(255,255,255,0.58)" }}>
+            {appMeta?.version ? `v${appMeta.version}` : "v..."}
+          </span>
         </div>
       </div>
     </aside>

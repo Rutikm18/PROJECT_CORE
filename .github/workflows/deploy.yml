@@ -21,50 +21,41 @@ jobs:
     name: Test, Build & Push
     runs-on: ubuntu-latest
 
-    # Give the runner write access to the repo so it can push the version bump.
     permissions:
-      contents: write
+      contents: read
 
     outputs:
       manager_image:      ${{ steps.push.outputs.manager_image }}
       threat_intel_image: ${{ steps.push.outputs.threat_intel_image }}
-      app_version:        ${{ steps.bump.outputs.version }}
+      app_version:        ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          # Needed so the version-bump commit can be pushed back.
-          token: ${{ github.token }}
+          # Full history is required for `git rev-list --count HEAD`.
           fetch-depth: 0
 
-      # ── Bump patch version ─────────────────────────────────────────────────
-      # Reads the VERSION file (e.g. "1.1.0"), increments the patch number to
-      # "1.1.1", writes it back, commits with [skip ci] so this workflow does
-      # not re-trigger, then pushes.  The new version is passed as a build-arg
-      # to the Docker image so it appears in /api/v1/meta and the dashboard.
-      - name: Bump patch version
-        id: bump
+      # ── Resolve build version ──────────────────────────────────────────────
+      # VERSION carries the major/minor base (1.0.0).  The patch is the Git
+      # commit count, producing 1.0.x without a bot commit or manual bump.
+      - name: Resolve app version
+        id: version
         run: |
-          CURRENT=$(cat VERSION | tr -d '[:space:]')
-          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
-          MINOR=$(echo "$CURRENT" | cut -d. -f2)
-          PATCH=$(echo "$CURRENT" | cut -d. -f3)
-          NEW_PATCH=$((PATCH + 1))
-          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          BASE=$(cat VERSION | tr -d '[:space:]')
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          if ! echo "${MAJOR}.${MINOR}" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+            MAJOR=1
+            MINOR=0
+          fi
+          PATCH=$(git rev-list --count HEAD)
+          APP_VERSION="${MAJOR}.${MINOR}.${PATCH}"
 
-          echo "$NEW_VERSION" > VERSION
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION
-          git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
-          git push
-
-          echo "version=${NEW_VERSION}"       >> "$GITHUB_OUTPUT"
-          echo "APP_VERSION=${NEW_VERSION}"   >> "$GITHUB_ENV"
+          echo "version=${APP_VERSION}"       >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=${APP_VERSION}"   >> "$GITHUB_ENV"
           echo "APP_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "APP_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "Bumped $CURRENT → $NEW_VERSION"
+          echo "Resolved app version ${APP_VERSION}"
 
       - name: Set up Python
         uses: actions/setup-python@v5

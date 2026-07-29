@@ -195,11 +195,8 @@ async def validate_with_ai(
     # were individually hand-verified as "individually catastrophic" and don't
     # need cross-layer corroboration to be trusted (that's the whole point of a
     # standalone floor) — only the FP-history safety net still applies.
-    base_conf_for_floor = getattr(cluster, "confidence", None)
-    cross_matrix_floor_hit = (
-        base_conf_for_floor is not None
-        and base_conf_for_floor >= ENGINE_CONFIG["confidence_threshold"]
-    )
+    from .cross_matrix import matched_floor
+    cross_matrix_floor_hit = matched_floor(cluster) is not None
     if cross_matrix_floor_hit and clean_rule:
         score = max(score, threshold)
 

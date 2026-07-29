@@ -40,6 +40,7 @@ The result of `evaluate_finding(finding, enriched, ai_verdict)` is:
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import re
 from typing import Any, Callable, Optional
@@ -254,6 +255,34 @@ def _source_feed_count(f: dict) -> int:
     return 0
 
 
+def _external_exposure_score(f: dict) -> float:
+    """Score public destinations and wildcard listeners without string heuristics."""
+    ev = _ev(f)
+    raw_ip = str(
+        ev.get("dst_ip")
+        or ev.get("remote_ip")
+        or ev.get("remote_address")
+        or ""
+    ).strip()
+    if raw_ip:
+        candidate = raw_ip
+        if candidate.startswith("[") and "]" in candidate:
+            candidate = candidate[1:candidate.index("]")]
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            try:
+                address = ipaddress.ip_address(candidate.rsplit(":", 1)[0])
+            except ValueError:
+                address = None
+        if address is not None and address.is_global:
+            return 1.0
+
+    if str(ev.get("bind_addr") or ev.get("addr") or "") in ("0.0.0.0", "::"):
+        return 0.5
+    return 0.0
+
+
 VECTOR_CRITERIA: list[dict] = [
     {
         "name":  "ioc_corroborated",
@@ -298,7 +327,7 @@ VECTOR_CRITERIA: list[dict] = [
         "label": "External / non-loopback destination",
         "description": "Connection is to a public-internet host or the port is reachable from outside (not 127.0.0.1).",
         "weight": 0.15,
-        "evaluate": lambda f, e: 1.0 if str(_ev(f).get("dst_ip") or _ev(f).get("remote_ip") or "").startswith(("10.","127.","192.168.","172.16.","172.17.","fe80:","::1")) is False and (_ev(f).get("dst_ip") or _ev(f).get("remote_ip") or _ev(f).get("addr") in ("0.0.0.0",)) else (0.5 if str(_ev(f).get("addr","")) in ("0.0.0.0","::") else 0.0),
+        "evaluate": lambda f, e: _external_exposure_score(f),
     },
     {
         "name":  "ai_verdict_tp",

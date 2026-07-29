@@ -233,7 +233,7 @@
 ## 2026-07-21
 
 ### Git-derived app version surfaced on the dashboard
-**What:** Version scheme is `1.0.<commit-count>` computed from `git rev-list --count HEAD`. `deploy.yml` computes it (with `fetch-depth: 0` so the count isn't 1 from a shallow clone) and passes `APP_VERSION`/`APP_COMMIT`/`APP_BUILT_AT` as Docker build-args → `ENV` in the image. `manager/manager/version.py` resolves version from env first, then git, then `1.0.0-dev`, cached with `lru_cache`. Exposed via `/api/v1/meta` and `/health`; the Dashboard header fetches `/api/v1/meta` and renders a `v1.0.N` badge.
+**What:** Version scheme is `1.0.<commit-count>` computed from `git rev-list --count HEAD`. `deploy.yml` computes it (with `fetch-depth: 0` so the count isn't 1 from a shallow clone) and passes `APP_VERSION`/`APP_COMMIT`/`APP_BUILT_AT` as Docker build-args → `ENV` in the image. `manager/manager/version.py` resolves version from env first, then git, then `1.0.0-dev`, cached with `lru_cache`. Exposed via `/api/v1/meta` and `/health`; the Dashboard sidebar fetches `/api/v1/meta` and renders a bottom-left `v1.0.N` badge.
 **Why:** User wanted the dashboard to show a version that auto-advances on every GitHub push without manual bumps or bot commits. Deriving the patch number from commit count means each push increments it for free; baking it in at build time avoids needing `.git` inside the stripped-source runtime image.
 
 ## 2026-07-23

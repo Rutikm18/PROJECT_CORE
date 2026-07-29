@@ -26,6 +26,13 @@ from .pg_pool import PgPool
 
 log = logging.getLogger("manager.db")
 
+
+def _literal_contains_pattern(value: str) -> str:
+    """Build a LIKE pattern that treats user input as literal text."""
+    escaped = value.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 SCHEMA = """
@@ -741,9 +748,13 @@ class Database:
         if end:
             parts.append("collected_at <= ?")
             args.append(end)
-        if search:
-            parts.append("data LIKE ?")
-            args.append(f"%{search}%")
+        if search and search.strip():
+            pattern = _literal_contains_pattern(search)
+            parts.append(
+                "(data ILIKE ? ESCAPE '\\' OR agent_id ILIKE ? ESCAPE '\\' "
+                "OR section ILIKE ? ESCAPE '\\')"
+            )
+            args.extend((pattern, pattern, pattern))
 
         where = ("WHERE " + " AND ".join(parts)) if parts else ""
         async with self._pool.read() as db:
@@ -786,7 +797,13 @@ class Database:
         if section:  parts.append("section=?");        args.append(section)
         if start:    parts.append("collected_at >= ?"); args.append(start)
         if end:      parts.append("collected_at <= ?"); args.append(end)
-        if search:   parts.append("data LIKE ?");      args.append(f"%{search}%")
+        if search and search.strip():
+            pattern = _literal_contains_pattern(search)
+            parts.append(
+                "(data ILIKE ? ESCAPE '\\' OR agent_id ILIKE ? ESCAPE '\\' "
+                "OR section ILIKE ? ESCAPE '\\')"
+            )
+            args.extend((pattern, pattern, pattern))
         where = ("WHERE " + " AND ".join(parts)) if parts else ""
         async with self._pool.read() as db:
             async with db.execute(

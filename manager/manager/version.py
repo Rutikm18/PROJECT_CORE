@@ -1,14 +1,15 @@
 """
 manager/manager/version.py — Application version resolution.
 
-Version scheme: 1.1.x  (major.minor.patch)
-  Patch is bumped automatically on every push to GitHub by the deploy workflow.
-  Major / minor are bumped manually by editing the VERSION file at the repo root.
+Version scheme: 1.0.x  (major.minor.patch)
+  Patch is derived from `git rev-list --count HEAD`, so it advances as the
+  repository advances. Major / minor come from the VERSION file at the repo root.
 
-Resolution order (first hit wins):
-  1. APP_VERSION env var  — baked into the Docker image at build time by deploy.yml
-  2. VERSION file at repo root — picked up by local / dev runs automatically
-  3. "1.1.0-dev"              — absolute last resort (no env, no file)
+Resolution order:
+  1. APP_VERSION env var       — baked into Docker images by deploy.yml
+  2. Git-derived 1.0.<count>   — local/dev runs from a checked-out repo
+  3. VERSION file at repo root — fallback when Git metadata is unavailable
+  4. "1.0.0-dev"              — absolute last resort
 
 Commit SHA and build timestamp come from APP_COMMIT / APP_BUILT_AT env vars
 (also baked in at build time).  The git fallback for SHA requires .git to be
@@ -19,6 +20,9 @@ from __future__ import annotations
 import functools
 import os
 import subprocess
+
+DEFAULT_VERSION = "1.0.0-dev"
+DEFAULT_SERIES = "1.0"
 
 
 def _git(*args: str) -> str | None:
@@ -45,16 +49,37 @@ def _read_version_file() -> str | None:
         return None
 
 
+def _clean_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    return value.strip() if value and value.strip() else None
+
+
+def _version_series() -> str:
+    """Return major.minor from VERSION, defaulting to 1.0."""
+    raw = _read_version_file() or ""
+    parts = raw.split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"{parts[0]}.{parts[1]}"
+    return DEFAULT_SERIES
+
+
+def _git_version() -> str | None:
+    count = _git("rev-list", "--count", "HEAD")
+    if not count or not count.isdigit():
+        return None
+    return f"{_version_series()}.{count}"
+
+
 @functools.lru_cache(maxsize=1)
 def get_version_info() -> dict:
     """Return {version, commit, built_at} for the running build (cached once)."""
-    version  = os.environ.get("APP_VERSION") or None
-    commit   = os.environ.get("APP_COMMIT")  or None
-    built_at = os.environ.get("APP_BUILT_AT") or None
+    version  = _clean_env("APP_VERSION")
+    commit   = _clean_env("APP_COMMIT")
+    built_at = _clean_env("APP_BUILT_AT")
 
     # Resolve version
-    if not version:
-        version = _read_version_file() or "1.1.0-dev"
+    if not version or version == DEFAULT_VERSION:
+        version = _git_version() or _read_version_file() or version or DEFAULT_VERSION
 
     # Resolve commit SHA for local runs (not available in prod image — no .git)
     if not commit:

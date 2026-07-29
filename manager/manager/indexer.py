@@ -350,6 +350,7 @@ CREATE TABLE IF NOT EXISTS feed_health (
 -- the CVE description — indexed via FTS5 for sub-millisecond package lookups.
 CREATE TABLE IF NOT EXISTS nvd_cve_local (
     cve_id        TEXT PRIMARY KEY,
+    vuln_status   TEXT NOT NULL DEFAULT '',
     description   TEXT NOT NULL DEFAULT '',
     cvss_score    DOUBLE PRECISION,
     cvss_vector   TEXT NOT NULL DEFAULT '',
@@ -705,6 +706,7 @@ _SOC_MIGRATIONS = [
     ("findings", "ai_verdict",              "TEXT    DEFAULT '{}'"),
     ("findings", "ai_validation_used",      "INTEGER DEFAULT 0"),
     ("findings", "terrain_validation",      "TEXT    DEFAULT '{}'"),
+    ("nvd_cve_local", "vuln_status",         "TEXT    DEFAULT ''"),
     # Unique Finding ID + Attack Terrain FK + Actions Log
     ("findings", "finding_uid",             "TEXT    DEFAULT ''"),
     ("findings", "terrain_id",              "TEXT    DEFAULT ''"),
@@ -2769,7 +2771,8 @@ class IntelDB:
         async with self._lock:
             rows = [
                 (
-                    c.get("cve_id", ""), c.get("description", ""), c.get("cvss_score"),
+                    c.get("cve_id", ""), c.get("vuln_status", ""),
+                    c.get("description", ""), c.get("cvss_score"),
                     c.get("cvss_vector", ""), c.get("severity", "info"),
                     c.get("cwe_ids", "[]"), c.get("cpe_uris", "[]"),
                     c.get("pkg_keywords", ""), c.get("published_at", ""),
@@ -2779,10 +2782,11 @@ class IntelDB:
             ]
             await self._conn.executemany("""
                 INSERT INTO nvd_cve_local
-                (cve_id, description, cvss_score, cvss_vector, severity,
+                (cve_id, vuln_status, description, cvss_score, cvss_vector, severity,
                  cwe_ids, cpe_uris, pkg_keywords, published_at, modified_at, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cve_id) DO UPDATE SET
+                    vuln_status = excluded.vuln_status,
                     description  = excluded.description,
                     cvss_score   = excluded.cvss_score,
                     cvss_vector  = excluded.cvss_vector,
@@ -2801,33 +2805,36 @@ class IntelDB:
         to_tsquery's `:*` prefix operator replaces SQLite FTS5's `term*`
         syntax (was a JOIN against a separate nvd_cve_fts virtual table; now a
         direct predicate against nvd_cve_local.search_vector — see _SCHEMA)."""
-        # to_tsquery is strict about its input grammar (unlike
-        # websearch_to_tsquery) — reduce to a single safe lexeme before
-        # appending the prefix operator, to avoid a syntax error on punctuation.
-        safe_term = re.sub(r"[^\w]", "", keyword.strip())
-        if not safe_term:
+        # to_tsquery is strict about grammar. Preserve multi-word package names
+        # as separate sanitized prefix lexemes instead of collapsing
+        # "apache httpd" into the impossible token "apachehttpd".
+        tokens = re.findall(r"\w+", keyword.lower())[:8]
+        if not tokens:
             return []
-        fts_term = safe_term + ":*"
+        fts_term = " & ".join(f"{token}:*" for token in tokens)
         try:
             rows = await self._fetchall("""
                 SELECT cve_id, description, cvss_score, cvss_vector,
                        severity, cwe_ids, cpe_uris, published_at, modified_at
                 FROM nvd_cve_local
                 WHERE search_vector @@ to_tsquery('english', ?)
+                  AND LOWER(vuln_status) NOT IN ('reject', 'rejected')
                 ORDER BY COALESCE(cvss_score, 0) DESC
                 LIMIT ?
             """, (fts_term, limit))
             return [dict(r) for r in rows]
         except Exception as exc:
             log.debug("NVD FTS search failed, using LIKE fallback: %s", exc)
+            predicates = " AND ".join("pkg_keywords ILIKE ?" for _ in tokens)
             rows = await self._fetchall("""
                 SELECT cve_id, description, cvss_score, cvss_vector, severity,
                        cwe_ids, cpe_uris, published_at, modified_at
                 FROM nvd_cve_local
-                WHERE pkg_keywords LIKE ?
+                WHERE """ + predicates + """
+                  AND LOWER(vuln_status) NOT IN ('reject', 'rejected')
                 ORDER BY COALESCE(cvss_score, 0) DESC
                 LIMIT ?
-            """, (f"%{keyword}%", limit))
+            """, (*[f"%{token}%" for token in tokens], limit))
             return [dict(r) for r in rows]
 
     async def get_nvd_state(self, key: str) -> Optional[str]:

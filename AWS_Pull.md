@@ -7,7 +7,11 @@ ssh -i your-key.pem ec2-user@<aws-ip>
 cd /path/to/macbook_data   # wherever the repo lives on AWS
 git pull origin main
 
-3. Rebuild and redeploy the manager
+3. Rebuild and redeploy the manager with Git-derived build metadata
+APP_SERIES="$(cut -d. -f1,2 VERSION)"
+export APP_VERSION="${APP_SERIES}.$(git rev-list --count HEAD)"
+export APP_COMMIT="$(git rev-parse --short HEAD)"
+export APP_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker compose build manager
 docker compose up -d manager
 
@@ -25,4 +29,3 @@ git pull origin main
 git stash pop      # re-apply if needed
 
 The rebuild is required because the Python source files are baked into the Docker image — git pull alone won't apply the new code until you docker compose build.
-

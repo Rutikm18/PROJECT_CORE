@@ -81,6 +81,10 @@ _PRIVATE_RE = re.compile(
 )
 
 
+class FeedRefreshError(RuntimeError):
+    """A scheduled feed refresh failed and must be recorded as unhealthy."""
+
+
 def _is_private(ip: str) -> bool:
     if _PRIVATE_RE.match(ip):
         return True
@@ -380,8 +384,7 @@ class FeedManager:
             async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
                 async with s.get(FEODO_URL) as r:
                     if r.status != 200:
-                        log.warning("Feodo Tracker returned %d", r.status)
-                        return 0
+                        raise FeedRefreshError(f"Feodo Tracker returned HTTP {r.status}")
                     text = await r.text()
             count = 0
             for row in csv.reader(io.StringIO(text)):
@@ -395,15 +398,14 @@ class FeedManager:
             return count
         except Exception as exc:
             log.warning("Feodo feed error: %s", exc)
-            return 0
+            raise FeedRefreshError(f"Feodo refresh failed: {exc}") from exc
 
     async def _fetch_emerging(self) -> int:
         try:
             async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
                 async with s.get(EMERGING_URL) as r:
                     if r.status != 200:
-                        log.warning("Emerging Threats returned %d", r.status)
-                        return 0
+                        raise FeedRefreshError(f"Emerging Threats returned HTTP {r.status}")
                     text = await r.text()
             count = 0
             for line in text.splitlines():
@@ -417,15 +419,14 @@ class FeedManager:
             return count
         except Exception as exc:
             log.warning("Emerging Threats feed error: %s", exc)
-            return 0
+            raise FeedRefreshError(f"Emerging Threats refresh failed: {exc}") from exc
 
     async def _fetch_urlhaus(self) -> int:
         try:
             async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
                 async with s.post(URLHAUS_URL, data={"limit": 1000}) as r:
                     if r.status != 200:
-                        log.warning("URLhaus returned %d", r.status)
-                        return 0
+                        raise FeedRefreshError(f"URLhaus returned HTTP {r.status}")
                     j = await r.json(content_type=None)
             count = 0
             for item in j.get("urls", []):
@@ -444,7 +445,7 @@ class FeedManager:
             return count
         except Exception as exc:
             log.warning("URLhaus feed error: %s", exc)
-            return 0
+            raise FeedRefreshError(f"URLhaus refresh failed: {exc}") from exc
 
     async def _fetch_threatfox(self) -> int:
         """ThreatFox recent IOCs — IPs and domains with malware family context."""
@@ -453,8 +454,7 @@ class FeedManager:
             async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
                 async with s.post(THREATFOX_URL, json=payload) as r:
                     if r.status != 200:
-                        log.warning("ThreatFox returned %d", r.status)
-                        return 0
+                        raise FeedRefreshError(f"ThreatFox returned HTTP {r.status}")
                     j = await r.json(content_type=None)
             count = 0
             for ioc in j.get("data", []) or []:
@@ -488,7 +488,7 @@ class FeedManager:
             return count
         except Exception as exc:
             log.warning("ThreatFox feed error: %s", exc)
-            return 0
+            raise FeedRefreshError(f"ThreatFox refresh failed: {exc}") from exc
 
     async def _fetch_spamhaus(self) -> int:
         """Spamhaus DROP + EDROP — known bad CIDR ranges stored for in-memory lookup."""
@@ -516,6 +516,8 @@ class FeedManager:
             except Exception as exc:
                 log.warning("Spamhaus %s feed error: %s", label, exc)
         self._spamhaus_cidrs = cidrs
+        if count == 0:
+            raise FeedRefreshError("Spamhaus DROP and EDROP both returned no usable CIDRs")
         log.info("Spamhaus DROP+EDROP: %d CIDR ranges loaded", count)
         return count
 
@@ -566,7 +568,7 @@ class FeedManager:
 
         log.error("All KEV sources failed (last error: %s) — keeping cached catalog (%d CVEs)",
                   last_exc, len(self._kev_set))
-        return 0
+        raise FeedRefreshError("all CISA KEV sources failed") from last_exc
 
     async def _fetch_ransomware_live(self) -> int:
         """ransomware.live — active groups and recent victims."""

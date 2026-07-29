@@ -113,6 +113,7 @@ def _parse_vuln(vuln: dict) -> Optional[dict]:
 
     return {
         "cve_id":       cve_id,
+        "vuln_status":  cve.get("vulnStatus", ""),
         "description":  desc[:500],
         "cvss_score":   cvss_score,
         "cvss_vector":  cvss_vector,
@@ -200,6 +201,7 @@ class NVDSyncWorker:
         total_upserted = 0
         start_index    = 0
         total_results: Optional[int] = None
+        sync_started_at = time.time()
 
         try:
             while True:
@@ -208,8 +210,7 @@ class NVDSyncWorker:
                     "startIndex":     start_index,
                 })
                 if page is None:
-                    log.warning("NVD full sync: fetch failed at index %d — aborting", start_index)
-                    break
+                    raise RuntimeError(f"NVD full sync page fetch failed at index {start_index}")
 
                 if total_results is None:
                     total_results = page.get("totalResults", 0)
@@ -233,9 +234,9 @@ class NVDSyncWorker:
                     break
                 await asyncio.sleep(self._delay)
 
-            now = str(time.time())
-            await self._db.set_nvd_state(_STATE_FULL, now)
-            await self._db.set_nvd_state(_STATE_DELTA, now)  # reset delta baseline
+            await self._db.set_nvd_state(_STATE_FULL, str(time.time()))
+            # Catch CVEs modified while a multi-hour full sync was running.
+            await self._db.set_nvd_state(_STATE_DELTA, str(sync_started_at))
             await self._db.record_feed_attempt(
                 "nvd:full_sync", success=True, entry_count=total_upserted)
             log.info("NVD full sync complete: %d CVEs upserted", total_upserted)
@@ -257,8 +258,10 @@ class NVDSyncWorker:
             return  # wait for first full sync to establish baseline
 
         # NVD allows at most 120-day window for lastMod queries
+        # Five-minute overlap protects against upstream indexing delay and
+        # second-level timestamp truncation. Upserts are idempotent.
         since = datetime.fromtimestamp(
-            max(last_ts, time.time() - 86400 * 119), tz=timezone.utc)
+            max(last_ts - 300, time.time() - 86400 * 119), tz=timezone.utc)
         until = datetime.now(tz=timezone.utc)
         since_s = since.strftime("%Y-%m-%dT%H:%M:%S.000")
         until_s = until.strftime("%Y-%m-%dT%H:%M:%S.000")
@@ -275,7 +278,7 @@ class NVDSyncWorker:
                     "lastModEndDate":   until_s,
                 })
                 if page is None:
-                    break
+                    raise RuntimeError(f"NVD delta sync page fetch failed at index {start_index}")
 
                 vulns = page.get("vulnerabilities", [])
                 if not vulns:
@@ -292,11 +295,10 @@ class NVDSyncWorker:
                     break
                 await asyncio.sleep(self._delay)
 
-            await self._db.set_nvd_state(_STATE_DELTA, str(time.time()))
-            if total_upserted:
-                log.info("NVD delta sync: %d CVEs updated", total_upserted)
-                await self._db.record_feed_attempt(
-                    "nvd:delta_sync", success=True, entry_count=total_upserted)
+            await self._db.set_nvd_state(_STATE_DELTA, str(until.timestamp()))
+            log.info("NVD delta sync: %d CVEs updated", total_upserted)
+            await self._db.record_feed_attempt(
+                "nvd:delta_sync", success=True, entry_count=total_upserted)
 
         except asyncio.CancelledError:
             raise

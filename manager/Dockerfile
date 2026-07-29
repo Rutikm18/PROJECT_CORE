@@ -68,6 +68,7 @@ COPY --from=deps /install /usr/local
 COPY --chown=jarvis:jarvis --from=build /build/shared/   /app/shared/
 COPY --chown=jarvis:jarvis --from=build /build/manager/  /app/manager/
 COPY --chown=jarvis:jarvis manager/rulepacks/ /app/manager/rulepacks/
+COPY --chown=jarvis:jarvis VERSION /app/VERSION
 
 # Copy entrypoint (this single shell script is the only plain text in the image)
 RUN chmod +x /app/manager/scripts/entrypoint.sh
@@ -80,8 +81,8 @@ USER jarvis
 
 # Build metadata — passed by docker-compose / deploy.yml (git-derived).
 # Version scheme is 1.0.<commit-count>, so it advances on every push.
-ARG APP_VERSION=1.0.0-dev
-ARG APP_COMMIT=unknown
+ARG APP_VERSION=
+ARG APP_COMMIT=
 ARG APP_BUILT_AT=
 ENV APP_VERSION=${APP_VERSION}
 ENV APP_COMMIT=${APP_COMMIT}

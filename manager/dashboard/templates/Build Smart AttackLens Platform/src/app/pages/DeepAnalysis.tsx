@@ -438,6 +438,9 @@ function RecordRow({ row, section, expanded, onToggle, agentName, agentOnline }:
         <span className={cn("w-1.5 h-1.5 rounded-full flex-shrink-0", agentOnline ? "bg-green-400 animate-pulse" : "bg-gray-300")} />
         <span className="text-[10px] font-mono text-gray-400 flex-shrink-0 w-28 tabular-nums">{date} {time}</span>
         <span className="text-[11px] text-gray-700 font-medium w-24 truncate flex-shrink-0">{agentName}</span>
+        <span className="text-[9px] font-semibold text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded flex-shrink-0">
+          {sm(section).label}
+        </span>
         {len !== null && (
           <span className="text-[10px] text-gray-400 tabular-nums flex-shrink-0 w-16">
             {len} <span className="text-gray-300">rows</span>
@@ -495,11 +498,13 @@ export default function DeepAnalysis() {
   );
   const sections = secResp?.sections ?? [];
 
-  // Auto-select first section when section list first arrives
+  // Keep the selected section valid when the agent filter changes.
   useEffect(() => {
-    if (sections.length > 0 && !section) setSection(sections[0]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sections.length]);
+    if (sections.length > 0 && !sections.includes(section)) {
+      setSection(sections[0]);
+      setPage(0);
+    }
+  }, [sections, section]);
 
   // Build the raw telemetry query URL (memoised — does NOT need to be called)
   const queryUrl = useMemo(() => {
@@ -529,19 +534,20 @@ export default function DeepAnalysis() {
     if (agentId) p.set("agent_id", agentId);
     p.set("section", s);
     p.set("window", window_);
+    if (search) p.set("search", search);
     return `${API}/count?${p}`;
-  }, [agentId, window_]);
+  }, [agentId, window_, search]);
 
   // Smart search — only active when query is ≥ 2 chars
   const smartSearchUrl = useMemo(() => {
-    if (!search || search.trim().length < 2) return null;
+    if (searchScope !== "all" || !search || search.trim().length < 2) return null;
     const p = new URLSearchParams();
     p.set("q", search.trim());
     if (agentId) p.set("agent_id", agentId);
     p.set("limit", "25");
     p.set("offset", "0");
     return `/api/v1/soc/smart-search?${p}`;
-  }, [search, agentId]);
+  }, [search, agentId, searchScope]);
 
   const { data: smartResult, loading: smartLoading, refetch: smartRefetch } = useFetch<{
     findings: FindingResult[]; total: number;
@@ -631,7 +637,7 @@ export default function DeepAnalysis() {
               onChange={e => {
                 setRawSearch(e.target.value);
                 if (deb.current) clearTimeout(deb.current);
-                deb.current = setTimeout(() => { setSearch(e.target.value); setPage(0); }, 300);
+                deb.current = setTimeout(() => { setSearch(e.target.value.trim()); setPage(0); }, 300);
               }}
               className="w-full pl-7 pr-7 py-1.5 text-[11px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 placeholder-gray-300" />
             {rawSearch && (
@@ -679,9 +685,15 @@ export default function DeepAnalysis() {
             {sections.length === 0
               ? <div className="px-3 py-6 text-[10px] text-gray-400 text-center">No data</div>
               : sections.map(s => (
-                <NavItem key={s} section={s} active={section === s}
+                <NavItem key={s} section={s}
+                  active={section === s && !(search && searchScope === "all")}
                   countUrl={countUrl(s)}
-                  onClick={() => { setSection(s); setPage(0); setExpandedId(null); }} />
+                  onClick={() => {
+                    setSection(s);
+                    if (search) setSearchScope("section");
+                    setPage(0);
+                    setExpandedId(null);
+                  }} />
               ))}
           </nav>
         </div>
@@ -816,7 +828,7 @@ export default function DeepAnalysis() {
               )
             ) : (
               rows.map(row => (
-                <RecordRow key={row.id} row={row} section={section}
+                <RecordRow key={row.id} row={row} section={row.section}
                   expanded={expandedId === row.id}
                   onToggle={() => setExpandedId(expandedId === row.id ? null : row.id)}
                   agentName={agents?.find(a => a.agent_id === row.agent_id)?.name ?? row.agent_id}

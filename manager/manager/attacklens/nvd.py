@@ -246,6 +246,7 @@ class CVELookup:
             params: dict = {
                 "keywordSearch":     keyword,
                 "keywordExactMatch": "",   # presence-only flag → exact substring match
+                "noRejected":        "",
                 "resultsPerPage":    MAX_RESULTS,
             }
             # versionStart/versionEnd are only honoured with virtualMatchString
@@ -290,7 +291,10 @@ class CVELookup:
                 await asyncio.sleep(REQUEST_DELAY - elapsed)
             try:
                 async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
-                    async with s.get(NVD_API_URL, params={"cveId": cve_id}) as r:
+                    async with s.get(
+                        NVD_API_URL,
+                        params={"cveId": cve_id, "noRejected": ""},
+                    ) as r:
                         _last_nvd_call = time.time()
                         if r.status != 200:
                             return None
@@ -322,6 +326,7 @@ class CVELookup:
                 "lastModEndDate": _nvd_dt(end),
                 "resultsPerPage": SYNC_PAGE_SIZE,
                 "startIndex": start_index,
+                "noRejected": "",
             }
             try:
                 async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
@@ -421,6 +426,7 @@ class CVELookup:
 
         return {
             "cve_id":               cve_id,
+            "vuln_status":          cve.get("vulnStatus", ""),
             "description":          desc,
             "cvss_score":           cvss_score,
             "cvss_vector":          cvss_vector,

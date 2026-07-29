@@ -22,25 +22,41 @@ def _fresh_info(**env: str) -> dict:
 
 class TestVersionResolution:
     def test_env_var_takes_priority(self):
-        info = _fresh_info(APP_VERSION="1.1.5", APP_COMMIT="abc1234", APP_BUILT_AT="2026-07-22T00:00:00Z")
-        assert info["version"] == "1.1.5"
+        info = _fresh_info(APP_VERSION="1.0.5", APP_COMMIT="abc1234", APP_BUILT_AT="2026-07-22T00:00:00Z")
+        assert info["version"] == "1.0.5"
         assert info["commit"] == "abc1234"
         assert info["built_at"] == "2026-07-22T00:00:00Z"
 
-    def test_version_file_fallback(self):
-        # No env vars — should pick up VERSION file from repo root
+    def test_git_count_fallback(self):
+        # No env vars — local/dev runs derive 1.0.x from the checked-out repo.
         clean = {k: "" for k in ("APP_VERSION", "APP_COMMIT", "APP_BUILT_AT")}
-        info = _fresh_info(**clean)
+        def fake_git(*args: str) -> str | None:
+            if args == ("rev-list", "--count", "HEAD"):
+                return "42"
+            if args == ("rev-parse", "--short", "HEAD"):
+                return "abc1234"
+            return None
+
+        with patch("manager.manager.version._git", side_effect=fake_git):
+            info = _fresh_info(**clean)
+        assert info["version"] == "1.0.42"
+        assert info["commit"] == "abc1234"
+
+    def test_version_file_fallback(self):
+        clean = {k: "" for k in ("APP_VERSION", "APP_COMMIT", "APP_BUILT_AT")}
+        with patch("manager.manager.version._git", return_value=None):
+            info = _fresh_info(**clean)
         parts = info["version"].split(".")
-        assert len(parts) == 3, f"Expected 1.1.x format, got {info['version']!r}"
-        assert parts[0] == "1" and parts[1] == "1"
+        assert len(parts) == 3, f"Expected 1.0.x format, got {info['version']!r}"
+        assert parts[0] == "1" and parts[1] == "0"
         assert parts[2].split("-")[0].isdigit()
 
     def test_dev_fallback_when_no_version_file(self):
         clean = {k: "" for k in ("APP_VERSION", "APP_COMMIT", "APP_BUILT_AT")}
-        with patch("manager.manager.version._read_version_file", return_value=None):
+        with patch("manager.manager.version._git", return_value=None), \
+             patch("manager.manager.version._read_version_file", return_value=None):
             info = _fresh_info(**clean)
-        assert info["version"] == "1.1.0-dev"
+        assert info["version"] == "1.0.0-dev"
 
     def test_get_version_string_matches_info(self):
         from manager.manager.version import get_version
@@ -65,8 +81,8 @@ class TestMetaEndpoint:
         r = self.client.get("/api/v1/meta")
         version = r.json()["version"]
         parts = version.split(".")
-        assert len(parts) == 3, f"Expected 1.1.x format, got: {version!r}"
-        assert parts[0] == "1" and parts[1] == "1"
+        assert len(parts) == 3, f"Expected 1.0.x format, got: {version!r}"
+        assert parts[0] == "1" and parts[1] == "0"
 
     def test_meta_is_not_intercepted_by_spa_catchall(self):
         # /api/v1/meta must return JSON, never the SPA shell
