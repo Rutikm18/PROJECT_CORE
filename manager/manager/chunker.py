@@ -33,7 +33,12 @@ class Chunk:
     data:         Any
 
 
-def split(data: Any, chunk_size: int = CHUNK_SIZE) -> list[Chunk]:
+def split(
+    data: Any,
+    chunk_size: int = CHUNK_SIZE,
+    *,
+    chunk_set_id: str = "",
+) -> list[Chunk]:
     """
     Split *data* into one or more Chunk objects.
 
@@ -43,7 +48,7 @@ def split(data: Any, chunk_size: int = CHUNK_SIZE) -> list[Chunk]:
     A unique chunk_set_id (hex UUID) is assigned to every call so that
     workers can correlate chunks back to the same logical payload.
     """
-    cid = uuid.uuid4().hex
+    cid = chunk_set_id or uuid.uuid4().hex
     if not isinstance(data, list) or len(data) <= CHUNK_THRESHOLD:
         return [Chunk(chunk_set_id=cid, chunk_index=0, chunk_total=1, data=data)]
 

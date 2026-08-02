@@ -5,8 +5,8 @@ Pins the Phase-1 fix that closed the dead-letter black hole: mac_intel.dead had
 no consumer, so any nack'd telemetry/detection work was silently lost forever.
 The replayer must (a) route a dead message back to its ORIGINAL queue using the
 x-death header, (b) fall back to a queue→routing-key map when x-death is absent,
-(c) retry with exponential backoff up to max_attempts, and (d) PARK (drop +
-alert) a poison message once attempts are exhausted — never hot-loop it.
+(c) schedule retry with durable broker backoff, and (d) persist poison messages
+to a parking queue once attempts are exhausted.
 
 Pure-logic tests: a fake exchange captures republishes; no live RabbitMQ.
 """
@@ -17,6 +17,7 @@ import asyncio
 from manager.manager.workers.dlq_replayer import DLQReplayer
 from manager.manager.queue.schemas import (
     QUEUE_TELEMETRY, QUEUE_ATTACKLENS, ROUTING_TELEMETRY, ROUTING_ATTACKLENS,
+    ROUTING_PARKED, retry_routing_key,
 )
 
 
@@ -71,43 +72,50 @@ def _run(coro):
 
 def test_handle_replays_to_origin_and_increments_attempts():
     r = DLQReplayer("amqp://x", base_delay_s=0.0)   # no real backoff sleep
-    ex = _FakeExchange()
+    retry = _FakeExchange()
+    parking = _FakeExchange()
     msg = _FakeMessage(body=b'{"agent_id":"a"}',
                        headers={"x-death": _xdeath(QUEUE_TELEMETRY, ROUTING_TELEMETRY)})
 
-    _run(r._handle(msg, ex))
+    _run(r._handle(msg, retry, parking))
 
-    assert len(ex.published) == 1
-    rk, message = ex.published[0]
-    assert rk == ROUTING_TELEMETRY
+    assert len(retry.published) == 1
+    rk, message = retry.published[0]
+    assert rk == retry_routing_key(ROUTING_TELEMETRY, 5_000)
     assert message.headers["x-replay-attempts"] == 1
     assert "x-death" not in message.headers          # reset for fresh tracking
+    assert parking.published == []
     assert r.stats["replayed"] == 1 and r.stats["parked"] == 0
 
 
 def test_handle_parks_after_max_attempts():
     r = DLQReplayer("amqp://x", base_delay_s=0.0, max_attempts=3)
-    ex = _FakeExchange()
+    retry = _FakeExchange()
+    parking = _FakeExchange()
     # already retried max times → next handle must PARK, not republish
     msg = _FakeMessage(headers={
         "x-death": _xdeath(QUEUE_ATTACKLENS, ROUTING_ATTACKLENS),
         "x-replay-attempts": 3,
     })
 
-    _run(r._handle(msg, ex))
+    _run(r._handle(msg, retry, parking))
 
-    assert ex.published == []                         # not replayed
+    assert retry.published == []
+    assert parking.published[0][0] == ROUTING_PARKED
+    assert parking.published[0][1].headers["x-park-reason"] == "retries_exhausted"
     assert r.stats["parked"] == 1 and r.stats["replayed"] == 0
 
 
 def test_handle_parks_unroutable_message():
     r = DLQReplayer("amqp://x", base_delay_s=0.0)
-    ex = _FakeExchange()
+    retry = _FakeExchange()
+    parking = _FakeExchange()
     msg = _FakeMessage(headers={})                   # no origin info at all
 
-    _run(r._handle(msg, ex))
+    _run(r._handle(msg, retry, parking))
 
-    assert ex.published == []
+    assert retry.published == []
+    assert parking.published[0][1].headers["x-park-reason"] == "unknown_origin"
     assert r.stats["parked"] == 1
 
 

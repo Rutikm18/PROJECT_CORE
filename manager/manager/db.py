@@ -18,6 +18,7 @@ correctly across multiple manager instances sharing this database (the
 horizontal-scaling case SQLite couldn't support).
 """
 
+import hashlib
 import json
 import time
 import logging
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS agent_keys (
 
 CREATE TABLE IF NOT EXISTS payloads (
     id           BIGSERIAL PRIMARY KEY,
+    event_id     TEXT UNIQUE,
     agent_id     TEXT NOT NULL,
     section      TEXT NOT NULL,
     collected_at INTEGER NOT NULL,
@@ -97,26 +99,38 @@ CREATE TABLE IF NOT EXISTS nonce_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_nonce_exp ON nonce_cache(expires_at);
 
--- Payload ledger: the durable outbox + reconciliation record for the detection
--- pipeline. A row is written 'received' once a payload is stored (the telemetry
--- worker), then marked 'processed' once detection runs (engine.process). The
--- reconciler replays any payload that is received-but-not-processed past a grace
--- window — closing the gap where a payload is stored but its detection hand-off
--- was lost (worker crash, DLQ exhaustion, sync-path drop). This is what makes
--- "raw is stored, so it's reprocessable" actually true instead of aspirational.
-CREATE TABLE IF NOT EXISTS payload_ledger (
-    agent_id     TEXT NOT NULL,
-    section      TEXT NOT NULL,
-    collected_at DOUBLE PRECISION NOT NULL,
-    received_at  DOUBLE PRECISION NOT NULL,
-    processed_at DOUBLE PRECISION,         -- NULL = detection not yet run
-    signal_count INTEGER,
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (agent_id, section, collected_at)
+-- Event-level durable detection outbox. event_id comes from the authenticated
+-- ingest nonce, so two payloads collected in the same second never collide.
+-- The exact raw data is retained here until processing succeeds, allowing the
+-- reconciler to replay the missed EVENT instead of an unrelated latest snapshot.
+CREATE TABLE IF NOT EXISTS detection_events (
+    event_id       TEXT PRIMARY KEY,
+    agent_id       TEXT NOT NULL,
+    section        TEXT NOT NULL,
+    collected_at   DOUBLE PRECISION NOT NULL,
+    received_at    DOUBLE PRECISION NOT NULL,
+    stored_at      DOUBLE PRECISION,
+    payload_json   TEXT NOT NULL,
+    metadata_json  TEXT NOT NULL DEFAULT '{}',
+    chunk_total    INTEGER NOT NULL DEFAULT 1,
+    chunk_size     INTEGER NOT NULL DEFAULT 50,
+    processed_at   DOUBLE PRECISION,
+    correlated_at  DOUBLE PRECISION,
+    signal_count   INTEGER,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at DOUBLE PRECISION
 );
--- Partial index: the reconciler's hot query is "unprocessed, oldest first".
-CREATE INDEX IF NOT EXISTS idx_ledger_unprocessed
-    ON payload_ledger(received_at) WHERE processed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_detection_events_pending
+    ON detection_events(received_at) WHERE processed_at IS NULL;
+-- Durable per-chunk completion makes active-active detection workers safe: all
+-- replicas converge through this table instead of process-local memory.
+CREATE TABLE IF NOT EXISTS detection_event_chunks (
+    event_id      TEXT NOT NULL REFERENCES detection_events(event_id) ON DELETE CASCADE,
+    chunk_index   INTEGER NOT NULL,
+    processed_at  DOUBLE PRECISION NOT NULL,
+    signal_count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_id, chunk_index)
+);
 """
 
 _MIGRATIONS = [
@@ -124,6 +138,10 @@ _MIGRATIONS = [
     ("agent_keys", "revoked",     "INTEGER DEFAULT 0"),
     ("agent_keys", "rotated_at",  "INTEGER DEFAULT 0"),
     ("agent_keys", "key_label",   "TEXT DEFAULT ''"),
+    ("payloads", "event_id",      "TEXT"),
+    ("detection_events", "stored_at", "DOUBLE PRECISION"),
+    ("detection_events", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("detection_events", "correlated_at", "DOUBLE PRECISION"),
 ]
 
 
@@ -143,6 +161,24 @@ class Database:
                 # no try/except-swallow needed (that was a SQLite workaround).
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {defn}")
                 await db.commit()
+            # Existing processed rows predate durable correlation tracking and
+            # must not be replayed as a new backlog during rollout.
+            await db.execute(
+                "UPDATE detection_events SET correlated_at=processed_at "
+                "WHERE processed_at IS NOT NULL AND correlated_at IS NULL"
+            )
+            await db.commit()
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_detection_events_incomplete "
+                "ON detection_events(received_at) "
+                "WHERE processed_at IS NULL OR correlated_at IS NULL"
+            )
+            await db.commit()
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_payloads_event_id "
+                "ON payloads(event_id)"
+            )
+            await db.commit()
 
     async def ping(self) -> bool:
         return await self._pool.ping()
@@ -418,16 +454,19 @@ class Database:
         return {r[0]: int(r[1] or 0) for r in rows}
 
     async def insert_payload(
-        self, agent_id: str, section: str, collected_at: int, data: dict
+        self, agent_id: str, section: str, collected_at: int, data: dict,
+        event_id: str = "",
     ) -> None:
         now = int(time.time())
         blob = json.dumps(data, default=str)
         async with self._pool.write() as db:
             try:
                 await db.execute("""
-                    INSERT INTO payloads(agent_id, section, collected_at, received_at, data)
-                    VALUES(?,?,?,?,?)
-                """, (agent_id, section, collected_at, now, blob))
+                    INSERT INTO payloads(
+                        event_id, agent_id, section, collected_at, received_at, data
+                    ) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT (event_id) DO NOTHING
+                """, (event_id or None, agent_id, section, collected_at, now, blob))
                 await db.commit()
             except Exception:
                 # Self-heal the FK to agents(agent_id). If the parent row is
@@ -443,111 +482,223 @@ class Database:
                     (agent_id, agent_id, now, now),
                 )
                 await db.execute("""
-                    INSERT INTO payloads(agent_id, section, collected_at, received_at, data)
-                    VALUES(?,?,?,?,?)
-                """, (agent_id, section, collected_at, now, blob))
+                    INSERT INTO payloads(
+                        event_id, agent_id, section, collected_at, received_at, data
+                    ) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT (event_id) DO NOTHING
+                """, (event_id or None, agent_id, section, collected_at, now, blob))
                 await db.commit()
 
-    # ── Payload ledger (outbox + reconciliation) ──────────────────────────────
+    # ── Event-level detection outbox + durable chunk completion ──────────────
 
     @staticmethod
-    def _ledger_key(collected_at: float) -> float:
-        """Normalize the ledger key to integer seconds. The agent sends int-second
-        collected_at, but float drift creeps in across the pipeline (a
-        time.time() fallback when a message lacks collected_at, JSON round-trips),
-        which would make ledger_received and ledger_processed write DIFFERENT keys
-        for the same payload — leaving a phantom 'pending' row the reconciler then
-        needlessly replays. Flooring to the second collapses that drift so the two
-        writes always land on the same row."""
-        try:
-            return float(int(float(collected_at)))
-        except (TypeError, ValueError):
-            return 0.0
+    def _legacy_event_id(
+        agent_id: str, section: str, collected_at: float, data=None,
+    ) -> str:
+        """Stable fallback for old/direct callers that do not supply an event ID."""
+        basis = json.dumps(
+            [agent_id, section, float(collected_at), data],
+            sort_keys=True, default=str, separators=(",", ":"),
+        )
+        return "legacy:" + hashlib.sha256(basis.encode()).hexdigest()
 
     async def ledger_received(
-        self, agent_id: str, section: str, collected_at: float
-    ) -> None:
-        """Record that a payload was stored and is awaiting detection. Idempotent
-        per (agent, section, collected_at) — a replay re-arms processed_at=NULL so
-        the reconciler will re-drive it if it's still not processed."""
+        self,
+        agent_id: str,
+        section: str,
+        collected_at: float,
+        *,
+        event_id: str = "",
+        data=None,
+        chunk_total: int = 1,
+        chunk_size: int = 50,
+        stored: bool = False,
+        metadata: dict | None = None,
+    ) -> str:
+        """Persist one exact event before detection fan-out; idempotent by ID."""
+        event_id = event_id or self._legacy_event_id(agent_id, section, collected_at, data)
         now = time.time()
+        payload_json = json.dumps(data, default=str, separators=(",", ":"))
+        metadata_json = json.dumps(metadata or {}, default=str, separators=(",", ":"))
+        stored_at = now if stored else None
         async with self._pool.write() as db:
             await db.execute("""
-                INSERT INTO payload_ledger(agent_id, section, collected_at, received_at)
-                VALUES(?,?,?,?)
-                ON CONFLICT (agent_id, section, collected_at) DO NOTHING
-            """, (agent_id, section, self._ledger_key(collected_at), now))
+                INSERT INTO detection_events(
+                    event_id, agent_id, section, collected_at, received_at, stored_at,
+                    payload_json, metadata_json, chunk_total, chunk_size
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (event_id) DO UPDATE SET
+                    stored_at=COALESCE(detection_events.stored_at, excluded.stored_at),
+                    metadata_json=CASE
+                        WHEN detection_events.metadata_json='{}' THEN excluded.metadata_json
+                        ELSE detection_events.metadata_json
+                    END
+            """, (
+                event_id, agent_id, section, float(collected_at), now, stored_at,
+                payload_json, metadata_json,
+                max(1, int(chunk_total)), max(1, int(chunk_size)),
+            ))
+            async with db.execute(
+                "SELECT agent_id, section, collected_at, payload_json, chunk_total, chunk_size "
+                "FROM detection_events WHERE event_id=?",
+                (event_id,),
+            ) as cur:
+                existing = await cur.fetchone()
+            if (
+                not existing
+                or existing["agent_id"] != agent_id
+                or existing["section"] != section
+                or float(existing["collected_at"]) != float(collected_at)
+                or existing["payload_json"] != payload_json
+            ):
+                await db.rollback()
+                raise ValueError(f"event_id collision or missing event row: {event_id}")
+            if int(existing["chunk_total"]) != max(1, int(chunk_total)):
+                await db.rollback()
+                raise ValueError(f"event_id {event_id} chunk_total changed")
+            if int(existing["chunk_size"]) != max(1, int(chunk_size)):
+                await db.rollback()
+                raise ValueError(f"event_id {event_id} chunk_size changed")
+            await db.commit()
+        return event_id
+
+    async def ledger_chunk_processed(
+        self,
+        event_id: str,
+        chunk_index: int,
+        chunk_total: int,
+        *,
+        signal_count: int = 0,
+    ) -> bool:
+        """Atomically record a chunk and return True only on event completion.
+
+        The event row is locked, so chunks handled by different manager replicas
+        cannot race. A duplicate delivery returns True only when detection is
+        complete but correlation still requires retry.
+        """
+        now = time.time()
+        index = int(chunk_index)
+        total = max(1, int(chunk_total))
+        if index < 0 or index >= total:
+            raise ValueError(f"invalid chunk index {index}/{total} for {event_id}")
+        async with self._pool.write() as db:
+            try:
+                async with db.execute(
+                    "SELECT chunk_total, processed_at, correlated_at FROM detection_events "
+                    "WHERE event_id=? FOR UPDATE",
+                    (event_id,),
+                ) as cur:
+                    event = await cur.fetchone()
+                if not event:
+                    raise KeyError(f"detection event not found: {event_id}")
+                if int(event["chunk_total"]) != total:
+                    raise ValueError(f"event_id {event_id} chunk_total mismatch")
+                if event["processed_at"] is not None:
+                    await db.commit()
+                    return event["correlated_at"] is None
+
+                inserted = await db.execute("""
+                    INSERT INTO detection_event_chunks(
+                        event_id, chunk_index, processed_at, signal_count
+                    ) VALUES(?,?,?,?)
+                    ON CONFLICT (event_id, chunk_index) DO NOTHING
+                """, (event_id, index, now, int(signal_count)))
+                if not (getattr(inserted, "rowcount", 0) or 0):
+                    await db.commit()
+                    return False
+
+                async with db.execute(
+                    "SELECT COUNT(*) AS done, COALESCE(SUM(signal_count),0) AS signals "
+                    "FROM detection_event_chunks WHERE event_id=?",
+                    (event_id,),
+                ) as cur:
+                    progress = await cur.fetchone()
+                if int(progress["done"]) < total:
+                    await db.commit()
+                    return False
+
+                completed = await db.execute("""
+                    UPDATE detection_events
+                    SET processed_at=?, signal_count=?
+                    WHERE event_id=? AND processed_at IS NULL
+                """, (now, int(progress["signals"]), event_id))
+                await db.commit()
+                return bool(getattr(completed, "rowcount", 0))
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def ledger_correlated(self, event_id: str) -> None:
+        """Mark the integration pass durable after all correlation writes succeed."""
+        async with self._pool.write() as db:
+            cur = await db.execute(
+                "UPDATE detection_events SET correlated_at=? "
+                "WHERE event_id=? AND processed_at IS NOT NULL",
+                (time.time(), event_id),
+            )
+            if not (getattr(cur, "rowcount", 0) or 0):
+                await db.rollback()
+                raise KeyError(f"detection event is not ready for correlation: {event_id}")
             await db.commit()
 
     async def ledger_processed(
-        self, agent_id: str, section: str, collected_at: float, signal_count: int = 0
+        self,
+        agent_id: str,
+        section: str,
+        collected_at: float,
+        signal_count: int = 0,
+        *,
+        event_id: str = "",
     ) -> None:
-        """Mark a payload's detection as complete. Upserts so a payload that was
-        processed without ever being ledger_received (e.g. sync path) still
-        records a terminal state rather than looking perpetually unprocessed."""
-        now = time.time()
-        async with self._pool.write() as db:
-            await db.execute("""
-                INSERT INTO payload_ledger(agent_id, section, collected_at, received_at,
-                                           processed_at, signal_count)
-                VALUES(?,?,?,?,?,?)
-                ON CONFLICT (agent_id, section, collected_at)
-                DO UPDATE SET processed_at = excluded.processed_at,
-                              signal_count = excluded.signal_count
-            """, (agent_id, section, self._ledger_key(collected_at), now, now, int(signal_count)))
-            await db.commit()
+        """Backward-compatible single-chunk completion for direct callers."""
+        event_id = await self.ledger_received(
+            agent_id, section, collected_at, event_id=event_id, data=None,
+        )
+        await self.ledger_chunk_processed(event_id, 0, 1, signal_count=signal_count)
+        await self.ledger_correlated(event_id)
 
-    async def ledger_unprocessed_sections(
+    async def ledger_unprocessed_events(
         self, grace_sec: float, max_attempts: int, limit: int = 200
     ) -> list[dict]:
-        """The reconciler's work list: distinct (agent, section) with at least
-        one payload still unprocessed past the grace window and under the retry
-        cap. Returns the newest unprocessed collected_at per section so the
-        reconciler can replay the current snapshot and reconcile the backlog up
-        to it in one shot."""
+        """Exact unprocessed events eligible for another replay attempt."""
         cutoff = time.time() - grace_sec
         async with self._pool.read() as db:
             async with db.execute("""
-                SELECT agent_id, section,
-                       MAX(collected_at) AS latest_unprocessed,
-                       COUNT(*)          AS pending,
-                       MAX(attempts)     AS attempts
-                FROM payload_ledger
-                WHERE processed_at IS NULL AND received_at < ? AND attempts < ?
-                GROUP BY agent_id, section
-                ORDER BY MAX(received_at) ASC
+                SELECT event_id, agent_id, section, collected_at, chunk_total,
+                       chunk_size, attempts
+                FROM detection_events
+                WHERE (processed_at IS NULL OR correlated_at IS NULL)
+                  AND received_at < ?
+                  AND COALESCE(last_attempt_at, received_at) < ?
+                  AND attempts < ?
+                ORDER BY received_at ASC
                 LIMIT ?
-            """, (cutoff, max_attempts, limit)) as cur:
+            """, (cutoff, cutoff, max_attempts, limit)) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
-    async def ledger_reconcile_section(
-        self, agent_id: str, section: str, up_to_collected_at: float
-    ) -> int:
-        """After the reconciler replays the current snapshot of a section, fold
-        the whole unprocessed backlog for that (agent, section) up to that point
-        into one terminal 'reconciled' state (processed_at set, attempts bumped).
-        Snapshot-based detection means re-driving the latest payload recovers the
-        section's current detection state — we don't need to replay each missed
-        historical payload. Returns rows reconciled."""
-        now = time.time()
-        async with self._pool.write() as db:
-            cur = await db.execute("""
-                UPDATE payload_ledger
-                SET processed_at = ?, attempts = attempts + 1
-                WHERE agent_id = ? AND section = ?
-                  AND processed_at IS NULL AND collected_at <= ?
-            """, (now, agent_id, section, self._ledger_key(up_to_collected_at)))
-            await db.commit()
-            return getattr(cur, "rowcount", 0) or 0
+    async def ledger_event_payload(self, event_id: str) -> dict | None:
+        async with self._pool.read() as db:
+            async with db.execute("""
+                SELECT event_id, agent_id, section, collected_at, stored_at,
+                       payload_json, metadata_json, chunk_total, chunk_size
+                FROM detection_events WHERE event_id=?
+            """, (event_id,)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["data"] = json.loads(result.pop("payload_json"))
+        result["metadata"] = json.loads(result.pop("metadata_json"))
+        return result
 
-    async def ledger_bump_attempt(self, agent_id: str, section: str) -> None:
-        """Record a failed replay attempt (so a permanently-unreplayable section
-        eventually crosses max_attempts and stops being retried + alerts)."""
+    async def ledger_bump_attempt(self, event_id: str) -> None:
+        """Record one event replay attempt, successful publish or not."""
         async with self._pool.write() as db:
             await db.execute("""
-                UPDATE payload_ledger SET attempts = attempts + 1
-                WHERE agent_id = ? AND section = ? AND processed_at IS NULL
-            """, (agent_id, section))
+                UPDATE detection_events
+                SET attempts=attempts+1, last_attempt_at=?
+                WHERE event_id=? AND (processed_at IS NULL OR correlated_at IS NULL)
+            """, (time.time(), event_id))
             await db.commit()
 
     async def ledger_lag(self) -> dict:
@@ -557,7 +708,8 @@ class Database:
         async with self._pool.read() as db:
             async with db.execute("""
                 SELECT COUNT(*) AS pending, MIN(received_at) AS oldest
-                FROM payload_ledger WHERE processed_at IS NULL
+                FROM detection_events
+                WHERE processed_at IS NULL OR correlated_at IS NULL
             """) as cur:
                 row = await cur.fetchone()
         pending = int(row["pending"]) if row and row["pending"] else 0
@@ -572,7 +724,8 @@ class Database:
         are kept — they are the reconciler's backlog). Returns rows deleted."""
         async with self._pool.write() as db:
             cur = await db.execute(
-                "DELETE FROM payload_ledger WHERE processed_at IS NOT NULL AND processed_at < ?",
+                "DELETE FROM detection_events WHERE processed_at IS NOT NULL "
+                "AND correlated_at IS NOT NULL AND processed_at < ?",
                 (float(cutoff_ts),),
             )
             await db.commit()

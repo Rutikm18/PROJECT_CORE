@@ -121,6 +121,7 @@ PYTHONPATH="${REPO_ROOT}" python3 -m PyInstaller \
     --hidden-import "agent.os.macos.collectors.system" \
     --hidden-import "agent.os.macos.collectors.posture" \
     --hidden-import "agent.os.macos.collectors.inventory" \
+    --hidden-import "agent.os.macos.collectors.developer_security" \
     --hidden-import "agent.os.macos.collectors.sca" \
     --hidden-import "agent.agent.sca" \
     --hidden-import "agent.agent.sca.engine" \
@@ -350,6 +351,20 @@ if grep -qE 'run_agent\.py|run_watchdog\.py' "${CONFIG_PATH}" 2>/dev/null; then
     -e 's|/Library/AttackLens/bin/run_watchdog\.py|/Library/AttackLens/bin/attacklens-watchdog|g' \
     "${CONFIG_PATH}"
   echo "  Migrated [binaries] paths in preserved config to native binaries"
+fi
+
+# Add the new hourly developer/AI security inventory on upgrade without
+# rewriting any operator-owned settings.  Existing explicit blocks win.
+if ! grep -q '^\[collection\.sections\.developer_security\]$' "${CONFIG_PATH}" 2>/dev/null; then
+  cat >> "${CONFIG_PATH}" <<'DEVELOPER_SECURITY_CONFIG'
+
+[collection.sections.developer_security]
+enabled      = true
+interval_sec = 3600
+send         = true
+timeout_sec  = 120
+DEVELOPER_SECURITY_CONFIG
+  echo "  Enabled hourly developer_security collection in preserved config"
 fi
 
 # Compatibility wrapper: anything still launching run_agent.sh gets the

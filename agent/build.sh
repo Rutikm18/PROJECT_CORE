@@ -109,6 +109,7 @@ HIDDEN=(
   "agent.os.macos.collectors.system"
   "agent.os.macos.collectors.posture"
   "agent.os.macos.collectors.inventory"
+  "agent.os.macos.collectors.developer_security"
   "agent.os.macos.normalizer"
   "agent.os.macos.keystore"
   "agent.os.macos.launchd"

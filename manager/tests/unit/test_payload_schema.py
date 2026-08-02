@@ -53,6 +53,23 @@ def test_missing_required_field_flagged():
     assert "agent_id" in r["missing"]
 
 
+def test_authenticated_agent_identity_must_match_inner_payload():
+    r = validate_payload(
+        _full_payload(agent_id="other-agent"),
+        authenticated_agent_id="mac-001",
+    )
+    assert r["ok"] is False
+    assert r["identity_mismatch"] is True
+
+
+def test_authenticated_agent_identity_match_is_ok():
+    r = validate_payload(
+        _full_payload(), authenticated_agent_id="mac-001",
+    )
+    assert r["ok"] is True
+    assert r["identity_mismatch"] is False
+
+
 def test_empty_required_field_flagged_separately_from_missing():
     r = validate_payload(_full_payload(section=""))
     assert r["ok"] is False

@@ -105,11 +105,19 @@ def _parse_vuln(vuln: dict) -> Optional[dict]:
                 cwes.append(d["value"])
 
     cpe_list: list[str] = []
+    cpe_matches: list[dict] = []
     for cfg in cve.get("configurations", []):
         for node in cfg.get("nodes", []):
             for m in node.get("cpeMatch", []):
                 if m.get("vulnerable"):
                     cpe_list.append(m.get("criteria", ""))
+                    cpe_matches.append({
+                        key: m.get(key) for key in (
+                            "criteria", "vulnerable", "versionStartIncluding",
+                            "versionStartExcluding", "versionEndIncluding",
+                            "versionEndExcluding",
+                        ) if m.get(key) is not None
+                    })
 
     return {
         "cve_id":       cve_id,
@@ -120,6 +128,7 @@ def _parse_vuln(vuln: dict) -> Optional[dict]:
         "severity":     _cvss_to_severity(cvss_score),
         "cwe_ids":      json.dumps(cwes[:10]),
         "cpe_uris":     json.dumps(cpe_list[:30]),
+        "cpe_matches":  json.dumps(cpe_matches[:30]),
         "pkg_keywords": _build_keywords(desc, cpe_list),
         "published_at": cve.get("published", ""),
         "modified_at":  cve.get("lastModified", ""),

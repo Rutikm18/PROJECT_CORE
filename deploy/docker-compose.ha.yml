@@ -1,16 +1,13 @@
 # ── AttackLens — Production HA docker-compose ─────────────────────────────────
 #
 # Topology:
-#   nginx (TLS LB) → manager-1 + manager-2 (active-active)
-#                  → rabbitmq (HA queue — AMQP)
-#                  → postgres (manager.db + intel.db — both replicas connect
-#                    to the SAME Postgres instance; Postgres itself handles
-#                    concurrent writers, no shared-SQLite-volume coordination
-#                    needed anymore).
-#   Shared volume: manager_data still holds .secrets (signing/encryption
-#                  keys, must be identical across replicas) and the
-#                  hot/warm/cold raw-telemetry store (index.py/aiosqlite —
-#                  that index was not part of the Postgres migration).
+#   nginx → two API/telemetry collectors → RabbitMQ → one concurrent,
+#                                                        agent-ordered detector
+#                                      ↘ PostgreSQL authoritative raw/outbox
+#   One maintenance process owns reconciliation, DLQ replay, and retention.
+#   One intel process owns scheduled feed, NVD, and enrichment work.
+#   The local gzip/SQLite archive is deliberately disabled: it is not safe on
+#   a shared filesystem. PostgreSQL is the HA raw-data and replay source.
 #
 # Scaling notes:
 #   - manager.db / intel.db already on PostgreSQL (see the postgres service
@@ -34,7 +31,7 @@ x-manager-env: &manager-env
   DATA_DIR:              /data
   LOG_FILE:              /logs/manager.log
   LOG_LEVEL:             ${LOG_LEVEL:-INFO}
-  RABBITMQ_URL:          amqp://guest:guest@rabbitmq:5672/
+  RABBITMQ_URL:          amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASS:-guest}@rabbitmq:5672/
   # Postgres — base DSN shared by manager.db + intel.db (server.py appends
   # /manager and /intel respectively). Embedded threat-intel mode (below)
   # reuses the /intel database directly — no separate threat_intel DSN needed.
@@ -45,6 +42,7 @@ x-manager-env: &manager-env
   ADMIN_TOKEN:           ${ADMIN_TOKEN:-}
   API_KEY:               ${API_KEY:-}
   MANAGER_EMBEDDED_THREAT_INTEL: "true"
+  TELEMETRY_ARCHIVE_ENABLED: "false"
   # AttackLens precision validation — correlation + confidence + AI gating
   # before a finding is promoted to is_active=1 (see .env.example).
   ATTACKLENS_VALIDATION:            ${ATTACKLENS_VALIDATION:-true}
@@ -54,7 +52,13 @@ x-manager-env: &manager-env
   AGENT_RATE:            ${AGENT_RATE:-20}
   AGENT_BURST:           ${AGENT_BURST:-60}
   AGENT_SLOTS:           ${AGENT_SLOTS:-6}
+  TELEMETRY_RABBIT_CONCURRENCY: ${TELEMETRY_RABBIT_CONCURRENCY:-20}
+  ATTACKLENS_RABBIT_CONCURRENCY: ${ATTACKLENS_RABBIT_CONCURRENCY:-20}
   ANTHROPIC_API_KEY:     ${ANTHROPIC_API_KEY:-}
+  LANGGRAPH_INVESTIGATIONS_ENABLED: ${LANGGRAPH_INVESTIGATIONS_ENABLED:-true}
+  LANGGRAPH_AUTO_INVESTIGATE:       ${LANGGRAPH_AUTO_INVESTIGATE:-true}
+  LANGGRAPH_AUTO_SEVERITIES:        ${LANGGRAPH_AUTO_SEVERITIES:-critical,high}
+  LANGGRAPH_MAX_REVIEW_ROUNDS:      ${LANGGRAPH_MAX_REVIEW_ROUNDS:-2}
   SMTP_HOST:             ${SMTP_HOST:-}
   SMTP_PORT:             ${SMTP_PORT:-587}
   SMTP_USER:             ${SMTP_USER:-}
@@ -104,7 +108,7 @@ services:
 
   # ── RabbitMQ (message queue) ───────────────────────────────────────────────
   rabbitmq:
-    image: rabbitmq:3.12-management-alpine
+    image: rabbitmq:3.13-management-alpine
     restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
@@ -114,7 +118,7 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     ports:
-      - "15672:15672"    # management UI (internal only — don't expose externally)
+      - "127.0.0.1:15672:15672"  # management UI reachable only from the host
     healthcheck:
       test: rabbitmq-diagnostics -q ping
       interval: 10s
@@ -129,6 +133,8 @@ services:
     container_name: attacklens-manager-1
     environment:
       <<: *manager-env
+      MANAGER_ROLES: "api,telemetry"
+      LOG_FILE:    /logs/manager-1.log
       BIND_HOST:   "0.0.0.0"
       BIND_PORT:   "8443"
       TLS_CERT:    /certs/server.crt
@@ -142,12 +148,45 @@ services:
     container_name: attacklens-manager-2
     environment:
       <<: *manager-env
+      MANAGER_ROLES: "api,telemetry"
+      LOG_FILE:    /logs/manager-2.log
       BIND_HOST:   "0.0.0.0"
       BIND_PORT:   "8443"
       TLS_CERT:    /certs/server.crt
       TLS_KEY:     /certs/server.key
     expose:
       - "8443"
+
+  # Detection processes many endpoints concurrently while serializing each
+  # endpoint's events, preserving the temporal windows used by rich detectors.
+  manager-detection-1:
+    <<: *manager-base
+    container_name: attacklens-manager-detection-1
+    environment:
+      <<: *manager-env
+      MANAGER_ROLES: "detection"
+      LOG_FILE: /logs/manager-detection-1.log
+
+  # Singleton ownership avoids duplicate retry, cleanup, and scheduled jobs.
+  manager-maintenance:
+    <<: *manager-base
+    container_name: attacklens-manager-maintenance
+    environment:
+      <<: *manager-env
+      MANAGER_ROLES: "maintenance"
+      LOG_FILE: /logs/manager-maintenance.log
+
+  manager-intel:
+    <<: *manager-base
+    container_name: attacklens-manager-intel
+    environment:
+      <<: *manager-env
+      MANAGER_ROLES: "intel"
+      LOG_FILE: /logs/manager-intel.log
+    # Only the intel role receives outbound Internet access for feed sync.
+    networks:
+      - internal
+      - external
 
   # ── Nginx load balancer (TLS termination + routing) ───────────────────────
   nginx:

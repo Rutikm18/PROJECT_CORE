@@ -2,7 +2,7 @@
 
 **Module:** `agent/os/macos/` &nbsp;·&nbsp; **Target:** macOS 12+ (Apple Silicon / ARM64, x86_64 compatible)
 **Status legend:** ✅ implemented & active · 🟡 implemented but not wired/active · 🔴 gap / to build
-**Last updated:** 2026-07-23
+**Last updated:** 2026-08-01
 
 > **Why this file exists.** Each OS needs a *different* agent — macOS uses `launchd`,
 > Windows uses the SCM (`service.py`), Linux uses `systemd`. The collectors, persistence
@@ -35,7 +35,7 @@
 
 ## 0a. Telemetry collection coverage (what the agent observes)
 
-The agent ships **23 collection sections** plus the synthetic **Agent Health** heartbeat. Each
+The agent ships **24 collection sections** plus the synthetic **Agent Health** heartbeat. Each
 section is an independent collector in the macOS registry (`collectors/__init__.py`), scheduled
 on its own cadence by the `Orchestrator`, guarded by a per-section circuit breaker + wall-clock
 budget (§3, §4), normalised to a canonical schema (`normalizer.py`), then encrypted and shipped.
@@ -63,11 +63,12 @@ Intervals below are the fresh-install defaults (`installer/generate_config.sh`) 
 | **Security** | SIP, Gatekeeper, FileVault, Firewall, XProtect, remote login/sharing, screensaver lock … (drives 23 CIS checks — §6) | `posture.py` `SecurityCollector` | 3600 s |
 | **Sysctl** | security-relevant kernel params (`kern.*`, `net.inet.*`, `security.*`) | `posture.py` `SysctlCollector` | 3600 s |
 | **Configs** | shell rc, `~/.ssh/config`, `authorized_keys`, `/etc/hosts`, `sshd_config`, `sudoers` (4 KiB cap) | `posture.py` `ConfigsCollector` | 3600 s |
+| **Developer Security** | privacy-safe developer/AI attack surface: VS Code/Cursor extensions, MCP servers, Node/Python/Homebrew, AI apps/CLIs, shell startup, launchd/cron, relevant processes, listeners, browser/native messaging, Git/hooks, credential-location metadata, Docker posture | `developer_security.py` `DeveloperSecurityCollector` | 3600 s |
 | **SBOM** | software bill of materials — components / dependencies for supply-chain risk | `inventory.py` `SbomCollector` | 3600 s |
 | **Apps** | installed applications inventory | `inventory.py` `AppsCollector` | 3600 s |
 | **Packages** | package-manager inventory (brew / pip / gem / npm / cargo …) | `inventory.py` `PackagesCollector` | 3600 s |
 | **Binaries** | Mach-O binary inventory with signing / trust verdict | `inventory.py` `BinariesCollector` | 3600 s |
-| **SCA** | CIS macOS Benchmark compliance scan (dedicated) | `sca.py` `ScaCollector` | 12 h *(in-code default only — see note)* |
+| **SCA** | CIS macOS Benchmark compliance scan (dedicated) | `sca.py` `ScaCollector` | 12 h |
 
 > Resilience per section: a hung/erroring collector is converted to a circuit-breaker failure
 > (skipped + probed on cooldown) and **never** overwrites the last good snapshot with an error
@@ -75,18 +76,14 @@ Intervals below are the fresh-install defaults (`installer/generate_config.sh`) 
 > timing the whole section out (§3, `collectors/base.py`). Missing privileged fields score
 > **unknown**, never a false FAIL (§6).
 
-> ⚠️ **Config divergence (flag for reconciliation).** The two schedule sources disagree, so the
-> effective cadence depends on which config a host runs:
+> **Schedule note.** The two schedule sources use different cadences for some high-volume
+> sections, so the effective cadence depends on which config a host runs:
 > - the in-code fallback `agent/agent/core.py::_DEFAULT_SECTIONS` (used only when the config has
 >   no `[collection.sections]`) — includes **sca @ 12 h**, runs metrics/connections/processes at
 >   **60 s**, apps/packages/sbom at **24 h**, and has **binaries disabled**;
-> - the fresh-install `installer/generate_config.sh` (what a pkg install actually runs) — **omits
->   `sca`**, runs metrics/connections/processes at **10 s**, and apps/packages/binaries/sbom at
+> - the fresh-install `installer/generate_config.sh` (what a pkg install actually runs) — includes
+>   **sca @ 12 h**, runs metrics/connections/processes at **10 s**, and apps/packages/binaries/sbom at
 >   **1 h** with binaries **enabled**.
->
-> Net: a default pkg install currently does **not** schedule the SCA compliance scan (the CIS
-> data still comes from the `security`/`sysctl`/`configs` sections — §6). Reconciling the two so
-> they agree (and adding `sca` to the generated config) is an open item.
 
 ---
 
@@ -206,8 +203,10 @@ even across manager outages, network drops, or reboots.
   `…/api/v1/ingest`.
 - **Disk spool** (`/Library/AttackLens/spool/unsent.ndjson`, append-only NDJSON):
   - On any send failure the envelope is written to disk, not dropped.
-  - **Replayed on startup** (`Sender.start()` drains the spool from the previous run) → survives reboot.
-  - **Auto-drained** back into the queue the moment the manager is reachable again.
+  - **Durable replay on startup/reconnect:** the sender leases the oldest record directly
+    from a rotated replay file and advances an inode-bound, fsynced cursor only after a manager
+    2xx ACK. A crash before the ACK causes an idempotent resend, not loss; a large spool is not
+    loaded into RAM or drained into a potentially full queue.
   - 50 MB cap; on overflow drops the **oldest** 10 % (newest data preferred) and logs it.
   - **Disk-full safe (2026-07-23):** `DiskSpool.write` never raises — ENOSPC / read-only FS /
     non-serialisable envelope are counted as dropped (not silently lost) and an ENOSPC write
@@ -216,7 +215,8 @@ even across manager outages, network drops, or reboots.
 - **Exponential backoff + jitter** (`retry_delay` × 2ⁿ, capped 60 s) on transient errors.
 - **HTTP status awareness:** `200` ok · `401` → spool + re-enroll after 3 strikes ·
   `429` honoured as transient · `503` (manager couldn't persist) → spool · other `4xx` → dropped
-  as unrecoverable (a bad payload is not retried forever).
+  as unrecoverable (a bad payload is not retried forever). Accepted, rejected, replay-ACKed,
+  corrupt/trimmed, and auth-rotation-discard counts are surfaced in `agent_health`.
 - **TLS 1.3 minimum** when manager URL is `https://`; plain `http://` supported for local dev
   (warns).
 
@@ -242,11 +242,11 @@ obviously isn't; resume the instant it returns.
   `manager/server.py:360`).
 - While offline, the loop **skips the full 3× retry cycle** and spools directly, re-probing
   every 30 s.
-- On a successful probe the spool is drained and normal sending resumes; `"Manager connection
-  restored"` is logged on the first 200 after an outage.
+- On a successful probe durable oldest-first spool replay resumes; `"Manager connection
+  restored"` is logged on the first 2xx after an outage.
 - **Wake-from-sleep resume (2026-07-23):** the drain loop measures `time.monotonic()` between
   its ~1 s iterations; a jump past `_WAKE_GAP_SEC` (30 s) means the Mac slept/hibernated, so
-  cached sockets are dead — it forces an immediate reprobe + spool drain rather than waiting
+  cached sockets are dead — it forces an immediate reprobe + spool replay rather than waiting
   out the offline backoff (up to 30 s).
 
 **Dashboard surfacing (2026-06-08):** `Sender.link_state()` snapshots manager connectivity
@@ -260,6 +260,13 @@ seconds-since-contact, offline spool size, and auth-failure count; rebuilt into
 Tests: `agent/tests/unit/test_link_state.py`, `manager/tests/unit/test_link_status_api.py`.
 
 **Status:** active — link state probed, heartbeated, and exposed to the dashboard.
+
+**Developer-security transport bounds (2026-08-01):** user-scoped package/editor/Git commands
+run with the target user's UID/GID when the installed LaunchDaemon is root, preventing
+root-owned cache files and wrong-HOME inventory. The raw snapshot has a deterministic 6 MiB
+ceiling with explicit truncation paths, while manager ingest enforces a 10 MiB streaming body
+limit and a 64 MiB post-decompression ceiling. Timeout/budget/permission/parse failures mark
+the snapshot `collection.partial=true` with structured issues instead of appearing healthy.
 
 ---
 
@@ -503,8 +510,8 @@ state machine, downtime math).
 ## 11. Single-instance guard  ✅
 
 **Requirement:** exactly one agent process delivers telemetry — two would race on the shared
-`unsent.ndjson` spool (duplicate sends, and `DiskSpool.drain()`'s read-then-remove corrupts
-across processes).
+`unsent.ndjson` spool (duplicate sends and conflicting replay-cursor/append ownership across
+processes).
 
 **Mechanism (`agent/single_instance.py`, 2026-07-23):** `core.main` acquires an exclusive
 advisory lock (`fcntl.flock`) on `attacklens-agent.lock`. A 5 s wait covers the normal

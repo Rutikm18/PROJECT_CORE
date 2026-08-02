@@ -46,14 +46,13 @@ from .workers.telemetry   import TelemetryWorker
 from .workers.attacklens  import AttackLensWorker
 from .workers.dlq_replayer import DLQReplayer
 from .workers.reconciler   import PayloadReconciler
-from .chunk_tracker       import ChunkTracker
 from .workers.intel       import ThreatIntelWorker
 from .workers.enrichment  import EnrichmentWorker
-from .workers.consumer    import TelemetryConsumer
 from .threat.nvd_sync     import NVDSyncWorker
 from .ai_analyst          import AIAnalyst
 from .notifications.email import EmailNotifier
 from .notifications.dispatcher import FindingNotificationDispatcher
+from .ai.investigation_graph import InvestigationService
 from .api.remediation     import router as remediation_router
 from .intel               import IntelPipeline
 from .api.intel              import router as intel_router
@@ -64,6 +63,24 @@ from .api.integrations       import router as integrations_router
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
+
+_MANAGER_ROLES = frozenset({"api", "telemetry", "detection", "maintenance", "intel"})
+
+
+def _parse_manager_roles(raw: str | None) -> frozenset[str]:
+    """Validate the independently scalable responsibilities for this process."""
+    if raw is None or not raw.strip():
+        return _MANAGER_ROLES
+    roles = frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+    unknown = sorted(roles - _MANAGER_ROLES)
+    if unknown:
+        raise ValueError(
+            "Unknown MANAGER_ROLES value(s): " + ", ".join(unknown)
+            + "; allowed: " + ", ".join(sorted(_MANAGER_ROLES))
+        )
+    if not roles:
+        raise ValueError("MANAGER_ROLES must contain at least one role")
+    return roles
 
 
 def setup_logging(
@@ -93,13 +110,14 @@ def create_app() -> FastAPI:
     # API_KEY is now optional — used only for WebSocket token auth.
     # Per-agent keys are stored in the agent_keys SQLite table after enrollment.
     api_key = os.environ.get("API_KEY", "")
+    roles = _parse_manager_roles(os.environ.get("MANAGER_ROLES"))
 
     data_dir = os.environ.get("DATA_DIR", os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "data"
     ))
     os.makedirs(data_dir, exist_ok=True)
-    # TelemetryStore (raw telemetry NDJSON+gzip files) stays on local disk
-    # under DATA_DIR — only manager.db/intel.db moved to Postgres.
+    # PostgreSQL is the authoritative raw-event store. TelemetryStore is an
+    # optional local archive and must be disabled when replicas share DATA_DIR.
     #
     # DATABASE_URL is the base connection string (no database name) shared by
     # both logical databases — matches docker-compose.postgres.yml, which
@@ -124,15 +142,24 @@ def create_app() -> FastAPI:
     store    = TelemetryStore(data_dir)
     hub      = WebSocketHub()
     intel_db = IntelDB(intel_path)
-    engine   = AttackLensEngine(db, intel_db)
+    engine   = AttackLensEngine(db, intel_db, central_intel_url=threat_intel_url)
+    investigations_enabled = os.environ.get(
+        "LANGGRAPH_INVESTIGATIONS_ENABLED", "true"
+    ).lower() not in ("false", "0", "no", "off")
+    investigation_service = InvestigationService(
+        intel_db,
+        engine.feeds,
+        dsn=intel_path,
+        max_review_rounds=int(os.environ.get("LANGGRAPH_MAX_REVIEW_ROUNDS", "2")),
+    )
     producer = None
+    producer_roles = roles & {"api", "telemetry", "maintenance"}
     if rabbitmq_url:
         try:
             from .queue.producer import QueueProducer as _QP
             producer = _QP(rabbitmq_url)
         except ImportError:
             log.warning("aio_pika not installed — RabbitMQ queue disabled (set RABBITMQ_URL only if aio_pika is installed)")
-    chunk_tracker = ChunkTracker()
 
     # Per-agent rate limiter: 10 req/s sustained, burst 30, max 4 concurrent per agent.
     # Override via env: AGENT_RATE=20 AGENT_BURST=60 AGENT_SLOTS=8
@@ -145,9 +172,11 @@ def create_app() -> FastAPI:
     _al_worker:       AttackLensWorker | None = None
     _intel_worker:    ThreatIntelWorker | None = None
     _enrich_worker:   EnrichmentWorker | None = None
-    _tel_consumer:    TelemetryConsumer | None = None
     _nvd_sync:        NVDSyncWorker | None = None
     _intel_pipeline:  IntelPipeline | None = None
+    _dlq_replayer:    DLQReplayer | None = None
+    _reconciler:      PayloadReconciler | None = None
+    _service_tasks:   list[asyncio.Task] = []
 
     # ── App ───────────────────────────────────────────────────────────────────
     from .version import get_version_info
@@ -242,9 +271,13 @@ def create_app() -> FastAPI:
                 cutoff = int(time.time()) - retention_days * 86400
                 n_payloads = await db.prune_payloads(cutoff)
                 n_sessions = await db.prune_agent_sessions(cutoff)
-                if n_payloads or n_sessions:
-                    log.info("Retention prune (>%dd, action=%s): payloads=%d agent_sessions=%d",
-                             retention_days, action, n_payloads, n_sessions)
+                n_events = await db.prune_ledger(cutoff)
+                if n_payloads or n_sessions or n_events:
+                    log.info(
+                        "Retention prune (>%dd, action=%s): payloads=%d "
+                        "agent_sessions=%d processed_detection_events=%d",
+                        retention_days, action, n_payloads, n_sessions, n_events,
+                    )
             except Exception as exc:
                 log.warning("Payload/session retention prune error: %s", exc)
             try:
@@ -259,14 +292,6 @@ def create_app() -> FastAPI:
                     log.info("intel.db retention prune (>%dd): %s", retention_days, idb_deleted)
             except Exception as exc:
                 log.warning("intel.db retention prune error: %s", exc)
-
-    async def _expire_chunks():
-        """Periodic chunk-tracker expiry — prevents unbounded memory growth."""
-        while True:
-            await asyncio.sleep(300)
-            n = await chunk_tracker.expire_old()
-            if n:
-                log.warning("Chunk tracker expired %d stale chunk set(s)", n)
 
     async def _dev_bootstrap_agent_key():
         """
@@ -291,57 +316,80 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        nonlocal _tel_worker, _al_worker, _intel_worker, _enrich_worker, _tel_consumer, _nvd_sync, _intel_pipeline
+        nonlocal _tel_worker, _al_worker, _intel_worker, _enrich_worker
+        nonlocal _nvd_sync, _intel_pipeline, _dlq_replayer, _reconciler
         setup_logging(
             logfile=os.environ.get("LOG_FILE", "manager/logs/manager.log"),
             level=os.environ.get("LOG_LEVEL", "INFO"),
         )
-        await db.init()  # initialises the SQLitePool (readers=4)
+        await db.init()
         await _dev_bootstrap_agent_key()
         await store.init()
         await intel_db.init()
-        await engine.start()
-        asyncio.create_task(_cleanup_store())
-        asyncio.create_task(_expire_chunks())
+        if "detection" in roles:
+            await engine.start()
+        if investigations_enabled and roles & {"api", "detection"}:
+            await investigation_service.start()
+        if "maintenance" in roles:
+            _service_tasks.append(asyncio.create_task(
+                _cleanup_store(), name="manager:retention",
+            ))
 
-        if producer is not None:
+        if producer is not None and producer_roles:
             await producer.start()
+
+        if producer is not None and "telemetry" in roles:
             _tel_worker = TelemetryWorker(rabbitmq_url, db, store, hub, producer)
-            _al_worker  = AttackLensWorker(rabbitmq_url, engine, chunk_tracker)
-            asyncio.create_task(_tel_worker.run())
-            asyncio.create_task(_al_worker.run())
-            _tel_consumer = TelemetryConsumer(rabbitmq_url, db, store, hub, producer, engine)
-            asyncio.create_task(_tel_consumer.run())
+            _service_tasks.append(asyncio.create_task(
+                _tel_worker.run(), name="manager:telemetry",
+            ))
+
+        if producer is not None and "detection" in roles:
+            _al_worker = AttackLensWorker(rabbitmq_url, engine)
+            _service_tasks.append(asyncio.create_task(
+                _al_worker.run(), name="manager:detection",
+            ))
+
+        if producer is not None and "maintenance" in roles:
             # DLQ replayer: drains mac_intel.dead (previously unconsumed → a
             # silent black hole for any nack'd telemetry/detection work) and
             # replays to the origin queue with backoff, parking poison messages.
             _dlq_replayer = DLQReplayer(rabbitmq_url)
             app.state.dlq_replayer = _dlq_replayer
-            asyncio.create_task(_dlq_replayer.run())
+            _service_tasks.append(asyncio.create_task(
+                _dlq_replayer.run(), name="manager:dlq-replayer",
+            ))
             # Payload reconciler: replays any payload that was stored but never
             # detected (lost hand-off past the DLQ) — the catch-all that makes
-            # "raw is reprocessable" true. Reads the payload_ledger.
+            # "raw is reprocessable" true. Reads the event-level detection outbox.
             _reconciler = PayloadReconciler(db, store, producer)
             app.state.reconciler = _reconciler
-            asyncio.create_task(_reconciler.run())
-            log.info("RabbitMQ: producer + workers + consumer + DLQ replayer + reconciler started (url=%s)", rabbitmq_url)
+            _service_tasks.append(asyncio.create_task(
+                _reconciler.run(), name="manager:reconciler",
+            ))
+        if producer is None:
+            log.info("RabbitMQ: not configured — synchronous detection is available on detection-role instances")
         else:
-            log.info("RabbitMQ: not configured — sync pipeline active")
+            log.info("RabbitMQ components started for roles=%s", ",".join(sorted(roles)))
 
-        if embedded_threat_intel:
+        # API instances initialise the pipeline for on-demand intel endpoints;
+        # only the intel role owns continuous feed/NVD schedules.
+        if embedded_threat_intel and roles & {"api", "intel"}:
             github_token = os.environ.get("GITHUB_TOKEN", "").strip()
             _intel_pipeline = IntelPipeline(engine.feeds, engine.nvd, github_token=github_token)
             await _intel_pipeline.start()
             app.state.intel_pipeline = _intel_pipeline
 
-            _intel_worker = ThreatIntelWorker(
-                intel_db, db, engine.feeds, engine.nvd,
-                intel_pipeline=_intel_pipeline,
-            )
-            await _intel_worker.start()
+            if "intel" in roles:
+                _intel_worker = ThreatIntelWorker(
+                    intel_db, db, engine.feeds, engine.nvd,
+                    intel_pipeline=_intel_pipeline,
+                )
+                await _intel_worker.start()
         else:
             app.state.intel_pipeline = None
-            log.info("Threat intel: central mode enabled (url=%s)", threat_intel_url or "not set")
+            if not embedded_threat_intel:
+                log.info("Threat intel: central mode enabled (url=%s)", threat_intel_url or "not set")
 
         # Shared state for route dependencies
         app.state.intel_db          = intel_db
@@ -352,36 +400,52 @@ def create_app() -> FastAPI:
         ai_analyst     = AIAnalyst(intel_db, engine.feeds)
         email_notifier = EmailNotifier()
         finding_notifications = FindingNotificationDispatcher(intel_db, email_notifier)
-        intel_db.set_finding_notification_handler(finding_notifications.handle_finding_event)
+
+        async def _handle_finding_event(finding: dict, event: str) -> None:
+            handlers = [finding_notifications.handle_finding_event(finding, event)]
+            if investigations_enabled:
+                handlers.append(investigation_service.handle_finding_event(finding, event))
+            results = await asyncio.gather(*handlers, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    log.warning("post-finding handler failed: %s", result)
+
+        intel_db.set_finding_notification_handler(_handle_finding_event)
         # Make the AI analyst available to the AttackLens precision validator
         # (the engine looks for this on its own attribute to call validate_with_ai).
         engine.attach_ai_analyst(ai_analyst)
         app.state.ai_analyst    = ai_analyst
         app.state.email_notifier = email_notifier
         app.state.finding_notification_dispatcher = finding_notifications
+        app.state.investigation_service = investigation_service
         log.info("AI Analyst enabled=%s  Email enabled=%s",
                  ai_analyst.enabled, email_notifier.enabled)
 
-        _enrich_worker = EnrichmentWorker(intel_db, rabbitmq_url or None)
-        await _enrich_worker.start()
+        if roles & {"api", "intel"}:
+            _enrich_worker = EnrichmentWorker(intel_db, rabbitmq_url or None)
+            await _enrich_worker.start(periodic="intel" in roles)
 
-        _nvd_sync = NVDSyncWorker(intel_db)
-        await _nvd_sync.start()
+        if embedded_threat_intel and "intel" in roles:
+            _nvd_sync = NVDSyncWorker(intel_db)
+            await _nvd_sync.start()
 
-        log.info("Manager started. DB=%s  Intel=%s  Data=%s",
-                 _redact_dsn(db_path), _redact_dsn(intel_path), data_dir)
+        log.info("Manager started. roles=%s DB=%s Intel=%s Data=%s archive=%s",
+                 ",".join(sorted(roles)), _redact_dsn(db_path),
+                 _redact_dsn(intel_path), data_dir, store.enabled)
         log.info("Enrollment mode: %s",
                  "OPEN (no token required)" if open_enrollment else
                  f"TOKEN ({len(enrollment_tokens)} token(s) configured)")
 
     @app.on_event("shutdown")
     async def shutdown():
+        if _reconciler:
+            await _reconciler.stop()
+        if _dlq_replayer:
+            await _dlq_replayer.stop()
         if _nvd_sync:
             await _nvd_sync.stop()
         if _enrich_worker:
             await _enrich_worker.stop()
-        if _tel_consumer:
-            await _tel_consumer.stop()
         if _intel_worker:
             await _intel_worker.stop()
         if _intel_pipeline:
@@ -390,7 +454,19 @@ def create_app() -> FastAPI:
             await _tel_worker.stop()
         if _al_worker:
             await _al_worker.stop()
-        if producer is not None:
+        # Do not close the engine or databases while consumer/reconciler tasks
+        # can still be using them. Cancellation leaves unacked RabbitMQ messages
+        # eligible for durable redelivery.
+        for task in _service_tasks:
+            task.cancel()
+        if _service_tasks:
+            await asyncio.gather(*_service_tasks, return_exceptions=True)
+            _service_tasks.clear()
+        if "detection" in roles:
+            await engine.stop()
+        if investigations_enabled and roles & {"api", "detection"}:
+            await investigation_service.stop()
+        if producer is not None and producer_roles:
             await producer.stop()
         await store.close()
         await intel_db.close()   # closes the SQLitePool
@@ -413,6 +489,7 @@ def create_app() -> FastAPI:
     from .api.allowlist              import make_allowlist_router
     from .api.custom_correlations   import make_custom_correlations_router
     from .api.cases                 import make_cases_router
+    from .api.investigations        import make_investigations_router
 
     enrollment_tokens = os.environ.get("ENROLLMENT_TOKENS", "").split(",")
     enrollment_tokens = [t.strip() for t in enrollment_tokens if t.strip()]
@@ -426,7 +503,7 @@ def create_app() -> FastAPI:
     admin_token = os.environ.get("ADMIN_TOKEN", "").strip()
 
     ingest_router    = make_ingest_router(
-        db, store, hub, nonce_cache, engine,
+        db, store, hub, nonce_cache, engine if "detection" in roles else None,
         producer=producer,
         rate_limiter=rate_limiter,
     )
@@ -446,6 +523,7 @@ def create_app() -> FastAPI:
     allowlist_router          = make_allowlist_router(intel_db)
     custom_correlations_router = make_custom_correlations_router(intel_db)
     cases_router               = make_cases_router(intel_db)
+    investigations_router      = make_investigations_router(investigation_service)
 
     app.include_router(ingest_router,       prefix="/api/v1")
     app.include_router(agents_router,       prefix="/api/v1/agents")
@@ -463,6 +541,7 @@ def create_app() -> FastAPI:
     app.include_router(allowlist_router,          prefix="/api/v1/allowlist")
     app.include_router(custom_correlations_router, prefix="/api/v1/custom-correlations")
     app.include_router(cases_router,               prefix="/api/v1/cases")
+    app.include_router(investigations_router,      prefix="/api/v1/ai")
     app.include_router(intel_router)              # prefix=/api/v1/intel defined inline
     app.include_router(finding_validation_router) # prefix=/api/v1/findings (POST /{id}/validate etc.)
     app.include_router(remediation_router)        # prefixes defined inline (actors, news, overview)
@@ -487,7 +566,7 @@ def create_app() -> FastAPI:
         except Exception:
             ok = False
         try:
-            idx_stats = await store.index.stats()
+            idx_stats = await store.index.stats() if store.enabled else {"enabled": False}
         except Exception:
             idx_stats = {}
         try:
@@ -501,6 +580,8 @@ def create_app() -> FastAPI:
             "db":      "ok" if ok else "error",
             "store":   idx_stats,
             "intel":   intel_stats,
+            "roles":   sorted(roles),
+            "archive_enabled": store.enabled,
         }
 
     # ── Build / version metadata (public — surfaced on the dashboard) ─────────

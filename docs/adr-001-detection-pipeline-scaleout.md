@@ -1,12 +1,11 @@
 # ADR-001 — Detection pipeline scale-out (Phase 3)
 
-**Status:** Accepted, not yet implemented (deferred until scale triggers are hit).
-**Date:** 2026-06-26.
-**Context:** Phases 1–2 (reliability) are shipped. Phase 3 is horizontal scale-out
-— deliberately designed-but-not-built, because the current load (1 agent → 1
-detection worker) does not justify the added topology/infra complexity. Building
-it now would be premature optimization. This ADR specifies it completely so it
-is execution-ready when the triggers below fire.
+**Status:** Reliability and role isolation implemented; partitioned horizontal
+detection remains gated on scale triggers.
+**Date:** 2026-08-02.
+**Context:** The pipeline now accepts many endpoint agents concurrently without
+splitting one endpoint's temporal detector state. Cross-process horizontal
+detection still requires sticky partitioning and remains execution-ready below.
 
 ---
 
@@ -14,14 +13,29 @@ is execution-ready when the triggers below fire.
 
 - **P1** — workers nack on critical-step failure (no more silent detection
   loss); DLQ replayer drains `mac_intel.dead` with backoff + poison parking;
-  correlation fires on *every* event via per-agent coalescing (was every 3rd).
-- **P2** — `payload_ledger` outbox: each stored payload is `received`, marked
-  `processed` after detection; the `PayloadReconciler` replays any
-  stored-but-undetected payload; ledger lag is exposed on `/ingest/health`.
+  correlation fires on *every* event (was every 3rd).
+- **P2** — exact `detection_events` outbox keyed by authenticated event ID,
+  durable `detection_event_chunks`, and verbatim reconciliation. Completion is
+  split into `processed_at` and `correlated_at`: an event stays replayable until
+  every chunk, finding write, and required correlation write succeeds. Ledger
+  lag is exposed on `/ingest/health`.
+- **P2.5** — explicit `api`, `telemetry`, `detection`, `maintenance`, and `intel`
+  roles. API/telemetry collectors can be replicated; singleton maintenance and
+  intel schedules are no longer duplicated. PostgreSQL is the HA raw source;
+  the shared gzip/SQLite archive is disabled.
+- **P2.6** — the telemetry and detection consumers process different agents
+  concurrently, bounded by broker prefetch, while an agent-keyed lock preserves
+  each endpoint's temporal order within the detection process.
+- **P2.7** — detector entity/baseline updates are buffered per event and flushed
+  only after findings persist, preventing a failed write from advancing state
+  and suppressing its own retry. Worker tasks are cancelled/drained before DB
+  shutdown, and legacy/rich source shapes supported by detectors are enforced in
+  the shared schema (`sysctl`, configs, and rich ARP wrappers).
 
-Net: at-least-once, self-healing, real-time-correlated detection on a **single**
-ordered worker. Phase 3 is only about making that scale to many workers/agents
-without losing ordering or correctness.
+Net: at-least-once, self-healing, real-time-correlated detection with bounded
+parallelism across agents and serialized processing per agent. Phase 3 is only
+about scaling the stateful detection role across processes without losing that
+affinity.
 
 ## Adoption triggers (do NOT build before the relevant one fires)
 
@@ -39,11 +53,11 @@ dependency and N shard queues for zero benefit.
 
 ## 3A — Partitioned, ordered worker scale-out
 
-**Problem.** Today `attacklens.work` is a direct queue with one consumer. Adding
-consumers (`prefetch>1`, N workers) makes a single agent's chunks process
-concurrently and out of order — clustering tolerates it via time windows, but
-the ChunkTracker correlation-on-completion can race, and ordering guarantees are
-lost.
+**Problem.** Today `attacklens.work` has one detection-role consumer with
+agent-keyed in-process serialization. Adding detection processes distributes a
+single agent across separate module-level temporal caches. Durable chunk
+completion remains correct, but rate/beacon/churn windows could miss part of a
+sequence.
 
 **Design.** Route detection work by a consistent hash of `agent_id` so all of an
 agent's events land on the same worker, in order. This is exactly how
@@ -55,7 +69,8 @@ Datadog/Crowdstrike shard telemetry.
 - New exchange `mac_intel.detect.hash` (type `x-consistent-hash`). Declare N
   shard queues `attacklens.work.{0..N-1}`, each bound with an integer weight
   routing key. Publish with `routing_key = agent_id` (the plugin hashes it).
-- Each worker consumes exactly one shard queue → an agent is sticky to a shard.
+- Each worker consumes exactly one shard queue → an agent is sticky to a shard;
+  its in-process agent lock still prevents concurrent events within that shard.
 - **Opt-in & reversible:** gate behind `ATTACKLENS_PARTITIONED_DETECTION`
   (default off). Off → today's single direct queue (zero change). The DLQ
   replayer routes back via `x-death` regardless.
@@ -101,8 +116,9 @@ window; `_run_correlations` reads it when gated on), a new
 
 ## 3C — Kafka/Redpanda hot path + HA datastores
 
-**Problem.** Single RabbitMQ + single Postgres are SPOFs and a throughput
-ceiling. RabbitMQ is excellent for work queues but not for replayable,
+**Problem.** A one-node RabbitMQ and one-node Postgres deployment are SPOFs and
+a throughput ceiling. Quorum queues only become replicated when the RabbitMQ
+cluster has multiple nodes. RabbitMQ is excellent for work queues but not for replayable,
 partitioned, high-throughput event logs at scale.
 
 **Design (Kappa architecture).**

@@ -36,5 +36,10 @@ async def test_local_nvd_search_excludes_rejected_records(pg_intel_dsn):
 
         multi_word = await db.search_nvd_local("apache httpd", limit=10)
         assert [row["cve_id"] for row in multi_word] == ["CVE-2026-3333"]
+
+        assert (await db.get_nvd_local_by_id("CVE-2026-1111"))["severity"] == "critical"
+        assert await db.get_nvd_local_by_id("CVE-2026-2222") is None
+        listed = await db.list_nvd_local(severity="critical", limit=10)
+        assert {row["cve_id"] for row in listed} == {"CVE-2026-1111", "CVE-2026-3333"}
     finally:
         await db.close()

@@ -143,6 +143,9 @@ services:
       LOG_LEVEL:               "${LOG_LEVEL:-info}"
       LOG_FILE:                "/app/logs/manager.log"
       DATA_DIR:                "/app/data"
+      # Single-process default; deploy/docker-compose.ha.yml splits these roles.
+      MANAGER_ROLES:           "${MANAGER_ROLES:-api,telemetry,detection,maintenance,intel}"
+      TELEMETRY_ARCHIVE_ENABLED: "${TELEMETRY_ARCHIVE_ENABLED:-true}"
       CORS_ORIGINS:            "${CORS_ORIGINS:-*}"
       HTTPS_ONLY:              "${HTTPS_ONLY:-true}"
 
@@ -171,15 +174,19 @@ services:
       # ── AttackLens precision validation ─────────────────────────────────────
       # Master switch for the cluster→signal validation pipeline (correlation +
       # confidence scoring) before a finding is promoted to is_active=1.
-      ATTACKLENS_VALIDATION:            "${ATTACKLENS_VALIDATION:-true}"
+      ATTACKLENS_VALIDATION:            "${ATTACKLENS_VALIDATION:-false}"
       # LLM precision verdict on top of the deterministic gates.
-      ATTACKLENS_AI_VALIDATION:         "${ATTACKLENS_AI_VALIDATION:-true}"
+      ATTACKLENS_AI_VALIDATION:         "${ATTACKLENS_AI_VALIDATION:-false}"
       ATTACKLENS_AI_PRECISION_THRESHOLD: "${ATTACKLENS_AI_PRECISION_THRESHOLD:-0.90}"
 
       # ── AI analyst (Claude API) ─────────────────────────────────────────────
       ANTHROPIC_API_KEY:       "${ANTHROPIC_API_KEY:-}"
       AI_ANALYST_MODEL:        "${AI_ANALYST_MODEL:-claude-sonnet-4-6}"
       AI_ANALYST_ENABLED:      "${AI_ANALYST_ENABLED:-true}"
+      LANGGRAPH_INVESTIGATIONS_ENABLED: "${LANGGRAPH_INVESTIGATIONS_ENABLED:-true}"
+      LANGGRAPH_AUTO_INVESTIGATE:       "${LANGGRAPH_AUTO_INVESTIGATE:-true}"
+      LANGGRAPH_AUTO_SEVERITIES:        "${LANGGRAPH_AUTO_SEVERITIES:-critical,high}"
+      LANGGRAPH_MAX_REVIEW_ROUNDS:      "${LANGGRAPH_MAX_REVIEW_ROUNDS:-2}"
 
       # ── Email notifications ─────────────────────────────────────────────────
       SMTP_HOST:               "${SMTP_HOST:-}"
@@ -250,6 +257,8 @@ services:
       NVD_SYNC_INTERVAL_SECONDS:    "${NVD_SYNC_INTERVAL_SECONDS:-7200}"
       NVD_SYNC_HOURS:               "${NVD_SYNC_HOURS:-48}"
       NVD_SYNC_MAX_PAGES:           "${NVD_SYNC_MAX_PAGES:-3}"
+      NVD_MIRROR_ENABLED:           "${NVD_MIRROR_ENABLED:-true}"
+      NVD_API_KEY:                  "${NVD_API_KEY:-}"
       ABUSEIPDB_KEY:                "${ABUSEIPDB_KEY:-}"
       OTX_KEY:                      "${OTX_KEY:-}"
       GREYNOISE_KEY:                "${GREYNOISE_KEY:-}"

@@ -101,6 +101,23 @@ def test_nvd_parser_preserves_rejected_status():
     assert parsed["vuln_status"] == "Rejected"
 
 
+def test_nvd_parser_preserves_cpe_version_ranges():
+    page = _nvd_page()
+    page["vulnerabilities"][0]["cve"]["configurations"] = [{
+        "nodes": [{"cpeMatch": [{
+            "vulnerable": True,
+            "criteria": "cpe:2.3:a:acme:widget:*:*:*:*:*:*:*:*",
+            "versionStartIncluding": "2.0",
+            "versionEndExcluding": "3.0",
+        }]}],
+    }]
+
+    parsed = _parse_vuln(page["vulnerabilities"][0])
+
+    assert parsed is not None
+    assert '"versionEndExcluding": "3.0"' in parsed["cpe_matches"]
+
+
 class _HttpErrorResponse:
     status = 503
 

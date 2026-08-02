@@ -91,4 +91,49 @@ def test_trim_drops_oldest_keeps_newest_when_oversize(tmp_path, monkeypatch):
 
 def test_stats_start_at_zero(tmp_path):
     s = _spool(tmp_path)
-    assert s.stats() == {"dropped_trim": 0, "dropped_corrupt": 0}
+    assert s.stats() == {
+        "dropped_trim": 0, "dropped_corrupt": 0, "dropped_auth": 0,
+    }
+
+
+def test_peek_survives_crash_until_ack(tmp_path):
+    """A leased envelope stays durable until a manager acceptance is ACKed."""
+    s = _spool(tmp_path)
+    s.write({"seq": 1})
+    s.write({"seq": 2})
+
+    first, _token = s.peek()
+    assert first == {"seq": 1}
+
+    # Simulate a process crash: construct a fresh spool without acknowledging.
+    restarted = _spool(tmp_path)
+    replayed, token = restarted.peek()
+    assert replayed == {"seq": 1}
+    assert restarted.ack(token) is True
+
+    second, second_token = restarted.peek()
+    assert second == {"seq": 2}
+    assert restarted.ack(second_token) is True
+    assert restarted.peek() is None
+
+
+def test_writes_during_replay_follow_existing_backlog(tmp_path):
+    s = _spool(tmp_path)
+    s.write({"seq": 1})
+    first, first_token = s.peek()  # rotates the current spool to replay
+    s.write({"seq": 2})           # lands in a new main spool
+
+    assert first == {"seq": 1}
+    assert s.ack(first_token) is True
+    second, second_token = s.peek()
+    assert second == {"seq": 2}
+    assert s.ack(second_token) is True
+
+
+def test_auth_rotation_discard_is_counted(tmp_path):
+    s = _spool(tmp_path)
+    s.write({"seq": 1})
+    s.write({"seq": 2})
+    assert s.discard_for_auth_rotation() == 2
+    assert s.stats()["dropped_auth"] == 2
+    assert s.peek() is None

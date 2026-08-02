@@ -73,3 +73,10 @@ def test_unexpected_3xx_is_not_silently_treated_as_success(tmp_path):
     s = _make_sender(tmp_path)
     with patch("urllib.request.urlopen", return_value=_mock_response(301)):
         assert s._send_with_retry({"section": "metrics", "agent_id": "a"}) is False
+
+
+def test_413_is_unrecoverable_but_observable(tmp_path):
+    s = _make_sender(tmp_path)
+    with patch("urllib.request.urlopen", return_value=_mock_response(413)):
+        assert s._send_with_retry({"section": "developer_security", "agent_id": "a"}) is True
+    assert s.link_state()["delivery_rejected_4xx"] == 1

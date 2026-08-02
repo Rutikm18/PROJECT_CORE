@@ -22,9 +22,19 @@ from .sysctl_monitor        import analyze as analyze_sysctl_monitor
 from .scheduled_task        import analyze as analyze_scheduled_task
 from .user_account          import analyze as analyze_user_account
 from .mount_monitor         import analyze as analyze_mount_monitor
+from .developer_security    import analyze as analyze_developer_security
+from .battery_health        import analyze as analyze_battery_health
+from .sca_compliance        import analyze as analyze_sca_compliance
+from .agent_health          import analyze as analyze_agent_health
+from .hardware_integrity    import analyze as analyze_hardware_integrity
 
 __all__ = [
     "analyze_mount_monitor",
+    "analyze_developer_security",
+    "analyze_battery_health",
+    "analyze_sca_compliance",
+    "analyze_agent_health",
+    "analyze_hardware_integrity",
     "analyze_lateral_movement",
     "analyze_persistence",
     "analyze_exfiltration",

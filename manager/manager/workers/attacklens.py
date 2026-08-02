@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -33,11 +34,10 @@ from ..queue.schemas import QUEUE_ATTACKLENS
 
 if TYPE_CHECKING:
     from ..attacklens.engine    import AttackLensEngine
-    from ..chunk_tracker    import ChunkTracker
 
 log = logging.getLogger("manager.workers.attacklens")
 
-_PREFETCH   = 5
+_PREFETCH   = max(1, int(os.environ.get("ATTACKLENS_RABBIT_CONCURRENCY", "10")))
 _RETRY_BASE = 5
 _RETRY_MAX  = 60
 
@@ -52,12 +52,19 @@ class AttackLensWorker:
         self,
         rabbitmq_url: str,
         engine:       "AttackLensEngine",
-        tracker:      "ChunkTracker",
+        tracker=None,
     ) -> None:
         self._url     = rabbitmq_url
         self._engine  = engine
-        self._tracker = tracker
+        # `tracker` is accepted for rolling-upgrade compatibility only. Chunk
+        # completion is now durable in Postgres and shared by all replicas.
         self._running = True
+        # Temporal detector windows are process-local. Parallelize different
+        # endpoints, but serialize every event for the same endpoint so its
+        # sequence cannot be split or raced inside this worker.
+        self._agent_locks: dict[str, asyncio.Lock] = {}
+        self._tasks: set[asyncio.Task] = set()
+        self._connection = None
 
     async def run(self) -> None:
         """Main loop: connect → consume → reconnect on failure."""
@@ -69,17 +76,25 @@ class AttackLensWorker:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                if not self._running:
+                    break
                 log.error("AttackLensWorker error — retry in %ss: %s", delay, exc)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _RETRY_MAX)
 
     async def stop(self) -> None:
         self._running = False
+        if self._connection is not None:
+            try:
+                await self._connection.close()
+            except Exception:
+                pass
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _connect_and_consume(self) -> None:
         conn    = await aio_pika.connect_robust(self._url)
+        self._connection = conn
         channel = await conn.channel()
         await channel.set_qos(prefetch_count=_PREFETCH)
 
@@ -88,33 +103,59 @@ class AttackLensWorker:
 
         log.info("AttackLensWorker consuming from %s (prefetch=%d)", QUEUE_ATTACKLENS, _PREFETCH)
 
-        async with queue.iterator() as msgs:
-            async for msg in msgs:
-                if not self._running:
-                    break
-                async with msg.process(requeue=False, ignore_processed=True):
-                    try:
-                        body = json.loads(msg.body)
-                        await self._process(body)
-                    except Exception as exc:
-                        log.error("AttackLensWorker failed to process msg: %s", exc)
-                        raise  # nack → DLQ
+        try:
+            async with queue.iterator() as msgs:
+                async for msg in msgs:
+                    if not self._running:
+                        break
+                    task = asyncio.create_task(self._handle(msg))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+        finally:
+            pending = list(self._tasks)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await conn.close()
+            finally:
+                if self._connection is conn:
+                    self._connection = None
 
-        await conn.close()
+    async def _handle(self, msg: aio_pika.IncomingMessage) -> None:
+        try:
+            async with msg.process(requeue=False, ignore_processed=True):
+                body = json.loads(msg.body)
+                agent_id = str(body.get("agent_id") or "")
+                lock = self._agent_locks.setdefault(agent_id, asyncio.Lock())
+                async with lock:
+                    await self._process(body)
+        except Exception as exc:
+            # msg.process has already nacked processing failures to the DLQ.
+            log.error("AttackLensWorker failed to process msg: %s", exc)
 
     async def _process(self, msg: dict) -> None:
         agent_id     = msg["agent_id"]
         section      = msg["section"]
         data         = msg["data"]
+        collected_at = float(msg.get("collected_at", time.time()))
         chunk_set_id = msg.get("chunk_set_id", "")
         chunk_index  = int(msg.get("chunk_index", 0))
         chunk_total  = int(msg.get("chunk_total", 1))
+        event_id     = str(msg.get("event_id") or chunk_set_id)
+        if not event_id:
+            raise ValueError("attacklens work message missing event_id")
         is_chunked   = chunk_total > 1
 
         start = time.monotonic()
-        await self._engine.process(
+        completed = await self._engine.process(
             agent_id, section, data,
             skip_correlation=is_chunked,
+            collected_at=collected_at,
+            event_id=event_id,
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
         )
         elapsed = time.monotonic() - start
 
@@ -123,15 +164,8 @@ class AttackLensWorker:
             agent_id, section, chunk_index + 1, chunk_total, elapsed,
         )
 
-        if not is_chunked:
-            return
-
-        # Register the chunk set (idempotent — safe from any chunk order)
-        await self._tracker.register(chunk_set_id, chunk_total)
-        all_done = await self._tracker.mark_done(chunk_set_id, chunk_index)
-        if all_done:
-            await self._engine.run_correlations(agent_id)
+        if completed:
             log.debug(
-                "ChunkSet %s complete → correlation triggered agent=%s section=%s",
-                chunk_set_id, agent_id, section,
+                "Detection event %s complete agent=%s section=%s",
+                event_id, agent_id, section,
             )

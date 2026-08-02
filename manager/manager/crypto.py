@@ -16,6 +16,7 @@ Used by: agent/sender.py  and  manager/security/verifier.py
 
 import gzip
 import hmac
+import io
 import json
 import os
 import hashlib
@@ -33,6 +34,7 @@ HKDF_SALT       = b"mac_intel_2026_salt_v1"
 HKDF_INFO_ENC   = b"mac_intel_enc_v1"
 HKDF_INFO_MAC   = b"mac_intel_mac_v1"
 REPLAY_WINDOW_S = 300         # ±5 minutes
+MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 
 
 def derive_keys(api_key: str) -> Tuple[bytes, bytes]:
@@ -138,8 +140,20 @@ def decrypt(envelope: dict, enc_key: bytes, mac_key: bytes) -> dict:
     except Exception as exc:
         raise ValueError(f"GCM decryption failed: {exc}") from exc
 
-    # 3. Decompress + parse
-    return json.loads(gzip.decompress(compressed))
+    # 3. Decompress with a hard output ceiling. The HTTP body is bounded too,
+    # but an authenticated enrolled agent could otherwise send a tiny gzip bomb
+    # that expands until manager memory is exhausted.
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as stream:
+            plaintext = stream.read(MAX_DECOMPRESSED_BYTES + 1)
+    except (OSError, EOFError) as exc:
+        raise ValueError(f"Gzip decompression failed: {exc}") from exc
+    if len(plaintext) > MAX_DECOMPRESSED_BYTES:
+        raise ValueError("Decompressed payload exceeds 64 MiB limit")
+    try:
+        return json.loads(plaintext)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Payload JSON invalid: {exc}") from exc
 
 
 # ── Internal ──────────────────────────────────────────────────────────────────

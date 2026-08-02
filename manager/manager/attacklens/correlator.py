@@ -745,11 +745,10 @@ class CorrelationEngine:
         Each rule is evaluated only against findings within its time_window_hours.
         Returns list of correlation dicts (not upserted — caller does that).
         """
-        try:
-            rows = await self._idb.get_findings(agent_id, active_only=True, limit=500)
-        except Exception as exc:
-            log.warning("Correlator fetch error agent=%s: %s", agent_id, exc)
-            return []
+        # A failed read is not equivalent to "no matching findings". Let the
+        # event-level caller nack/replay instead of silently completing an
+        # uncorrelated telemetry event.
+        rows = await self._idb.get_findings(agent_id, active_only=True, limit=500)
 
         # Full lookup (no time filter) for building indexes
         all_by_cat: dict[str, list[dict]] = {}

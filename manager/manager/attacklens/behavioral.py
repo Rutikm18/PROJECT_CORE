@@ -63,8 +63,8 @@ class BehavioralAnalyzer:
         try:
             return await fn(agent_id, data)
         except Exception as exc:
-            log.debug("Behavioral analysis failed for %s/%s: %s", agent_id, section, exc)
-            return []
+            log.warning("Behavioral analysis failed for %s/%s: %s", agent_id, section, exc)
+            raise
 
     # ── Section analyzers ─────────────────────────────────────────────────────
 
@@ -575,14 +575,21 @@ class BehavioralAnalyzer:
 
     # ── Signal adapter ────────────────────────────────────────────────────────
 
-    async def analyze_as_signals(self, agent_id: str, section: str, data: Any) -> list:
+    async def analyze_as_signals(
+        self,
+        agent_id: str,
+        section: str,
+        data: Any,
+        findings: list[dict] | None = None,
+    ) -> list:
         """
         Run behavioral analysis and return Signal objects instead of finding dicts.
         Delegated to by the new confidence pipeline in engine.py.
         Produces the same detections as analyze() but wrapped as Signal instances.
         """
         from .signals import Signal, layer_for
-        findings = await self.analyze(agent_id, section, data)
+        if findings is None:
+            findings = await self.analyze(agent_id, section, data)
         signals: list[Signal] = []
         for f in findings:
             # Normalise score→strength; behavioral signals carry lower weight (0.55)

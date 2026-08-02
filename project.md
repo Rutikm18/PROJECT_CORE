@@ -164,7 +164,7 @@ Focused on **agent reliability and operational trustworthiness** — the edges w
 - Doc consolidation: single canonical `docs/INSTALL.md` router + signposts; deprecated the old installer path.
 
 **Testing**
-- ~40 new unit tests across boot-persistence, keystore boot-safety, single-instance, config robustness, disk-full spool, and clock-skew; full agent suite green (**476 passing**).
+- Expanded unit coverage across boot-persistence, keystore boot-safety, single-instance, config robustness, durable spool replay, disk-full handling, clock-skew, and developer-security collection; full agent suite green (**527 passing**).
 - `CAPABILITIES.md` rewritten to reflect active auto-launch + all new resilience capabilities and a full 23-section telemetry coverage matrix.
 
 **Deep Analysis search and data integrity (July 2026)**
@@ -180,6 +180,16 @@ Focused on **agent reliability and operational trustworthiness** — the edges w
 - `VERSION` stores the manually controlled `major.minor` series (`1.0`); the patch is derived from `git rev-list --count HEAD`, producing a monotonically increasing `1.0.x` for each commit pushed to a repository with full history.
 - CI and the deployment script inject the resolved version, commit SHA, and build timestamp into the manager image. `/api/v1/meta` exposes those values and the dashboard displays the version in the lower-left sidebar.
 - This avoids a version-bump commit that recursively triggers CI. A shallow clone must be unshallowed before deriving the count; the deployment workflow uses `fetch-depth: 0`.
+
+**Multi-stream detection and central threat intel (August 2026)**
+- Removed competing consumers from `agent.telemetry`. `TelemetryWorker` is now the single queue owner and only acknowledges after raw storage plus detection fan-out succeeds, preventing payloads from being silently accepted without detection.
+- Preserved the original `(agent_id, canonical section, collected_at)` identity through AttackLens processing. Chunked snapshots are marked complete only after every chunk finishes, eliminating phantom ledger backlog and duplicate reconciliation.
+- Added canonical aliases for ports, connections, users, services, tasks, packages, SBOM, security, containers, and open-file streams. Rich detection modules now run **in addition to** established inline rules, so enabling a module cannot remove prior coverage.
+- Added a dedicated `developer_security` analyzer for unsafe editor extension auto-execution, mutable MCP servers with sensitive capability exposure, world-writable PATH entries, native-messaging abuse, Git execution overrides, exposed credential files, wildcard AI/developer listeners, and host-controlling Docker workloads.
+- Changed validation to shadow/off by default for the all-findings dashboard. The prior `0.95` promotion threshold rejected ordinary module signals before persistence, making successful detections look absent. Deterministic findings remain visible while precision policy can be calibrated on the validated view.
+- Central mode now serves one coherent IOC/KEV/NVD dataset to both detection and dashboard APIs. Snapshots are atomically replaced, stale data survives central outages, ThreatFox hash and IPv6 IOCs are supported, malformed values are rejected, and source-filtered IOC queries stay central.
+- The central service owns the full NVD mirror and delta lifecycle. Package and CVE-ID lookups query it before the public API; CPE version bounds are persisted and applied locally; rejected CVEs remain excluded; dashboard list/search/stats use the same mirror.
+- Verification: **363 manager unit tests**, **527 agent unit tests**, **14 ingest integration tests**, and the targeted stream/intel suite pass against PostgreSQL.
 
 ---
 
@@ -213,9 +223,9 @@ LangChain is optional for model and tool adapters. The current direct SDK plus s
 - **P0 onboarding:** the one-command installer ships placeholder `REPO_URL`/server-IP values; fresh installs default to plain HTTP + `tls_verify=false`.
 - **Validation provenance:** gate names and cluster metadata exist in the schema but are not fully persisted by the finding upsert path. Promotion score and terrain score also share one `precision_score` field and should be split.
 - **Validation degradation policy:** allowlist, deduplication, and false-positive-history database errors currently fail open. Define an explicit `verified / degraded / unavailable` state instead of treating infrastructure failure as clean evidence.
-- **Threat-intel freshness:** manager-side in-memory IOC sets can become stale when a separate central feed service performs refreshes. Define a `ThreatIntelProvider` contract with freshness metadata, stale-while-revalidate caching, and persisted/bulk-loaded Spamhaus CIDRs.
 - **CVE identity accuracy:** package-keyword matching is not enough for production vulnerability attribution. Normalize inventory to package URL/ecosystem, prefer OSV and vendor advisories for ecosystem-aware matching, and use curated package-to-CPE mappings for NVD. Account for distro backports before declaring an installed version vulnerable.
-- **NVD client duplication:** consolidate the two `CVELookup` implementations and make the active detection path query the local mirror before rate-limited live NVD lookup.
+- **NVD client duplication:** consolidate the legacy and AttackLens `CVELookup` implementations. The active path now uses the central/local mirror first, but duplicate implementations still increase maintenance risk.
+- **Central intel hardening:** keep the threat-intel API on the internal network or add service authentication and rate limits before exposing it. Package-correlation requests can trigger expensive work and should not be internet-accessible.
 
 ---
 

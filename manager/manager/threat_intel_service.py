@@ -21,6 +21,7 @@ from .indexer import IntelDB
 from .pg_pool import _redact_dsn
 from .attacklens.feeds import FeedManager
 from .attacklens.nvd import CVELookup
+from .threat.nvd_sync import NVDSyncWorker
 
 log = logging.getLogger("threat_intel")
 
@@ -28,6 +29,9 @@ FEED_INTERVAL_SECONDS = int(os.environ.get("THREAT_FEED_INTERVAL_SECONDS", "3600
 NVD_INTERVAL_SECONDS = int(os.environ.get("NVD_SYNC_INTERVAL_SECONDS", "7200"))
 NVD_SYNC_HOURS = int(os.environ.get("NVD_SYNC_HOURS", "48"))
 NVD_SYNC_MAX_PAGES = int(os.environ.get("NVD_SYNC_MAX_PAGES", "3"))
+NVD_MIRROR_ENABLED = os.environ.get("NVD_MIRROR_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 class CentralThreatIntelWorker:
@@ -37,10 +41,13 @@ class CentralThreatIntelWorker:
         self.intel_db = intel_db
         self.feeds = FeedManager(intel_db)
         self.nvd = CVELookup(intel_db)
+        self.nvd_mirror = NVDSyncWorker(intel_db) if NVD_MIRROR_ENABLED else None
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
         await self.feeds.refresh()
+        if self.nvd_mirror:
+            await self.nvd_mirror.start()
         self._tasks = [
             # Core IP/domain threat feeds
             asyncio.create_task(self._loop("feodo",           self.feeds.refresh_feodo,           FEED_INTERVAL_SECONDS)),
@@ -50,20 +57,25 @@ class CentralThreatIntelWorker:
             asyncio.create_task(self._loop("spamhaus",        self.feeds.refresh_spamhaus,         FEED_INTERVAL_SECONDS * 6)),
             # Vulnerability intel
             asyncio.create_task(self._loop("cisa_kev",        self.feeds.refresh_cisa_kev,         FEED_INTERVAL_SECONDS * 4)),
-            asyncio.create_task(self._loop("nvd_recent",      self._sync_nvd_recent,               NVD_INTERVAL_SECONDS)),
             # Threat actors + news
             asyncio.create_task(self._loop("ransomware_live", self.feeds.refresh_ransomware_live,  FEED_INTERVAL_SECONDS * 3)),
             asyncio.create_task(self._loop("security_news",   self.feeds.refresh_security_news,    FEED_INTERVAL_SECONDS * 2)),
         ]
+        if not self.nvd_mirror:
+            self._tasks.append(asyncio.create_task(
+                self._loop("nvd_recent", self._sync_nvd_recent, NVD_INTERVAL_SECONDS)
+            ))
         log.info("Central threat-intel worker started (%d feed loops)", len(self._tasks))
 
     async def stop(self) -> None:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self.nvd_mirror:
+            await self.nvd_mirror.stop()
 
-    async def _loop(self, source: str, fn, interval: int) -> None:
-        delay = 0
+    async def _loop(self, source: str, fn, interval: int, initial_delay: int = 0) -> None:
+        delay = initial_delay
         while True:
             await asyncio.sleep(delay)
             delay = interval
@@ -155,16 +167,63 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "service": "threat-intel", "db": db_path}
+        return {"status": "ok", "service": "threat-intel", "db": _redact_dsn(db_path)}
 
     @app.get("/api/v1/intel/summary")
     async def summary() -> dict[str, Any]:
-        return await intel_db.get_threat_intel_overview()
+        overview = await intel_db.get_threat_intel_overview()
+        nvd = await intel_db.get_nvd_stats()
+        if nvd.get("total", 0):
+            overview["cves"] = nvd["total"]
+            overview["cve_by_severity"] = nvd.get("by_severity", {})
+        return overview
 
     @app.get("/api/v1/intel/feeds")
     async def feeds() -> dict[str, Any]:
         rows = await intel_db.get_all_feed_health()
         return {"feeds": rows, "count": len(rows)}
+
+    @app.get("/api/v1/intel/snapshot")
+    async def snapshot() -> dict[str, Any]:
+        """Atomic hot-cache snapshot consumed by manager detection engines."""
+        return worker.feeds.export_snapshot()
+
+    @app.get("/api/v1/intel/nvd/stats")
+    async def nvd_stats() -> dict[str, Any]:
+        return await intel_db.get_nvd_stats()
+
+    @app.get("/api/v1/intel/nvd/search")
+    async def nvd_search(
+        q: str = Query(..., min_length=1, max_length=256),
+        limit: int = Query(20, ge=1, le=200),
+    ) -> dict[str, Any]:
+        rows = await intel_db.search_nvd_local(q.lower(), limit=limit)
+        return {"results": rows, "count": len(rows), "query": q}
+
+    @app.get("/api/v1/intel/nvd/{cve_id}")
+    async def nvd_by_id(cve_id: str) -> dict[str, Any]:
+        from fastapi import HTTPException
+        cve = await intel_db.get_nvd_local_by_id(cve_id)
+        if not cve:
+            cve = await intel_db.get_cve_by_id(cve_id.upper())
+        if not cve:
+            raise HTTPException(404, f"CVE not found: {cve_id}")
+        return {"cve": CVELookup._normalize_local_row(cve)}
+
+    @app.get("/api/v1/intel/iocs")
+    async def iocs(
+        ioc_type: str = Query("ip", pattern="^(ip|domain|hash)$"),
+        source: str | None = Query(None, max_length=80),
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        rows = await intel_db.get_all_iocs(ioc_type)
+        if source:
+            rows = [row for row in rows if row.get("source") == source]
+        return {
+            "iocs": rows[offset:offset + limit], "total": len(rows),
+            "offset": offset, "limit": limit,
+        }
 
     @app.get("/api/v1/intel/cves")
     async def cves(
@@ -172,7 +231,11 @@ def create_app() -> FastAPI:
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
     ) -> dict[str, Any]:
-        rows = await intel_db.list_cves(severity=severity, limit=limit, offset=offset)
+        rows = await intel_db.list_nvd_local(
+            severity=severity, limit=limit, offset=offset,
+        )
+        if not rows:
+            rows = await intel_db.list_cves(severity=severity, limit=limit, offset=offset)
         return {"cves": rows, "count": len(rows), "offset": offset}
 
     @app.post("/api/v1/intel/correlate/packages")
@@ -207,6 +270,22 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         news = await intel_db.get_recent_news(hours=hours, limit=limit)
         return {"news": news, "count": len(news), "window_hours": hours}
+
+    @app.get("/api/v1/intel/epss/top")
+    async def epss_top(limit: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
+        rows = await intel_db._fetchall(
+            "SELECT cve_id, epss, percentile, model_date FROM epss_scores "
+            "ORDER BY epss DESC LIMIT ?", (limit,),
+        )
+        return {"scores": [dict(row) for row in rows], "count": len(rows)}
+
+    @app.post("/api/v1/intel/epss/bulk")
+    async def epss_bulk(payload: dict[str, Any]) -> dict[str, Any]:
+        ids = payload.get("cve_ids") or []
+        if not isinstance(ids, list):
+            ids = []
+        clean = [str(cve).upper() for cve in ids[:100] if str(cve).strip()]
+        return {"scores": await intel_db.get_epss_bulk(clean)}
 
     @app.get("/api/v1/intel/epss/{cve_id}")
     async def epss_score(cve_id: str) -> dict[str, Any]:

@@ -31,7 +31,9 @@ Rate control algorithm:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -45,6 +47,7 @@ from shared.wire import (
     REPLAY_WINDOW_SECONDS,
     validate_payload,
 )
+from shared.sections import VALID_SECTION_NAMES, canonical_section
 
 if TYPE_CHECKING:
     from ..db             import Database
@@ -54,6 +57,11 @@ if TYPE_CHECKING:
     from ..pool           import AgentRateLimiter
 
 log = logging.getLogger("manager.api.ingest")
+
+try:
+    _MAX_ENVELOPE_BYTES = max(1024, int(os.environ.get("MAX_INGEST_BYTES", "10485760")))
+except ValueError:
+    _MAX_ENVELOPE_BYTES = 10_485_760
 
 # Payload-schema validation mode. Default OFF (flag-and-tag) for backward
 # compatibility — set ATTACKLENS_INGEST_STRICT_PAYLOAD=1 to reject payloads
@@ -116,6 +124,8 @@ def _record_schema_gaps(agent_id: str, section: str, report: dict) -> None:
         _SCHEMA_GAPS["data_error"] += 1
     elif report["data_empty"]:
         _SCHEMA_GAPS["data_empty"] += 1
+    if report.get("identity_mismatch"):
+        _SCHEMA_GAPS["identity_mismatch"] += 1
     log.warning(
         "payload schema gap agent=%s section=%s missing=%s empty=%s "
         "data_empty=%s data_error=%s recommended_missing=%s",
@@ -140,6 +150,7 @@ def make_ingest_router(
     """
     from ..crypto        import decrypt, derive_keys
     from ..queue.schemas import build_telemetry_msg
+    from ..chunker       import CHUNK_SIZE, split as chunk_split
 
     router = APIRouter()
 
@@ -175,21 +186,54 @@ def make_ingest_router(
 
         _stat("received")
         # ── 1. Parse ──────────────────────────────────────────────────────────
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > _MAX_ENVELOPE_BYTES:
+                    _note_error("oversize", f"content-length={content_length}")
+                    raise HTTPException(413, "Ingest envelope exceeds size limit")
+            except ValueError:
+                raise HTTPException(400, "Invalid Content-Length header")
         try:
-            envelope = await request.json()
-        except Exception:
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > _MAX_ENVELOPE_BYTES:
+                    _note_error("oversize", f"streamed>{_MAX_ENVELOPE_BYTES}")
+                    raise HTTPException(413, "Ingest envelope exceeds size limit")
+                body.extend(chunk)
+            envelope = json.loads(body)
+        except HTTPException:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
             _note_error("parse", "invalid JSON")
             raise HTTPException(400, "Invalid JSON body")
+
+        if not isinstance(envelope, dict):
+            raise HTTPException(400, "JSON body must be an object")
 
         # ── 2. Schema check ───────────────────────────────────────────────────
         for field in REQUIRED_ENVELOPE_FIELDS:
             if field not in envelope:
                 raise HTTPException(400, f"Missing field: {field}")
 
+        if not isinstance(envelope.get("agent_id"), str) or not envelope["agent_id"]:
+            raise HTTPException(400, "agent_id must be a non-empty string")
+        if len(envelope["agent_id"]) > 256:
+            raise HTTPException(400, "agent_id exceeds 256 characters")
+        for field in ("nonce", "ct", "hmac"):
+            if not isinstance(envelope.get(field), str) or not envelope[field]:
+                raise HTTPException(400, f"{field} must be a non-empty string")
+
         # ── 3. Timestamp replay window ────────────────────────────────────────
         # 401 (not 400): stale timestamp is a security rejection (replay protection),
         # not a client schema error.
-        skew = abs(time.time() - float(envelope["timestamp"]))
+        try:
+            timestamp = float(envelope["timestamp"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "timestamp must be numeric")
+        if not math.isfinite(timestamp):
+            raise HTTPException(400, "timestamp must be finite")
+        skew = abs(time.time() - timestamp)
         if skew > REPLAY_WINDOW_SECONDS:
             raise HTTPException(401, "Timestamp out of window — replay rejected")
 
@@ -225,7 +269,7 @@ def make_ingest_router(
             # ── 7. HMAC + decrypt ─────────────────────────────────────────────
             try:
                 payload = decrypt(envelope, enc_key, mac_key)
-            except ValueError as exc:
+            except (ValueError, TypeError, KeyError) as exc:
                 _note_error("decrypt", exc)
                 log.warning("Decrypt failed agent=%s: %s", raw_agent_id, exc)
                 raise HTTPException(401, "Verification failed")
@@ -251,13 +295,31 @@ def make_ingest_router(
             # was not — missing/empty inner fields were silently defaulted. Now
             # we validate against the canonical contract and either flag (count +
             # log, default) or reject (HTTP 422, strict mode). Backward-compatible.
-            report = validate_payload(payload)
+            report = validate_payload(
+                payload, authenticated_agent_id=raw_agent_id,
+            )
             if not report["ok"]:
                 _record_schema_gaps(
                     payload.get("agent_id", raw_agent_id),
                     payload.get("section", envelope.get("section", "unknown")),
                     report,
                 )
+                # Authentication is performed with the envelope agent's key.
+                # Never let an authenticated endpoint attribute its telemetry to
+                # another enrolled endpoint through the encrypted inner payload.
+                if report["identity_mismatch"]:
+                    _note_error(
+                        "identity_mismatch",
+                        "payload agent_id differs from authenticated envelope",
+                    )
+                    log.warning(
+                        "Payload identity mismatch authenticated_agent=%s claimed_agent=%s",
+                        raw_agent_id, payload.get("agent_id"),
+                    )
+                    raise HTTPException(
+                        403,
+                        "Payload agent_id does not match authenticated envelope",
+                    )
                 if _STRICT_PAYLOAD and (report["missing"] or report["empty"]):
                     raise HTTPException(
                         422,
@@ -266,8 +328,15 @@ def make_ingest_router(
                     )
 
             # ── 9. Extract fields ─────────────────────────────────────────────
-            agent_id   = payload.get("agent_id",    envelope["agent_id"])
-            section    = payload.get("section",      envelope.get("section", "unknown"))
+            # Identity is bound to the authenticated envelope above. Do not use
+            # an inner-payload fallback for routing or persistence.
+            agent_id   = raw_agent_id
+            section    = canonical_section(
+                payload.get("section", envelope.get("section", "unknown"))
+            )
+            if section not in VALID_SECTION_NAMES:
+                _note_error("unsupported_section", section)
+                raise HTTPException(422, f"Unsupported telemetry section: {section!r}")
             collected  = payload.get("collected_at", int(float(envelope["timestamp"])))
             agent_name = payload.get("agent_name",   "")
             os_name    = payload.get("os",           "macos")
@@ -279,8 +348,22 @@ def make_ingest_router(
             await db.upsert_agent(agent_id, agent_name, client_ip)
 
             # ── 11a. Queue mode ───────────────────────────────────────────────
+            prepared_chunks = None
             if producer is not None and producer.ready:
                 try:
+                    prepared_chunks = chunk_split(data, chunk_set_id=nonce)
+                    # The event outbox is committed BEFORE the HTTP 202. If the
+                    # broker later loses a pre-storage delivery, reconciliation
+                    # can reconstruct and republish the exact telemetry event.
+                    await db.ledger_received(
+                        agent_id, section, float(collected),
+                        event_id=nonce, data=data,
+                        chunk_total=len(prepared_chunks), chunk_size=CHUNK_SIZE,
+                        metadata={
+                            "agent_name": agent_name, "os": os_name,
+                            "hostname": hostname, "client_ip": client_ip,
+                        },
+                    )
                     await producer.publish_telemetry(
                         build_telemetry_msg(
                             agent_id     = agent_id,
@@ -291,6 +374,7 @@ def make_ingest_router(
                             collected_at = float(collected),
                             client_ip    = client_ip,
                             data         = data,
+                            event_id     = nonce,
                         )
                     )
                     # Durably handed off → record nonce so retries are idempotent.
@@ -306,59 +390,50 @@ def make_ingest_router(
 
             # ── 11b–14b. Sync pipeline ────────────────────────────────────────
 
-            # Step 1: persist to file store.
-            # On failure return 503 so the agent spools and retries — never
-            # return 200 here, that would cause silent permanent data loss.
+            # PostgreSQL is the horizontally-safe raw source of truth. The
+            # event outbox and raw row must commit before acknowledgement.
+            try:
+                sync_chunks = prepared_chunks or chunk_split(data, chunk_set_id=nonce)
+                await db.ledger_received(
+                    agent_id, section, float(collected),
+                    event_id=nonce, data=data,
+                    chunk_total=len(sync_chunks), chunk_size=CHUNK_SIZE,
+                    metadata={
+                        "agent_name": agent_name, "os": os_name,
+                        "hostname": hostname, "client_ip": client_ip,
+                    },
+                )
+                await db.insert_payload(
+                    agent_id, section, int(float(collected)), data, event_id=nonce,
+                )
+                await db.ledger_received(
+                    agent_id, section, float(collected),
+                    event_id=nonce, data=data,
+                    chunk_total=len(sync_chunks), chunk_size=CHUNK_SIZE,
+                    stored=True,
+                    metadata={
+                        "agent_name": agent_name, "os": os_name,
+                        "hostname": hostname, "client_ip": client_ip,
+                    },
+                )
+            except Exception as exc:
+                _note_error("raw_persistence", exc)
+                raise HTTPException(
+                    503,
+                    detail="Raw persistence unavailable — agent should retry",
+                ) from exc
+            _stat("stored_raw")
+            _stat("index_ok")
+
+            # Optional file archive. In HA this is disabled so no replica writes
+            # shared gzip buckets or a shared SQLite index.
             try:
                 await store.write(
                     agent_id=agent_id, section=section, ts=float(collected),
-                    data=data, os=os_name, hostname=hostname,
+                    data=data, os=os_name, hostname=hostname, event_id=nonce,
                 )
-            except OSError as exc:
-                log.error(
-                    "Store write I/O error agent=%s section=%s path=%s: %s",
-                    agent_id, section,
-                    getattr(exc, "filename", "unknown"),
-                    exc,
-                )
-                raise HTTPException(
-                    503,
-                    detail="Storage unavailable — agent should retry",
-                ) from exc
             except Exception as exc:
-                log.error(
-                    "Store write failed agent=%s section=%s: %s",
-                    agent_id, section, exc,
-                )
-                raise HTTPException(
-                    503,
-                    detail="Storage error — agent should retry",
-                ) from exc
-
-            _stat("stored_raw")
-            # Persisted durably to the file store → NOW record the nonce, so any
-            # retry of this exact envelope is idempotently ack'd rather than
-            # reprocessed. (Stored after store.write, never before — a 503 above
-            # leaves the nonce unrecorded so the retry is reprocessed, not lost.)
-            await db.store_nonce(nonce, REPLAY_WINDOW_SECONDS)
-
-            # Step 2: update SQLite index. Failure here is non-fatal for the
-            # file-store record (already written above) but we log clearly so
-            # operators can detect index drift.
-            try:
-                await db.insert_payload(agent_id, section, int(float(collected)), data)
-                _stat("index_ok")
-            except Exception as exc:
-                # NOTE: this is the SILENT failure that makes Deep Analysis empty —
-                # /api/v1/raw reads this SQLite index. Surfaced via the counter +
-                # last_error so it's no longer invisible. Still non-fatal (the file
-                # store has the record and the index can be rebuilt).
-                _note_error("index", exc)
-                log.error(
-                    "DB index write failed agent=%s section=%s ts=%s: %s — "
-                    "file-store record exists but DB index (Deep Analysis) is behind",
-                    agent_id, section, collected, exc,
-                )
+                log.warning("optional telemetry archive write failed event_id=%s: %s", nonce, exc)
 
             # Step 3: hand to the bounded detection executor (non-blocking,
             # never crashes ingest). engine.enqueue() caps concurrent detection
@@ -367,10 +442,24 @@ def make_ingest_router(
             # under large data volumes. A saturated queue drops + counts (raw
             # telemetry is already persisted above and is reprocessable).
             if engine is not None:
-                accepted = engine.enqueue(
-                    agent_id, section, data, collected_at=float(collected)
-                )
+                accepted = True
+                for chunk in sync_chunks:
+                    accepted = engine.enqueue(
+                        agent_id, section, chunk.data,
+                        collected_at=float(collected), event_id=nonce,
+                        chunk_index=chunk.chunk_index, chunk_total=chunk.chunk_total,
+                    ) and accepted
                 _stat("detection_dispatched" if accepted else "detection_dropped")
+                if not accepted:
+                    _note_error("detection_queue", "bounded executor saturated")
+                    raise HTTPException(
+                        503,
+                        detail="Detection queue saturated — agent should retry",
+                    )
+
+            # Raw storage, durable ledger, and detection hand-off all succeeded.
+            # Only now remember the nonce and acknowledge the payload.
+            await db.store_nonce(nonce, REPLAY_WINDOW_SECONDS)
 
             # Step 4: push to live dashboard — totally optional; never crashes ingest.
             try:

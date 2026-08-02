@@ -765,6 +765,39 @@ async def test_correlator_suppress_action(pg_intel_dsn):
 
 
 @pytest.mark.asyncio
+async def test_custom_actions_use_postgres_safe_updates(pg_intel_dsn):
+    idb = await _mk_db(pg_intel_dsn)
+    try:
+        await _seed_finding(idb, "agent-01", category="process", item_key="action-target")
+        row = await idb._fetchone(
+            "SELECT id FROM findings WHERE agent_id=? AND item_key=?",
+            ("agent-01", "action-target"),
+        )
+        finding_id = int(row["id"])
+
+        await idb.apply_custom_correlation_action(
+            finding_id, "tag", ["reviewed", "custom-rule"],
+        )
+        await idb.apply_custom_correlation_action(finding_id, "elevate")
+        updated = await idb._fetchone(
+            "SELECT tags, severity FROM findings WHERE id=?", (finding_id,),
+        )
+        assert set(json.loads(updated["tags"])) == {"reviewed", "custom-rule"}
+        assert updated["severity"] == "critical"
+
+        await idb.apply_custom_correlation_action(finding_id, "suppress")
+        suppressed = await idb._fetchone(
+            "SELECT status, is_active, closed_at FROM findings WHERE id=?",
+            (finding_id,),
+        )
+        assert suppressed["status"] == "false_positive"
+        assert suppressed["is_active"] == 0
+        assert suppressed["closed_at"] is not None
+    finally:
+        await idb.close()
+
+
+@pytest.mark.asyncio
 async def test_correlator_condition_no_match_no_fire(pg_intel_dsn):
     """Condition requires 'network' category but only 'process' findings exist."""
     idb = await _mk_db(pg_intel_dsn)

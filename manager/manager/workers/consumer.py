@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -11,7 +12,7 @@ import aio_pika
 
 from ..queue.connection import declare_topology
 from ..queue.schemas    import QUEUE_TELEMETRY, build_attacklens_msg
-from ..chunker          import split as chunk_split
+from ..chunker          import CHUNK_SIZE, split as chunk_split
 
 if TYPE_CHECKING:
     from ..db              import Database
@@ -136,62 +137,52 @@ class TelemetryConsumer:
         agent_name = msg.get("agent_name", "")
         os_name    = msg.get("os", "macos")
         hostname   = msg.get("hostname", "")
+        event_id = str(msg.get("event_id") or "")
+        if not event_id:
+            event_id = "legacy:" + hashlib.sha256(
+                json.dumps(msg, sort_keys=True, default=str).encode()
+            ).hexdigest()
+        chunks = chunk_split(data, chunk_set_id=event_id)
 
-        # 1. Three-tier file store
+        # PostgreSQL is the critical, idempotent raw source and replay outbox.
+        await self._db.ledger_received(
+            agent_id, section, collected,
+            event_id=event_id, data=data, chunk_total=len(chunks), chunk_size=CHUNK_SIZE,
+            metadata={"agent_name": agent_name, "os": os_name, "hostname": hostname},
+        )
+        await self._db.insert_payload(
+            agent_id, section, int(collected), data, event_id=event_id,
+        )
+        await self._db.ledger_received(
+            agent_id, section, collected,
+            event_id=event_id, data=data, chunk_total=len(chunks), chunk_size=CHUNK_SIZE,
+            stored=True,
+            metadata={"agent_name": agent_name, "os": os_name, "hostname": hostname},
+        )
+
+        # Optional local archive; never blocks the critical detection path.
         try:
             await self._store.write(
-                agent_id=agent_id,
-                section=section,
-                ts=collected,
-                data=data,
-                os=os_name,
-                hostname=hostname,
+                agent_id=agent_id, section=section, ts=collected, data=data,
+                os=os_name, hostname=hostname, event_id=event_id,
             )
         except Exception as exc:
-            log.error("store.write failed agent=%s section=%s: %s", agent_id, section, exc)
-            raise
-
-        # 1b. Ledger the payload as received-pending-detection (same as
-        # TelemetryWorker) so the reconciler/outbox sees a consistent record no
-        # matter which of the two competing agent.telemetry consumers handled it.
-        try:
-            await self._db.ledger_received(agent_id, section, collected)
-        except Exception as exc:
-            log.debug("ledger_received failed agent=%s section=%s: %s", agent_id, section, exc)
-
-        # 2. SQLite payload summary — best-effort, not all builds expose this
-        insert = (
-            getattr(self._db, "insert_telemetry", None)
-            or getattr(self._db, "insert_payload", None)
-        )
-        if insert is not None:
-            try:
-                await insert(agent_id, section, int(collected), data)
-            except TypeError:
-                try:
-                    await insert(agent_id, section, data, collected)
-                except Exception as exc:
-                    log.debug("db insert skipped agent=%s section=%s: %s", agent_id, section, exc)
-            except Exception as exc:
-                log.debug("db insert skipped agent=%s section=%s: %s", agent_id, section, exc)
+            log.warning("optional archive write failed event_id=%s: %s", event_id, exc)
 
         # 3. Fan-out to attacklens.work (chunked for large list payloads)
-        try:
-            chunks = chunk_split(data)
-            for chunk in chunks:
-                await self._producer.publish_attacklens_work(
-                    build_attacklens_msg(
-                        agent_id=agent_id,
-                        section=section,
-                        collected_at=collected,
-                        data=chunk.data,
-                        chunk_set_id=chunk.chunk_set_id,
-                        chunk_index=chunk.chunk_index,
-                        chunk_total=chunk.chunk_total,
-                    )
+        for chunk in chunks:
+            await self._producer.publish_attacklens_work(
+                build_attacklens_msg(
+                    agent_id=agent_id,
+                    section=section,
+                    collected_at=collected,
+                    data=chunk.data,
+                    event_id=event_id,
+                    chunk_set_id=chunk.chunk_set_id,
+                    chunk_index=chunk.chunk_index,
+                    chunk_total=chunk.chunk_total,
                 )
-        except Exception as exc:
-            log.warning("attacklens publish failed agent=%s section=%s: %s", agent_id, section, exc)
+            )
 
         # 4. WebSocket broadcast — best-effort
         try:

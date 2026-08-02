@@ -33,6 +33,7 @@ _DATA_POINT_LAYER: dict[str, Layer] = {
     "open_files":     "surface",
     "storage":        "surface",
     "containers":     "surface",
+    "developer_security": "surface",
     "ports":          "exposure",
     "connections":    "exposure",
     "network":        "exposure",

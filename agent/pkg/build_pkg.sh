@@ -63,6 +63,7 @@ python3 -m PyInstaller \
     --hidden-import "agent.agent.normalizer" \
     --hidden-import "agent.agent.enrollment" \
     --hidden-import "agent.agent.keystore" \
+    --hidden-import "agent.os.macos.collectors.developer_security" \
     --hidden-import "tomllib" \
     --distpath "${BUILD_DIR}/bin" \
     agent/agent_entry.py

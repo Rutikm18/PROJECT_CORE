@@ -63,6 +63,7 @@ SHODAN_IDB_URL       = "https://internetdb.shodan.io/{ip}"
 EPSS_API_URL         = "https://api.first.org/data/v1/epss"
 
 FEED_TTL       = 3600          # 1 hour
+CENTRAL_SYNC_TTL = 60          # manager-side snapshot refresh interval
 ABUSEIPDB_TTL  = 86400         # 24 hours
 NEWS_TTL       = 3600 * 6      # 6 hours
 CHECK_TIMEOUT  = aiohttp.ClientTimeout(total=20)
@@ -94,6 +95,46 @@ def _is_private(ip: str) -> bool:
         return False
 
 
+def _normalize_ip(value: object) -> str | None:
+    try:
+        address = ipaddress.ip_address(str(value or "").strip().strip("[]"))
+    except ValueError:
+        return None
+    if not address.is_global:
+        return None
+    return str(address)
+
+
+def _normalize_domain(value: object) -> str | None:
+    raw = str(value or "").strip().lower().rstrip(".")
+    if not raw or "://" in raw or "/" in raw:
+        return None
+    try:
+        domain = raw.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if len(domain) > 253 or "." not in domain:
+        return None
+    labels = domain.split(".")
+    if any(not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+           for label in labels):
+        return None
+    return domain
+
+
+def _parse_ip_ioc(value: object) -> str | None:
+    raw = str(value or "").strip()
+    direct = _normalize_ip(raw)
+    if direct:
+        return direct
+    if raw.startswith("[") and "]:" in raw:
+        return _normalize_ip(raw[1:raw.index("]:")])
+    host, separator, port = raw.rpartition(":")
+    if separator and port.isdigit():
+        return _normalize_ip(host)
+    return None
+
+
 class FeedManager:
     """
     Async threat feed manager.  Call `refresh()` once at startup and
@@ -122,20 +163,27 @@ class FeedManager:
         bulk_epss(cve_ids)          → dict[str, float]
     """
 
-    def __init__(self, db) -> None:
+    def __init__(self, db, central_url: str = "") -> None:
         self._db = db
+        self._central_url = central_url.strip().rstrip("/")
         self._ip_set:    set[str]        = set()
         self._ip_meta:   dict[str, dict] = {}
         self._domain_set:  set[str]       = set()
         self._domain_meta: dict[str, dict] = {}
+        self._hash_set:  set[str]        = set()
+        self._hash_meta: dict[str, dict] = {}
         self._kev_set:   set[str]        = set()   # CISA KEV CVE IDs
         self._kev_source:    str | None  = None     # which source last succeeded
         self._kev_synced_at: float       = 0.0      # epoch of last successful KEV load
         self._actor_meta: dict[str, dict] = {}      # threat actors by lowercase name
         self._news_cache: list[dict]     = []       # recent security news
-        self._spamhaus_cidrs: list[ipaddress.IPv4Network] = []
+        self._spamhaus_cidrs: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self._lock = asyncio.Lock()
         self._last_refresh = 0.0
+        self._central_status = {
+            "enabled": bool(self._central_url), "fresh": False,
+            "last_success": 0.0, "last_error": "",
+        }
         self._abuseipdb_key = os.environ.get("ABUSEIPDB_KEY", "").strip()
         self._otx_key       = os.environ.get("OTX_KEY", "").strip()
         self._greynoise_key = os.environ.get("GREYNOISE_KEY", "").strip()
@@ -164,6 +212,12 @@ class FeedManager:
     def get_domain_details(self, domain: str) -> Optional[dict]:
         return self._domain_meta.get(domain.lower())
 
+    def is_malicious_hash(self, value: str) -> bool:
+        return str(value or "").lower() in self._hash_set
+
+    def get_hash_details(self, value: str) -> Optional[dict]:
+        return self._hash_meta.get(str(value or "").lower())
+
     def is_kev_cve(self, cve_id: str) -> bool:
         return cve_id.upper() in self._kev_set
 
@@ -180,6 +234,7 @@ class FeedManager:
         return {
             "total_ips":       len(self._ip_set),
             "total_domains":   len(self._domain_set),
+            "total_hashes":    len(self._hash_set),
             "kev_cves":        len(self._kev_set),
             "kev_source":      self._kev_source,
             "kev_age_sec":     int(time.time() - self._kev_synced_at) if self._kev_synced_at else None,
@@ -188,24 +243,54 @@ class FeedManager:
             "news_items":      len(self._news_cache),
             "ip_by_source":    dict(ip_sources),
             "domain_by_source": dict(dom_sources),
+            "central": dict(self._central_status),
+        }
+
+    @property
+    def central_enabled(self) -> bool:
+        return bool(self._central_url)
+
+    def export_snapshot(self) -> dict:
+        """Serializable IOC/KEV snapshot for managers using the central service."""
+        def _rows(meta: dict[str, dict]) -> list[dict]:
+            return [{"value": value, **details} for value, details in meta.items()]
+
+        return {
+            "generated_at": time.time(),
+            "ips": _rows(self._ip_meta),
+            "domains": _rows(self._domain_meta),
+            "hashes": _rows(self._hash_meta),
+            "kev_ids": sorted(self._kev_set),
+            "spamhaus_cidrs": [str(net) for net in self._spamhaus_cidrs],
+            "stats": self.get_stats(),
         }
 
     # ── Initial load ──────────────────────────────────────────────────────────
 
     async def refresh(self) -> int:
-        """Load from DB cache only (no network). Called at startup."""
-        if time.time() - self._last_refresh < FEED_TTL:
+        """Refresh the embedded cache or atomically pull the central snapshot."""
+        ttl = CENTRAL_SYNC_TTL if self.central_enabled else FEED_TTL
+        if time.time() - self._last_refresh < ttl:
             return 0
         async with self._lock:
-            if time.time() - self._last_refresh < FEED_TTL:
+            if time.time() - self._last_refresh < ttl:
                 return 0
             log.info("Refreshing threat feeds...")
-            await self._load_from_cache()
-            await asyncio.gather(
-                self._fetch_feodo(),
-                self._fetch_emerging(),
-                return_exceptions=True,
-            )
+            if not self._last_refresh:
+                await self._load_from_cache()
+            if self.central_enabled:
+                try:
+                    await self._load_from_central()
+                except Exception as exc:
+                    self._central_status["fresh"] = False
+                    self._central_status["last_error"] = str(exc)[:300]
+                    log.warning("Central threat-intel snapshot refresh failed; using stale cache: %s", exc)
+            else:
+                await asyncio.gather(
+                    self._fetch_feodo(),
+                    self._fetch_emerging(),
+                    return_exceptions=True,
+                )
             self._last_refresh = time.time()
             log.info("Threat feeds refreshed — %d IPs, %d domains, %d KEVs, %d actors",
                      len(self._ip_set), len(self._domain_set),
@@ -313,6 +398,12 @@ class FeedManager:
         cached = await self._db.get_epss(cve_id)
         if cached and (time.time() - cached.get("cached_at", 0)) < 86400 * 7:
             return cached
+        if self.central_enabled:
+            try:
+                return await self._central_json("GET", f"/api/v1/intel/epss/{cve_id}")
+            except Exception as exc:
+                log.debug("Central EPSS lookup failed for %s: %s", cve_id, exc)
+                return cached
         try:
             async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
                 async with s.get(EPSS_API_URL, params={"cve": cve_id}) as r:
@@ -334,38 +425,69 @@ class FeedManager:
 
     async def bulk_epss(self, cve_ids: list[str]) -> dict[str, float]:
         """Return EPSS scores for multiple CVEs from cache (no live fetch)."""
+        if self.central_enabled and cve_ids:
+            try:
+                payload = await self._central_json(
+                    "POST", "/api/v1/intel/epss/bulk", json_body={"cve_ids": cve_ids[:100]},
+                )
+                return {str(k): float(v) for k, v in (payload.get("scores") or {}).items()}
+            except Exception as exc:
+                log.debug("Central bulk EPSS lookup failed: %s", exc)
         return await self._db.get_epss_bulk(cve_ids)
 
     # ── Feed fetchers ─────────────────────────────────────────────────────────
 
     async def _load_from_cache(self) -> None:
         rows = await self._db.get_all_iocs("ip")
+        ip_set: set[str] = set()
+        ip_meta: dict[str, dict] = {}
         for row in rows:
-            ip = row["ioc_value"]
-            self._ip_set.add(ip)
-            self._ip_meta[ip] = {
+            ip = _normalize_ip(row["ioc_value"])
+            if not ip:
+                continue
+            ip_set.add(ip)
+            ip_meta[ip] = {
                 "source":      row["source"],
                 "severity":    row["severity"],
                 "description": row["description"],
                 "confidence":  row["confidence"],
             }
         rows_dom = await self._db.get_all_iocs("domain")
+        domain_set: set[str] = set()
+        domain_meta: dict[str, dict] = {}
         for row in rows_dom:
-            dom = row["ioc_value"].lower()
-            self._domain_set.add(dom)
-            self._domain_meta[dom] = {
+            dom = _normalize_domain(row["ioc_value"])
+            if not dom:
+                continue
+            domain_set.add(dom)
+            domain_meta[dom] = {
                 "source":      row["source"],
                 "severity":    row["severity"],
                 "description": row["description"],
                 "confidence":  row["confidence"],
             }
-        # Load KEV CVE IDs
+        hash_set: set[str] = set()
+        hash_meta: dict[str, dict] = {}
+        for row in await self._db.get_all_iocs("hash"):
+            value = row["ioc_value"].lower()
+            if not re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}", value):
+                continue
+            hash_set.add(value)
+            hash_meta[value] = {
+                "source": row["source"], "severity": row["severity"],
+                "description": row["description"], "confidence": row["confidence"],
+            }
+        kev_set: set[str] = set()
         try:
             kev_rows = await self._db.list_kev(limit=10000)
             for r in kev_rows:
-                self._kev_set.add(r["cve_id"].upper())
+                kev_set.add(r["cve_id"].upper())
         except Exception:
             pass
+        self._ip_set, self._ip_meta = ip_set, ip_meta
+        self._domain_set, self._domain_meta = domain_set, domain_meta
+        self._hash_set, self._hash_meta = hash_set, hash_meta
+        self._kev_set = kev_set
         # Load threat actors
         try:
             actors = await self._db.get_threat_actors(active_only=False, limit=1000)
@@ -373,12 +495,89 @@ class FeedManager:
                 self._actor_meta[a["name"].lower()] = a
         except Exception:
             pass
-        # Load recent news
         try:
             self._news_cache = await self._db.get_recent_news(hours=72, limit=100)
         except Exception:
             pass
 
+    async def _central_json(
+        self, method: str, path: str, *, json_body: dict | None = None,
+    ) -> dict:
+        if not self._central_url:
+            raise FeedRefreshError("central threat-intel URL is not configured")
+        async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as session:
+            async with session.request(
+                method, f"{self._central_url}{path}", json=json_body,
+            ) as response:
+                if response.status != 200:
+                    raise FeedRefreshError(
+                        f"central threat-intel {path} returned HTTP {response.status}"
+                    )
+                payload = await response.json(content_type=None)
+        if not isinstance(payload, dict):
+            raise FeedRefreshError(f"central threat-intel {path} returned invalid JSON")
+        return payload
+
+    async def _load_from_central(self) -> None:
+        payload = await self._central_json("GET", "/api/v1/intel/snapshot")
+        required_lists = ("ips", "domains", "hashes", "kev_ids", "spamhaus_cidrs")
+        invalid = [name for name in required_lists if not isinstance(payload.get(name), list)]
+        if invalid:
+            raise FeedRefreshError(
+                "central threat-intel snapshot missing list field(s): " + ", ".join(invalid)
+            )
+
+        def _parse(rows: object, normalizer) -> tuple[set[str], dict[str, dict]]:
+            values: set[str] = set()
+            metadata: dict[str, dict] = {}
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                value = normalizer(row.get("value"))
+                if not value:
+                    continue
+                values.add(value)
+                metadata[value] = {
+                    "source": str(row.get("source") or "central"),
+                    "severity": str(row.get("severity") or "medium"),
+                    "confidence": int(row.get("confidence") or 0),
+                    "description": str(row.get("description") or ""),
+                }
+            return values, metadata
+
+        ip_set, ip_meta = _parse(payload.get("ips"), _normalize_ip)
+        domain_set, domain_meta = _parse(payload.get("domains"), _normalize_domain)
+        hash_set, hash_meta = _parse(
+            payload.get("hashes"),
+            lambda value: str(value or "").lower().strip()
+            if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", str(value or "").strip())
+            else None,
+        )
+        kev_set = {
+            str(cve).upper() for cve in (payload.get("kev_ids") or []) if cve
+        }
+        cidrs: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for raw in payload.get("spamhaus_cidrs") or []:
+            try:
+                cidrs.append(ipaddress.ip_network(str(raw), strict=False))
+            except ValueError:
+                continue
+
+        # Swap only after the complete response validates. A failed refresh keeps
+        # the previous snapshot intact instead of converting dependency failure
+        # into a false "clean" verdict.
+        self._ip_set, self._ip_meta = ip_set, ip_meta
+        self._domain_set, self._domain_meta = domain_set, domain_meta
+        self._hash_set, self._hash_meta = hash_set, hash_meta
+        self._kev_set = kev_set
+        self._spamhaus_cidrs = cidrs
+        now = time.time()
+        self._kev_source = "central"
+        self._kev_synced_at = float(payload.get("generated_at") or now)
+        self._central_status.update({
+            "fresh": True, "last_success": now, "last_error": "",
+            "snapshot_generated_at": float(payload.get("generated_at") or now),
+        })
     async def _fetch_feodo(self) -> int:
         try:
             async with aiohttp.ClientSession(timeout=CHECK_TIMEOUT) as s:
@@ -392,8 +591,9 @@ class FeedManager:
                     continue
                 ip      = row[1].strip() if len(row) > 1 else row[0].strip()
                 malware = row[4].strip() if len(row) > 4 else "BotnetC2"
-                await self._add_ip(ip, "feodo", "critical", 90, f"Feodo C2 — {malware}")
-                count += 1
+                count += int(await self._add_ip(
+                    ip, "feodo", "critical", 90, f"Feodo C2 — {malware}"
+                ))
             log.info("Feodo Tracker: %d IPs loaded", count)
             return count
         except Exception as exc:
@@ -412,9 +612,10 @@ class FeedManager:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                await self._add_ip(line, "emerging_threats", "high", 80,
-                                   "Emerging Threats compromised host")
-                count += 1
+                count += int(await self._add_ip(
+                    line, "emerging_threats", "high", 80,
+                    "Emerging Threats compromised host",
+                ))
             log.info("Emerging Threats: %d IPs loaded", count)
             return count
         except Exception as exc:
@@ -437,10 +638,10 @@ class FeedManager:
                 if not host:
                     continue
                 if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-                    await self._add_ip(host, "urlhaus", "high", 80, f"URLhaus {threat}")
+                    accepted = await self._add_ip(host, "urlhaus", "high", 80, f"URLhaus {threat}")
                 else:
-                    await self._add_domain(host, "urlhaus", "high", 80, f"URLhaus {threat}")
-                count += 1
+                    accepted = await self._add_domain(host, "urlhaus", "high", 80, f"URLhaus {threat}")
+                count += int(accepted)
             log.info("URLhaus: %d entries loaded", count)
             return count
         except Exception as exc:
@@ -466,22 +667,29 @@ class FeedManager:
                 desc = f"ThreatFox {malware} ({threat_type})"
                 severity = "critical" if confidence >= 90 else "high" if confidence >= 70 else "medium"
                 if ioc_type in ("ip:port", "ip"):
-                    # Strip port if present
-                    ip_part = ioc_value.split(":")[0].strip("[]")
-                    await self._add_ip(ip_part, "threatfox", severity, confidence, desc)
-                    count += 1
+                    ip_value = _parse_ip_ioc(ioc_value)
+                    count += int(bool(ip_value) and await self._add_ip(
+                        ip_value, "threatfox", severity, confidence, desc
+                    ))
                 elif ioc_type == "domain":
-                    await self._add_domain(ioc_value, "threatfox", severity, confidence, desc)
-                    count += 1
+                    count += int(await self._add_domain(
+                        ioc_value, "threatfox", severity, confidence, desc
+                    ))
+                elif ioc_type in ("sha256_hash", "md5_hash", "sha1_hash", "hash"):
+                    count += int(await self._add_hash(
+                        ioc_value, "threatfox", severity, confidence, desc
+                    ))
                 elif ioc_type == "url":
                     try:
                         from urllib.parse import urlparse
                         host = urlparse(ioc_value).hostname or ""
                         if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-                            await self._add_ip(host, "threatfox", severity, confidence, desc)
+                            accepted = await self._add_ip(host, "threatfox", severity, confidence, desc)
                         elif host:
-                            await self._add_domain(host, "threatfox", severity, confidence, desc)
-                        count += 1
+                            accepted = await self._add_domain(host, "threatfox", severity, confidence, desc)
+                        else:
+                            accepted = False
+                        count += int(accepted)
                     except Exception:
                         pass
             log.info("ThreatFox: %d IOCs loaded", count)
@@ -703,9 +911,10 @@ class FeedManager:
 
     async def _add_ip(self, ip: str, source: str, severity: str,
                       confidence: int, description: str,
-                      ttl: int = FEED_TTL * 24) -> None:
-        if not ip or _is_private(ip):
-            return
+                      ttl: int = FEED_TTL * 24) -> bool:
+        ip = _normalize_ip(ip)
+        if not ip:
+            return False
         self._ip_set.add(ip)
         self._ip_meta[ip] = {
             "source":      source,
@@ -719,13 +928,14 @@ class FeedManager:
             description=description,
             expires_at=time.time() + ttl,
         )
+        return True
 
     async def _add_domain(self, domain: str, source: str, severity: str,
                           confidence: int, description: str,
-                          ttl: int = FEED_TTL * 24) -> None:
-        domain = domain.lower().strip()
-        if not domain or domain in ("localhost", "127.0.0.1", "::1"):
-            return
+                          ttl: int = FEED_TTL * 24) -> bool:
+        domain = _normalize_domain(domain)
+        if not domain:
+            return False
         self._domain_set.add(domain)
         self._domain_meta[domain] = {
             "source":      source,
@@ -739,3 +949,22 @@ class FeedManager:
             description=description,
             expires_at=time.time() + ttl,
         )
+        return True
+
+    async def _add_hash(self, value: str, source: str, severity: str,
+                        confidence: int, description: str,
+                        ttl: int = FEED_TTL * 24) -> bool:
+        value = value.lower().strip()
+        if not re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}", value):
+            return False
+        self._hash_set.add(value)
+        self._hash_meta[value] = {
+            "source": source, "severity": severity,
+            "confidence": confidence, "description": description,
+        }
+        await self._db.upsert_ioc(
+            ioc_type="hash", ioc_value=value, source=source,
+            severity=severity, confidence=confidence,
+            description=description, expires_at=time.time() + ttl,
+        )
+        return True

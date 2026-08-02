@@ -34,6 +34,10 @@ from .rules import get_tactic, severity_to_score
 log = logging.getLogger("manager.attacklens.rulepack")
 
 
+class RulePackEvaluationError(RuntimeError):
+    """One or more executable rules failed for the current payload."""
+
+
 RuleFn = Callable[["RulePackDetector", str, dict, dict | None], dict | None]
 
 
@@ -91,6 +95,7 @@ _SECTION_CATEGORY: dict[str, str] = {
     "battery": "battery",
     "binaries": "binary",
     "configs": "config",
+    "developer_security": "developer_security",
     "connections": "connection",
     "containers": "container",
     "hardware": "hardware",
@@ -550,6 +555,10 @@ class RulePackDetector:
     def rules_for(self, section: str) -> list[RulePackRule]:
         return self._rules.get(_canonical_section(section), [])
 
+    def has_executable_rules(self, section: str) -> bool:
+        """Return true only when loaded YAML has an implemented evaluator."""
+        return any(rule.id in _RULE_EVALUATORS for rule in self.rules_for(section))
+
     async def analyze(
         self,
         agent_id: str,
@@ -562,6 +571,7 @@ class RulePackDetector:
         if not rules:
             return []
         findings: list[dict] = []
+        errors: list[str] = []
         items = self._iter_items(section, data)
         for rule in rules:
             evaluator = _RULE_EVALUATORS.get(rule.id)
@@ -571,10 +581,15 @@ class RulePackDetector:
                 try:
                     match = evaluator(self, agent_id, item, {"feeds": feeds})
                 except Exception as exc:
-                    log.debug("rulepack evaluator failed rule=%s: %s", rule.id, exc)
+                    errors.append(f"{rule.id}:{type(exc).__name__}:{exc}")
                     continue
                 if match:
                     findings.append(self._finding(agent_id, rule, item, match, {"feeds": feeds}))
+        if errors:
+            raise RulePackEvaluationError(
+                f"{len(errors)} rulepack evaluation(s) failed for {section}: "
+                + "; ".join(errors[:5])
+            )
         return findings
 
     @staticmethod

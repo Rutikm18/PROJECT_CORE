@@ -357,6 +357,7 @@ CREATE TABLE IF NOT EXISTS nvd_cve_local (
     severity      TEXT NOT NULL DEFAULT 'info',
     cwe_ids       TEXT NOT NULL DEFAULT '[]',
     cpe_uris      TEXT NOT NULL DEFAULT '[]',
+    cpe_matches   TEXT NOT NULL DEFAULT '[]',
     pkg_keywords  TEXT NOT NULL DEFAULT '',
     published_at  TEXT NOT NULL DEFAULT '',
     modified_at   TEXT NOT NULL DEFAULT '',
@@ -656,6 +657,29 @@ CREATE TABLE IF NOT EXISTS finding_timeline (
     created_at  DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_finding_timeline_fid ON finding_timeline(finding_id, id);
+
+-- ── Stateful post-detection investigation runs ─────────────────────────────
+-- LangGraph owns its checkpoint tables. This application-owned index keeps
+-- API status, analyst decisions, and bounded final output easy to query/audit.
+CREATE TABLE IF NOT EXISTS investigation_runs (
+    run_id          TEXT PRIMARY KEY,
+    finding_id      INTEGER NOT NULL,
+    thread_id       TEXT NOT NULL UNIQUE,
+    status          TEXT NOT NULL DEFAULT 'running',
+    current_node    TEXT NOT NULL DEFAULT '',
+    review_payload  TEXT NOT NULL DEFAULT '{}',
+    result          TEXT NOT NULL DEFAULT '{}',
+    analyst_actor   TEXT NOT NULL DEFAULT '',
+    analyst_decision TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    created_at      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    completed_at    DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_investigation_finding
+    ON investigation_runs(finding_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_investigation_status
+    ON investigation_runs(status, updated_at DESC);
 """
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -707,6 +731,7 @@ _SOC_MIGRATIONS = [
     ("findings", "ai_validation_used",      "INTEGER DEFAULT 0"),
     ("findings", "terrain_validation",      "TEXT    DEFAULT '{}'"),
     ("nvd_cve_local", "vuln_status",         "TEXT    DEFAULT ''"),
+    ("nvd_cve_local", "cpe_matches",         "TEXT    DEFAULT '[]'"),
     # Unique Finding ID + Attack Terrain FK + Actions Log
     ("findings", "finding_uid",             "TEXT    DEFAULT ''"),
     ("findings", "terrain_id",              "TEXT    DEFAULT ''"),
@@ -880,6 +905,20 @@ class IngestDeduplicator:
             "hit_rate":     round(self._hits / total, 4) if total else 0.0,
             "pending_flush": sum(e.pending_count for e in self._cache.values()),
         }
+
+    def overlay_pending(self, finding: dict) -> dict:
+        """Expose buffered heartbeats to readers before the batch DB flush."""
+        entry = self._cache.get((
+            finding.get("agent_id"), finding.get("category"), finding.get("item_key"),
+        ))
+        if entry is None or entry.pending_count <= 0:
+            return finding
+        finding["scan_count"] = int(finding.get("scan_count") or 0) + entry.pending_count
+        finding["last_detected_at"] = max(
+            float(finding.get("last_detected_at") or 0), entry.last_seen_at,
+        )
+        finding["consecutive_unchanged"] = entry.consecutive_unchanged
+        return finding
 
 
 class IntelDB:
@@ -1246,8 +1285,12 @@ class IntelDB:
                         "exploitability_score": exploitability_score,
                         "exploitability_band": exploitability_band,
                     }
-                    if _finding_is_alertable(notify_payload):
-                        self._schedule_finding_notification(notify_payload, "created")
+                    # Emit the post-persist hook for every new finding. Each
+                    # downstream consumer owns its policy: email filters for
+                    # critical/exploitable findings, while investigations use
+                    # LANGGRAPH_AUTO_SEVERITIES. Keeping the filter here made
+                    # high-severity investigations impossible to trigger.
+                    self._schedule_finding_notification(notify_payload, "created")
                 await self._append_timeline(agent_id, category, "added",
                                             item_key, f.get("title",""),
                                             evidence_j, None, ts)
@@ -1346,7 +1389,7 @@ class IntelDB:
             f"LIMIT ? OFFSET ?",
             (*args, limit, offset),
         )
-        return [dict(r) for r in rows]
+        return [self._dedup.overlay_pending(dict(r)) for r in rows]
 
     async def get_active_findings_global(
         self,
@@ -2187,6 +2230,33 @@ class IntelDB:
 
         return await self.get_finding_by_id(finding_id)
 
+    async def apply_custom_correlation_action(
+        self, finding_id: int, action: str, tags: list[str] | None = None,
+    ) -> None:
+        """Apply an analyst correlation action as one serialized DB write."""
+        async with self._lock:
+            if action == "suppress":
+                await self._conn.execute(
+                    "UPDATE findings SET status='false_positive', is_active=0, "
+                    "closed_at=? WHERE id=?",
+                    (time.time(), finding_id),
+                )
+            elif action == "elevate":
+                await self._conn.execute(
+                    "UPDATE findings SET severity='critical', score=9.5 "
+                    "WHERE id=? AND severity IN ('high','medium','low','info')",
+                    (finding_id,),
+                )
+            elif action == "tag":
+                await self._conn.execute(
+                    "UPDATE findings SET tags=(COALESCE(NULLIF(tags,''),'[]')::jsonb "
+                    "|| ?::jsonb)::text WHERE id=?",
+                    (json.dumps(tags or []), finding_id),
+                )
+            else:
+                raise ValueError(f"unsupported custom correlation action: {action}")
+            await self._conn.commit()
+
     async def bulk_update_findings(
         self, finding_ids: list[int], *,
         status: str | None = None,
@@ -2775,6 +2845,7 @@ class IntelDB:
                     c.get("description", ""), c.get("cvss_score"),
                     c.get("cvss_vector", ""), c.get("severity", "info"),
                     c.get("cwe_ids", "[]"), c.get("cpe_uris", "[]"),
+                    c.get("cpe_matches", "[]"),
                     c.get("pkg_keywords", ""), c.get("published_at", ""),
                     c.get("modified_at", ""), c.get("synced_at", 0),
                 )
@@ -2783,8 +2854,8 @@ class IntelDB:
             await self._conn.executemany("""
                 INSERT INTO nvd_cve_local
                 (cve_id, vuln_status, description, cvss_score, cvss_vector, severity,
-                 cwe_ids, cpe_uris, pkg_keywords, published_at, modified_at, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cwe_ids, cpe_uris, cpe_matches, pkg_keywords, published_at, modified_at, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cve_id) DO UPDATE SET
                     vuln_status = excluded.vuln_status,
                     description  = excluded.description,
@@ -2793,6 +2864,7 @@ class IntelDB:
                     severity     = excluded.severity,
                     cwe_ids      = excluded.cwe_ids,
                     cpe_uris     = excluded.cpe_uris,
+                    cpe_matches  = excluded.cpe_matches,
                     pkg_keywords = excluded.pkg_keywords,
                     modified_at  = excluded.modified_at,
                     synced_at    = excluded.synced_at
@@ -2815,7 +2887,7 @@ class IntelDB:
         try:
             rows = await self._fetchall("""
                 SELECT cve_id, description, cvss_score, cvss_vector,
-                       severity, cwe_ids, cpe_uris, published_at, modified_at
+                       severity, cwe_ids, cpe_uris, cpe_matches, published_at, modified_at
                 FROM nvd_cve_local
                 WHERE search_vector @@ to_tsquery('english', ?)
                   AND LOWER(vuln_status) NOT IN ('reject', 'rejected')
@@ -2823,12 +2895,13 @@ class IntelDB:
                 LIMIT ?
             """, (fts_term, limit))
             return [dict(r) for r in rows]
+
         except Exception as exc:
             log.debug("NVD FTS search failed, using LIKE fallback: %s", exc)
             predicates = " AND ".join("pkg_keywords ILIKE ?" for _ in tokens)
             rows = await self._fetchall("""
                 SELECT cve_id, description, cvss_score, cvss_vector, severity,
-                       cwe_ids, cpe_uris, published_at, modified_at
+                       cwe_ids, cpe_uris, cpe_matches, published_at, modified_at
                 FROM nvd_cve_local
                 WHERE """ + predicates + """
                   AND LOWER(vuln_status) NOT IN ('reject', 'rejected')
@@ -2836,6 +2909,33 @@ class IntelDB:
                 LIMIT ?
             """, (*[f"%{token}%" for token in tokens], limit))
             return [dict(r) for r in rows]
+
+    async def get_nvd_local_by_id(self, cve_id: str) -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT cve_id, description, cvss_score, cvss_vector, severity, "
+            "cwe_ids, cpe_uris, cpe_matches, published_at, modified_at "
+            "FROM nvd_cve_local WHERE cve_id=? AND "
+            "LOWER(vuln_status) NOT IN ('reject', 'rejected')",
+            (cve_id.upper(),),
+        )
+        return dict(row) if row else None
+
+    async def list_nvd_local(
+        self, *, severity: str | None = None, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        where = "LOWER(vuln_status) NOT IN ('reject', 'rejected')"
+        args: list[Any] = []
+        if severity:
+            where += " AND LOWER(severity)=?"
+            args.append(severity.lower())
+        rows = await self._fetchall(
+            "SELECT cve_id, description, cvss_score, cvss_vector, severity, "
+            "cwe_ids, cpe_uris, cpe_matches, published_at, modified_at "
+            f"FROM nvd_cve_local WHERE {where} "
+            "ORDER BY COALESCE(cvss_score, 0) DESC, modified_at DESC LIMIT ? OFFSET ?",
+            (*args, limit, offset),
+        )
+        return [dict(row) for row in rows]
 
     async def get_nvd_state(self, key: str) -> Optional[str]:
         row = await self._fetchone(
@@ -3035,6 +3135,117 @@ class IntelDB:
         cutoff = time.time() - 7 * 86400
         row = await self._fetchone("SELECT COUNT(*) AS n FROM security_news WHERE cached_at>?", (cutoff,))
         return row["n"] if row else 0
+
+    # ── Stateful AI investigations ───────────────────────────────────────────
+
+    @staticmethod
+    def _shape_investigation_run(row) -> dict | None:
+        if row is None:
+            return None
+        data = dict(row)
+        for field in ("review_payload", "result"):
+            value = data.get(field)
+            if isinstance(value, str):
+                try:
+                    data[field] = json.loads(value) if value else {}
+                except (TypeError, ValueError):
+                    data[field] = {}
+        return data
+
+    async def create_investigation_run(
+        self, run_id: str, finding_id: int, thread_id: str,
+    ) -> dict:
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                """INSERT INTO investigation_runs
+                   (run_id,finding_id,thread_id,status,created_at,updated_at)
+                   VALUES (?,?,?,'running',?,?)""",
+                (run_id, finding_id, thread_id, now, now),
+            )
+            await self._conn.commit()
+        return await self.get_investigation_run(run_id) or {}
+
+    async def get_investigation_run(self, run_id: str) -> dict | None:
+        row = await self._fetchone(
+            "SELECT * FROM investigation_runs WHERE run_id=?", (run_id,),
+        )
+        return self._shape_investigation_run(row)
+
+    async def get_latest_investigation_run(self, finding_id: int) -> dict | None:
+        row = await self._fetchone(
+            "SELECT * FROM investigation_runs WHERE finding_id=? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (finding_id,),
+        )
+        return self._shape_investigation_run(row)
+
+    async def get_open_investigation_run(self, finding_id: int) -> dict | None:
+        row = await self._fetchone(
+            "SELECT * FROM investigation_runs WHERE finding_id=? "
+            "AND status IN ('running','pending_review') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (finding_id,),
+        )
+        return self._shape_investigation_run(row)
+
+    async def update_investigation_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        current_node: str | None = None,
+        review_payload: dict | None = None,
+        result: dict | None = None,
+        analyst_actor: str | None = None,
+        analyst_decision: str | None = None,
+        error: str | None = None,
+        completed: bool = False,
+    ) -> dict | None:
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                """UPDATE investigation_runs SET
+                   status=COALESCE(?,status),
+                   current_node=COALESCE(?,current_node),
+                   review_payload=COALESCE(?,review_payload),
+                   result=COALESCE(?,result),
+                   analyst_actor=COALESCE(?,analyst_actor),
+                   analyst_decision=COALESCE(?,analyst_decision),
+                   error=COALESCE(?,error),
+                   updated_at=?,
+                   completed_at=CASE WHEN ?=1 THEN ? ELSE completed_at END
+                   WHERE run_id=?""",
+                (
+                    status, current_node,
+                    json.dumps(review_payload, default=str) if review_payload is not None else None,
+                    json.dumps(result, default=str) if result is not None else None,
+                    analyst_actor, analyst_decision, error, now,
+                    1 if completed else 0, now, run_id,
+                ),
+            )
+            await self._conn.commit()
+        return await self.get_investigation_run(run_id)
+
+    async def record_investigation_decision(
+        self, finding_id: int, run_id: str, decision: str, actor: str, feedback: str,
+    ) -> None:
+        finding = await self.get_finding_by_id(finding_id)
+        if not finding:
+            return
+        await self._log_activity(
+            finding_id,
+            finding.get("agent_id") or "",
+            f"investigation_{decision}",
+            actor or "analyst",
+            "pending_review",
+            decision,
+            (feedback or f"LangGraph investigation {decision}")[:500],
+            time.time(),
+            finding_uid=finding.get("finding_uid") or "",
+            metadata={"run_id": run_id, "workflow": "langgraph_investigation"},
+        )
+        await self._conn.commit()
 
     # ── AI analysis ───────────────────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ Each submodule groups related collectors:
   sca.py       — CIS benchmark compliance scan (SCA)                   (12 hr)
   inventory.py — software:        storage, tasks, apps, packages,
                                   binaries, sbom                        (10 min – 24 hr)
+  developer_security.py — coding-agent/tool attack surface              (1 hr)
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from .system    import (
 )
 from .posture   import SecurityCollector, SysctlCollector, ConfigsCollector
 from .sca       import ScaCollector
+from .developer_security import DeveloperSecurityCollector
 from .inventory import (
     StorageCollector, TasksCollector, AppsCollector,
     PackagesCollector, BinariesCollector, SbomCollector,
@@ -54,6 +56,8 @@ COLLECTORS: dict[str, object] = {
     "configs":     ConfigsCollector(),
     # compliance (12 hr)
     "sca":         ScaCollector(),
+    # developer / AI tool security posture (1 hr)
+    "developer_security": DeveloperSecurityCollector(),
     # inventory (24 hr)
     "apps":        AppsCollector(),
     "packages":    PackagesCollector(),

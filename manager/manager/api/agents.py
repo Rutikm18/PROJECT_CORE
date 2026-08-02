@@ -93,15 +93,7 @@ def make_agents_router(db: "Database", store: "TelemetryStore") -> APIRouter:
     # ── Section summary (freshness for timeline) ──────────────────────────────
     @router.get("/{agent_id}/sections")
     async def get_sections(agent_id: str):
-        """Return per-section summary: latest timestamp, row count, file count."""
-        # Try file-store index first (richer data)
-        try:
-            summary = await store.index.get_section_summary(agent_id)
-            if summary:
-                return {s["section"]: s for s in summary}
-        except Exception:
-            pass
-        # Fallback: SQLite section last times
+        """Return per-section freshness from the shared PostgreSQL raw store."""
         return await db.get_section_last_times(agent_id)
 
     # ── Section time-series ───────────────────────────────────────────────────
@@ -126,31 +118,8 @@ def make_agents_router(db: "Database", store: "TelemetryStore") -> APIRouter:
         if end <= 0:
             end = now
 
-        # Try file store first (richer, multi-tier)
-        try:
-            rows = await store.query(
-                agent_id=agent_id,
-                section=section,
-                window=window,
-                limit=limit,
-                start=float(start),
-                end=float(end),
-            )
-            if rows:
-                # Normalise to {collected_at, data} shape the dashboard expects
-                return [
-                    {
-                        "collected_at": int(r.get("ts", r.get("collected_at", 0))),
-                        "data":         r.get("data", {}),
-                        "os":           r.get("os", ""),
-                        "hostname":     r.get("hostname", ""),
-                    }
-                    for r in rows
-                ]
-        except Exception as exc:
-            log.debug("Store query failed, falling back to db: %s", exc)
-
-        # Fallback: SQLite payloads table
+        # Shared PostgreSQL is authoritative; filesystem archives are optional
+        # exports and are never queried on the HA request path.
         rows = await db.query_section(
             agent_id, section,
             limit=limit,

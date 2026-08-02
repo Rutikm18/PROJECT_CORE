@@ -14,23 +14,29 @@ import inspect
 
 import pytest
 
-from manager.manager.attacklens.engine import _DETECTION_MODULE_ROUTES
-from manager.manager.attacklens.detections import mount_monitor
+from manager.manager.attacklens.engine import (
+    _DETECTION_MODULE_ROUTES,
+    detection_source_coverage,
+)
+from manager.manager.attacklens.rulepack import RulePackDetector
+from manager.manager.attacklens.detections import battery_health, mount_monitor, sca_compliance
+from shared.sections import VALID_SECTION_NAMES
 
 
-# The 24 telemetry categories the agent ships (23 sections + agent_health).
-ALL_SECTIONS = {
-    "metrics", "connections", "processes", "ports", "network", "arp", "mounts",
-    "battery", "openfiles", "services", "users", "hardware", "containers",
-    "storage", "tasks", "security", "sysctl", "configs", "sca", "apps",
-    "packages", "binaries", "sbom", "agent_health",
-}
+# Use the same canonical source registry as ingest and the agent. A hand-written
+# test set can silently omit a newly-added source and still pass.
+ALL_SECTIONS = set(VALID_SECTION_NAMES)
 
-# Sections intentionally covered ONLY by the universal rulepack + behavioral
-# (low security-signal inventory/health telemetry — no dedicated module needed):
-#   battery, hardware, sca, agent_health, metrics, openfiles.
-# They still pass through _dispatch + rulepack; they just don't require a rich
-# module route the way the high-signal sections below do.
+
+def test_every_canonical_source_has_an_executable_detection_path():
+    coverage = detection_source_coverage(RulePackDetector.load())
+    assert set(coverage) == ALL_SECTIONS
+    assert not {section: paths for section, paths in coverage.items() if not paths}
+
+
+def test_sca_and_battery_are_dedicated_routes_not_metadata_only():
+    assert _DETECTION_MODULE_ROUTES["sca"]
+    assert _DETECTION_MODULE_ROUTES["battery"]
 
 
 def _routed_modules() -> set[str]:
@@ -92,6 +98,64 @@ class FakeDB:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+class TestBatteryHealth:
+    def test_explicit_bad_condition_and_severe_degradation_fire(self):
+        out = _run(battery_health.analyze("mac-1", "battery", {
+            "present": True,
+            "condition": "Service Recommended",
+            "charge_pct": 75,
+            "capacity_mah": 2500,
+            "design_mah": 5000,
+            "cycle_count": 400,
+        }, FakeDB()))
+        assert {finding["rule_id"] for finding in out} == {
+            "BATTERY-HEALTH-001", "BATTERY-HEALTH-002",
+        }
+
+    def test_cycle_counter_decrease_fires_only_after_durable_baseline(self):
+        db = FakeDB()
+        assert _run(battery_health.analyze(
+            "mac-1", "battery", {"present": True, "cycle_count": 120}, db,
+        )) == []
+        out = _run(battery_health.analyze(
+            "mac-1", "battery", {"present": True, "cycle_count": 3}, db,
+        ))
+        assert [finding["rule_id"] for finding in out] == ["BATTERY-002"]
+        assert out[0]["evidence"]["previous_cycle_count"] == 120
+
+    def test_absent_battery_is_not_an_alert(self):
+        assert _run(battery_health.analyze(
+            "desktop-1", "battery", {"present": False}, FakeDB(),
+        )) == []
+
+
+class TestScaCompliance:
+    def test_only_failed_applicable_checks_become_findings(self):
+        payload = {
+            "policies": [{
+                "policy": {"id": "cis-macos", "name": "CIS macOS"},
+                "applicable": True,
+                "checks": [
+                    {"id": "1.1", "title": "Enable updates", "result": "passed"},
+                    {"id": "2.1", "title": "Enable firewall", "result": "failed",
+                     "reason": "firewall disabled", "remediation": "Enable the firewall",
+                     "mitre": ["T1562.004"]},
+                    {"id": "3.1", "title": "Unknown probe", "result": "not_applicable"},
+                ],
+            }],
+        }
+        out = _run(sca_compliance.analyze("mac-1", "sca", payload, FakeDB()))
+        assert len(out) == 1
+        assert out[0]["item_key"] == "sca:cis-macos:2.1"
+        assert out[0]["category"] == "compliance"
+        assert out[0]["evidence"]["reason"] == "firewall disabled"
+
+    def test_unrelated_section_is_ignored(self):
+        assert _run(sca_compliance.analyze(
+            "mac-1", "security", {"policies": []}, FakeDB(),
+        )) == []
 
 
 class TestMountMonitor:

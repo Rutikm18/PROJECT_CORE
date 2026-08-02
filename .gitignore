@@ -72,3 +72,5 @@ sast-report.json
 .idea/
 .vscode/
 docker-compose.override.yml
+
+LEARNINGS.md

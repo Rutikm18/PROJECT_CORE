@@ -50,6 +50,9 @@ SECTION_DEFS: tuple[SectionDef, ...] = (
     SectionDef("security",    "posture",   3600,  "SIP, Gatekeeper, FileVault, Firewall"),
     SectionDef("sysctl",      "posture",   3600,  "Kernel security parameters"),
     SectionDef("configs",     "posture",   3600,  "Shell rc, SSH config, /etc/hosts"),
+    SectionDef("developer_security", "posture", 3600,
+               "Developer tools, AI agents, MCP, browser and package-manager posture"),
+    SectionDef("sca",         "posture",   43200, "Security configuration assessment checks"),
     # ── Software inventory (24 hr) ───────────────────────────────────────
     SectionDef("apps",        "inventory", 86400, "Installed .app bundles"),
     SectionDef("packages",    "inventory", 86400, "brew, pip, npm, gems"),
@@ -64,3 +67,32 @@ SECTIONS: dict[str, SectionDef] = {s.name: s for s in SECTION_DEFS}
 
 # Frozenset of valid names — used for fast validation in the API layer
 VALID_SECTION_NAMES: FrozenSet[str] = frozenset(SECTIONS)
+
+# Accepted producer aliases. Normalize once at ingest so storage, detection,
+# correlation, and reconciliation all use the same durable section key.
+SECTION_ALIASES: dict[str, str] = {
+    "listening_ports": "ports", "netstat": "ports", "ss_output": "ports",
+    "net_tcp_connection": "ports", "open_ports": "ports",
+    "network_sessions": "connections", "connectivity": "connections",
+    "open_files": "openfiles",
+    "user_accounts": "users", "passwd_entries": "users", "local_users": "users",
+    "kernel_params": "sysctl", "sysctl_output": "sysctl",
+    "launchd_services": "services", "systemd_services": "services",
+    "windows_services": "services",
+    "scheduled_tasks": "tasks", "cron_jobs": "tasks", "launchd_tasks": "tasks",
+    "systemd_timers": "tasks",
+    "brew_packages": "packages", "pip_packages": "packages",
+    "npm_packages": "packages", "dpkg_packages": "packages",
+    "rpm_packages": "packages", "winget_packages": "packages",
+    "choco_packages": "packages", "scoop_packages": "packages",
+    "installed_packages": "packages", "installed_apps": "apps",
+    "sbom_cyclonedx": "sbom", "sbom_spdx": "sbom", "pip_list": "sbom",
+    "npm_list": "sbom", "gem_list": "sbom",
+    "security_posture": "security", "endpoint_posture": "security",
+    "pods": "containers", "container_security": "containers",
+}
+
+
+def canonical_section(section: object) -> str:
+    value = str(section or "").strip().lower().replace("-", "_")
+    return SECTION_ALIASES.get(value, value)

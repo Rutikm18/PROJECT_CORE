@@ -337,6 +337,33 @@ SCHEMAS: dict[str, dict] = {
     "security":    SECURITY,
     "sysctl":      SYSCTL_RECORD,
     "configs":     CONFIGS_RECORD,
+    "developer_security": {
+        "schema_version": int,
+        "platform": str,
+        "scope": dict,
+        "privacy": dict,
+        "capabilities": dict,
+        "collection": dict,
+    },
+    "sca": {
+        "policies": list,
+        "summary": dict,
+        "engine": dict,
+    },
+    "agent_health": {
+        "agent_id": str,
+        "hostname": str,
+        "os": str,
+        "arch": str,
+        "uptime_sec": int,
+        "queue_depth": int,
+        "sections": dict,
+        "skipped_overlap": int,
+        "generated_at": int,
+        "link": (dict, None),
+        "policy_versions": (dict, None),
+        "response_enabled": (bool, None),
+    },
     "apps":        APPS_RECORD,
     "packages":    PACKAGES_RECORD,
     "binaries":    BINARIES_RECORD,
@@ -345,15 +372,20 @@ SCHEMAS: dict[str, dict] = {
 
 # Sections where `data` is a list of records (vs a single dict)
 LIST_SECTIONS: frozenset[str] = frozenset({
-    "connections", "processes", "ports", "arp", "mounts",
+    "connections", "processes", "ports", "mounts",
     "openfiles", "services", "users", "hardware", "containers",
     "storage", "tasks", "sysctl", "configs", "apps", "packages",
     "binaries", "sbom",
 })
 # Sections where `data` is a single dict (not a list)
 DICT_SECTIONS: frozenset[str] = frozenset({
-    "metrics", "network", "battery", "security",
+    "metrics", "network", "battery", "security", "developer_security",
+    "sca", "agent_health",
 })
+# Sources with two intentionally supported wire shapes. ARP agents normally
+# send a flat list, while richer network sensors send an object containing
+# entries plus gateway/DHCP/statistics context used by the ARP detector.
+FLEX_SECTIONS: frozenset[str] = frozenset({"arp"})
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -371,7 +403,21 @@ def validate_section(section: str, data: Any) -> list[str]:
 
     errors: list[str] = []
 
-    if section in LIST_SECTIONS:
+    if section in FLEX_SECTIONS:
+        if isinstance(data, list):
+            records = data
+        elif isinstance(data, dict):
+            records = data.get("entries") or data.get("arp_table") or []
+            if not isinstance(records, list):
+                return [f"{section}: entries must be a list"]
+        else:
+            return [
+                f"{section}: data must be a list or dict, got {type(data).__name__}"
+            ]
+        for i, record in enumerate(records[:5]):
+            if not isinstance(record, dict):
+                errors.append(f"{section}[{i}]: expected object")
+    elif section in LIST_SECTIONS:
         if not isinstance(data, list):
             return [f"{section}: data must be a list, got {type(data).__name__}"]
         for i, record in enumerate(data[:5]):   # validate first 5 records

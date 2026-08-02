@@ -42,7 +42,7 @@ class _StubEngine(AttackLensEngine):
         self._cur_concurrent = 0
 
     async def process(self, agent_id, section, data, skip_correlation=False,
-                      collected_at=None):
+                      collected_at=None, event_id="", chunk_index=0, chunk_total=1):
         self._cur_concurrent += 1
         self._max_concurrent = max(self._max_concurrent, self._cur_concurrent)
         try:
@@ -106,13 +106,31 @@ async def test_concurrency_is_capped_at_worker_count(monkeypatch):
     await _start_executor(eng, workers=3, monkeypatch=monkeypatch)
     try:
         for i in range(40):
-            eng.enqueue("a", "ports", [{"i": i}])
+            eng.enqueue(f"agent-{i}", "ports", [{"i": i}])
         await asyncio.sleep(0.05)        # let workers pick up and block on gate
         assert eng._max_concurrent <= 3, eng._max_concurrent
         assert eng._cur_concurrent == 3  # exactly the pool size is in flight
         eng._gate.set()                  # release
         await eng._detect_queue.join()
         assert eng._detect_stats["processed"] == 40
+    finally:
+        eng._gate.set()
+        await _stop_executor(eng)
+
+
+@pytest.mark.asyncio
+async def test_same_agent_is_serialized_across_executor_workers(monkeypatch):
+    eng = _StubEngine()
+    eng._gate = asyncio.Event()
+    await _start_executor(eng, workers=3, monkeypatch=monkeypatch)
+    try:
+        for i in range(6):
+            eng.enqueue("same-agent", "ports", [{"i": i}])
+        await asyncio.sleep(0.05)
+        assert eng._cur_concurrent == 1
+        eng._gate.set()
+        await eng._detect_queue.join()
+        assert eng._detect_stats["processed"] == 6
     finally:
         eng._gate.set()
         await _stop_executor(eng)
@@ -144,10 +162,14 @@ async def test_worker_survives_a_failing_payload(monkeypatch):
     an error and keeps draining."""
     eng = _StubEngine()
     orig = eng.process
-    async def flaky(agent_id, section, data, skip_correlation=False, collected_at=None):
+    async def flaky(agent_id, section, data, skip_correlation=False, collected_at=None,
+                    event_id="", chunk_index=0, chunk_total=1):
         if section == "boom":
             raise RuntimeError("kaboom")
-        await orig(agent_id, section, data, collected_at=collected_at)
+        await orig(
+            agent_id, section, data, collected_at=collected_at, event_id=event_id,
+            chunk_index=chunk_index, chunk_total=chunk_total,
+        )
     eng.process = flaky  # type: ignore
     await _start_executor(eng, workers=2, monkeypatch=monkeypatch)
     try:

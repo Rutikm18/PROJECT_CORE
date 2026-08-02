@@ -80,14 +80,18 @@ def client(app):
         yield c
 
 
-def _envelope(section: str = "metrics") -> dict:
+def _envelope(section: str = "metrics", data: dict | None = None) -> dict:
     enc_key, mac_key = derive_keys(_AGENT_KEY)
     payload = {
         "section":      section,
         "agent_id":     _AGENT_ID,
         "agent_name":   "Integration Test Mac",
         "collected_at": int(time.time()),
-        "data":         {"cpu_pct": 8.0, "mem_pct": 42.0},
+        "os":           "macos",
+        "os_version":   "15.0",
+        "arch":         platform.machine(),
+        "hostname":     socket.gethostname(),
+        "data":         data if data is not None else {"cpu_pct": 8.0, "mem_pct": 42.0},
     }
     env = encrypt(payload, enc_key, mac_key, _AGENT_ID, int(time.time()))
     env["section"] = section
@@ -102,11 +106,59 @@ def test_valid_payload_returns_ok(client):
     assert r.json()["status"] == "ok"
 
 
+def test_developer_security_payload_is_received_and_queryable(client):
+    """Pin the new hourly snapshot's complete encrypted agent→manager path."""
+    snapshot = {
+        "schema_version": 1,
+        "platform": "macos",
+        "privacy": {"credential_values_collected": False},
+        "capabilities": {"mcp_servers": {"servers": []}},
+        "collection": {"partial": False, "errors": []},
+    }
+    sent = client.post(
+        "/api/v1/ingest", json=_envelope("developer_security", snapshot)
+    )
+    assert sent.status_code == 200
+    assert sent.json()["status"] == "ok"
+
+    received = client.get(
+        f"/api/v1/agents/{_AGENT_ID}/developer_security", params={"window": "1h"}
+    )
+    assert received.status_code == 200
+    rows = received.json()
+    assert rows
+    assert rows[0]["data"]["schema_version"] == 1
+    assert rows[0]["data"]["capabilities"]["mcp_servers"]["servers"] == []
+
+
 def test_invalid_json_returns_400(client):
     r = client.post("/api/v1/ingest",
                     content=b"not-json",
                     headers={"Content-Type": "application/json"})
     assert r.status_code == 400
+
+
+def test_non_object_json_returns_400(client):
+    r = client.post("/api/v1/ingest", json=["not", "an", "envelope"])
+    assert r.status_code == 400
+
+
+def test_malformed_timestamp_returns_400_not_500(client):
+    env = _envelope()
+    env["timestamp"] = {"unexpected": "object"}
+    r = client.post("/api/v1/ingest", json=env)
+    assert r.status_code == 400
+
+
+def test_oversized_ingest_is_rejected_before_crypto(client, monkeypatch):
+    from manager.manager.api import ingest as ingest_module
+    monkeypatch.setattr(ingest_module, "_MAX_ENVELOPE_BYTES", 128)
+    r = client.post(
+        "/api/v1/ingest",
+        content=b"{" + b"x" * 500 + b"}",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 413
 
 
 def test_missing_hmac_returns_400(client):
@@ -123,6 +175,23 @@ def test_tampered_hmac_returns_401(client):
     env["hmac"] = "00" * 32
     r = client.post("/api/v1/ingest", json=env)
     assert r.status_code == 401
+
+
+def test_authenticated_agent_cannot_attribute_payload_to_another_agent(client):
+    enc_key, mac_key = derive_keys(_AGENT_KEY)
+    payload = {
+        "section": "metrics",
+        "agent_id": "victim-agent",
+        "collected_at": int(time.time()),
+        "data": {"cpu_pct": 8.0, "mem_pct": 42.0},
+    }
+    env = encrypt(payload, enc_key, mac_key, _AGENT_ID, int(time.time()))
+    env["section"] = "metrics"
+
+    r = client.post("/api/v1/ingest", json=env)
+
+    assert r.status_code == 403
+    assert "does not match" in r.json()["detail"]
 
 
 def test_replay_returns_duplicate_200(client):

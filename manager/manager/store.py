@@ -105,6 +105,9 @@ class TelemetryStore:
 
     def __init__(self, data_dir: str):
         self.root  = Path(data_dir)
+        self.enabled = os.environ.get(
+            "TELEMETRY_ARCHIVE_ENABLED", "true"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.hot   = self.root / "hot"
         self.warm  = self.root / "warm"
         self.cold  = self.root / "cold"
@@ -119,6 +122,9 @@ class TelemetryStore:
 
     async def init(self) -> None:
         """Create directories and initialise the index."""
+        if not self.enabled:
+            log.info("Telemetry file archive disabled; PostgreSQL is the raw source of truth")
+            return
         for d in (self.hot, self.warm, self.cold):
             d.mkdir(parents=True, exist_ok=True)
         await self.index.init()
@@ -137,6 +143,7 @@ class TelemetryStore:
         os:       str = "",
         hostname: str = "",
         schema:   int = 1,
+        event_id: str = "",
     ) -> None:
         """
         Persist one telemetry record and update rollup buckets + index.
@@ -145,6 +152,8 @@ class TelemetryStore:
         but the actual file writes are synchronous (run in the default
         thread pool via asyncio.to_thread for large payloads).
         """
+        if not self.enabled:
+            return
         record = {
             "schema":   schema,
             "ts":       ts,
@@ -153,6 +162,7 @@ class TelemetryStore:
             "hostname": hostname,
             "section":  section,
             "data":     data,
+            "event_id": event_id,
         }
 
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
@@ -215,6 +225,8 @@ class TelemetryStore:
         start  : Unix epoch start (overrides window if > 0)
         end    : Unix epoch end   (overrides window if > 0)
         """
+        if not self.enabled:
+            return []
         now = time.time()
         if start <= 0:
             secs = WINDOW_SECONDS.get(window, 3600)
@@ -246,6 +258,8 @@ class TelemetryStore:
 
     async def latest(self, agent_id: str, section: str) -> dict | None:
         """Return the most recent record for this agent+section."""
+        if not self.enabled:
+            return None
         path = self.root / "latest" / agent_id / f"{section}.ndjson.gz"
         if not path.exists():
             return None
@@ -272,8 +286,10 @@ class TelemetryStore:
                               archive pipeline needed — cold already IS the
                               compressed archive once it stops being pruned.
         """
-        now = datetime.now(tz=timezone.utc)
         deleted: dict[str, int] = {"hot": 0, "warm": 0, "cold": 0, "index": 0}
+        if not self.enabled:
+            return deleted
+        now = datetime.now(tz=timezone.utc)
 
         # Hot: delete files older than 24 h
         hot_cutoff = now - timedelta(seconds=HOT_RETENTION_SEC)
@@ -317,6 +333,8 @@ class TelemetryStore:
         total: that index is known to lag behind what's actually on disk
         (confirmed separately — total_rows can read 0 while real files exist),
         so a dashboard-facing size figure must come from the real files."""
+        if not self.enabled:
+            return {"enabled": False, "path": None, "file_count": 0, "total_bytes": 0}
         return await asyncio.to_thread(self._archive_stats_sync)
 
     def _archive_stats_sync(self) -> dict:

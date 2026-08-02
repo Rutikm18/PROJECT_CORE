@@ -42,7 +42,7 @@ from .rules import (
 from .allowlist import (
     is_trusted_ip, is_apple_system_process, get_dual_use_info,
     is_suspicious_spawn, has_benign_parent, adjust_finding_for_allowlist,
-    cap_severity, APPLE_SYSTEM_PROCS,
+    cap_severity, APPLE_SYSTEM_PROCS, APPLE_SYSTEM_PATH_PREFIXES,
 )
 from .behavioral  import BehavioralAnalyzer
 from .feeds       import FeedManager
@@ -63,6 +63,8 @@ from .detections  import (
     analyze_privilege_escalation, analyze_binary_integrity,
     analyze_defense_evasion, analyze_app_vulnerability,
     analyze_package_vulnerability, analyze_mount_monitor,
+    analyze_developer_security, analyze_battery_health, analyze_sca_compliance,
+    analyze_agent_health, analyze_hardware_integrity,
 )
 from .clustering  import cluster_signals
 from .confidence  import score_confidence
@@ -79,6 +81,8 @@ from .ai_validator import (
 )
 from .asset_priority import apply_priority_to_enriched, apply_priority_to_finding
 from ..threat.scoring import score_matrix
+from shared.sections import VALID_SECTION_NAMES, canonical_section
+from shared.schema import DICT_SECTIONS, FLEX_SECTIONS, LIST_SECTIONS
 
 log = logging.getLogger("manager.attacklens.engine")
 
@@ -162,14 +166,128 @@ _DETECTION_MODULE_ROUTES: dict[str, list] = {
     "tasks":      [analyze_persistence, analyze_scheduled_task],
     "configs":    [analyze_persistence, analyze_privilege_escalation],
     "binaries":   [analyze_privilege_escalation, analyze_binary_integrity],
-    "security":   [analyze_defense_evasion],
+    "security":   [analyze_defense_evasion, analyze_sbom_posture],
     "sysctl":     [analyze_sysctl_monitor, analyze_defense_evasion],
     "apps":       [analyze_app_vulnerability],
     "packages":   [analyze_app_vulnerability, analyze_package_vulnerability],
     # previously undetected sections — new-mount / removable-media / share
     "mounts":     [analyze_mount_monitor],
     "storage":    [analyze_mount_monitor],
+    "developer_security": [analyze_developer_security],
+    "battery":    [analyze_battery_health],
+    "sca":        [analyze_sca_compliance],
+    "agent_health": [analyze_agent_health],
+    "hardware":   [analyze_hardware_integrity],
 }
+
+# One shared map drives both inline dispatch and coverage validation.
+_INLINE_ANALYZER_METHODS: dict[str, str] = {
+    "ports": "_ports", "processes": "_processes",
+    "connections": "_connections", "services": "_services",
+    "apps": "_apps", "packages": "_packages", "network": "_network",
+    "users": "_users", "tasks": "_tasks", "security": "_security",
+    "configs": "_configs", "binaries": "_binaries", "metrics": "_metrics",
+    "openfiles": "_openfiles",
+}
+
+
+class UnsupportedDetectionSource(ValueError):
+    """Telemetry cannot be completed without an executable detection path."""
+
+
+class InvalidDetectionSourceData(ValueError):
+    """A known source arrived in a shape none of its detectors can evaluate."""
+
+
+class _DeferredDetectionState:
+    """Buffer detector baselines until the event's findings are durable.
+
+    Rich and behavioral detectors update entity/baseline state while analysing.
+    If a later signal/finding write fails, committing that state immediately can
+    make the retry believe the observation was already seen and suppress the
+    very finding that failed to persist.  This proxy provides read-your-writes
+    during one event and flushes state only after finding persistence succeeds.
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+        self._entity_updates: dict[tuple[str, str, str], tuple[str, float]] = {}
+        self._baseline_updates: dict[tuple[str, str], dict] = {}
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+    async def get_entity_state(
+        self, agent_id: str, category: str, entity_key: str,
+    ) -> Optional[dict]:
+        staged = self._entity_updates.get((agent_id, category, entity_key))
+        if staged is not None:
+            fingerprint, seen_at = staged
+            return {"fingerprint": fingerprint, "seen_at": seen_at}
+        return await self._db.get_entity_state(agent_id, category, entity_key)
+
+    async def set_entity_state(
+        self, agent_id: str, category: str, entity_key: str,
+        fingerprint: str, ts: float,
+    ) -> None:
+        self._entity_updates[(agent_id, category, entity_key)] = (
+            fingerprint, float(ts),
+        )
+
+    async def get_baseline(self, agent_id: str, metric: str) -> Optional[dict]:
+        staged = self._baseline_updates.get((agent_id, metric))
+        if staged is not None:
+            return dict(staged)
+        return await self._db.get_baseline(agent_id, metric)
+
+    async def upsert_baseline(self, agent_id: str, metric: str, data: dict) -> None:
+        self._baseline_updates[(agent_id, metric)] = dict(data)
+
+    async def commit(self) -> None:
+        for (agent_id, category, entity_key), (fingerprint, ts) in (
+            self._entity_updates.items()
+        ):
+            await self._db.set_entity_state(
+                agent_id, category, entity_key, fingerprint, ts,
+            )
+        for (agent_id, metric), data in self._baseline_updates.items():
+            await self._db.upsert_baseline(agent_id, metric, data)
+
+
+def _normalize_legacy_detection_shape(section: str, data: Any) -> Any:
+    """Mirror supported agent-normalizer compatibility forms at replay time."""
+    if section == "sysctl" and isinstance(data, dict):
+        return [
+            {"key": str(key), "value": str(value), "security_relevant": True}
+            for key, value in data.items()
+            if key
+        ]
+    if section == "configs" and isinstance(data, dict):
+        return [
+            {"path": str(path), "content": str(content), "suspicious": False}
+            for path, content in data.items()
+            if path
+        ]
+    return data
+
+
+def detection_source_coverage(
+    rulepack: RulePackDetector,
+    *,
+    modules_enabled: bool = True,
+) -> dict[str, tuple[str, ...]]:
+    """Return executable detection paths for every canonical telemetry source."""
+    coverage: dict[str, tuple[str, ...]] = {}
+    for section in sorted(VALID_SECTION_NAMES):
+        paths: list[str] = []
+        if modules_enabled and _DETECTION_MODULE_ROUTES.get(section):
+            paths.append("module")
+        if section in _INLINE_ANALYZER_METHODS:
+            paths.append("inline")
+        if rulepack.has_executable_rules(section):
+            paths.append("rulepack")
+        coverage[section] = tuple(paths)
+    return coverage
 
 # Map an agent section → the engine's finding `category` (keeps terrain mapping
 # and dedup consistent with the inline analyzers).
@@ -183,6 +301,8 @@ _SECTION_CATEGORY: dict[str, str] = {
     "agent_health": "agent_health", "battery": "battery", "hardware": "hardware",
     "mounts": "mount", "openfiles": "open_file", "open_files": "open_file",
     "storage": "storage",
+    "developer_security": "developer_security",
+    "sca": "compliance",
 }
 
 # Evidence keys that change every snapshot — excluded from the item_key hash so
@@ -292,16 +412,44 @@ class AttackLensEngine:
     findings into the IntelDB (verified findings store).
     """
 
-    def __init__(self, db, intel_db, ai_analyst=None) -> None:
+    def __init__(self, db, intel_db, ai_analyst=None, central_intel_url: str = "") -> None:
         self._db      = db           # main manager DB (agents, keys)
         self._idb     = intel_db     # IntelDB (findings, timeline, baseline)
-        self._feeds   = FeedManager(intel_db)
-        self._nvd     = CVELookup(intel_db)
+        self._feeds   = FeedManager(intel_db, central_url=central_intel_url)
+        self._nvd     = CVELookup(intel_db, central_url=central_intel_url)
         self._behav   = BehavioralAnalyzer(intel_db)
         self._corr         = CorrelationEngine(intel_db)
         self._custom_corr  = CustomCorrelator(intel_db)   # analyst-defined rules
         self._fleet        = FleetCorrelator(intel_db, db)  # cross-host / global-threat layer
         self._rulepack     = RulePackDetector.load()        # manager-owned YAML rule packs
+        # These legacy module caches are process-global. Reset them once for a
+        # newly constructed engine so a restarted manager (or a replacement app
+        # in the same interpreter) cannot inherit another engine's rate budget.
+        # They are deliberately NOT reset per event: doing that erased every
+        # other agent's rate-limit history under concurrent ingest.
+        import sys as _sys
+        for analyze in {
+            analyzer
+            for routes in _DETECTION_MODULE_ROUTES.values()
+            for analyzer in routes
+        }:
+            module = _sys.modules.get(getattr(analyze, "__module__", ""))
+            for attr in ("_dedup_cache", "_rate_counter"):
+                cache = getattr(module, attr, None)
+                if isinstance(cache, dict):
+                    cache.clear()
+        self._source_coverage = detection_source_coverage(
+            self._rulepack,
+            modules_enabled=bool(ENGINE_CONFIG.get("use_detection_modules", True)),
+        )
+        missing_sources = sorted(
+            section for section, paths in self._source_coverage.items() if not paths
+        )
+        if missing_sources:
+            raise RuntimeError(
+                "AttackLens has no executable detector for canonical source(s): "
+                + ", ".join(missing_sources)
+            )
         # Optional AI analyst — used by the precision validator if set.
         # Server wiring assigns this after both objects are constructed.
         self._ai_analyst = ai_analyst
@@ -326,6 +474,8 @@ class AttackLensEngine:
         # to _DETECTION_WORKERS. Counters give operators a live throughput view.
         self._detect_queue: Optional[asyncio.Queue] = None
         self._detect_workers: list[asyncio.Task] = []
+        self._detect_agent_locks: dict[str, asyncio.Lock] = {}
+        self._background_tasks: list[asyncio.Task] = []
         self._detect_stats = {
             "enqueued": 0, "processed": 0, "dropped_queue_full": 0, "errors": 0,
         }
@@ -371,8 +521,14 @@ class AttackLensEngine:
     async def start(self) -> None:
         """Call once at startup. Feed scheduling is owned by ThreatIntelWorker."""
         await self._feeds.refresh()   # initial load from DB cache only (no network)
-        asyncio.create_task(self._nvd_worker())
-        asyncio.create_task(self._fleet_worker())
+        self._background_tasks = [
+            asyncio.create_task(self._nvd_worker(), name="attacklens:nvd"),
+            asyncio.create_task(self._fleet_worker(), name="attacklens:fleet"),
+        ]
+        if self._feeds.central_enabled:
+            self._background_tasks.append(asyncio.create_task(
+                self._central_feed_worker(), name="attacklens:central-intel",
+            ))
         # Bounded detection executor: create the queue on the running loop and
         # spawn the fixed worker pool that drains it.
         self._detect_queue = asyncio.Queue(maxsize=_DETECTION_QUEUE_MAX)
@@ -384,8 +540,30 @@ class AttackLensEngine:
         log.info("AttackLens engine started (detection workers=%d, queue_max=%d)",
                  _DETECTION_WORKERS, _DETECTION_QUEUE_MAX)
 
+    async def stop(self) -> None:
+        """Cancel all engine-owned tasks before database connections are closed."""
+        tasks = [*self._detect_workers, *self._background_tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._detect_workers.clear()
+        self._background_tasks.clear()
+        self._ready = False
+
+    async def _central_feed_worker(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self._feeds.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("central threat-intel refresh loop failed: %s", exc)
+
     def enqueue(self, agent_id: str, section: str, data: Any,
-                collected_at: float | None = None) -> bool:
+                collected_at: float | None = None, event_id: str = "",
+                chunk_index: int = 0, chunk_total: int = 1) -> bool:
         """Hand a payload to the bounded detection executor. Non-blocking.
 
         Returns True if accepted, False if dropped (queue saturated). Ingest
@@ -404,13 +582,21 @@ class AttackLensEngine:
             # fire-and-forget so nothing depends on start() ordering.
             try:
                 asyncio.create_task(
-                    self.process(agent_id, section, data, collected_at=collected_at)
+                    self.process(
+                        agent_id, section, data,
+                        collected_at=collected_at, event_id=event_id,
+                        chunk_index=chunk_index, chunk_total=chunk_total,
+                        skip_correlation=chunk_total > 1,
+                    )
                 )
             except RuntimeError:
                 pass  # no running loop (sync test context) — caller awaits process directly
             return True
         try:
-            self._detect_queue.put_nowait((agent_id, section, data, collected_at))
+            self._detect_queue.put_nowait((
+                agent_id, section, data, collected_at, event_id,
+                chunk_index, chunk_total,
+            ))
             self._detect_stats["enqueued"] += 1
             return True
         except asyncio.QueueFull:
@@ -431,11 +617,22 @@ class AttackLensEngine:
         assert self._detect_queue is not None
         while True:
             try:
-                agent_id, section, data, collected_at = await self._detect_queue.get()
+                (agent_id, section, data, collected_at, event_id,
+                 chunk_index, chunk_total) = await self._detect_queue.get()
             except asyncio.CancelledError:
                 raise
             try:
-                await self.process(agent_id, section, data, collected_at=collected_at)
+                locks = getattr(self, "_detect_agent_locks", None)
+                if locks is None:  # compatibility for lightweight test doubles
+                    locks = self._detect_agent_locks = {}
+                lock = locks.setdefault(agent_id, asyncio.Lock())
+                async with lock:
+                    await self.process(
+                        agent_id, section, data,
+                        collected_at=collected_at, event_id=event_id,
+                        chunk_index=chunk_index, chunk_total=chunk_total,
+                        skip_correlation=chunk_total > 1,
+                    )
                 self._detect_stats["processed"] += 1
             except Exception as exc:
                 self._detect_stats["errors"] += 1
@@ -492,16 +689,37 @@ class AttackLensEngine:
         data: Any,
         skip_correlation: bool = False,
         collected_at: float | None = None,
-    ) -> None:
+        event_id: str = "",
+        chunk_index: int = 0,
+        chunk_total: int = 1,
+    ) -> bool:
         """
         Entry point for every payload (or chunk).
 
-        skip_correlation=True when the caller is processing a chunk that is
-        part of a larger chunk set — the ChunkTracker will fire correlation
-        once when the final chunk completes, rather than once per chunk.
+        skip_correlation=True when processing one chunk of a larger event. The
+        durable event ledger triggers correlation once when all chunks commit.
         """
+        section = canonical_section(section)
+        data = _normalize_legacy_detection_shape(section, data)
+        if section not in self._source_coverage:
+            raise UnsupportedDetectionSource(
+                f"unsupported telemetry source {section!r}; payload remains unprocessed"
+            )
+        if section in LIST_SECTIONS and not isinstance(data, list):
+            raise InvalidDetectionSourceData(
+                f"{section} detection requires list data, got {type(data).__name__}"
+            )
+        if section in DICT_SECTIONS and not isinstance(data, dict):
+            raise InvalidDetectionSourceData(
+                f"{section} detection requires object data, got {type(data).__name__}"
+            )
+        if section in FLEX_SECTIONS and not isinstance(data, (list, dict)):
+            raise InvalidDetectionSourceData(
+                f"{section} detection requires list or object data, "
+                f"got {type(data).__name__}"
+            )
         if not self._ready:
-            return
+            return False
         # Captured BEFORE dispatch: present entities will be re-stamped with a
         # last_detected_at > t0 during this call; entities absent from this fresh
         # snapshot keep their older timestamp and get auto-resolved below.
@@ -512,11 +730,21 @@ class AttackLensEngine:
             # Dispatch ONCE per payload and reuse — the detections/ modules keep
             # internal dedup state, so a second dispatch in the same payload
             # would be suppressed (and the shadow-emit path would get nothing).
-            disp_findings = await self._dispatch(agent_id, section, data)
+            detection_state = _DeferredDetectionState(self._idb)
+            disp_findings = await self._dispatch(
+                agent_id, section, data, detection_db=detection_state,
+            )
             signals = await self._dispatch_to_signals(
                 agent_id, section, data, findings=disp_findings,
             )
-            beh_signals = await self._behav.analyze_as_signals(agent_id, section, data)
+            # Analyze behavior once. The legacy path previously ran this twice,
+            # advancing baselines twice for one payload and potentially hiding
+            # the first result from the second pass.
+            event_behavior = BehavioralAnalyzer(detection_state)
+            beh_findings = await event_behavior.analyze(agent_id, section, data)
+            beh_signals = await event_behavior.analyze_as_signals(
+                agent_id, section, data, findings=beh_findings,
+            )
             signals.extend(beh_signals)
 
             # Stamp raw-payload provenance onto every signal BEFORE persisting,
@@ -526,11 +754,8 @@ class AttackLensEngine:
 
             # Persist all signals (raw, before any filtering)
             for sig in signals:
-                try:
-                    sig_id = await self._idb.upsert_signal(sig)
-                    sig.id = sig_id
-                except Exception as exc:
-                    log.debug("upsert_signal failed: %s", exc)
+                sig_id = await self._idb.upsert_signal(sig)
+                sig.id = sig_id
 
             # ── Stage 2: shadow mode — emit findings the old way ───────────────
             if not ENGINE_CONFIG["validation_pipeline_enabled"]:
@@ -539,8 +764,7 @@ class AttackLensEngine:
                 # the UI's AI Precision Validator panel has something honest
                 # to show instead of a misleading "0% / NO LLM VERDICT".
                 findings = list(disp_findings)   # reuse the single dispatch above
-                beh_old  = await self._behav.analyze(agent_id, section, data)
-                findings.extend(beh_old)
+                findings.extend(beh_findings)
                 ts = time.time()
                 try:
                     agent_priority = await resolve_agent_priority(self._idb, agent_id)
@@ -561,6 +785,11 @@ class AttackLensEngine:
             else:
                 # ── Stage 3: cluster → confidence → validate → emit ────────────
                 await self._run_validation_pipeline(agent_id, signals)
+
+            # Detector state is an effect of successfully persisted detection,
+            # not merely attempted analysis. A failure above leaves the original
+            # baseline intact so an at-least-once retry cannot miss the finding.
+            await detection_state.commit()
 
             # ── Auto-resolve incidents whose evidence is no longer present ─────
             # For a live-inventory section delivered as a whole, valid snapshot,
@@ -590,24 +819,65 @@ class AttackLensEngine:
                         log.debug("auto_resolve_absent failed agent=%s section=%s: %s",
                                   agent_id, section, exc)
 
+            # Mark complete only after every required detection/persistence stage
+            # succeeds. A failed completion write must propagate so the queue is
+            # retried; otherwise completed work and the durable ledger disagree.
+            if event_id:
+                completed = await self.mark_payload_chunk_processed(
+                    event_id, chunk_index, chunk_total, signal_count=len(signals),
+                )
+                if completed:
+                    await self.run_correlations(agent_id)
+                    await self.mark_payload_correlated(event_id)
+                return completed
             if not skip_correlation:
-                self._request_correlation(agent_id)
-
-            # Mark the payload's detection complete in the ledger (the reconciler
-            # replays anything that never reaches this point). Keyed on the same
-            # (agent, section, collected_at) the telemetry worker recorded as
-            # 'received'. Best-effort: a ledger write must never fail detection.
-            try:
-                if self._db is not None:
-                    await self._db.ledger_processed(
-                        agent_id, section, prov_ts, signal_count=len(signals),
-                    )
-            except Exception as exc:
-                log.debug("ledger_processed failed agent=%s section=%s: %s",
-                          agent_id, section, exc)
+                await self.run_correlations(agent_id)
+                await self.mark_payload_processed(
+                    agent_id, section, prov_ts, signal_count=len(signals),
+                )
+            return not skip_correlation
         except Exception as exc:
             log.warning("AttackLens.process error agent=%s section=%s: %s",
                         agent_id, section, exc)
+            raise
+
+    async def mark_payload_processed(
+        self,
+        agent_id: str,
+        section: str,
+        collected_at: float,
+        *,
+        signal_count: int = 0,
+    ) -> None:
+        """Complete the durable detection ledger after all payload chunks succeed."""
+        if self._db is None:
+            return
+        await self._db.ledger_processed(
+            agent_id,
+            canonical_section(section),
+            collected_at,
+            signal_count=signal_count,
+        )
+
+    async def mark_payload_chunk_processed(
+        self,
+        event_id: str,
+        chunk_index: int,
+        chunk_total: int,
+        *,
+        signal_count: int = 0,
+    ) -> bool:
+        """Durably complete one chunk; True only for the event's final chunk."""
+        if self._db is None:
+            return chunk_total <= 1
+        return await self._db.ledger_chunk_processed(
+            event_id, chunk_index, chunk_total, signal_count=signal_count,
+        )
+
+    async def mark_payload_correlated(self, event_id: str) -> None:
+        """Finalize an event only after its integration/correlation pass succeeds."""
+        if self._db is not None:
+            await self._db.ledger_correlated(event_id)
 
     async def _dispatch_to_signals(self, agent_id: str, section: str, data: Any,
                                    findings: list[dict] | None = None) -> list[Signal]:
@@ -722,6 +992,7 @@ class AttackLensEngine:
         clusters = [c for c in clusters if any(id(s) in new_sig_ids for s in c.signals)]
 
         ts = time.time()
+        cluster_errors: list[Exception] = []
         for cluster in clusters:
             try:
                 enriched = await self._enrich_cluster(cluster)
@@ -810,6 +1081,13 @@ class AttackLensEngine:
                         )
                 except Exception:
                     pass
+                cluster_errors.append(exc)
+        if cluster_errors:
+            first = cluster_errors[0]
+            raise RuntimeError(
+                f"validation failed for {len(cluster_errors)} cluster(s): "
+                f"{type(first).__name__}: {first}"
+            ) from first
 
     async def _attach_legacy_precision(self, f: dict) -> None:
         """
@@ -1072,7 +1350,7 @@ class AttackLensEngine:
         mal_hash = False
         for h in hashes:
             try:
-                if await self._idb.is_malicious_hash(h):
+                if self._feeds.is_malicious_hash(h) or await self._idb.is_malicious_hash(h):
                     mal_hash = True
                     break
             except Exception as exc:
@@ -1232,9 +1510,9 @@ class AttackLensEngine:
     async def run_correlations(self, agent_id: str) -> None:
         """
         Public trigger for cross-section correlation.
-        Called by ChunkTracker when the last chunk of a chunk set completes.
+        Called after the durable event ledger commits the final chunk.
         """
-        self._request_correlation(agent_id)
+        await self._run_correlations(agent_id)
 
     def _request_correlation(self, agent_id: str) -> None:
         """Request a correlation pass for an agent, coalescing concurrent
@@ -1264,11 +1542,17 @@ class AttackLensEngine:
                     self._correlate_dirty.discard(agent_id)
                     continue   # data arrived mid-pass — fold it into one more run
                 break
+        except Exception as exc:
+            # Background/legacy callers have no queue message to nack. Keep the
+            # failure visible; durable event callers await run_correlations()
+            # directly and therefore propagate the exception for replay.
+            log.warning("Correlation error agent=%s: %s", agent_id, exc)
         finally:
             self._correlate_inflight.discard(agent_id)
 
     async def _run_correlations(self, agent_id: str) -> None:
         """Evaluate cross-section correlation rules (built-in + custom) and store results."""
+        errors: list[tuple[str, Exception]] = []
         try:
             correlations = await self._corr.correlate(agent_id)
             ts = time.time()
@@ -1276,6 +1560,7 @@ class AttackLensEngine:
                 await self._idb.upsert_correlation(c, ts)
         except Exception as exc:
             log.warning("Correlation error agent=%s: %s", agent_id, exc)
+            errors.append(("built_in", exc))
         # Custom analyst-defined rules — run independently so a bug here never
         # suppresses built-in correlation results.
         try:
@@ -1283,51 +1568,28 @@ class AttackLensEngine:
             ts = time.time()
             for c in custom_hits:
                 action = c.get("action", "alert")
-                if action == "suppress":
-                    # Suppress: find matching findings and mark false_positive
+                if action in {"suppress", "elevate", "tag"}:
                     for sig in (c.get("signals") or []):
                         fid = sig.get("id")
                         if fid:
                             try:
-                                await self._idb._conn.execute(
-                                    "UPDATE findings SET status='false_positive', is_active=0 WHERE id=?",
-                                    (fid,),
+                                await self._idb.apply_custom_correlation_action(
+                                    int(fid), action, c.get("custom_tags") or [],
                                 )
-                                await self._idb._conn.commit()
-                            except Exception:
-                                pass
-                elif action == "elevate":
-                    # Elevate: raise severity of matched findings
-                    for sig in (c.get("signals") or []):
-                        fid = sig.get("id")
-                        if fid:
-                            try:
-                                await self._idb._conn.execute(
-                                    "UPDATE findings SET severity='critical', score=9.5 WHERE id=? AND severity IN ('medium','low','info')",
-                                    (fid,),
-                                )
-                                await self._idb._conn.commit()
-                            except Exception:
-                                pass
-                elif action == "tag":
-                    # Tag: append custom tags to matched findings' tags field
-                    for sig in (c.get("signals") or []):
-                        fid = sig.get("id")
-                        if fid:
-                            try:
-                                extra = json.dumps(c.get("custom_tags") or [])
-                                await self._idb._conn.execute(
-                                    "UPDATE findings SET tags = json_array_extend(COALESCE(tags,'[]'), ?) WHERE id=?",
-                                    (extra, fid),
-                                )
-                                await self._idb._conn.commit()
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                errors.append((f"custom_{action}", exc))
                 else:
                     # alert (default): persist as a correlation finding
                     await self._idb.upsert_correlation(c, ts)
         except Exception as exc:
             log.warning("Custom correlation error agent=%s: %s", agent_id, exc)
+            errors.append(("custom", exc))
+        if errors:
+            source, first = errors[0]
+            raise RuntimeError(
+                f"{len(errors)} correlation path(s) failed for {agent_id}; "
+                f"first={source}:{type(first).__name__}:{first}"
+            ) from first
 
     async def run_fleet_correlations(self) -> None:
         """Public trigger for the cross-host sweep (e.g. a periodic scheduler)."""
@@ -1364,17 +1626,18 @@ class AttackLensEngine:
 
     # ── Dispatcher ────────────────────────────────────────────────────────────
 
-    async def _dispatch(self, agent_id: str, section: str, data: Any) -> list[dict]:
-        # Route verified sections through the rich detections/ modules (which
-        # carry baselines, allowlists, MITRE mapping + the FP fixes); fall back
-        # to the inline analyzer for everything else. Each module's findings are
-        # adapted to the engine finding format. Opt out via use_detection_modules.
+    async def _dispatch(
+        self, agent_id: str, section: str, data: Any, *, detection_db=None,
+    ) -> list[dict]:
+        # Rich modules are ADDITIVE to the established inline analyzers. Replacing
+        # the inline path here removed existing static rules whenever a module was
+        # enabled for that section (for example process malware-name rules).
+        section = canonical_section(section)
         findings: list[dict] = []
-        routed = False
+        detector_errors: list[tuple[str, Exception]] = []
         if ENGINE_CONFIG.get("use_detection_modules", True):
             routes = _DETECTION_MODULE_ROUTES.get(section)
             if routes:
-                routed = True
                 # The engine is the single dedup authority: upsert_finding dedups
                 # by fingerprint and WANTS every observation to re-upsert (so
                 # scan_count + last_detected_at refresh, which auto-resolve relies
@@ -1384,48 +1647,41 @@ class AttackLensEngine:
                 import sys as _sys
                 for analyze in routes:
                     _m = _sys.modules.get(getattr(analyze, "__module__", ""))
-                    for _attr in ("_dedup_cache", "_rate_counter"):
-                        _c = getattr(_m, _attr, None)
-                        if isinstance(_c, dict):
-                            _c.clear()
+                    _c = getattr(_m, "_dedup_cache", None)
+                    if isinstance(_c, dict):
+                        _c.clear()
                 mod_findings: list[dict] = []
                 for analyze in routes:
                     try:
-                        res = await analyze(agent_id, section, data, self._idb, "")
+                        res = await analyze(
+                            agent_id, section, data, detection_db or self._idb, "",
+                        )
                     except Exception as exc:
                         log.warning(
                             "detection module %s failed agent=%s section=%s: %s",
                             getattr(analyze, "__module__", "?"), agent_id, section, exc,
                         )
+                        detector_errors.append((getattr(analyze, "__module__", "?"), exc))
                         continue
                     for f in (res or []):
                         mod_findings.append(_adapt_module_finding(f, section))
                 findings.extend(mod_findings)
 
-        if not routed:
-            fn = {
-                "ports":       self._ports,
-                "processes":   self._processes,
-                "connections": self._connections,
-                "services":    self._services,
-                "apps":        self._apps,
-                "packages":    self._packages,
-                "network":     self._network,
-                "users":       self._users,
-                "tasks":       self._tasks,
-                "security":    self._security,
-                "configs":     self._configs,
-                "binaries":    self._binaries,
-                "metrics":     self._metrics,
-                "openfiles":   self._openfiles,
-            }.get(section)
-            if fn is not None:
-                findings.extend(await fn(agent_id, data))
+        method_name = _INLINE_ANALYZER_METHODS.get(section)
+        if method_name is not None:
+            findings.extend(await getattr(self, method_name)(agent_id, data))
 
         try:
             findings.extend(await self._rulepack.analyze(agent_id, section, data, self._feeds))
         except Exception as exc:
-            log.debug("rulepack analyze failed agent=%s section=%s: %s", agent_id, section, exc)
+            log.warning("rulepack analyze failed agent=%s section=%s: %s", agent_id, section, exc)
+            detector_errors.append(("rulepack", exc))
+        if detector_errors:
+            source, first = detector_errors[0]
+            raise RuntimeError(
+                f"{len(detector_errors)} detector path(s) failed for {section}; "
+                f"first={source}:{type(first).__name__}:{first}"
+            ) from first
         return findings
 
     # ── Section analyzers ─────────────────────────────────────────────────────

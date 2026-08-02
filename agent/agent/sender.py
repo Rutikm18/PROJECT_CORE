@@ -10,6 +10,7 @@ Features:
 """
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -77,6 +78,8 @@ class DiskSpool:
 
     def __init__(self, path: str):
         self.path = path
+        self._replay_path = path + ".replay"
+        self._offset_path = path + ".offset"
         self._lock = threading.Lock()
         # Cumulative, process-lifetime counts of envelopes that never made it
         # to the manager because they were discarded on-disk (size trim) or
@@ -84,6 +87,7 @@ class DiskSpool:
         # loss that was previously silent past a log line.
         self._dropped_trim = 0
         self._dropped_corrupt = 0
+        self._dropped_auth = 0
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def write(self, envelope: dict) -> None:
@@ -107,7 +111,7 @@ class DiskSpool:
         with self._lock:
             # Trim spool if too large (drop first ~10 % of lines = oldest)
             try:
-                if os.path.getsize(self.path) > _SPOOL_MAX_BYTES:
+                if self.size() > _SPOOL_MAX_BYTES:
                     self._trim()
             except FileNotFoundError:
                 pass
@@ -128,13 +132,32 @@ class DiskSpool:
                         pass
 
     def drain(self) -> list[dict]:
-        """Read and clear all spooled envelopes.  Returns list of dicts."""
+        """Read and clear all spooled envelopes. Returns list of dicts.
+
+        Normal delivery uses peek()/ack(), which keeps records durable until the
+        manager acknowledges them. drain() is retained for explicit administrative
+        discard and tests; it may load the bounded (50 MiB) spool into memory.
+        """
         with self._lock:
+            lines: list[str] = []
+            offset = self._read_offset_locked()
+            try:
+                with open(self._replay_path, encoding="utf-8") as f:
+                    f.seek(offset)
+                    lines.extend(f.readlines())
+            except FileNotFoundError:
+                pass
             try:
                 with open(self.path, encoding="utf-8") as f:
-                    lines = f.readlines()
-                os.remove(self.path)
+                    lines.extend(f.readlines())
             except FileNotFoundError:
+                pass
+            for target in (self.path, self._replay_path, self._offset_path):
+                try:
+                    os.remove(target)
+                except FileNotFoundError:
+                    pass
+            if not lines:
                 return []
         out = []
         corrupt = 0
@@ -153,11 +176,92 @@ class DiskSpool:
                         corrupt, self._dropped_corrupt)
         return out
 
+    def peek(self) -> tuple[dict, tuple[int, int, int, int, str]] | None:
+        """Lease the oldest envelope without removing it from durable storage.
+
+        The returned token must be passed to ack() only after the manager has
+        accepted the envelope. A process crash before ack causes an idempotent
+        resend, never data loss. New writes continue into the main spool while a
+        stable replay file is consumed by byte offset.
+        """
+        with self._lock:
+            for _ in range(2):
+                if not self._ensure_replay_locked():
+                    return None
+                offset = self._read_offset_locked()
+                try:
+                    st = os.stat(self._replay_path)
+                    with open(self._replay_path, "rb") as f:
+                        f.seek(offset)
+                        while True:
+                            start = f.tell()
+                            raw = f.readline()
+                            end = f.tell()
+                            if not raw:
+                                self._finish_replay_locked()
+                                break
+                            stripped = raw.strip()
+                            if not stripped:
+                                self._write_offset_locked(end)
+                                offset = end
+                                continue
+                            try:
+                                envelope = json.loads(stripped)
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                self._dropped_corrupt += 1
+                                self._write_offset_locked(end)
+                                offset = end
+                                log.warning(
+                                    "Spool replay: dropped corrupt line "
+                                    "(cumulative=%d)", self._dropped_corrupt,
+                                )
+                                continue
+                            digest = hashlib.sha256(raw).hexdigest()
+                            return envelope, (st.st_dev, st.st_ino, start, end, digest)
+                except FileNotFoundError:
+                    self._finish_replay_locked()
+            return None
+
+    def ack(self, token: tuple[int, int, int, int, str]) -> bool:
+        """Advance the durable replay cursor if token is still the leased head."""
+        dev, ino, start, end, digest = token
+        with self._lock:
+            try:
+                st = os.stat(self._replay_path)
+                if (st.st_dev, st.st_ino) != (dev, ino):
+                    return False
+                if self._read_offset_locked() != start:
+                    return False
+                with open(self._replay_path, "rb") as f:
+                    f.seek(start)
+                    raw = f.readline()
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    return False
+                self._write_offset_locked(end)
+                return True
+            except FileNotFoundError:
+                return False
+
+    def discard_for_auth_rotation(self) -> int:
+        """Discard ciphertext that cannot be re-keyed and count the loss."""
+        envelopes = self.drain()
+        with self._lock:
+            self._dropped_auth += len(envelopes)
+        if envelopes:
+            log.warning(
+                "Spool auth rotation: discarded %d unrecoverable envelope(s) "
+                "(cumulative=%d)", len(envelopes), self._dropped_auth,
+            )
+        return len(envelopes)
+
     def size(self) -> int:
-        try:
-            return os.path.getsize(self.path)
-        except FileNotFoundError:
-            return 0
+        total = 0
+        for target in (self.path, self._replay_path):
+            try:
+                total += os.path.getsize(target)
+            except OSError:
+                pass
+        return total
 
     def stats(self) -> dict:
         """Cumulative (process-lifetime) counts of envelopes dropped on disk."""
@@ -165,7 +269,52 @@ class DiskSpool:
             return {
                 "dropped_trim":    self._dropped_trim,
                 "dropped_corrupt": self._dropped_corrupt,
+                "dropped_auth":    self._dropped_auth,
             }
+
+    def _ensure_replay_locked(self) -> bool:
+        if os.path.exists(self._replay_path):
+            return True
+        try:
+            os.replace(self.path, self._replay_path)
+        except FileNotFoundError:
+            return False
+        try:
+            os.remove(self._offset_path)
+        except FileNotFoundError:
+            pass
+        return True
+
+    def _finish_replay_locked(self) -> None:
+        for target in (self._replay_path, self._offset_path):
+            try:
+                os.remove(target)
+            except FileNotFoundError:
+                pass
+
+    def _read_offset_locked(self) -> int:
+        try:
+            st = os.stat(self._replay_path)
+            with open(self._offset_path, encoding="ascii") as f:
+                raw = f.read().strip()
+            dev, ino, offset = raw.split(":", 2)
+            if (int(dev), int(ino)) != (st.st_dev, st.st_ino):
+                return 0
+            return max(0, int(offset))
+        except (FileNotFoundError, OSError, ValueError):
+            return 0
+
+    def _write_offset_locked(self, offset: int) -> None:
+        tmp = self._offset_path + ".tmp"
+        st = os.stat(self._replay_path)
+        with open(tmp, "w", encoding="ascii") as f:
+            # Bind the cursor to this replay file's inode. If the process dies
+            # between rotating a new replay file and clearing an old cursor, the
+            # stale cursor is ignored instead of skipping records in the new file.
+            f.write(f"{st.st_dev}:{st.st_ino}:{offset}")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._offset_path)
 
     def _trim(self) -> None:
         """Drop the first 10 % of lines to make room (holding lock)."""
@@ -229,6 +378,11 @@ class Sender:
 
         # Auth-failure tracking: counts consecutive 401s to detect key invalidation
         self._auth_fail_count = 0
+        self._delivery_stats = {
+            "accepted_2xx": 0,
+            "rejected_4xx": 0,
+            "replay_acked": 0,
+        }
         # Optional callback — called when persistent auth failure detected.
         # Signature: on_auth_error() -> None.  Set by caller after construction.
         self.on_auth_error: "threading.Callable | None" = None
@@ -246,13 +400,9 @@ class Sender:
 
     def start(self) -> threading.Thread:
         self._stop.clear()
-        # Drain any spool from previous run immediately
-        spooled = self._spool.drain()
-        if spooled:
-            log.info("Replaying %d spooled envelopes from previous run", len(spooled))
-            for env in spooled:
-                self.queue.put_nowait(env)
-
+        # The sender loop replays directly from disk with peek()/ack(). Keeping
+        # the record on disk until a manager ACK avoids both unbounded startup
+        # memory and the crash-loss window created by drain-then-enqueue.
         t = threading.Thread(target=self._drain_loop, daemon=True, name="sender")
         t.start()
         return t
@@ -288,6 +438,10 @@ class Sender:
             "spool_bytes":           self._spool.size(),
             "spool_dropped_trim":    spool_stats["dropped_trim"],
             "spool_dropped_corrupt": spool_stats["dropped_corrupt"],
+            "spool_dropped_auth":    spool_stats["dropped_auth"],
+            "delivery_accepted_2xx": self._delivery_stats["accepted_2xx"],
+            "delivery_rejected_4xx": self._delivery_stats["rejected_4xx"],
+            "delivery_replay_acked": self._delivery_stats["replay_acked"],
             "auth_failures":         self._auth_fail_count,
             "last_contact_ts":       int(last) if last else 0,
             "seconds_since_contact": int(time.time() - last) if last else None,
@@ -356,7 +510,7 @@ class Sender:
                                 self._auth_fail_count,
                             )
                             self._auth_fail_count = 0
-                            self._spool.drain()   # stale encrypted data, discard
+                            self._spool.discard_for_auth_rotation()
                             if self.on_auth_error:
                                 threading.Thread(
                                     target=self.on_auth_error,
@@ -364,10 +518,7 @@ class Sender:
                                     name="re-enroll",
                                 ).start()
                         else:
-                            log.info("Manager back online — draining spool")
-                            spooled = self._spool.drain()
-                            for env in spooled:
-                                self.queue.put_nowait(env)
+                            log.info("Manager back online — durable spool replay enabled")
                     else:
                         probe_delay = min(probe_delay * 2, _SPOOL_RETRY_MAX)
                         log.debug("Manager still unreachable — spool has %d bytes, "
@@ -375,10 +526,22 @@ class Sender:
             except Exception as exc:
                 log.error("sender reprobe/drain error (continuing): %s", exc)
 
+            replay_token = None
             try:
-                envelope = self.queue.get(timeout=1)
-            except queue.Empty:
-                continue
+                replay = self._spool.peek() if self._online else None
+            except Exception as exc:
+                # A damaged/unwritable cursor must not kill the only delivery
+                # thread. Live in-memory telemetry can still be sent, while the
+                # durable backlog remains untouched for a later retry/repair.
+                log.error("Spool replay read failed (continuing with live queue): %s", exc)
+                replay = None
+            if replay is not None:
+                envelope, replay_token = replay
+            else:
+                try:
+                    envelope = self.queue.get(timeout=1)
+                except queue.Empty:
+                    continue
 
             # The whole send path is guarded: an unexpected error (a malformed
             # envelope, an SSL/urllib edge case _send_with_retry didn't catch)
@@ -393,6 +556,10 @@ class Sender:
 
                 success = self._send_with_retry(envelope)
                 if success:
+                    if replay_token is not None and not self._spool.ack(replay_token):
+                        log.warning("Spool replay ACK cursor changed; envelope may be resent idempotently")
+                    elif replay_token is not None:
+                        self._delivery_stats["replay_acked"] += 1
                     # Delivered (or cleanly handled) → sender is making progress (R6).
                     if self.heartbeat is not None:
                         try:
@@ -400,8 +567,9 @@ class Sender:
                         except Exception:
                             pass
                 if not success:
-                    log.warning("Spooling %s to disk", envelope.get("section"))
-                    self._spool.write(envelope)
+                    if replay_token is None:
+                        log.warning("Spooling %s to disk", envelope.get("section"))
+                        self._spool.write(envelope)
                     self._online = False
                     # Just went offline — reprobe quickly (fast-first backoff).
                     probe_delay = _SPOOL_RETRY_MIN
@@ -416,7 +584,7 @@ class Sender:
                                 self._auth_fail_count,
                             )
                             self._auth_fail_count = 0
-                            self._spool.drain()   # old encrypted data can't be re-keyed
+                            self._spool.discard_for_auth_rotation()
                             if self.on_auth_error:
                                 threading.Thread(
                                     target=self.on_auth_error,
@@ -425,10 +593,11 @@ class Sender:
                                 ).start()
             except Exception as exc:
                 log.error("sender send-loop error (continuing): %s", exc)
-                try:
-                    self._spool.write(envelope)   # don't lose the datum
-                except Exception:
-                    pass
+                if replay_token is None:
+                    try:
+                        self._spool.write(envelope)   # don't lose the datum
+                    except Exception:
+                        pass
 
     # ── Send with retry ───────────────────────────────────────────────────────
 
@@ -508,6 +677,7 @@ class Sender:
                         self._online = True
                         self._last_contact_ts = time.time()
                         self._auth_fail_count = 0
+                        self._delivery_stats["accepted_2xx"] += 1
                         log.debug("Sent %s → %d", section, resp.status)
                         return True
                     elif resp.status == 401:
@@ -537,6 +707,7 @@ class Sender:
                         # 503 = manager accepted but couldn't persist; must spool
                     elif 400 <= resp.status < 500:
                         self._auth_fail_count = 0
+                        self._delivery_stats["rejected_4xx"] += 1
                         log.error(
                             "Manager rejected HTTP %d agent=%s section=%s — "
                             "dropping (unrecoverable client error)",
@@ -560,6 +731,7 @@ class Sender:
                     # this is defense-in-depth for older managers.
                     low = body_text.lower()
                     if any(k in low for k in ("replay", "duplicate", "out of window")):
+                        self._delivery_stats["rejected_4xx"] += 1
                         log.info(
                             "HTTP 401 replay/duplicate agent=%s section=%s — "
                             "manager already has it; dropping (not an auth failure): %r",
@@ -590,6 +762,7 @@ class Sender:
                     )
                 elif 400 <= exc.code < 500:
                     self._auth_fail_count = 0
+                    self._delivery_stats["rejected_4xx"] += 1
                     log.error(
                         "Manager rejected HTTP %d agent=%s section=%s — "
                         "dropping: %r",

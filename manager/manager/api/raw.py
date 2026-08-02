@@ -19,6 +19,7 @@ import logging
 from typing import Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, Query
+from shared.sections import VALID_SECTION_NAMES
 
 if TYPE_CHECKING:
     from ..db import Database
@@ -163,13 +164,7 @@ def make_raw_router(db: "Database") -> APIRouter:
     # evaluators). Battery is kept non-feeding until its rule-pack conditions
     # have the required historical/CMDB inputs.
     _EXPECTED_SECTIONS: dict[str, bool] = {
-        # section: feeds_detection?
-        "metrics": True,  "connections": True, "processes": True, "ports": True,
-        "network": True,  "arp": True,         "mounts": True,    "battery": False,
-        "openfiles": True, "services": True,   "users": True,     "hardware": True,
-        "containers": True, "storage": True,   "tasks": True,     "security": True,
-        "sysctl": True,   "configs": True,     "apps": True,      "packages": True,
-        "binaries": True, "sbom": True,
+        section: True for section in VALID_SECTION_NAMES
     }
 
     def _has_real_data(data) -> bool:

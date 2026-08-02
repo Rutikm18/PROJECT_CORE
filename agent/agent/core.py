@@ -83,6 +83,9 @@ _DEFAULT_SECTIONS: dict = {
 "sca":         {"enabled": True,  "interval_sec": 43200, "send": True, "timeout_sec": 60},
     "sysctl":      {"enabled": True,  "interval_sec": 3600,  "send": True},
     "configs":     {"enabled": True,  "interval_sec": 3600,  "send": True},
+    "developer_security": {
+        "enabled": True, "interval_sec": 3600, "send": True, "timeout_sec": 120,
+    },
     "apps":        {"enabled": True,  "interval_sec": 86400, "send": True},
     "packages":    {"enabled": True,  "interval_sec": 86400, "send": True},
     "binaries":    {"enabled": False, "interval_sec": 86400, "send": False},

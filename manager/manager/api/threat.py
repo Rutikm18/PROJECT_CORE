@@ -46,6 +46,74 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         except Exception:
             return None
 
+    async def _central_dashboard(
+        cve_limit: int, news_hours: int, news_limit: int,
+        kev_limit: int, actor_limit: int, epss_limit: int,
+    ) -> dict | None:
+        if not central_url:
+            return None
+        paths = {
+            "summary": "/api/v1/intel/summary",
+            "feeds": "/api/v1/intel/feeds",
+            "cves": f"/api/v1/intel/cves?limit={cve_limit}&offset=0",
+            "kev": f"/api/v1/intel/kev?limit={kev_limit}",
+            "actors": f"/api/v1/intel/actors?active_only=true&limit={actor_limit}",
+            "news": f"/api/v1/intel/news?hours={news_hours}&limit={news_limit}",
+            "epss": f"/api/v1/intel/epss/top?limit={epss_limit}",
+        }
+        values = await asyncio.gather(*(_central_get(path) for path in paths.values()))
+        parts = dict(zip(paths, values))
+        if not any(value is not None for value in values):
+            return None
+
+        summary = parts["summary"] or {}
+        feeds = (parts["feeds"] or {}).get("feeds") or []
+        cves = (parts["cves"] or {}).get("cves") or []
+        kev_part = parts["kev"] or {}
+        kev = kev_part.get("vulnerabilities") or []
+        actors = (parts["actors"] or {}).get("actors") or []
+        news = (parts["news"] or {}).get("news") or []
+        epss = (parts["epss"] or {}).get("scores") or []
+        kev_ids = {row.get("cve_id") for row in kev if isinstance(row, dict)}
+        epss_map = {
+            row.get("cve_id"): row.get("epss") for row in epss if isinstance(row, dict)
+        }
+        enriched_cves = [
+            {
+                **cve,
+                "is_kev": cve.get("cve_id") in kev_ids,
+                "epss": epss_map.get(cve.get("cve_id")),
+                "priority": _priority_label(
+                    cve, cve.get("cve_id") in kev_ids,
+                    epss_map.get(cve.get("cve_id")),
+                ),
+            }
+            for cve in cves if isinstance(cve, dict)
+        ]
+        unavailable = [name for name, value in parts.items() if value is None]
+        return {
+            "source": "central",
+            "degraded": bool(unavailable),
+            "unavailable_sources": unavailable,
+            "stats": {
+                "kev_count": kev_part.get("total", len(kev)),
+                "actor_count": (parts["actors"] or {}).get("total_active", len(actors)),
+                "nvd_total": summary.get("cves", 0),
+                "nvd_critical": (summary.get("cve_by_severity") or {}).get("critical", 0),
+                "nvd_high": (summary.get("cve_by_severity") or {}).get("high", 0),
+                "ioc_count": summary.get("ioc_cache", 0),
+                "active_feeds": sum(1 for row in feeds if row.get("status") in ("ok", "live")),
+                "total_feeds": len(feeds),
+                "last_nvd_sync": 0,
+            },
+            "feeds": feeds,
+            "top_cves": enriched_cves,
+            "kev_recent": kev,
+            "actors": actors,
+            "news": news,
+            "top_epss": epss,
+        }
+
     # ── Comprehensive dashboard (single call for the UI) ─────────────────────
     @router.get("/intel/dashboard")
     async def intel_dashboard(
@@ -61,6 +129,12 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         All sub-queries run concurrently via asyncio.gather.
         Returns feeds, top CVEs, KEV, threat actors, news, EPSS top scores.
         """
+        central = await _central_dashboard(
+            cve_limit, news_hours, news_limit, kev_limit, actor_limit, epss_limit,
+        )
+        if central is not None:
+            return central
+
         (
             feeds,
             nvd_stats,
@@ -137,6 +211,12 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         active_only: bool = Query(True),
         limit:       int  = Query(50, ge=1, le=200),
     ):
+        central = await _central_get(
+            f"/api/v1/intel/actors?active_only={str(active_only).lower()}&limit={limit}"
+        )
+        if central is not None:
+            central["source"] = "central"
+            return central
         rows = await intel_db.get_threat_actors(active_only=active_only, limit=limit)
         return {"actors": rows, "count": len(rows)}
 
@@ -146,12 +226,23 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         hours: int = Query(48, ge=1, le=168),
         limit: int = Query(30, ge=1, le=100),
     ):
+        central = await _central_get(f"/api/v1/intel/news?hours={hours}&limit={limit}")
+        if central is not None:
+            central["source"] = "central"
+            return central
         rows = await intel_db.get_recent_news(hours=hours, limit=limit)
         return {"news": rows, "count": len(rows)}
 
     # ── CISA KEV ──────────────────────────────────────────────────────────────
     @router.get("/intel/kev")
     async def intel_kev(limit: int = Query(100, ge=1, le=500)):
+        central = await _central_get(f"/api/v1/intel/kev?limit={limit}")
+        if central is not None:
+            return {
+                "kev": central.get("vulnerabilities") or [],
+                "count": central.get("total", 0),
+                "source": "central",
+            }
         rows = await intel_db.list_kev(limit=limit)
         count = await intel_db.kev_count()
         return {"kev": rows, "count": count}
@@ -159,6 +250,10 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
     # ── Top EPSS scores ───────────────────────────────────────────────────────
     @router.get("/intel/epss/top")
     async def intel_epss_top(limit: int = Query(20, ge=1, le=100)):
+        central = await _central_get(f"/api/v1/intel/epss/top?limit={limit}")
+        if central is not None:
+            central["source"] = "central"
+            return central
         try:
             rows = await intel_db._fetchall(
                 "SELECT cve_id, epss, percentile, model_date FROM epss_scores "
@@ -241,6 +336,10 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
     @router.get("/nvd/stats")
     async def nvd_stats():
         """NVD local mirror: total CVE count, coverage by severity, last sync timestamps."""
+        central = await _central_get("/api/v1/intel/nvd/stats")
+        if central is not None:
+            central["source"] = "central"
+            return central
         try:
             return await intel_db.get_nvd_stats()
         except Exception as exc:
@@ -253,6 +352,13 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         limit: int = Query(20, ge=1, le=200),
     ):
         """FTS5 search against local NVD mirror — returns CVEs matching the keyword."""
+        from urllib.parse import urlencode
+        central = await _central_get(
+            "/api/v1/intel/nvd/search?" + urlencode({"q": q, "limit": limit})
+        )
+        if central is not None:
+            central["source"] = "central"
+            return central
         results = await intel_db.search_nvd_local(q.lower(), limit=limit)
         return {"results": results, "count": len(results), "query": q}
 
@@ -260,6 +366,10 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
     @router.get("/feeds")
     async def feed_health():
         """Return health status for every configured threat intel feed."""
+        central = await _central_get("/api/v1/intel/feeds")
+        if central is not None:
+            central["source"] = "central"
+            return central
         rows = await intel_db.get_all_feed_health()
         return {"feeds": rows, "count": len(rows)}
 
@@ -272,6 +382,16 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         offset:   int           = Query(0,     ge=0),
     ):
         """Browse the IOC cache with optional type and source filters."""
+        from urllib.parse import urlencode
+        central = await _central_get(
+            "/api/v1/intel/iocs?" + urlencode({
+                "ioc_type": ioc_type, "limit": limit, "offset": offset,
+                **({"source": source} if source else {}),
+            })
+        )
+        if central is not None:
+            central["source"] = "central"
+            return central
         all_rows = await intel_db.get_all_iocs(ioc_type)
         if source:
             all_rows = [r for r in all_rows if r.get("source") == source]

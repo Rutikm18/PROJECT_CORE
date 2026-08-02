@@ -1,13 +1,8 @@
 """
 manager/tests/unit/test_payload_ledger.py — outbox/reconciliation ledger.
 
-Pins the Phase-2 mechanism that makes "raw is stored, so it's reprocessable"
-actually true: every stored payload is recorded 'received', marked 'processed'
-once detection runs, and the reconciler's work-list is exactly the
-received-but-not-processed backlog past a grace window. Verifies the ledger
-state transitions, the grace/attempt filtering of the reconciler query, the
-backlog-collapse, and the health lag metric — against a real Postgres
-(pg_manager_dsn / conftest).
+Pins the event-level detection outbox and durable chunk completion against real
+Postgres (pg_manager_dsn / conftest).
 """
 from __future__ import annotations
 
@@ -30,27 +25,34 @@ async def _db(dsn) -> Database:
 async def test_received_then_processed_transitions(pg_manager_dsn):
     d = await _db(pg_manager_dsn)
     try:
-        await d.ledger_received("agent-1", "ports", 1000.0)
+        await d.ledger_received(
+            "agent-1", "ports", 1000.0, event_id="event-1", data=[{"port": 22}],
+        )
         lag = await d.ledger_lag()
         assert lag["pending"] == 1
 
-        await d.ledger_processed("agent-1", "ports", 1000.0, signal_count=3)
+        assert await d.ledger_chunk_processed("event-1", 0, 1, signal_count=3)
+        assert (await d.ledger_lag())["pending"] == 1
+        await d.ledger_correlated("event-1")
         lag = await d.ledger_lag()
         assert lag["pending"] == 0
     finally:
         await d.close()
 
 
-async def test_collected_at_float_drift_maps_to_same_row(pg_manager_dsn):
-    """received and processed for the SAME payload must collapse to one ledger
-    row even when collected_at drifts in fractional precision across the pipeline
-    (e.g. a time.time() fallback). The key is floored to the second."""
+async def test_same_agent_section_timestamp_keeps_distinct_events(pg_manager_dsn):
     d = await _db(pg_manager_dsn)
     try:
-        await d.ledger_received("agent-1", "metrics", 1782477291)          # int
-        await d.ledger_processed("agent-1", "metrics", 1782477291.322768)  # drifted float, same second
-        lag = await d.ledger_lag()
-        assert lag["pending"] == 0, "float drift within the same second must not leave a phantom pending row"
+        await d.ledger_received(
+            "agent-1", "metrics", 1782477291, event_id="event-a", data={"cpu_pct": 1},
+        )
+        await d.ledger_received(
+            "agent-1", "metrics", 1782477291, event_id="event-b", data={"cpu_pct": 2},
+        )
+        assert (await d.ledger_lag())["pending"] == 2
+        assert await d.ledger_chunk_processed("event-a", 0, 1)
+        await d.ledger_correlated("event-a")
+        assert (await d.ledger_lag())["pending"] == 1
     finally:
         await d.close()
 
@@ -58,8 +60,9 @@ async def test_collected_at_float_drift_maps_to_same_row(pg_manager_dsn):
 async def test_received_is_idempotent(pg_manager_dsn):
     d = await _db(pg_manager_dsn)
     try:
-        await d.ledger_received("agent-1", "ports", 2000.0)
-        await d.ledger_received("agent-1", "ports", 2000.0)   # dup — no error, no double row
+        kwargs = {"event_id": "event-2", "data": [{"port": 80}]}
+        await d.ledger_received("agent-1", "ports", 2000.0, **kwargs)
+        await d.ledger_received("agent-1", "ports", 2000.0, **kwargs)
         lag = await d.ledger_lag()
         assert lag["pending"] == 1
     finally:
@@ -82,37 +85,45 @@ async def test_reconciler_query_respects_grace_window(pg_manager_dsn):
     d = await _db(pg_manager_dsn)
     try:
         # Fresh receipt (now) — inside grace, must NOT be in the work-list yet.
-        await d.ledger_received("agent-1", "ports", 4000.0)
-        rows = await d.ledger_unprocessed_sections(grace_sec=120, max_attempts=5)
+        await d.ledger_received(
+            "agent-1", "ports", 4000.0, event_id="fresh", data=[{"port": 80}],
+        )
+        rows = await d.ledger_unprocessed_events(grace_sec=120, max_attempts=5)
         assert rows == []
 
         # A receipt well in the past — outside grace, must appear.
-        await d.ledger_received("agent-1", "packages", 4100.0)
+        await d.ledger_received(
+            "agent-1", "packages", 4100.0, event_id="old", data=[{"name": "x"}],
+        )
         # backdate its received_at directly
         async with d._pool.write() as db:
             await db.execute(
-                "UPDATE payload_ledger SET received_at = ? WHERE section='packages'",
+                "UPDATE detection_events SET received_at = ? WHERE event_id='old'",
                 (time.time() - 600,),
             )
             await db.commit()
-        rows = await d.ledger_unprocessed_sections(grace_sec=120, max_attempts=5)
-        secs = {r["section"] for r in rows}
-        assert "packages" in secs and "ports" not in secs
+        rows = await d.ledger_unprocessed_events(grace_sec=120, max_attempts=5)
+        assert [r["event_id"] for r in rows] == ["old"]
     finally:
         await d.close()
 
 
-async def test_reconcile_section_collapses_backlog(pg_manager_dsn):
+async def test_chunk_completion_is_durable_and_exactly_once(pg_manager_dsn):
     d = await _db(pg_manager_dsn)
     try:
-        for ts in (5000.0, 5001.0, 5002.0):
-            await d.ledger_received("agent-1", "apps", ts)
-        assert (await d.ledger_lag())["pending"] == 3
-
-        # Reconcile up to the latest — the whole backlog collapses to processed.
-        n = await d.ledger_reconcile_section("agent-1", "apps", 5002.0)
-        assert n == 3
+        data = [{"name": str(i)} for i in range(75)]
+        await d.ledger_received(
+            "agent-1", "apps", 5000.0, event_id="chunked", data=data, chunk_total=2,
+        )
+        assert not await d.ledger_chunk_processed("chunked", 1, 2, signal_count=2)
+        assert not await d.ledger_chunk_processed("chunked", 1, 2, signal_count=2)
+        assert await d.ledger_chunk_processed("chunked", 0, 2, signal_count=1)
+        assert await d.ledger_chunk_processed("chunked", 0, 2, signal_count=1)
+        await d.ledger_correlated("chunked")
+        assert not await d.ledger_chunk_processed("chunked", 0, 2, signal_count=1)
         assert (await d.ledger_lag())["pending"] == 0
+        payload = await d.ledger_event_payload("chunked")
+        assert payload["data"] == data
     finally:
         await d.close()
 
@@ -120,15 +131,48 @@ async def test_reconcile_section_collapses_backlog(pg_manager_dsn):
 async def test_reconciler_query_respects_max_attempts(pg_manager_dsn):
     d = await _db(pg_manager_dsn)
     try:
-        await d.ledger_received("agent-1", "sbom", 6000.0)
+        await d.ledger_received(
+            "agent-1", "sbom", 6000.0, event_id="give-up", data=[{"name": "x"}],
+        )
         async with d._pool.write() as db:
             await db.execute(
-                "UPDATE payload_ledger SET received_at = ?, attempts = 5 WHERE section='sbom'",
+                "UPDATE detection_events SET received_at = ?, attempts = 5 "
+                "WHERE event_id='give-up'",
                 (time.time() - 600,),
             )
             await db.commit()
         # attempts (5) >= max_attempts (5) → excluded from the work-list (gave up).
-        rows = await d.ledger_unprocessed_sections(grace_sec=120, max_attempts=5)
-        assert all(r["section"] != "sbom" for r in rows)
+        rows = await d.ledger_unprocessed_events(grace_sec=120, max_attempts=5)
+        assert all(r["event_id"] != "give-up" for r in rows)
     finally:
         await d.close()
+
+
+async def test_upgrade_adds_correlation_completion_without_replaying_old_rows(
+    pg_manager_dsn,
+):
+    d = await _db(pg_manager_dsn)
+    try:
+        await d.ledger_processed(
+            "agent-1", "metrics", 7000.0, event_id="pre-upgrade",
+        )
+        async with d._pool.write() as db:
+            await db.execute("DROP INDEX IF EXISTS idx_detection_events_incomplete")
+            await db.execute("ALTER TABLE detection_events DROP COLUMN correlated_at")
+            await db.commit()
+    finally:
+        await d.close()
+
+    upgraded = Database(pg_manager_dsn)
+    await upgraded.init()
+    try:
+        assert (await upgraded.ledger_lag())["pending"] == 0
+        async with upgraded._pool.read() as db:
+            async with db.execute(
+                "SELECT correlated_at FROM detection_events WHERE event_id=?",
+                ("pre-upgrade",),
+            ) as cur:
+                row = await cur.fetchone()
+        assert row["correlated_at"] is not None
+    finally:
+        await upgraded.close()

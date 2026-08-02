@@ -80,7 +80,7 @@ class EnrichmentWorker:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    async def start(self) -> None:
+    async def start(self, *, periodic: bool = True) -> None:
         if self._running:
             return
         self._running = True
@@ -88,6 +88,9 @@ class EnrichmentWorker:
             timeout=_HTTP_TIMEOUT,
             headers={"User-Agent": _USER_AGENT},
         )
+        if not periodic:
+            log.info("EnrichmentWorker: on-demand mode enabled")
+            return
         if self._misp_enabled:
             self._tasks.append(asyncio.create_task(self._misp_loop()))
             log.info("EnrichmentWorker: MISP loop enabled (%s)", self._misp_url)

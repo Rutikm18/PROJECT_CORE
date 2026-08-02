@@ -19,6 +19,7 @@ Accuracy notes:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -182,8 +183,9 @@ class CVELookup:
         # → [{"cve_id": "CVE-2024-...", "cvss_score": 9.1, ...}, ...]
     """
 
-    def __init__(self, db) -> None:
+    def __init__(self, db, central_url: str = "") -> None:
         self._db = db
+        self._central_url = central_url.strip().rstrip("/")
 
     async def lookup(self, package: str, version: str = "") -> list[dict]:
         """Return cached or freshly-fetched CVEs for a package."""
@@ -192,17 +194,114 @@ class CVELookup:
         if cached:
             return cached
 
-        cves = await self._fetch_nvd(package, version)
+        local_candidates, cves = await self._fetch_local(package, version)
+        if local_candidates and not cves:
+            await self._db.set_cve_cache(cache_key, [], ttl=CVE_TTL)
+            return []
+        if not cves and self._central_url:
+            cves = await self._fetch_central(package, version)
+        if not cves:
+            cves = await self._fetch_nvd(package, version)
         if cves:
             await self._db.set_cve_cache(cache_key, cves, ttl=CVE_TTL)
         return cves
+
+    async def _fetch_local(self, package: str, version: str) -> tuple[bool, list[dict]]:
+        """Query the owned NVD mirror and restore structured range metadata."""
+        try:
+            rows = await self._db.search_nvd_local(package.lower(), limit=MAX_RESULTS)
+        except (AttributeError, NotImplementedError):
+            return False, []
+        except Exception as exc:
+            log.debug("Local NVD mirror lookup failed for %s: %s", package, exc)
+            return False, []
+
+        results: list[dict] = []
+        for raw in rows or []:
+            row = self._normalize_local_row(raw)
+            if not row:
+                continue
+            if version and not cve_affects_version(row, version):
+                continue
+            results.append(row)
+        return bool(rows), results
+
+    @staticmethod
+    def _normalize_local_row(raw: object) -> dict:
+        if not isinstance(raw, dict):
+            try:
+                raw = dict(raw)  # type: ignore[arg-type]
+            except Exception:
+                return {}
+        row = dict(raw)
+        for source_key, target_key in (
+            ("cwe_ids", "cwe_ids"),
+            ("cpe_uris", "affected_cpe"),
+            ("cpe_matches", "affected_cpe_matches"),
+        ):
+            value = row.get(source_key, row.get(target_key, []))
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, ValueError):
+                    value = []
+            row[target_key] = value if isinstance(value, list) else []
+        row.setdefault("exploit_available", False)
+        return row
+
+    async def _fetch_central(self, package: str, version: str) -> list[dict]:
+        """Use the central service's owned NVD cache before direct NVD fallback."""
+        try:
+            async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+                async with session.post(
+                    f"{self._central_url}/api/v1/intel/correlate/packages",
+                    json={"packages": [{"name": package, "version": version}]},
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    payload = await response.json(content_type=None)
+            return [
+                match["cve"] for match in (payload.get("matches") or [])
+                if isinstance(match, dict) and isinstance(match.get("cve"), dict)
+            ]
+        except Exception as exc:
+            log.debug("Central CVE lookup failed for %s: %s", package, exc)
+            return []
 
     async def get_cve(self, cve_id: str) -> Optional[dict]:
         """Fetch a single CVE by ID."""
         cached = await self._db.get_cve_by_id(cve_id)
         if cached:
             return cached
+        try:
+            local = await self._db.get_nvd_local_by_id(cve_id)
+        except (AttributeError, NotImplementedError):
+            local = None
+        except Exception as exc:
+            log.debug("Local NVD CVE lookup failed for %s: %s", cve_id, exc)
+            local = None
+        if local:
+            return self._normalize_local_row(local)
+        if self._central_url:
+            central = await self._fetch_central_cve(cve_id)
+            if central:
+                return central
         return await self._fetch_single_cve(cve_id)
+
+    async def _fetch_central_cve(self, cve_id: str) -> Optional[dict]:
+        try:
+            async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+                async with session.get(
+                    f"{self._central_url}/api/v1/intel/nvd/{cve_id.upper()}"
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    payload = await response.json(content_type=None)
+            cve = payload.get("cve") if isinstance(payload, dict) else None
+            return cve if isinstance(cve, dict) else None
+        except Exception as exc:
+            log.debug("Central NVD CVE lookup failed for %s: %s", cve_id, exc)
+            return None
 
     async def sync_recent(self, hours: int = 48, max_pages: int = 3) -> int:
         """

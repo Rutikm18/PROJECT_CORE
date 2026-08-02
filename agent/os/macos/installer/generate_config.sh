@@ -256,6 +256,18 @@ enabled      = true
 interval_sec = 3600
 send         = true
 
+[collection.sections.developer_security]
+enabled      = true
+interval_sec = 3600
+send         = true
+timeout_sec  = 120
+
+[collection.sections.sca]
+enabled      = true
+interval_sec = 43200
+send         = true
+timeout_sec  = 60
+
 [collection.sections.apps]
 enabled      = true
 interval_sec = 3600

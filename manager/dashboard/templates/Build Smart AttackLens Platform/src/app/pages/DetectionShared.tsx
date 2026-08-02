@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRBAC } from "../context/RBACContext";
+import { useAuth } from "../context/AuthContext";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -2412,6 +2413,266 @@ type AIRemediationResult = {
   latency_ms:   number;
 };
 
+type InvestigationVerdict = {
+  verdict?: string;
+  confidence?: number;
+  summary?: string;
+  evidence_ids?: string[];
+  gaps?: string[];
+};
+
+type InvestigationHypothesis = {
+  id?: string;
+  statement?: string;
+  status?: string;
+  confidence?: number;
+  supporting_ids?: string[];
+  contradicting_ids?: string[];
+};
+
+type InvestigationRun = {
+  run_id: string;
+  status: "running" | "pending_review" | "completed" | "rejected" | "failed";
+  current_node?: string;
+  review_payload?: {
+    verdict?: InvestigationVerdict;
+    hypotheses?: InvestigationHypothesis[];
+    allowed_decisions?: string[];
+    review_round?: number;
+    errors?: string[];
+  };
+  result?: {
+    verdict?: InvestigationVerdict;
+    hypotheses?: InvestigationHypothesis[];
+    remediation?: Record<string, any>;
+    analyst?: { actor?: string; decision?: string; feedback?: string; review_round?: number };
+    errors?: string[];
+  };
+  error?: string;
+  updated_at?: number;
+};
+
+const INVESTIGATION_STATUS: Record<string, string> = {
+  running: "bg-blue-50 text-blue-700 border-blue-200",
+  pending_review: "bg-amber-50 text-amber-700 border-amber-200",
+  completed: "bg-green-50 text-green-700 border-green-200",
+  rejected: "bg-gray-100 text-gray-700 border-gray-200",
+  failed: "bg-red-50 text-red-700 border-red-200",
+};
+
+function InvestigationPanel({ finding }: { finding: DetectionFinding }) {
+  const { user } = useAuth();
+  const [run, setRun] = useState<InvestigationRun | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const response = await fetch(`/api/v1/ai/investigations/${finding.id}`);
+      if (response.status === 404) {
+        setRun(null);
+        return;
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? `HTTP ${response.status}`);
+      }
+      setRun(await response.json());
+      setError(null);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [finding.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    if (run?.status !== "running") return;
+    const timer = window.setInterval(() => void load(), 3000);
+    return () => window.clearInterval(timer);
+  }, [run?.status, load]);
+
+  const start = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/v1/ai/investigations/${finding.id}`, { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail ?? `HTTP ${response.status}`);
+      setRun(body);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const decide = async (decision: "approve" | "reject" | "request_more") => {
+    if (!run) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/v1/ai/investigations/run/${run.run_id}/decision`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision, actor: user?.email ?? "analyst", feedback }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail ?? `HTTP ${response.status}`);
+      setRun(body);
+      setFeedback("");
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const review = run?.review_payload ?? {};
+  const result = run?.result ?? {};
+  const verdict = run?.status === "pending_review" ? review.verdict : result.verdict;
+  const hypotheses = run?.status === "pending_review" ? review.hypotheses : result.hypotheses;
+  const allowed = new Set(review.allowed_decisions ?? []);
+  const remediation = result.remediation;
+  const remediationSteps = Array.isArray(remediation?.steps) ? remediation.steps : [];
+
+  return (
+    <div className="px-4 py-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <GitBranch className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" />
+          <span className="text-[10px] font-bold text-gray-700 uppercase tracking-wider">Investigation</span>
+          {run && (
+            <span className={cn("text-[8px] font-bold px-1.5 py-0.5 border rounded", INVESTIGATION_STATUS[run.status])}>
+              {run.status.replace("_", " ")}
+            </span>
+          )}
+        </div>
+        <button
+          onClick={run ? load : start}
+          disabled={loading || submitting}
+          title={run ? "Refresh investigation" : "Start investigation"}
+          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[9px] font-bold bg-white border border-gray-200 rounded hover:border-blue-300 hover:text-blue-700 disabled:opacity-50"
+        >
+          <RefreshCw className={cn("w-3 h-3", (loading || submitting) && "animate-spin")} />
+          {run ? "Refresh" : "Start"}
+        </button>
+      </div>
+
+      {error && (
+        <div className="flex items-start gap-2 p-2.5 bg-red-50 text-red-700 border border-red-200 rounded text-[10px]">
+          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />{error}
+        </div>
+      )}
+
+      {loading && !run && (
+        <div className="flex items-center justify-center py-5 text-gray-400 text-[10px]">
+          <RefreshCw className="w-3.5 h-3.5 animate-spin mr-2" />Loading investigation
+        </div>
+      )}
+
+      {!loading && !run && !error && (
+        <div className="border border-dashed border-gray-200 rounded p-4 text-center">
+          <p className="text-[10px] text-gray-500">No investigation run</p>
+        </div>
+      )}
+
+      {run?.status === "running" && (
+        <div className="flex items-center gap-2 p-3 bg-blue-50 text-blue-700 border border-blue-200 rounded text-[10px]">
+          <Activity className="w-3.5 h-3.5 animate-pulse" />Gathering evidence and evaluating hypotheses
+        </div>
+      )}
+
+      {verdict && (
+        <div className="border border-gray-200 rounded p-3 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[9px] font-bold text-gray-500 uppercase">Verdict</span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] font-bold text-gray-800 uppercase">{verdict.verdict ?? "inconclusive"}</span>
+              <span className="text-[9px] tabular-nums text-gray-500">{Math.round((verdict.confidence ?? 0) * 100)}%</span>
+            </div>
+          </div>
+          <p className="text-[10px] leading-relaxed text-gray-700">{verdict.summary}</p>
+          {(verdict.evidence_ids?.length ?? 0) > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {verdict.evidence_ids?.map(id => <span key={id} className="font-mono text-[8px] px-1.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-100 rounded">{id}</span>)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {(hypotheses?.length ?? 0) > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-[9px] font-bold text-gray-400 uppercase">Bounded hypotheses</div>
+          {hypotheses?.map((hypothesis, index) => (
+            <div key={hypothesis.id ?? index} className="border border-gray-100 bg-gray-50 rounded p-2.5">
+              <div className="flex items-start gap-2">
+                <span className="font-mono text-[8px] font-bold text-blue-600 mt-0.5">{hypothesis.id ?? `HP-${index + 1}`}</span>
+                <p className="text-[10px] text-gray-700 leading-relaxed flex-1">{hypothesis.statement}</p>
+                <span className="text-[8px] text-gray-500 uppercase">{hypothesis.status}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {run?.status === "pending_review" && (
+        <div className="space-y-2 border-t border-gray-100 pt-3">
+          <textarea
+            value={feedback}
+            onChange={event => setFeedback(event.target.value)}
+            maxLength={1000}
+            rows={2}
+            placeholder="Analyst feedback"
+            className="w-full resize-none text-[10px] border border-gray-200 rounded px-2.5 py-2 outline-none focus:border-blue-400"
+          />
+          <div className="flex flex-wrap gap-1.5">
+            {allowed.has("approve") && (
+              <button onClick={() => decide("approve")} disabled={submitting} className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-green-600 text-white rounded text-[9px] font-bold disabled:opacity-50">
+                <CheckCircle2 className="w-3 h-3" />Approve verdict
+              </button>
+            )}
+            {allowed.has("reject") && (
+              <button onClick={() => decide("reject")} disabled={submitting} className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-white text-gray-700 border border-gray-300 rounded text-[9px] font-bold disabled:opacity-50">
+                <XCircle className="w-3 h-3" />Reject
+              </button>
+            )}
+            {allowed.has("request_more") && (
+              <button onClick={() => decide("request_more")} disabled={submitting} className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-blue-50 text-blue-700 border border-blue-200 rounded text-[9px] font-bold disabled:opacity-50">
+                <Search className="w-3 h-3" />More evidence
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {remediation && Object.keys(remediation).length > 0 && (
+        <div className="border border-green-200 bg-green-50/50 rounded p-3 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[9px] font-bold text-green-800 uppercase">Remediation draft</span>
+            <span className="text-[8px] text-green-700">Not authorized for execution</span>
+          </div>
+          {remediation.summary && <p className="text-[10px] text-gray-700">{String(remediation.summary)}</p>}
+          {remediationSteps.slice(0, 8).map((step: any, index: number) => (
+            <div key={index} className="flex items-start gap-2 text-[10px] text-gray-700">
+              <span className="font-mono text-[8px] text-green-700 mt-0.5">{index + 1}</span>
+              <span>{String(step.title ?? step.detail ?? "Remediation step")}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {run?.status === "failed" && run.error && <p className="text-[9px] text-red-600">{run.error}</p>}
+    </div>
+  );
+}
+
 const URGENCY_STYLE: Record<string, string> = {
   immediate:     "bg-red-100 text-red-700 border-red-200",
   urgent:        "bg-orange-100 text-orange-700 border-orange-200",
@@ -2529,6 +2790,8 @@ function AIAnalysisPanel({ finding: f }: { finding: DetectionFinding }) {
 
   return (
     <div className="divide-y divide-gray-50">
+
+      <InvestigationPanel finding={f} />
 
       {/* ── Analysis section ──────────────────────────────────────── */}
       <div className="px-4 py-4 space-y-3">

@@ -283,6 +283,25 @@ enabled      = true
 interval_sec = 3600
 send         = true
 
+# Developer/AI tool attack surface: VS Code/Cursor extensions, MCP servers,
+# Node/Python/Homebrew posture, AI apps/CLIs, shell startup files, launchd,
+# cron, relevant processes, listeners, browser extensions/native messaging,
+# Git/hooks, credential-location metadata, and Docker security settings.
+# Secret/credential values and file contents are never transmitted.
+[collection.sections.developer_security]
+enabled      = true
+interval_sec = 3600
+send         = true
+timeout_sec  = 120
+
+# CIS benchmark Security Configuration Assessment. Failed checks are routed
+# through the manager's compliance detector; unknown checks remain visible.
+[collection.sections.sca]
+enabled      = true
+interval_sec = 43200
+send         = true
+timeout_sec  = 60
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SOFTWARE INVENTORY  — 24 hr

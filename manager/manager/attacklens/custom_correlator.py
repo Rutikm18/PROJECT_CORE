@@ -134,15 +134,12 @@ class CustomCorrelator:
         if not rules:
             return []
 
-        try:
-            findings = await self._idb.get_findings(agent_id, active_only=True, limit=500)
-        except Exception as exc:
-            log.warning("CustomCorrelator: DB read error agent=%s: %s", agent_id, exc)
-            return []
+        findings = await self._idb.get_findings(agent_id, active_only=True, limit=500)
 
         now = time.time()
         results: list[dict] = []
 
+        errors: list[tuple[str, Exception]] = []
         for rule in rules:
             if not rule.get("enabled", True):
                 continue
@@ -162,6 +159,14 @@ class CustomCorrelator:
                         pass
             except Exception as exc:
                 log.warning("CustomCorrelator: rule %s eval error: %s", rule.get("id"), exc)
+                errors.append((str(rule.get("id") or "unknown"), exc))
+
+        if errors:
+            rule_id, first = errors[0]
+            raise RuntimeError(
+                f"{len(errors)} custom correlation rule(s) failed; "
+                f"first={rule_id}:{type(first).__name__}:{first}"
+            ) from first
 
         return results
 
@@ -213,22 +218,18 @@ class CustomCorrelator:
         }
 
     async def _load_rules(self) -> list[dict]:
-        try:
-            rows = await self._idb._fetchall(
-                "SELECT * FROM custom_correlation_rules WHERE enabled = 1 ORDER BY created_at DESC",
-                (),
-            )
-            result = []
-            for row in rows:
-                r = dict(row)
-                for field in ("conditions", "attack_chain", "tags"):
-                    if isinstance(r.get(field), str):
-                        try:
-                            r[field] = json.loads(r[field]) or {}
-                        except Exception:
-                            r[field] = {} if field == "conditions" else []
-                result.append(r)
-            return result
-        except Exception as exc:
-            log.warning("CustomCorrelator: failed to load rules: %s", exc)
-            return []
+        rows = await self._idb._fetchall(
+            "SELECT * FROM custom_correlation_rules WHERE enabled = 1 ORDER BY created_at DESC",
+            (),
+        )
+        result = []
+        for row in rows:
+            r = dict(row)
+            for field in ("conditions", "attack_chain", "tags"):
+                if isinstance(r.get(field), str):
+                    try:
+                        r[field] = json.loads(r[field]) or {}
+                    except Exception:
+                        r[field] = {} if field == "conditions" else []
+            result.append(r)
+        return result

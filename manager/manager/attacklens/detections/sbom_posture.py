@@ -92,7 +92,7 @@ HIGH_DISABLED: frozenset[str] = frozenset({
 SBOM_SECTIONS: frozenset[str] = frozenset({
     "sbom", "sbom_cyclonedx", "sbom_spdx",
     "pip_list", "npm_list", "gem_list",
-    "security_posture", "endpoint_posture",
+    "security", "security_posture", "endpoint_posture",
 })
 
 CVE_CACHE_TTL_SECS: int          = 21600   # 6 hours
@@ -666,7 +666,7 @@ async def analyze(
 
     findings: list[dict] = []
 
-    if section in {"security_posture", "endpoint_posture"}:
+    if section in {"security", "security_posture", "endpoint_posture"}:
         posture = ingest_posture(data)
         for f in detect_posture_issues(agent_id, posture):
             f["affected_asset"] = hostname or agent_id

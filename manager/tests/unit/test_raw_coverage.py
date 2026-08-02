@@ -64,7 +64,7 @@ async def test_coverage_statuses_and_gate(pg_manager_dsn):
         assert "users" in j["empty"]
         assert "security" in j["stale"]
         assert "sbom" in j["missing"]
-        assert j["expected"] == 22
+        assert j["expected"] == 25
     finally:
         await db.close()
 

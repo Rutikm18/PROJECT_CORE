@@ -78,7 +78,9 @@ def _is_blank(v: Any) -> bool:
     return v is None or v == "" or v == [] or v == {}
 
 
-def validate_payload(payload: Mapping[str, Any]) -> dict:
+def validate_payload(
+    payload: Mapping[str, Any], *, authenticated_agent_id: str | None = None,
+) -> dict:
     """Validate the decrypted payload against the canonical contract.
 
     Pure and side-effect-free so both the ingest endpoint and stream consumers
@@ -90,11 +92,13 @@ def validate_payload(payload: Mapping[str, Any]) -> dict:
       data_empty          → `data` present but empty ({}/[]/""/None)
       data_error          → `data` is just a collector error ({"error": "..."})
       recommended_missing → recommended keys absent or blank
+      identity_mismatch   → inner agent_id differs from authenticated envelope
     """
     if not isinstance(payload, Mapping):
         return {
             "ok": False, "missing": sorted(REQUIRED_PAYLOAD_FIELDS), "empty": [],
             "data_empty": True, "data_error": False,
+            "identity_mismatch": False,
             "recommended_missing": sorted(RECOMMENDED_PAYLOAD_FIELDS),
         }
 
@@ -115,13 +119,22 @@ def validate_payload(payload: Mapping[str, Any]) -> dict:
         if f not in payload or _is_blank(payload.get(f))
     )
 
-    ok = not missing and not empty and not data_empty and not data_error
+    identity_mismatch = bool(
+        authenticated_agent_id
+        and payload.get(P_AGENT_ID) != authenticated_agent_id
+    )
+
+    ok = (
+        not missing and not empty and not data_empty and not data_error
+        and not identity_mismatch
+    )
     return {
         "ok": ok,
         "missing": missing,
         "empty": empty,
         "data_empty": data_empty,
         "data_error": data_error,
+        "identity_mismatch": identity_mismatch,
         "recommended_missing": recommended_missing,
     }
 
