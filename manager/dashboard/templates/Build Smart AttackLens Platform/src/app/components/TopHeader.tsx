@@ -22,6 +22,7 @@ import { useRBAC, type Role } from "../context/RBACContext";
 import { useAuth } from "../context/AuthContext";
 import { cn } from "../../lib/utils";
 import { useTimezone, tzAbbr, fmtTime, fmtDate, initTimezone } from "../context/timezoneStore";
+import { TimeRangePicker, isTimeAwareRoute } from "./TimeRangePicker";
 
 // ── Breadcrumb ────────────────────────────────────────────────────────────────
 
@@ -304,6 +305,13 @@ export function TopHeader() {
 
         {/* ── RIGHT: controls ─────────────────────────────────────────────── */}
         <div className="flex items-center gap-0.5 flex-shrink-0" onClick={e => e.stopPropagation()}>
+
+          {/* Time range picker (hidden on non-time-aware pages) */}
+          {isTimeAwareRoute(location.pathname) && (
+            <div className="mr-1">
+              <TimeRangePicker />
+            </div>
+          )}
 
           {/* Live indicator */}
           <div className="flex items-center gap-1 px-2 py-1 rounded-lg mr-1"
