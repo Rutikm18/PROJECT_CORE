@@ -1373,7 +1373,9 @@ class IntelDB:
                            category: str | None = None,
                            active_only: bool = True,
                            limit: int = 500,
-                           offset: int = 0) -> list[dict]:
+                           offset: int = 0,
+                           window_start: int | None = None,
+                           window_end: int | None = None) -> list[dict]:
         parts = ["agent_id=?"]
         args: list = [agent_id]
         if severity:
@@ -1382,6 +1384,9 @@ class IntelDB:
             parts.append("category=?");  args.append(category)
         if active_only:
             parts.append("is_active=1")
+        if window_start is not None and window_end is not None:
+            parts.append("first_detected_at BETWEEN ? AND ?")
+            args.extend([float(window_start), float(window_end)])
         where = " AND ".join(parts)
         rows = await self._fetchall(
             f"SELECT * FROM findings WHERE {where} "

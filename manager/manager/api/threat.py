@@ -29,6 +29,7 @@ log = logging.getLogger("manager")
 import aiohttp
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
+from manager.manager.timewindow import resolve_window, WindowError
 
 
 def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
@@ -417,7 +418,14 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
         active_only: bool          = Query(True),
         limit:       int           = Query(100, ge=1, le=1000),
         offset:      int           = Query(0, ge=0),
+        window:      str           = Query("1h"),
+        start:       Optional[int] = Query(None),
+        end:         Optional[int] = Query(None),
     ):
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         rows = await intel_db.get_findings(
             agent_id,
             severity=severity,
@@ -425,6 +433,8 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
             active_only=active_only,
             limit=limit,
             offset=offset,
+            window_start=ws,
+            window_end=we,
         )
         return {"findings": rows, "count": len(rows), "offset": offset}
 
@@ -442,11 +452,18 @@ def make_threat_router(intel_db, central_url: str = "") -> APIRouter:
     async def timeline(
         agent_id: str,
         category: Optional[str] = Query(None),
-        since:    float         = Query(0.0, description="Unix timestamp"),
+        since:    float         = Query(0.0, description="Unix timestamp (legacy; overridden by window)"),
         limit:    int           = Query(200, ge=1, le=1000),
+        window:   str           = Query("1h"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         rows = await intel_db.get_timeline(
-            agent_id, category=category, since=since, limit=limit)
+            agent_id, category=category, since=float(ws), limit=limit)
         return {"events": rows, "count": len(rows)}
 
     # ── FTS Search ────────────────────────────────────────────────────────────

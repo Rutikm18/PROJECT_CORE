@@ -27,7 +27,9 @@ import logging
 import time
 from typing import Optional, TYPE_CHECKING
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+
+from manager.manager.timewindow import resolve_window, WindowError
 
 if TYPE_CHECKING:
     from ..indexer import IntelDB
@@ -220,12 +222,21 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
         validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
+        window:   str           = Query("1h", description="30s|1m|5m|15m|1h|6h|1d|7d|15d|30d"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
         """
         Package CVE findings — installed packages matched against NVD.
         Each finding includes: CVE IDs, CVSS, EPSS, KEV status, risk score,
         exploitation evidence, impact statement, and step-by-step remediation.
+
+        window filters first_detected_at (event time). Current-state package inventory is unaffected.
         """
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         rows = await intel_db.get_soc_findings(
             agent_id=agent_id,
             category="package",
@@ -236,6 +247,8 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             limit=limit,
             offset=offset,
             live_agent_ids=await _live_agent_ids(),
+            window_start=ws,
+            window_end=we,
         )
         rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
         return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
@@ -248,7 +261,14 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
         validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
+        window:   str           = Query("1h"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         rows = await intel_db.get_soc_findings(
             agent_id=agent_id,
             category="port",
@@ -258,6 +278,8 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             limit=limit,
             offset=offset,
             live_agent_ids=await _live_agent_ids(),
+            window_start=ws,
+            window_end=we,
         )
         rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
         return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
@@ -271,11 +293,18 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         limit:     int           = Query(150, ge=1, le=500),
         offset:    int           = Query(0, ge=0),
         validated_only: bool     = Query(False, description="Only findings with precision_score ≥ configured threshold"),
+        window:    str           = Query("1h"),
+        start:     Optional[int] = Query(None),
+        end:       Optional[int] = Query(None),
     ):
         """
         All persistence-related findings: launchd services, cron/launchd tasks,
         malicious config patterns, SUID/world-writable binaries.
         """
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         persistence_cats = [sub_type] if sub_type else ["service", "task", "config", "binary"]
         all_rows = []
         live_ids = await _live_agent_ids()
@@ -289,6 +318,8 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
                 limit=limit,
                 offset=0,
                 live_agent_ids=live_ids,
+                window_start=ws,
+                window_end=we,
             )
             for cat in persistence_cats
         ])
@@ -308,8 +339,15 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
         validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
+        window:   str           = Query("1h"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
         """Aggregate every category that belongs to the dashboard's Vector panel."""
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         wanted_cats = [sub_type] if sub_type in _VECTOR_CATEGORIES else _VECTOR_CATEGORIES
         live_ids = await _live_agent_ids()
         results = await asyncio.gather(*[
@@ -317,6 +355,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
                 agent_id=agent_id, category=cat, severity=severity,
                 active_only=True, sort_by="composite_score",
                 limit=limit + offset, offset=0, live_agent_ids=live_ids,
+                window_start=ws, window_end=we,
             ) for cat in wanted_cats
         ], return_exceptions=True)
         all_rows: list[dict] = []
@@ -347,20 +386,27 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
         validated_only: bool    = Query(False, description="Only findings with precision_score ≥ configured threshold"),
+        window:   str           = Query("1h"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         live_ids = await _live_agent_ids()
         results = await asyncio.gather(
             intel_db.get_soc_findings(
                 agent_id=agent_id, category="process",
                 severity=severity, active_only=True,
                 sort_by="composite_score", limit=limit, offset=0,
-                live_agent_ids=live_ids,
+                live_agent_ids=live_ids, window_start=ws, window_end=we,
             ),
             intel_db.get_soc_findings(
                 agent_id=agent_id, category="app",
                 severity=severity, active_only=True,
                 sort_by="composite_score", limit=limit, offset=0,
-                live_agent_ids=live_ids,
+                live_agent_ids=live_ids, window_start=ws, window_end=we,
             ),
         )
         all_rows = sorted(
@@ -380,8 +426,15 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         limit:    int           = Query(100, ge=1, le=500),
         offset:   int           = Query(0, ge=0),
         validated_only: bool    = Query(False),
+        window:   str           = Query("1h"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
         """Identity & access terrain — user, account, identity, and auth categories."""
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         live_ids = await _live_agent_ids()
         cats = ["user", "identity", "account", "auth", "privilege", "credential"]
         results = await asyncio.gather(*[
@@ -389,6 +442,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
                 agent_id=agent_id, category=cat, severity=severity,
                 active_only=True, sort_by="composite_score",
                 limit=limit, offset=0, live_agent_ids=live_ids,
+                window_start=ws, window_end=we,
             )
             for cat in cats
         ])
@@ -435,7 +489,14 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
                         "Defaulting True hid everything in shadow mode (precision "
                         "scores below the bar), which read as 'no data'.",
         ),
+        window:   str           = Query("1h"),
+        start:    Optional[int] = Query(None),
+        end:      Optional[int] = Query(None),
     ):
+        try:
+            ws, we = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         # ── ID Search fast-path: direct indexed lookup ─────────────────────────
         if id_search:
             term = id_search.strip().upper()
@@ -456,6 +517,8 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
             active_only=True, sort_by=sort_by, limit=limit, offset=offset,
             min_precision=await _validated_prefilter(intel_db, validated_only),
             live_agent_ids=await _live_agent_ids(),
+            window_start=ws,
+            window_end=we,
         )
         rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
         return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
