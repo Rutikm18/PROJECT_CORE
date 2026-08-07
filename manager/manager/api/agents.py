@@ -8,7 +8,7 @@ Endpoints:
   GET /api/v1/agents/{id}/{section}               time-series data
 
 Query parameters for section data:
-  window  : 5m | 15m | 1h | 8h | 1d | 7d | 30d | 90d (default: 1h)
+  window  : 30s|1m|5m|15m|1h|6h|1d|7d|15d|30d (default: 1h)
   limit   : max records returned (default: 100, max: 1000)
   start   : Unix epoch start (overrides window)
   end     : Unix epoch end   (overrides window)
@@ -23,7 +23,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from ..models import AgentSummary, AgentDetail, SectionRow
 from shared.sections import VALID_SECTION_NAMES
-from shared.wire     import WINDOW_SECONDS
+from manager.manager.timewindow import resolve_window, WindowError
 
 if TYPE_CHECKING:
     from ..db    import Database
@@ -103,20 +103,16 @@ def make_agents_router(db: "Database", store: "TelemetryStore") -> APIRouter:
         section:  str,
         window:   str = Query(default="1h"),
         limit:    int = Query(default=100, ge=1, le=1000),
-        start:    int = Query(default=0),
-        end:      int = Query(default=0),
+        start:    int | None = Query(default=None),
+        end:      int | None = Query(default=None),
     ):
         if section not in VALID_SECTION_NAMES:
             raise HTTPException(400, f"Invalid section: {section!r}")
 
-        now = int(time.time())
-
-        # Resolve start/end from window shortcut
-        if start <= 0:
-            secs  = WINDOW_SECONDS.get(window, 3600)
-            start = now - secs
-        if end <= 0:
-            end = now
+        try:
+            start, end = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
         # Shared PostgreSQL is authoritative; filesystem archives are optional
         # exports and are never queried on the HA request path.

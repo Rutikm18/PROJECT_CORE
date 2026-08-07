@@ -24,16 +24,9 @@ from shared.sections import VALID_SECTION_NAMES
 if TYPE_CHECKING:
     from ..db import Database
 
-log = logging.getLogger("manager.api.raw")
+from manager.manager.timewindow import resolve_window as _shared_resolve, WindowError
 
-# Preset time windows in seconds
-_TIME_WINDOWS = {
-    "5m":  5 * 60,
-    "1h":  3600,
-    "6h":  6 * 3600,
-    "24h": 24 * 3600,
-    "7d":  7 * 24 * 3600,
-}
+log = logging.getLogger("manager.api.raw")
 
 
 def make_raw_router(db: "Database") -> APIRouter:
@@ -292,10 +285,12 @@ def _resolve_window(
     end:    Optional[int],
     now:    int,
 ) -> tuple[int, int]:
-    """Convert window preset OR explicit start/end into (start, end) epoch ints."""
-    if window and window in _TIME_WINDOWS:
-        return now - _TIME_WINDOWS[window], now
-    return (start or 0), (end or now)
+    """Delegate to shared resolver; preserve lenient behavior for internal raw browser."""
+    try:
+        return _shared_resolve(window, start, end, now=now)
+    except WindowError:
+        # Raw endpoints are internal; fall back gracefully instead of 422.
+        return (start or 0), (end or now)
 
 
 # Every developer_security capability and the key it stores its records under.
