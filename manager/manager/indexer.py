@@ -1384,9 +1384,12 @@ class IntelDB:
             parts.append("category=?");  args.append(category)
         if active_only:
             parts.append("is_active=1")
+        # Interval-overlap window (see get_soc_findings): active during [start,end],
+        # not merely first-seen within it — keeps still-active findings visible in
+        # short windows instead of blanking the view.
         if window_start is not None and window_end is not None:
-            parts.append("first_detected_at BETWEEN ? AND ?")
-            args.extend([float(window_start), float(window_end)])
+            parts.append("first_detected_at <= ? AND last_detected_at >= ?")
+            args.extend([float(window_end), float(window_start)])
         where = " AND ".join(parts)
         rows = await self._fetchall(
             f"SELECT * FROM findings WHERE {where} "
@@ -2006,10 +2009,16 @@ class IntelDB:
         elif active_only and status in _TERMINAL:
             parts.append("f.is_active=0")   # terminal states are always inactive
 
-        # Event-time window filter (on first_detected_at; covered by idx_find_first_detected).
+        # Event-time window filter — INTERVAL OVERLAP, not first-seen containment.
+        # A finding "belongs" to [start,end] if it was active at any point during
+        # it: it began on/before the window end AND was last seen on/after the
+        # window start. Filtering first_detected_at alone hid still-active findings
+        # (first seen hours ago, re-detected seconds ago) from every short window —
+        # picking "5m"/"1h" wrongly emptied the dashboard. first_detected_at is
+        # covered by idx_find_first_detected; last_detected_at by idx_find_ts.
         if window_start is not None and window_end is not None:
-            parts.append("f.first_detected_at BETWEEN ? AND ?")
-            args.extend([float(window_start), float(window_end)])
+            parts.append("f.first_detected_at <= ? AND f.last_detected_at >= ?")
+            args.extend([float(window_end), float(window_start)])
 
         where = ("WHERE " + " AND ".join(parts)) if parts else ""
         valid_sorts = {"score": "f.score DESC", "last_detected_at": "f.last_detected_at DESC",

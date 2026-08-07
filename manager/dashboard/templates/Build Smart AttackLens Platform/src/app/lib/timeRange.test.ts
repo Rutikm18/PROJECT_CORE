@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   parseRangeFromParams, rangeToParams, pollIntervalMs, validateCustom,
-  DEFAULT_WINDOW,
+  rangesEqual, isDefaultRange, DEFAULT_RANGE, DEFAULT_WINDOW,
 } from "./timeRange";
 
 describe("timeRange", () => {
@@ -34,4 +34,18 @@ describe("timeRange", () => {
     expect(validateCustom(100, 5000, 1000)).toMatch(/future/i);    // end in future
   });
   it("default window is 1h", () => { expect(DEFAULT_WINDOW).toBe("1h"); });
+
+  it("rangesEqual compares by kind and value", () => {
+    expect(rangesEqual({ kind: "relative", key: "1h" }, { kind: "relative", key: "1h" })).toBe(true);
+    expect(rangesEqual({ kind: "relative", key: "1h" }, { kind: "relative", key: "6h" })).toBe(false);
+    expect(rangesEqual({ kind: "absolute", start: 1, end: 2 }, { kind: "absolute", start: 1, end: 2 })).toBe(true);
+    expect(rangesEqual({ kind: "absolute", start: 1, end: 2 }, { kind: "absolute", start: 1, end: 3 })).toBe(false);
+    expect(rangesEqual({ kind: "relative", key: "1h" }, { kind: "absolute", start: 1, end: 2 })).toBe(false);
+  });
+  it("isDefaultRange is true only for relative 1h", () => {
+    expect(isDefaultRange(DEFAULT_RANGE)).toBe(true);
+    expect(isDefaultRange({ kind: "relative", key: "1h" })).toBe(true);
+    expect(isDefaultRange({ kind: "relative", key: "6h" })).toBe(false);
+    expect(isDefaultRange({ kind: "absolute", start: 1, end: 2 })).toBe(false);
+  });
 });

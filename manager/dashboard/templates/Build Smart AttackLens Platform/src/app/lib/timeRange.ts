@@ -30,6 +30,21 @@ export function rangeToParams(r: TimeRange): URLSearchParams {
     : new URLSearchParams({ start: String(r.start), end: String(r.end) });
 }
 
+export const DEFAULT_RANGE: TimeRange = { kind: "relative", key: DEFAULT_WINDOW };
+
+/** True when two ranges are semantically identical (used to avoid redundant state churn / render loops). */
+export function rangesEqual(a: TimeRange, b: TimeRange): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "relative" && b.kind === "relative") return a.key === b.key;
+  if (a.kind === "absolute" && b.kind === "absolute") return a.start === b.start && a.end === b.end;
+  return false;
+}
+
+/** True when the range is the app default (relative 1h) — i.e. no active filter. */
+export function isDefaultRange(r: TimeRange): boolean {
+  return rangesEqual(r, DEFAULT_RANGE);
+}
+
 export function pollIntervalMs(r: TimeRange): number | null {
   if (r.kind === "absolute") return null;      // frozen historical view — never poll
   const secs = WINDOW_SECONDS[r.key];

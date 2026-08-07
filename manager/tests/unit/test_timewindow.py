@@ -47,7 +47,13 @@ def test_start_ge_end_raises():
     with pytest.raises(WindowError):
         resolve_window(None, start=NOW, end=NOW - 5, now=NOW)
 
-def test_start_within_skew_future_but_end_clamped_still_valid():
-    # end slightly in the future within skew → clamped to now, start valid
-    s, e = resolve_window(None, start=NOW - 10, end=NOW + SKEW_SECONDS - 1, now=NOW)
+def test_end_within_skew_is_tolerated_not_clamped():
+    # end slightly in the future but within skew → kept as-is (tolerate client-clock skew)
+    end = NOW + SKEW_SECONDS - 1
+    s, e = resolve_window(None, start=NOW - 10, end=end, now=NOW)
+    assert e == end and s == NOW - 10
+
+def test_end_beyond_skew_is_clamped_to_now():
+    # end further than skew in the future → clamped to now
+    s, e = resolve_window(None, start=NOW - 10, end=NOW + SKEW_SECONDS + 100, now=NOW)
     assert e == NOW and s == NOW - 10

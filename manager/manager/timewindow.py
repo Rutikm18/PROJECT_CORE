@@ -33,9 +33,11 @@ def resolve_window(
     if start is not None and end is not None:
         start = int(start)
         end = int(end)
+        # Tolerate mild client-clock skew: an end up to SKEW_SECONDS ahead of
+        # server-now is kept as-is; only a clearly-future end is clamped to now.
+        # (The previous form clamped *every* end > now, so SKEW_SECONDS was dead
+        # code and a client 2s ahead lost its most recent bucket.)
         if end > now + SKEW_SECONDS:
-            end = now
-        elif end > now:
             end = now
         if start >= end:
             raise WindowError(f"start ({start}) must be < end ({end})")

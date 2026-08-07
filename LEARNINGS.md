@@ -365,8 +365,20 @@
 **Why:** The global picker in `TopHeader` replaces per-page controls — keeping the local ones would create conflicting, independent selectors that overwrite each other's query params.
 
 ### `npm install --force` required when peerDeps are optional
-**What:** The FE `package.json` lists `react`/`react-dom` as optional `peerDependencies`. Running `npm install --legacy-peer-deps` treats them as removable and deletes them; `npm install --force` reinstalls everything correctly.
+**What:** The FE `package.json` lists `react`/`react-dom` as optional `peerDependencies`. Running `npm install --legacy-peer-deps` treats them as removable and deletes them; `npm install --force` reinstalls everything correctly. NOTE: `make build-dashboard` runs `npm install --legacy-peer-deps` first — if deps are already present, skip that step and run `npm run build` directly to avoid re-triggering the deletion.
 **Why:** A build failure (`react/jsx-runtime not found`) was traced to this behavior after `--legacy-peer-deps` silently dropped the React packages that were only listed as optional peers, not as direct deps.
+
+### Time-window filter must use interval-overlap, not first-seen containment
+**What:** `get_soc_findings`/`get_findings` (indexer.py) now filter with `first_detected_at <= window_end AND last_detected_at >= window_start` — a finding "belongs" to a window if it was active at *any point* during it — instead of the old `first_detected_at BETWEEN start AND end`.
+**Why:** The containment filter hid still-active findings (first seen hours ago, re-detected seconds ago) from every short window, so picking 30s/5m/1h wrongly emptied the dashboard — the reported "filter doesn't work" bug. Overlap keeps live threats visible while a strictly-historical custom range still excludes findings that hadn't started yet. Both `first_detected_at` (idx_find_first_detected) and `last_detected_at` (idx_find_ts) are indexed.
+
+### `resolve_window` SKEW_SECONDS was dead code
+**What:** The absolute-mode clamp had two branches (`end > now+SKEW` and `elif end > now`) that both set `end = now`, so the documented 5-min skew tolerance never happened. Fixed to only clamp when `end > now + SKEW_SECONDS`; an end within skew is kept as-is.
+**Why:** A client clock a few seconds ahead lost its most-recent bucket every request. The fix makes the code match the docstring's stated tolerance.
+
+### Global time-range context reset + URL back/forward sync
+**What:** `TimeRangeContext` gained a `useEffect` that re-syncs in-memory state from the URL's range params (browser back/forward, shared deep links) via `rangesEqual` guarding against render loops. `TimeRangePicker` gained a Reset control (→ `DEFAULT_RANGE` 1h) plus an amber dot on the trigger when a non-default filter is active. New pure helpers `rangesEqual`/`isDefaultRange`/`DEFAULT_RANGE` in `timeRange.ts`.
+**Why:** The picker had no way to clear a custom/absolute filter back to default, and browser back/forward left the picker showing a stale window because state was initialized once and never re-read the URL.
 
 ### PyInstaller `--add-data` source paths resolve against `--specpath`, not the CWD
 **What:** `build_pkg.sh` bundled the SCA policy with a CWD-relative source (`agent/agent/sca/policies/sca_apple_macos.yml`) while also passing `--specpath "${BUILD_DIR}"`. PyInstaller resolves relative `datas` *source* paths relative to the spec file's directory, so it looked under `.../pkg/build/agent/…` and aborted the build with "Unable to find … when adding binary and data files". Fixed by making the source absolute (`${REPO_ROOT}/agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies`); the *destination* stays relative — that's where the SCA engine loads it inside the bundle at runtime.

@@ -306,7 +306,8 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
           closed  → only closed/resolved/accepted/fp findings
           all     → every finding regardless of state
         """
-        # Resolve event-time window (filters first_detected_at).
+        # Resolve event-time window (interval-overlap filter: findings active
+        # at any point in [start,end], see indexer.get_soc_findings).
         try:
             window_start, window_end = resolve_window(window, start, end)
         except WindowError as exc:

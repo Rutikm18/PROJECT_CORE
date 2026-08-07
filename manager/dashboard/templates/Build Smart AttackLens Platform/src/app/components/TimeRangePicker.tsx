@@ -1,7 +1,10 @@
 import { useState } from "react";
-import { Clock, Calendar, RefreshCw, ChevronDown } from "lucide-react";
+import { Clock, Calendar, RefreshCw, ChevronDown, RotateCcw } from "lucide-react";
 import { useTimeRange } from "../context/TimeRangeContext";
-import { WINDOW_KEYS, validateCustom, type TimeRange, type WindowKey } from "../lib/timeRange";
+import {
+  WINDOW_KEYS, validateCustom, DEFAULT_RANGE, isDefaultRange,
+  type TimeRange, type WindowKey,
+} from "../lib/timeRange";
 import { cn } from "../../lib/utils";
 
 const LABELS: Record<WindowKey, string> = {
@@ -27,6 +30,7 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
       : `${fmtEpoch(range.start)} → ${fmtEpoch(range.end)}`;
 
   const isAbsolute = range.kind === "absolute";
+  const isDefault = isDefaultRange(range);
 
   function applyCustom() {
     const s = Math.floor(new Date(startDt).getTime() / 1000);
@@ -36,6 +40,15 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
     if (err) { setValidErr(err); return; }
     setValidErr(null);
     setRange({ kind: "absolute", start: s, end: e });
+    setCustomOpen(false);
+    setOpen(false);
+  }
+
+  function reset() {
+    setRange(DEFAULT_RANGE);
+    setStartDt("");
+    setEndDt("");
+    setValidErr(null);
     setCustomOpen(false);
     setOpen(false);
   }
@@ -55,6 +68,7 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
       >
         {isAbsolute ? <Calendar className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
         <span className="max-w-[120px] truncate">{activeLabel}</span>
+        {!isDefault && <span className="w-1.5 h-1.5 rounded-full bg-amber-500" title="Custom filter active" />}
         {!isAbsolute && lastUpdated && (
           <span className="text-[9px] opacity-60 ml-0.5">
             {Math.round((Date.now() - lastUpdated) / 1000)}s ago
@@ -73,7 +87,21 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
           >
             {/* Preset buttons */}
             <div className="px-2 pt-2 pb-1">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wider px-1 mb-1">Relative presets</div>
+              <div className="flex items-center justify-between px-1 mb-1">
+                <span className="text-[9px] font-bold text-gray-400 uppercase tracking-wider">Relative presets</span>
+                <button
+                  onClick={reset}
+                  disabled={isDefault}
+                  title="Reset to default (1h)"
+                  className={cn(
+                    "flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider transition-colors",
+                    isDefault ? "text-gray-300 cursor-default" : "text-blue-600 hover:text-blue-700",
+                  )}
+                >
+                  <RotateCcw className="w-2.5 h-2.5" />
+                  Reset
+                </button>
+              </div>
               <div className="grid grid-cols-5 gap-1">
                 {WINDOW_KEYS.map(key => (
                   <button
