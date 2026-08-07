@@ -30,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from .. import finding_lifecycle as lc
+from manager.manager.timewindow import resolve_window, WindowError
 
 log = logging.getLogger("manager.findings")
 
@@ -281,6 +282,9 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
         sort_by:      str             = Query("score", description="score|last_detected_at|severity|sla_due"),
         limit:        int             = Query(500, ge=1, le=1000),
         offset:       int             = Query(0, ge=0),
+        window:       str             = Query("1h",  description="30s|1m|5m|15m|1h|6h|1d|7d|15d|30d — event time window"),
+        start:        Optional[int]   = Query(None,  description="Absolute range start (epoch seconds, overrides window)"),
+        end:          Optional[int]   = Query(None,  description="Absolute range end (epoch seconds, overrides window)"),
         min_precision: Optional[float] = Query(
             None, ge=0.0, le=1.0,
             description="Static precision floor. Findings with precision_score < this value are dropped. "
@@ -302,6 +306,12 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
           closed  → only closed/resolved/accepted/fp findings
           all     → every finding regardless of state
         """
+        # Resolve event-time window (filters first_detected_at).
+        try:
+            window_start, window_end = resolve_window(window, start, end)
+        except WindowError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
         # view param takes precedence
         if view == "active":
             active_only = True
@@ -365,6 +375,8 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
                 offset=offset,
                 min_precision=min_precision_sql,
                 live_agent_ids=await _live_agent_ids(),
+                window_start=window_start,
+                window_end=window_end,
             )
         except Exception as exc:
             log.exception("list_findings failed")

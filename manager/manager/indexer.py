@@ -1940,6 +1940,8 @@ class IntelDB:
         sort_by: str = "score",
         min_precision: float | None = None,
         live_agent_ids: list[str] | None = None,
+        window_start: int | None = None,
+        window_end: int | None = None,
     ) -> list[dict]:
         """Global findings list with full SOC filters.
 
@@ -1998,6 +2000,11 @@ class IntelDB:
             parts.append("f.is_active=1")
         elif active_only and status in _TERMINAL:
             parts.append("f.is_active=0")   # terminal states are always inactive
+
+        # Event-time window filter (on first_detected_at; covered by idx_find_first_detected).
+        if window_start is not None and window_end is not None:
+            parts.append("f.first_detected_at BETWEEN ? AND ?")
+            args.extend([float(window_start), float(window_end)])
 
         where = ("WHERE " + " AND ".join(parts)) if parts else ""
         valid_sorts = {"score": "f.score DESC", "last_detected_at": "f.last_detected_at DESC",
