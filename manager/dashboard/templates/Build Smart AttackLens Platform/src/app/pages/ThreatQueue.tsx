@@ -20,6 +20,8 @@
  *   Any closed state → REOPENED → back to TRIAGING
  */
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTimeRange } from "../context/TimeRangeContext";
+import { rangeToParams } from "../lib/timeRange";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle, RefreshCw, CheckCircle2, XCircle, Shield,
@@ -753,6 +755,8 @@ function FindingDetailPanel({
 
 export default function ThreatQueue() {
   const { can } = useRBAC();
+  const { range } = useTimeRange();
+  const qs = rangeToParams(range).toString();
 
   // Data
   const [findings, setFindings]   = useState<Finding[]>([]);
@@ -828,6 +832,8 @@ export default function ThreatQueue() {
     // Validation).  Closed/historical views skip it so analysts can audit
     // past decisions even if thresholds were tightened later.
     if (viewMode !== "closed") p.set("validated_only", "true");
+    // Append global time window (first_detected_at filter).
+    for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     try {
       const r = await fetch(`${SOC}/findings?${p}`);
       if (!r.ok) throw new Error(`${r.status}`);
@@ -839,7 +845,7 @@ export default function ThreatQueue() {
       setError(null);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); setLastSync(Math.floor(Date.now() / 1000)); }
-  }, [severity, status, agentId, slaOnly, search, sortKey, viewMode]);
+  }, [severity, status, agentId, slaOnly, search, sortKey, viewMode, qs]);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);

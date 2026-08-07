@@ -5,7 +5,9 @@
  *             bar-fill · bounce-in KPIs · scan-line · ECG waveform
  * Theme: orange/amber gradient · white cards · rounded-2xl
  */
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, useContext } from "react";
+import { useTimeRange } from "../context/TimeRangeContext";
+import { rangeToParams } from "../lib/timeRange";
 import { createPortal } from "react-dom";
 import {
   RefreshCw, X, Search, Filter, AlertTriangle, Shield,
@@ -517,20 +519,23 @@ export function FindingActions({
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useDetectionData(url: string, refreshMs = 30_000) {
+  const { range } = useTimeRange();
+  const qs = rangeToParams(range).toString();
   const [findings, setFindings] = useState<DetectionFinding[]>([]);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState<string | null>(null);
   const [rev,      setRev]      = useState(0);
   const load = useCallback(async () => {
     try {
-      const r = await fetch(url);
+      const sep = url.includes("?") ? "&" : "?";
+      const r = await fetch(`${url}${sep}${qs}`);
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       const body = await r.json();
       setFindings(body.findings ?? body ?? []);
       setError(null);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); }
-  }, [url, rev]);
+  }, [url, rev, qs]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const t = setInterval(() => setRev(v => v + 1), refreshMs); return () => clearInterval(t); }, [refreshMs]);
   return { findings, loading, error, refetch: () => setRev(v => v + 1) };

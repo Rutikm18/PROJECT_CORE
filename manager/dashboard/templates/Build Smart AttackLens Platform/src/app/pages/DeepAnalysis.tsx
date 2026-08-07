@@ -4,6 +4,8 @@
  */
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useNavigate } from "react-router";
+import { useTimeRange } from "../context/TimeRangeContext";
+import { rangeToParams } from "../lib/timeRange";
 import {
   Database, Search, RefreshCw, X, Clock, ChevronRight,
   ChevronDown, Cpu, Globe, Package, Activity, Users,
@@ -485,8 +487,9 @@ function RecordRow({ row, section, expanded, onToggle, agentName, agentOnline }:
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function DeepAnalysis() {
+  const { range } = useTimeRange();
+  const qs = rangeToParams(range).toString();
   const [agentId,    setAgentId]    = useState("");
-  const [window_,    setWindow]     = useState<TimeWindow>("1h");
   const [section,    setSection]    = useState("");
   const [rawSearch,  setRawSearch]  = useState("");
   const [search,     setSearch]     = useState("");
@@ -521,31 +524,31 @@ export default function DeepAnalysis() {
     if (agentId) p.set("agent_id", agentId);
     // Drop section filter for all-sections search
     if (section && !(search && searchScope === "all")) p.set("section", section);
-    p.set("window", window_);
+    for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     if (search) p.set("search", search);
     p.set("limit", String(PAGE_SIZE));
     p.set("offset", String(page * PAGE_SIZE));
     return `${API}/query?${p}`;
-  }, [agentId, section, window_, search, searchScope, page]);
+  }, [agentId, section, qs, search, searchScope, page]);
 
   // Total-count URL (same filters, no pagination)
   const totalCountUrl = useMemo(() => {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
     if (section && !(search && searchScope === "all")) p.set("section", section);
-    p.set("window", window_);
+    for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     if (search) p.set("search", search);
     return `${API}/count?${p}`;
-  }, [agentId, section, window_, search, searchScope]);
+  }, [agentId, section, qs, search, searchScope]);
 
   const countUrl = useCallback((s: string) => {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
     p.set("section", s);
-    p.set("window", window_);
+    for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     if (search) p.set("search", search);
     return `${API}/count?${p}`;
-  }, [agentId, window_, search]);
+  }, [agentId, qs, search]);
 
   // Smart search — only active when query is ≥ 2 chars
   const smartSearchUrl = useMemo(() => {
@@ -626,16 +629,6 @@ export default function DeepAnalysis() {
               </option>
             ))}
           </select>
-
-          {/* Time window */}
-          <div className="flex items-center border border-gray-200 rounded-xl overflow-hidden bg-white">
-            {WINDOWS.map(w => (
-              <button key={w.value} onClick={() => { setWindow(w.value); setPage(0); }}
-                className={cn("px-2.5 py-1.5 text-[10px] font-bold transition-colors",
-                  window_ === w.value ? "bg-orange-500 text-white" : "text-gray-500 hover:bg-gray-50"
-                )}>{w.label}</button>
-            ))}
-          </div>
 
           {/* Search */}
           <div className="relative flex-1 min-w-[160px] max-w-[320px]">
@@ -720,7 +713,7 @@ export default function DeepAnalysis() {
                   {search && searchScope === "all" ? "All Sections" : curMeta.label}
                 </span>
                 <span className="text-[10px] text-gray-400 font-mono">
-                  {rows.length}{rows.length === PAGE_SIZE ? "+" : ""} rows{search ? ` matching "${search}"` : ""} · {window_}
+                  {rows.length}{rows.length === PAGE_SIZE ? "+" : ""} rows{search ? ` matching "${search}"` : ""}
                 </span>
               </div>
             ) : (

@@ -12,6 +12,8 @@
  * Animations: al-bounce-in, al-bar-fill, al-row-in, count-up hook (globals.css)
  */
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTimeRange } from "../context/TimeRangeContext";
+import { rangeToParams } from "../lib/timeRange";
 import {
   PieChart, Pie, Cell, LineChart, Line, BarChart, Bar,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
@@ -275,6 +277,9 @@ function RadialRing({ pct, color, label, size = 68 }: {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function SecurityDashboard() {
+  const { range } = useTimeRange();
+  const qs = rangeToParams(range).toString();
+
   const [soc,      setSoc]      = useState<SocDash | null>(null);
   const [metrics,  setMetrics]  = useState<SocMetrics | null>(null);
   const [agents,   setAgents]   = useState<PostureAgent[]>([]);
@@ -294,11 +299,13 @@ export default function SecurityDashboard() {
 
   const load = useCallback(async () => {
     const [socR, metrR, posR, pkgR, netR] = await Promise.allSettled([
-      fetch(`${SOC}/dashboard`).then(r => r.ok ? r.json() : null),
-      fetch(`${SOC}/metrics`).then(r => r.ok ? r.json() : null),
+      // Time-series endpoints get the global window filter.
+      fetch(`${SOC}/dashboard?${qs}`).then(r => r.ok ? r.json() : null),
+      fetch(`${SOC}/metrics?${qs}`).then(r => r.ok ? r.json() : null),
+      // Current-state endpoint — always shows latest, no window filter.
       fetch(`${POSTURE}/agents`).then(r => r.ok ? r.json() : []),
-      fetch(`${DETECT}/packages?limit=8&sort_by=composite_score`).then(r => r.ok ? r.json() : null),
-      fetch(`${DETECT}/network?limit=8`).then(r => r.ok ? r.json() : null),
+      fetch(`${DETECT}/packages?limit=8&sort_by=composite_score&${qs}`).then(r => r.ok ? r.json() : null),
+      fetch(`${DETECT}/network?limit=8&${qs}`).then(r => r.ok ? r.json() : null),
     ]);
     if (socR.status === "fulfilled" && socR.value)     setSoc(socR.value);
     if (metrR.status === "fulfilled" && metrR.value)   setMetrics(metrR.value);
@@ -307,7 +314,7 @@ export default function SecurityDashboard() {
     if (netR.status === "fulfilled"  && netR.value)    setNetThreats(netR.value.findings ?? netR.value ?? []);
     setLoading(false);
     setLastSync(Math.floor(Date.now() / 1000));
-  }, []);
+  }, [qs]);
 
   useEffect(() => { load(); const t = setInterval(load, 60_000); return () => clearInterval(t); }, [load]);
 

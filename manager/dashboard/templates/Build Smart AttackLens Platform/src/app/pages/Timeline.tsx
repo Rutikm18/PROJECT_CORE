@@ -9,6 +9,8 @@
  *   GET /api/v1/soc/findings       → recent findings list
  */
 import { useState, useEffect, useCallback } from "react";
+import { useTimeRange } from "../context/TimeRangeContext";
+import { rangeToParams } from "../lib/timeRange";
 import {
   BarChart3, RefreshCw, AlertTriangle, CheckCircle2, Clock,
   Shield, TrendingUp, TrendingDown, Zap, Database, Activity,
@@ -966,6 +968,8 @@ function SectionHeader({ title, sub, count, icon, color = "orange" }: {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Timeline() {
+  const { range } = useTimeRange();
+  const qs = rangeToParams(range).toString();
   const [dash, setDash]         = useState<DashStats | null>(null);
   const [metrics, setMetrics]   = useState<Metrics | null>(null);
   const [monthly, setMonthly]   = useState<MonthlyPoint[]>([]);
@@ -978,10 +982,10 @@ export default function Timeline() {
     setLoading(true);
     try {
       const [dashR, metricsR, monthlyR, findingsR] = await Promise.allSettled([
-        fetch(`${SOC}/dashboard`).then(r => r.ok ? r.json() : null),
-        fetch(`${SOC}/metrics`).then(r => r.ok ? r.json() : null),
-        fetch(`${SOC}/historical?months=6`).then(r => r.ok ? r.json() : null),
-        fetch(`${SOC}/findings?sort_by=last_detected_at&limit=50&active_only=false`).then(r => r.ok ? r.json() : null),
+        fetch(`${SOC}/dashboard?${qs}`).then(r => r.ok ? r.json() : null),
+        fetch(`${SOC}/metrics?${qs}`).then(r => r.ok ? r.json() : null),
+        fetch(`${SOC}/historical?months=6&${qs}`).then(r => r.ok ? r.json() : null),
+        fetch(`${SOC}/findings?sort_by=last_detected_at&limit=50&active_only=false&${qs}`).then(r => r.ok ? r.json() : null),
       ]);
       if (dashR.status === "fulfilled"    && dashR.value)    setDash(dashR.value);
       if (metricsR.status === "fulfilled" && metricsR.value) setMetrics(metricsR.value);
@@ -991,7 +995,7 @@ export default function Timeline() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [qs]);
 
   useEffect(() => {
     fetchAll();

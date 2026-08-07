@@ -11,6 +11,8 @@
  * snapshot is lazy-loaded via /raw/record?id= only when it is expanded.
  */
 import { useState, useEffect, useRef, useMemo } from "react";
+import { useTimeRange } from "../context/TimeRangeContext";
+import { rangeToParams } from "../lib/timeRange";
 import {
   Radio, RefreshCw, Clock, AlertTriangle, Search, X, ShieldAlert,
   Table2, Activity, ChevronRight, ChevronDown,
@@ -37,7 +39,7 @@ interface ListRow {
 }
 type Tab = "overview" | "health";
 type TimeWindow = "1h" | "6h" | "24h" | "7d";
-const WINDOWS: TimeWindow[] = ["1h", "6h", "24h", "7d"];
+const WINDOWS: TimeWindow[] = ["1h", "6h", "24h", "7d"]; // kept for type compat
 
 function useFetch<T>(url: string | null) {
   const [data, setData] = useState<T | null>(null);
@@ -136,9 +138,10 @@ function RecordRow({ row, agentName, agentOnline, expanded, onToggle, filter, fo
 }
 
 export default function DeepMesh() {
+  const { range } = useTimeRange();
+  const qs = rangeToParams(range).toString();
   const [agentId, setAgentId] = useState("");
   const [tab, setTab] = useState<Tab>("overview");
-  const [window_, setWindow] = useState<TimeWindow>("24h");
   const [rawSearch, setRawSearch] = useState("");
   const [search, setSearch] = useState("");
   const [riskOnly, setRiskOnly] = useState(false);
@@ -154,11 +157,11 @@ export default function DeepMesh() {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
     p.set("section", "developer_security");
-    p.set("window", window_);
+    for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     p.set("limit", "50");
     p.set("include_data", "false");
     return `${API}/query?${p}`;
-  }, [agentId, window_]);
+  }, [agentId, qs]);
 
   const { data: result, loading, error, refetch } = useFetch<{ rows: ListRow[] }>(listUrl);
 
@@ -168,10 +171,10 @@ export default function DeepMesh() {
     const p = new URLSearchParams();
     if (agentId) p.set("agent_id", agentId);
     p.set("section", "developer_security");
-    p.set("window", window_);
+    for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     p.set("limit", "1");
     return `${API}/query?${p}`;
-  }, [tab, agentId, window_]);
+  }, [tab, agentId, qs]);
   const { data: healthResult, loading: healthLoading } = useFetch<{ rows: { data: unknown; collected_at: number }[] }>(healthUrl);
 
   useEffect(() => { const t = setInterval(refetch, 60_000); return () => clearInterval(t); }, [refetch]);
@@ -223,15 +226,6 @@ export default function DeepMesh() {
               <option key={a.agent_id} value={a.agent_id}>{a.status === "online" ? "● " : "○ "}{a.name}</option>
             ))}
           </select>
-
-          {/* Time window */}
-          <div className="flex items-center border border-gray-200 rounded-xl overflow-hidden bg-white">
-            {WINDOWS.map(w => (
-              <button key={w} onClick={() => { setWindow(w); setExpandedId(null); }}
-                className={cn("px-2.5 py-1.5 text-[10px] font-bold transition-colors",
-                  window_ === w ? "bg-violet-500 text-white" : "text-gray-500 hover:bg-gray-50")}>{w}</button>
-            ))}
-          </div>
 
           <button onClick={refetch} className="p-1.5 hover:bg-gray-50 rounded-lg transition-colors ml-auto">
             <RefreshCw className={cn("w-3.5 h-3.5 text-gray-400", loading && "animate-spin")} />
@@ -346,7 +340,7 @@ export default function DeepMesh() {
                 <span className="w-4 h-4 border-2 border-gray-200 border-t-violet-400 rounded-full animate-spin" />
               </div>
             ) : rows.length === 0 ? (
-              <EmptyState window={window_} />
+              <EmptyState />
             ) : (
               <div className="flex-1 overflow-y-auto">
                 {rows.map(row => (
