@@ -69,6 +69,7 @@ sudo attacklens-service logs 100    # last 100 lines of agent/watchdog logs
 sudo attacklens-service config      # print agent.toml
 sudo attacklens-service diagnose    # files, services, exit codes, manager connectivity
 sudo attacklens-service repair      # AUTO-FIX all known install faults, reload, verify
+sudo attacklens-service reset-enrollment  # clear cached key + spool, re-enroll (fixes 401 loops)
 sudo attacklens-service uninstall   # complete removal
 ```
 
@@ -83,8 +84,9 @@ sudo attacklens-watchdog status|start|stop|restart|logs   # if /Library/AttackLe
 
 ## 5. Troubleshooting
 
-**Start with the one-shot auto-fix — it resolves everything below except a
-missing CLI:**
+**Start with the one-shot auto-fix — it resolves most install faults below
+(exceptions: a missing CLI, and the 401 re-enrollment loop which needs
+`reset-enrollment`):**
 ```bash
 sudo attacklens-service repair
 ```
@@ -92,6 +94,9 @@ It fixes: stale `[binaries]` paths in agent.toml, agent plist missing the
 `run` subcommand (exit-code-2 crash loop), missing `run_agent.sh` wrapper,
 missing `/usr/local/bin` tools, lost exec bits / quarantine flags, and stuck
 services (Bootstrap error 5). Idempotent — safe to run any time.
+
+For an agent stuck in a **401 / "Verification failed" re-enrollment loop**, use
+`sudo attacklens-service reset-enrollment` instead (see below).
 
 ### "attacklens-service: command not found"
 You installed a pre-2.1.0 PKG, which didn't ship the CLI. Rebuild the PKG from
@@ -136,6 +141,33 @@ curl -sk http://<manager-ip>:8080/health
   unless you fronted it with TLS. Fix `url` in agent.toml, then
   `sudo attacklens-service restart`.
 - Firewall between endpoint and manager: test with `nc -vz <ip> 8080`.
+
+### Agent stuck re-enrolling / repeated 401 "Verification failed"
+The agent log loops on:
+```
+agent.sender WARNING HTTP 401 ... section=agent_health — manager says: '{"detail":"Verification failed"}'
+agent.sender WARNING Persistent 401 ... clearing spool and triggering re-enrollment
+agent.enrollment INFO Enrolling without token ...
+```
+**Cause:** the agent's cached API key (and/or spooled envelopes) were sealed
+under a key the manager no longer holds — most often because the manager's
+database was reset (`docker compose down -v`), invalidating every previously
+issued key. `Verification failed` is the manager's *decrypt/HMAC* step, not an
+enrollment failure — the key it has for this agent doesn't match the one the
+agent is signing with.
+
+**Fix — one command** (stops services, drops the stale key + spool, re-enrolls once):
+```bash
+sudo attacklens-service reset-enrollment
+```
+Then confirm the loop is gone:
+```bash
+sudo attacklens-service logs 30      # expect ONE "Enrollment complete", then 200s
+```
+
+> v2.1.0+ agents also gate re-enrollment with **single-flight + backoff**, so 24
+> section senders failing at once can no longer rotate the key in a runaway loop
+> — the reset above is only needed to clear the *stale* key/spool that seeded it.
 
 ### SCA section missing from payloads
 The policy is bundled in the binary from v2.1.0. On older installs the frozen

@@ -935,6 +935,31 @@ class Database:
             })
         return result
 
+    async def get_payload_by_id(self, payload_id: int) -> dict | None:
+        """Fetch one full payload row by id — backs GET /raw/record for lazy
+        loading a snapshot after a metadata-only list query."""
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT id, agent_id, section, collected_at, received_at, data "
+                "FROM payloads WHERE id=?",
+                (payload_id,),
+            ) as cur:
+                r = await cur.fetchone()
+        if r is None:
+            return None
+        try:
+            data = json.loads(r[5])
+        except Exception:
+            data = {}
+        return {
+            "id":           r[0],
+            "agent_id":     r[1],
+            "section":      r[2],
+            "collected_at": r[3],
+            "received_at":  r[4],
+            "data":         data,
+        }
+
     async def count_payloads(
         self, *,
         agent_id: str | None = None,

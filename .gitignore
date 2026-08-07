@@ -74,3 +74,6 @@ sast-report.json
 docker-compose.override.yml
 
 LEARNINGS.md
+
+# macOS agent pkg build: auto-incrementing version state (build-local)
+agent/os/macos/pkg/.pkg_version

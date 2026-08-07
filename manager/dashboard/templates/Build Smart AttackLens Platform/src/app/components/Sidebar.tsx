@@ -13,7 +13,7 @@ import {
   Crosshair, BarChart3, Monitor, Database,
   ClipboardList, LayoutDashboard, Activity,
   Settings, Server, Building2, MapPin, Layers,
-  ShieldCheck, GitMerge,
+  ShieldCheck, GitMerge, Radio,
 } from "lucide-react";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 
@@ -27,6 +27,7 @@ interface NavItem {
   badgePulse?: boolean;
   catKeys?: string[];
   comingSoon?: boolean;
+  beta?: boolean;
 }
 
 interface NavGroup {
@@ -105,6 +106,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { label: "Timeline & History", to: "/timeline",          icon: BarChart3 },
       { label: "Deep Analysis",      to: "/analysis/deep",         icon: Database  },
+      { label: "DeepMesh",           to: "/analysis/deepmesh",     icon: Radio, beta: true },
       { label: "Custom Rules",  to: "/analysis/custom-rules", icon: GitMerge, comingSoon: true },
       { label: "Asset Registry",     to: "/assets",                icon: Monitor   },
       // { label: "Detection Accuracy", to: "/analysis/accuracy", icon: Activity  },
@@ -358,6 +360,12 @@ export function Sidebar() {
                           <span className="flex-shrink-0 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide rounded-full"
                             style={{ background: "rgba(217,119,6,0.18)", color: "rgba(252,211,77,0.9)" }}>
                             Soon
+                          </span>
+                        )}
+                        {item.beta && (
+                          <span className="flex-shrink-0 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide rounded-full"
+                            style={{ background: "rgba(124,58,237,0.18)", color: "rgba(167,139,250,0.95)" }}>
+                            Beta
                           </span>
                         )}
                         {item.badgeColor && count > 0 && (

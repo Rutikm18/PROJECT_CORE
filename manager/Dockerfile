@@ -73,8 +73,11 @@ COPY --chown=jarvis:jarvis VERSION /app/VERSION
 # Copy entrypoint (this single shell script is the only plain text in the image)
 RUN chmod +x /app/manager/scripts/entrypoint.sh
 
-# Runtime directories (writable by app user)
-RUN mkdir -p /app/data /app/logs && \
+# Runtime directories (writable by app user). Pre-create the hot/warm/cold tiers
+# so a deploy WITHOUT bind mounts (named-volume or ephemeral) is writable on first
+# boot too. When ./data is bind-mounted the host ownership wins — install.sh's
+# prepare_bind_mounts() chowns the host dirs to this same uid (1000).
+RUN mkdir -p /app/data/hot /app/data/warm /app/data/cold /app/logs && \
     chown -R jarvis:jarvis /app/data /app/logs
 
 USER jarvis
@@ -95,7 +98,7 @@ ENV PYTHONUNBUFFERED=1
 # Manager listens on plain HTTP — TLS is handled by Caddy
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
   CMD curl -fs http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["/app/manager/scripts/entrypoint.sh"]

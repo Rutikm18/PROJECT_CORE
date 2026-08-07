@@ -87,6 +87,7 @@ export const ROUTES = {
   analysis: {
     root:     "/analysis",
     deep:     "/analysis/deep",
+    deepmesh: "/analysis/deepmesh",
     accuracy: "/analysis/accuracy",
     coverage: "/analysis/coverage",
   },

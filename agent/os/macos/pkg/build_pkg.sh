@@ -17,7 +17,11 @@
 #  Environment variables:
 #    MANAGER_IP      Manager IP or domain (optional — baked into pkg, can be set later)
 #    MANAGER_PORT    Manager port (default: 8443)
-#    VERSION         Semantic version (default: 1.0.0)
+#    VERSION         Semantic version. If unset, the patch auto-increments on
+#                    every build from the last-built version recorded in
+#                    .pkg_version (2.1.0 → 2.1.1 → 2.1.2 …). Setting it explicitly
+#                    overrides the bump and becomes the new baseline.
+#    AUTO_BUMP       true | false (default: true) — false reuses the last version
 #    ARCH            arm64 | x86_64 | universal2 (default: arm64)
 #    ENROLL_TOKEN    Enrollment token — leave empty for open-enrollment managers
 #    TLS_VERIFY      true | false (default: false for IP-based, true for domain)
@@ -37,7 +41,36 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="${VERSION:-2.1.0}"
+# ── Version: auto-increment the patch on every build ──────────────────────────
+# The last successfully-built version is persisted in .pkg_version next to this
+# script. Each run bumps the patch by 1 (2.1.0 → 2.1.1 → 2.1.2 …). An explicit
+# `VERSION=x.y.z bash build_pkg.sh` overrides the auto-bump and becomes the new
+# baseline for subsequent runs. Set `AUTO_BUMP=false` to reuse the last version
+# verbatim (e.g. rebuilding the same release after a transient failure).
+_SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_STATE_FILE="${_SCRIPT_DIR_EARLY}/.pkg_version"
+DEFAULT_VERSION="2.1.0"       # treated as the last-built baseline on first run
+AUTO_BUMP="${AUTO_BUMP:-true}"
+
+if [[ -n "${VERSION:-}" ]]; then
+  # Explicit override — honour it verbatim; recorded as the new baseline on success.
+  :
+else
+  if [[ -f "${VERSION_STATE_FILE}" ]]; then
+    _LAST_BUILT="$(tr -d '[:space:]' < "${VERSION_STATE_FILE}")"
+  else
+    _LAST_BUILT="${DEFAULT_VERSION}"
+  fi
+  if [[ "${AUTO_BUMP}" == "true" && "${_LAST_BUILT}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
+  elif [[ "${_LAST_BUILT}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    VERSION="${_LAST_BUILT}"       # AUTO_BUMP=false — reuse last version
+  else
+    echo "  WARNING: unparseable version '${_LAST_BUILT}' in ${VERSION_STATE_FILE} — resetting to ${DEFAULT_VERSION}" >&2
+    VERSION="${DEFAULT_VERSION}"
+  fi
+fi
+
 ARCH="${ARCH:-arm64}"
 NOTARIZE="${NOTARIZE:-false}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
@@ -126,7 +159,7 @@ PYTHONPATH="${REPO_ROOT}" python3 -m PyInstaller \
     --hidden-import "agent.agent.sca" \
     --hidden-import "agent.agent.sca.engine" \
     --hidden-import "yaml" \
-    --add-data "agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies" \
+    --add-data "${REPO_ROOT}/agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies" \
     --hidden-import "agent.os.macos.normalizer" \
     --hidden-import "agent.os.macos.keystore" \
     --hidden-import "psutil" \
@@ -548,6 +581,14 @@ else
 fi
 
 echo "  [6/6] DONE"
+
+# ── Record the built version so the next run auto-increments the patch ─────────
+# Only written after productbuild succeeded and the pkg exists (set -e would have
+# aborted earlier on failure, leaving the previous baseline intact for a retry).
+if [[ -f "${PKG_FINAL}" ]]; then
+  printf '%s\n' "${VERSION}" > "${VERSION_STATE_FILE}"
+  echo "  Recorded version ${VERSION} → ${VERSION_STATE_FILE} (next build: patch +1)"
+fi
 
 # ── Notarisation ──────────────────────────────────────────────────────────────
 if [[ "$NOTARIZE" == "true" && -n "$SIGN_IDENTITY" ]]; then

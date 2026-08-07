@@ -30,6 +30,13 @@ SKIP_CONFIRM="${SKIP_CONFIRM:-0}"
 LOG_FILE="/tmp/attacklens-install-$(date +%s).log"
 REPAIR_MODE="${REPAIR_MODE:-0}"
 
+# Container app user — manager/threat-intel run as this uid/gid (see manager/Dockerfile:
+# `useradd -m -u 1000 jarvis`). The compose bind-mounts host ./data and ./logs over
+# /app/data and /app/logs, and a bind mount keeps the HOST dir's ownership — so these
+# host dirs must be writable by this uid or the manager crashes writing manager.log.
+CONTAINER_UID="${CONTAINER_UID:-1000}"
+CONTAINER_GID="${CONTAINER_GID:-1000}"
+
 # ── Minimum required versions ────────────────────────────────────────────────
 DOCKER_MIN="25.0.0"
 COMPOSE_MIN="2.27.0"
@@ -731,8 +738,89 @@ pull_images() {
   die "Cannot continue without images." 4
 }
 
+# ── Bind-mount ownership (prevents the #1 first-boot manager crash) ───────────
+# The manager container runs as uid $CONTAINER_UID but ./data and ./logs are
+# bind-mounted over /app/data and /app/logs. If the repo was cloned/run as root,
+# those host dirs are root-owned and the container user cannot create
+# /app/logs/manager.log → the manager aborts in startup() with:
+#     PermissionError: [Errno 13] Permission denied: '/app/logs/manager.log'
+# → container is "unhealthy" → Caddy's depends_on fails → whole deploy fails.
+# Pre-creating the dirs and handing them to the container uid makes first boot work.
+prepare_bind_mounts() {
+  # Let .env (APP_UID/APP_GID, written by env.sh) drive the target ownership so
+  # the host chown and the container user can never drift apart.
+  if [ -f .env ]; then
+    local env_uid env_gid
+    env_uid=$(grep -oP '^APP_UID=\K.*' .env 2>/dev/null | head -1 || true)
+    env_gid=$(grep -oP '^APP_GID=\K.*' .env 2>/dev/null | head -1 || true)
+    [ -n "${env_uid:-}" ] && CONTAINER_UID="$env_uid"
+    [ -n "${env_gid:-}" ] && CONTAINER_GID="$env_gid"
+  fi
+  info "Preparing ./data and ./logs for container uid ${CONTAINER_UID}..."
+  # Pre-create the exact dirs the manager writes on first boot (tiered store +
+  # threat-intel's own data subdir) so ownership is correct before any mount.
+  $SUDO mkdir -p data/hot data/warm data/cold data/threat-intel logs
+  if $SUDO chown -R "${CONTAINER_UID}:${CONTAINER_GID}" data logs 2>/dev/null; then
+    # Owner + group rwX (X = dir-traverse only, no spurious +x on files). No 777.
+    $SUDO chmod -R u+rwX,g+rwX data logs 2>/dev/null || true
+    ok "data/ and logs/ owned by uid ${CONTAINER_UID} (u+rwX,g+rwX)"
+  else
+    warn "Could not chown data/ logs/ to uid ${CONTAINER_UID} — the manager may fail to write its log"
+    warn "Fix manually: chown -R ${CONTAINER_UID}:${CONTAINER_GID} data logs"
+  fi
+}
+
+# Detect + repair the root-owned bind-mount case after a failed start. Returns 0
+# only when it actually recognized the permission error and applied a fix, so the
+# caller knows a retry is worthwhile.
+fix_bind_mount_permissions() {
+  docker compose logs manager 2>/dev/null \
+    | grep -qiE "Permission denied: '/app/(logs|data)" || return 1
+  warn "Manager crashed writing /app/logs (host bind mount not writable by uid ${CONTAINER_UID})."
+  $SUDO mkdir -p data logs data/threat-intel
+  if $SUDO chown -R "${CONTAINER_UID}:${CONTAINER_GID}" data logs 2>/dev/null \
+     || $SUDO chmod -R 777 data logs 2>/dev/null; then
+    ok "Reset ownership of data/ and logs/ — safe to retry"
+    return 0
+  fi
+  return 1
+}
+
+# Prove the container user can actually write the bind mounts BEFORE we bring up
+# the whole stack — using the real image/user, so it catches ownership problems
+# that a host-side `test -w` would miss (e.g. root-owned mount, SELinux label,
+# rootless-Docker uid remapping). Fail fast with a clear message instead of a
+# cryptic mid-startup PermissionError.
+preflight_write_test() {
+  info "Verifying container can write /app/data and /app/logs..."
+  if docker compose run --rm --no-deps --entrypoint sh manager -c '
+        set -e
+        mkdir -p /app/data/hot
+        touch /app/data/hot/.write-test && rm -f /app/data/hot/.write-test
+        touch /app/logs/.write-test    && rm -f /app/logs/.write-test
+      ' >/dev/null 2>&1; then
+    ok "Container write test passed"
+    return 0
+  fi
+  warn "Container cannot write the bind mounts — attempting ownership fix..."
+  prepare_bind_mounts
+  if docker compose run --rm --no-deps --entrypoint sh manager -c '
+        set -e; touch /app/data/hot/.write-test && rm -f /app/data/hot/.write-test
+        touch /app/logs/.write-test && rm -f /app/logs/.write-test' >/dev/null 2>&1; then
+    ok "Container write test passed after ownership fix"
+    return 0
+  fi
+  fail "Container user (uid ${CONTAINER_UID}) still cannot write ./data or ./logs."
+  echo "   Fix:  $SUDO chown -R ${CONTAINER_UID}:${CONTAINER_GID} data logs"
+  echo "   Then: docker compose up -d"
+  die "Bind-mount write test failed — refusing to start with unwritable volumes." 4
+}
+
 # ── Start containers ─────────────────────────────────────────────────────────
 start_services() {
+  prepare_bind_mounts
+  preflight_write_test
+
   if docker compose ps -q 2>/dev/null | grep -q .; then
     info "Stopping existing containers..."
     docker compose down --remove-orphans 2>&1 | tail -2 || true
@@ -745,6 +833,9 @@ start_services() {
     warn "First attempt failed — retrying with --build..."
     if docker compose up -d --remove-orphans --build 2>&1 | tail -15; then
       ok "Services started (with rebuild)"
+    elif fix_bind_mount_permissions && \
+         docker compose up -d --remove-orphans 2>&1 | tail -15; then
+      ok "Services started (after bind-mount permission fix)"
     else
       fail "Could not start containers"
       diagnose_failure
@@ -778,18 +869,36 @@ diagnose_failure() {
     fi
   done
 
+  # Targeted: the manager's most common first-boot failure — it can't write its
+  # log/data dir because the host bind mount is owned by root, not uid $CONTAINER_UID.
+  if docker compose logs manager 2>/dev/null | grep -qiE "Permission denied: '/app/(logs|data)"; then
+    fail "Manager cannot write to /app/logs or /app/data (host bind mount owned by root)."
+    echo "   Container runs as uid ${CONTAINER_UID}; host ./data and ./logs must be writable by it."
+    echo "   Fix:"
+    echo "     $SUDO chown -R ${CONTAINER_UID}:${CONTAINER_GID} data logs && docker compose up -d"
+  fi
+
   echo ""
   info "Container status:"
   docker compose ps -a 2>/dev/null || true
 
+  # Bind-mount ownership is the usual manager-crash culprit — surface it plainly.
   echo ""
-  info "Recent logs per service:"
+  info "Manager bind mounts (source -> destination):"
+  docker inspect attacklens-manager \
+    --format '{{range .Mounts}}   {{println .Source "->" .Destination}}{{end}}' 2>/dev/null || true
+  info "Host directory ownership (want uid ${CONTAINER_UID}):"
+  ls -ld data logs data/hot 2>/dev/null | sed 's/^/   /' || true
+
+  echo ""
+  info "Recent logs per service (manager gets a deeper tail — its traceback lives here):"
   for svc in manager postgres rabbitmq caddy threat-intel; do
-    local n
-    n=$(docker compose logs --tail=15 "$svc" 2>/dev/null | wc -l || echo "0")
+    local n tail_n=15
+    [ "$svc" = "manager" ] && tail_n=100
+    n=$(docker compose logs --tail="$tail_n" "$svc" 2>/dev/null | wc -l || echo "0")
     if [ "$n" -gt 0 ]; then
       echo -e "\n  ${BLD}── ${svc} ──${NC}"
-      docker compose logs --tail=15 "$svc" 2>/dev/null | sed 's/^/  /' || true
+      docker compose logs --tail="$tail_n" "$svc" 2>/dev/null | sed 's/^/  /' || true
     fi
   done
 
@@ -861,7 +970,37 @@ verify_deployment() {
   docker compose exec -T rabbitmq rabbitmq-diagnostics check_port_listener 5672 &>/dev/null 2>&1 && \
     ok "RabbitMQ ready" || warn "RabbitMQ not ready yet"
 
-  [ "$all_ok" = false ] && warn "Some services need more time — check: docker compose ps"
+  # ── Databases exist (all three, or the manager can't start) ─────────────────
+  local pg_user dbs
+  pg_user=$(grep -oP '^POSTGRES_USER=\K.*' .env 2>/dev/null | head -1 || echo "attacklens")
+  pg_user="${pg_user:-attacklens}"
+  dbs=$(docker compose exec -T postgres psql -U "$pg_user" -d postgres -tAc \
+        "SELECT datname FROM pg_database WHERE datname IN ('manager','intel','threat_intel');" \
+        2>/dev/null | tr -d ' ' | sort | tr '\n' ' ' || echo "")
+  for db in manager intel threat_intel; do
+    if echo " $dbs " | grep -q " $db "; then
+      ok "Database '${db}' exists"
+    else
+      warn "Database '${db}' MISSING — if this is a re-deploy on an old volume, run: docker compose down -v && bash install.sh"
+      all_ok=false
+    fi
+  done
+
+  # ── Internal services must NOT be internet-exposed ──────────────────────────
+  if command -v ss &>/dev/null; then
+    for port in 5432 5672 15672; do
+      if ss -tlnp 2>/dev/null | grep -E ":${port} " | grep -qE '0\.0\.0\.0|\[::\]|\*:'; then
+        fail "SECURITY: port ${port} is listening on a public interface (0.0.0.0)."
+        echo "   It must be loopback-only. Pull latest compose (binds 127.0.0.1) and re-up,"
+        echo "   or block it: $SUDO iptables -I DOCKER-USER -p tcp --dport ${port} -j DROP"
+        all_ok=false
+      else
+        ok "Port ${port} not publicly exposed"
+      fi
+    done
+  fi
+
+  [ "$all_ok" = false ] && warn "Some checks need attention — review the messages above and: docker compose ps"
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────

@@ -61,6 +61,7 @@ const ThreatIntelligence = lazy(() => import("../pages/ThreatIntelligence"));
 const AssetRegistry      = lazy(() => import("../pages/AssetRegistry"));
 const Timeline           = lazy(() => import("../pages/Timeline"));
 const DeepAnalysis       = lazy(() => import("../pages/DeepAnalysis"));
+const DeepMesh           = lazy(() => import("../pages/DeepMesh"));
 const Accuracy           = lazy(() => import("../pages/Accuracy"));
 const DetectionCoverage       = lazy(() => import("../pages/DetectionCoverage"));
 const CustomCorrelationRules  = lazy(() => import("../pages/CustomCorrelationRules"));
@@ -172,6 +173,9 @@ export const router = createBrowserRouter([
             children: [
               { index: true,          element: <Navigate to="/analysis/deep" replace /> },
               { path: "deep",         element: <S><DeepAnalysis /></S> },
+              { path: "deepmesh",     element: <S><DeepMesh /></S> },
+              // Back-compat: the page was briefly shipped as /analysis/surface.
+              { path: "surface",      element: <Navigate to="/analysis/deepmesh" replace /> },
               { path: "custom-rules", element: <S><CustomCorrelationRules /></S> },
               // { path: "accuracy",     element: <S><Accuracy /></S> },
               // { path: "coverage",     element: <S><DetectionCoverage /></S> },

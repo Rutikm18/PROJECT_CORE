@@ -199,6 +199,14 @@ LOG_LEVEL=info
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
 CORS_ORIGINS=*
+
+# ── Container runtime user ────────────────────────────────────────────────────
+# The manager/threat-intel images run as this uid/gid (manager/Dockerfile:
+# useradd -u 1000 jarvis). install.sh chowns the ./data and ./logs bind mounts
+# to it so the container can write its logs and store on first boot. Change only
+# if you rebuild the image with a different user.
+APP_UID=1000
+APP_GID=1000
 EOF
 
 ok ".env written"

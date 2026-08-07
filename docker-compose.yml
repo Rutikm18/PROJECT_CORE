@@ -43,14 +43,18 @@ services:
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-attacklens}"
       POSTGRES_DB:       "manager"
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      # Internal only — bind to loopback so a bare-metal / NAT host (no cloud
+      # security group in front) never leaks the database to the internet.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - attacklens_pg_data:/var/lib/postgresql/data
       - ./manager/postgres-init:/docker-entrypoint-initdb.d:ro
     networks:
       - attacklens_internal
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-attacklens}"]
+      # -d targets the real DB so the probe stops logging the misleading
+      # `database "<user>" does not exist` FATAL on every interval.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-attacklens} -d ${POSTGRES_DB:-manager}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -63,8 +67,10 @@ services:
     restart: unless-stopped
     logging: *default-logging
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      # Internal only — broker (5672) and management UI (15672) must never be
+      # internet-reachable. Loopback bind is the bare-metal safety net.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-attacklens}"
       RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-changeme}"
@@ -225,11 +231,13 @@ services:
       - attacklens_internal
 
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 20s
+      retries: 5
+      # Generous first-boot window: the very first run creates DB schema and can
+      # coincide with threat-intel's initial NVD sync hammering shared Postgres.
+      start_period: 120s
 
   # ── Central reusable threat intelligence service ───────────────────────────
   threat-intel:

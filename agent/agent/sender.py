@@ -36,6 +36,15 @@ _SPOOL_RETRY_MAX = 30
 _PROBE_TIMEOUT = 5
 # Consecutive 401s from an "online" manager before triggering re-enrollment
 _AUTH_FAIL_THRESHOLD = 3
+# Re-enrollment backoff bounds. A mass key-invalidation (e.g. the manager DB was
+# reset) makes every one of the ~24 section senders cross the 401 threshold at
+# once. Without coordination each incident spawned its own re-enroll thread,
+# rotating the key repeatedly — and every rotation invalidated the requests still
+# in flight under the previous key, a self-sustaining spiral. Single-flight (one
+# re-enroll at a time) plus a growing gap between attempts lets the freshly
+# issued key settle before anything else can rotate it again.
+_REENROLL_BACKOFF_MIN = 5.0     # seconds — minimum gap between re-enrollments
+_REENROLL_BACKOFF_MAX = 300.0   # cap the growth so recovery latency stays bounded
 # Upper bound on how long we'll honor a server-supplied Retry-After (matrix R12):
 # respect the manager's rate-limit hint, but a pathological value must not park a
 # send for hours — cap it and let normal backoff + spooling take over.
@@ -387,6 +396,14 @@ class Sender:
         # Signature: on_auth_error() -> None.  Set by caller after construction.
         self.on_auth_error: "threading.Callable | None" = None
 
+        # Single-flight re-enrollment state (see _trigger_reenroll). The lock
+        # guards all three fields; the backoff grows per incident and resets to
+        # _REENROLL_BACKOFF_MIN on the next accepted 2xx (a re-enroll that stuck).
+        self._reenroll_lock = threading.Lock()
+        self._reenroll_in_flight = False
+        self._last_reenroll_ts = 0.0
+        self._reenroll_backoff = _REENROLL_BACKOFF_MIN
+
     # ── SSL ───────────────────────────────────────────────────────────────────
 
     def _build_ssl_ctx(self):
@@ -506,17 +523,9 @@ class Sender:
                         if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
                             log.warning(
                                 "Manager back online after %d auth failures — "
-                                "clearing spool and triggering re-enrollment",
-                                self._auth_fail_count,
+                                "re-enrolling", self._auth_fail_count,
                             )
-                            self._auth_fail_count = 0
-                            self._spool.discard_for_auth_rotation()
-                            if self.on_auth_error:
-                                threading.Thread(
-                                    target=self.on_auth_error,
-                                    daemon=True,
-                                    name="re-enroll",
-                                ).start()
+                            self._trigger_reenroll()
                         else:
                             log.info("Manager back online — durable spool replay enabled")
                     else:
@@ -578,19 +587,10 @@ class Sender:
                     # the key is invalid — trigger re-enrollment and clear bad spool.
                     if self._auth_fail_count >= _AUTH_FAIL_THRESHOLD:
                         if self._probe():
-                            log.warning(
-                                "Persistent 401 after %d attempts — manager online but key rejected; "
-                                "clearing spool and triggering re-enrollment",
-                                self._auth_fail_count,
-                            )
-                            self._auth_fail_count = 0
-                            self._spool.discard_for_auth_rotation()
-                            if self.on_auth_error:
-                                threading.Thread(
-                                    target=self.on_auth_error,
-                                    daemon=True,
-                                    name="re-enroll",
-                                ).start()
+                            # Single-flight + backoff: coalesces the ~24 sections
+                            # that fail together into one re-enroll and stops the
+                            # rotate → invalidate-in-flight → 401 spiral.
+                            self._trigger_reenroll()
             except Exception as exc:
                 log.error("sender send-loop error (continuing): %s", exc)
                 if replay_token is None:
@@ -598,6 +598,57 @@ class Sender:
                         self._spool.write(envelope)   # don't lose the datum
                     except Exception:
                         pass
+
+    # ── Re-enrollment (single-flight + backoff) ────────────────────────────────
+
+    def _trigger_reenroll(self) -> None:
+        """Coalesce all concurrent 401 incidents into one backed-off re-enroll.
+
+        Called from both the reconnect path and the send-failure path. It:
+          - runs at most ONE re-enrollment at a time (single-flight), so 24
+            sections failing together can't rotate the key 24 times; and
+          - refuses to start another until a growing backoff has elapsed, so a
+            freshly issued key gets a chance to take effect before the next try.
+
+        Only when it actually starts a re-enroll does it reset the 401 counter
+        and drop the spool sealed under the dead key — if it's suppressed, the
+        counter stays high and the loop retries once the backoff window opens.
+        """
+        if not self.on_auth_error:
+            return
+        now = time.monotonic()
+        with self._reenroll_lock:
+            if self._reenroll_in_flight:
+                log.debug("Re-enrollment already in flight — coalescing this 401")
+                return
+            remaining = self._reenroll_backoff - (now - self._last_reenroll_ts)
+            if self._last_reenroll_ts and remaining > 0:
+                log.debug("Re-enrollment suppressed by backoff (%.0fs remaining)", remaining)
+                return
+            self._reenroll_in_flight = True
+            self._last_reenroll_ts = now
+            backoff = self._reenroll_backoff
+            # Grow for the NEXT incident; a successful 2xx resets it to the floor.
+            self._reenroll_backoff = min(self._reenroll_backoff * 2, _REENROLL_BACKOFF_MAX)
+
+        log.warning("Persistent 401 — re-enrolling (single-flight; next attempt "
+                    "no sooner than %.0fs)", backoff)
+        self._auth_fail_count = 0
+        try:
+            self._spool.discard_for_auth_rotation()
+        except Exception as exc:
+            log.error("spool discard during re-enroll failed (continuing): %s", exc)
+
+        def _runner():
+            try:
+                self.on_auth_error()
+            except Exception as exc:
+                log.error("re-enrollment callback failed: %s", exc)
+            finally:
+                with self._reenroll_lock:
+                    self._reenroll_in_flight = False
+
+        threading.Thread(target=_runner, daemon=True, name="re-enroll").start()
 
     # ── Send with retry ───────────────────────────────────────────────────────
 
@@ -678,6 +729,12 @@ class Sender:
                         self._last_contact_ts = time.time()
                         self._auth_fail_count = 0
                         self._delivery_stats["accepted_2xx"] += 1
+                        # A delivery under the current key proves re-enrollment
+                        # stuck — reset the backoff so the next unrelated incident
+                        # recovers quickly instead of inheriting a long delay.
+                        if self._reenroll_backoff != _REENROLL_BACKOFF_MIN:
+                            with self._reenroll_lock:
+                                self._reenroll_backoff = _REENROLL_BACKOFF_MIN
                         log.debug("Sent %s → %d", section, resp.status)
                         return True
                     elif resp.status == 401:

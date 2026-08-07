@@ -223,6 +223,33 @@ cmd_doctor() {
     info "Docker unavailable or not in repo dir — skipping service checks"
   fi
 
+  # Data directories — the manager runs as uid ${APP_UID:-1000} and writes here.
+  # A root-owned bind mount is the #1 cause of the manager crashing on first boot
+  # (PermissionError: '/app/logs/manager.log'), so validate write access up front.
+  hdr "  Data Directories"
+  local app_uid="${APP_UID:-1000}"
+  cd "$(dirname "$0")" 2>/dev/null || true
+  for dir in data data/hot data/warm data/cold logs; do
+    mkdir -p "$dir" 2>/dev/null || true
+    if [ ! -d "$dir" ]; then
+      fail "${dir} — could not create"
+      overall_ok=false
+    elif [ -w "$dir" ] && ( : > "$dir/.doctor-write-test" 2>/dev/null ); then
+      rm -f "$dir/.doctor-write-test" 2>/dev/null || true
+      local owner
+      owner=$(stat -c '%u' "$dir" 2>/dev/null || stat -f '%u' "$dir" 2>/dev/null || echo "?")
+      if [ "$owner" = "$app_uid" ] || [ "$owner" = "?" ]; then
+        pass "${dir} — writable (uid ${owner})"
+      else
+        warn "${dir} — writable now, but owned by uid ${owner}, not ${app_uid} (container may still fail)"
+      fi
+    else
+      fail "${dir} — NOT writable by container uid ${app_uid}"
+      echo -e "       Fix: ${BLD}sudo chown -R ${app_uid}:${app_uid} data logs${NC}"
+      overall_ok=false
+    fi
+  done
+
   # Internet
   hdr "  Internet Connectivity"
   if curl -fsSL --max-time 5 https://api.github.com &>/dev/null; then

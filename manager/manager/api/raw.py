@@ -102,12 +102,19 @@ def make_raw_router(db: "Database") -> APIRouter:
         search:   Optional[str] = Query(None, max_length=256),
         limit:    int = Query(200, ge=1, le=1000),
         offset:   int = Query(0, ge=0),
+        include_data: bool = Query(True, description="Set false for a lightweight "
+                                   "metadata-only list (omits the full payload)"),
     ):
         """
         Paginated raw payload query.
 
         Returns rows ordered by collected_at DESC.
-        Each row contains the full payload JSON + metadata.
+        Each row contains metadata + a compact preview + summary; the full payload
+        JSON is included only when `include_data=true` (the default). Pass
+        `include_data=false` to build a cheap timeline/list — some sections (e.g.
+        developer_security) ship ~300 KB snapshots, so loading N of them just to
+        show timestamps is wasteful. Fetch the full payload per row on demand via
+        GET /raw/record?id=.
 
         Filter combinations:
           - No filters        → most recent N rows across all agents/sections
@@ -129,26 +136,31 @@ def make_raw_router(db: "Database") -> APIRouter:
             offset=offset,
         )
 
-        # Enrich each row with a compact preview string
+        # Enrich each row with a section-aware preview + summary. The preview and
+        # summary are always computed server-side (cheap), so a metadata-only list
+        # still shows meaningful content without shipping the payload.
         result = []
         for r in rows:
             data = r.get("data", {})
-            preview = _data_preview(data)
-            result.append({
+            row = {
                 "id":           r["id"],
                 "agent_id":     r["agent_id"],
                 "section":      r["section"],
                 "collected_at": r["collected_at"],
                 "received_at":  r["received_at"],
-                "record_count": _record_count(data),
-                "preview":      preview,
-                "data":         data,
-            })
+                "record_count": _record_count(data, r["section"]),
+                "preview":      _data_preview(data, r["section"]),
+                "summary":      _section_summary(data, r["section"]),
+            }
+            if include_data:
+                row["data"] = data
+            result.append(row)
 
         return {
             "rows":    result,
             "limit":   limit,
             "offset":  offset,
+            "included_data": include_data,
             "filters": {
                 "agent_id": agent_id,
                 "section":  section,
@@ -156,6 +168,27 @@ def make_raw_router(db: "Database") -> APIRouter:
                 "end":      resolved_end,
                 "search":   search,
             },
+        }
+
+    @router.get("/record")
+    async def get_record(id: int = Query(..., ge=1, description="payload row id")):
+        """Fetch ONE full payload by id — used to lazy-load a row's data after a
+        metadata-only list (include_data=false), so large snapshots are fetched
+        only when a row is actually expanded."""
+        row = await db.get_payload_by_id(id)
+        if row is None:
+            return {"found": False, "id": id}
+        data = row.get("data", {})
+        return {
+            "found":        True,
+            "id":           row["id"],
+            "agent_id":     row["agent_id"],
+            "section":      row["section"],
+            "collected_at": row["collected_at"],
+            "received_at":  row["received_at"],
+            "record_count": _record_count(data, row["section"]),
+            "summary":      _section_summary(data, row["section"]),
+            "data":         data,
         }
 
     # ── First-layer data checkpoint ─────────────────────────────────────────
@@ -265,8 +298,90 @@ def _resolve_window(
     return (start or 0), (end or now)
 
 
-def _record_count(data: object) -> int:
-    """Number of records in this payload — list = len(list), dict = 1."""
+# Every developer_security capability and the key it stores its records under.
+# Mirrors the agent collector schema; used to count records per capability so the
+# DeepMesh capability nav + list rows are informative without the payload.
+_DEVSEC_CAP_ITEMS: dict[str, Optional[str]] = {
+    "editor_extensions":   "items",
+    "mcp_servers":         "servers",
+    "browser_extensions":  "items",
+    "native_messaging":    "items",
+    "agent_cli_tools":     "items",
+    "ai_applications":     "items",
+    "listening_ports":     "items",
+    "processes":           "items",
+    "launchd":             "items",
+    "cron":                "users",
+    "shell_startup":       "files",
+    "node_packages":       "users",
+    "python_packages":     "users",
+    "homebrew":            None,      # special-cased: formulae + casks
+    "git":                 "users",
+    "credential_locations": "locations",
+    "docker":              "containers",
+}
+
+# Short subset (with friendly labels) used for the compact list-row preview text.
+_DEVSEC_PREVIEW: tuple[tuple[str, str], ...] = (
+    ("editor_extensions", "ext"), ("mcp_servers", "mcp"),
+    ("browser_extensions", "browser"), ("agent_cli_tools", "cli"),
+    ("listening_ports", "listen"), ("native_messaging", "native"),
+)
+
+
+def _devsec_counts(caps: dict) -> dict[str, int]:
+    """Record count per capability, keyed by capability name (all 17)."""
+    counts: dict[str, int] = {}
+    for cap_key, items_key in _DEVSEC_CAP_ITEMS.items():
+        cap = caps.get(cap_key)
+        if not isinstance(cap, dict):
+            counts[cap_key] = 0
+            continue
+        if cap_key == "homebrew":
+            counts[cap_key] = len(cap.get("formulae") or []) + len(cap.get("casks") or [])
+        elif isinstance(cap.get("count"), int):
+            counts[cap_key] = cap["count"]
+        elif items_key and isinstance(cap.get(items_key), list):
+            counts[cap_key] = len(cap[items_key])
+        else:
+            counts[cap_key] = 0
+    return counts
+
+
+def _devsec_summary(data: dict) -> Optional[dict]:
+    """Compact capability counts + collection health for a developer_security
+    snapshot, computed server-side so a metadata-only list row is still
+    meaningful without shipping the ~300 KB payload."""
+    caps = data.get("capabilities")
+    if not isinstance(caps, dict):
+        return None
+    collection = data.get("collection") if isinstance(data.get("collection"), dict) else {}
+    return {
+        "counts":     _devsec_counts(caps),
+        "capabilities_present": sum(1 for c in caps.values() if isinstance(c, dict) and "error" not in c),
+        "partial":    bool(collection.get("partial")),
+        "error_count": len(collection.get("errors", []) or []),
+        "duration_ms": collection.get("duration_ms"),
+    }
+
+
+def _section_summary(data: object, section: str) -> Optional[dict]:
+    """Section-aware structured summary for list rows (currently developer_security)."""
+    if section == "developer_security" and isinstance(data, dict):
+        return _devsec_summary(data)
+    return None
+
+
+def _record_count(data: object, section: str = "") -> int:
+    """Number of records in this payload — list = len(list), dict = 1.
+
+    For developer_security the top-level is a dict with no single record list, so
+    count the total records across its capability lists instead of returning 1.
+    """
+    if section == "developer_security" and isinstance(data, dict):
+        summary = _devsec_summary(data)
+        if summary:
+            return sum(summary["counts"].values())
     if isinstance(data, list):
         return len(data)
     if isinstance(data, dict):
@@ -278,8 +393,23 @@ def _record_count(data: object) -> int:
     return 0
 
 
-def _data_preview(data: object, max_chars: int = 140) -> str:
-    """Short human-readable preview of payload data."""
+def _data_preview(data: object, section: str = "", max_chars: int = 140) -> str:
+    """Short human-readable preview of payload data.
+
+    Dict-shaped nested sections (developer_security) get a purpose-built preview
+    of capability counts + collection health — the generic "first 4 keys" preview
+    would only show schema_version/platform/scope, which is useless in a list.
+    """
+    if section == "developer_security" and isinstance(data, dict):
+        summary = _devsec_summary(data)
+        if summary:
+            counts = summary["counts"]
+            parts = [f"{label}={counts[key]}" for key, label in _DEVSEC_PREVIEW if key in counts]
+            if summary["partial"]:
+                parts.append(f"partial({summary['error_count']} err)")
+            preview = "  ·  ".join(parts)
+            return preview[:max_chars] + ("…" if len(preview) > max_chars else "")
+
     if isinstance(data, list) and data:
         first = data[0]
         if isinstance(first, dict):

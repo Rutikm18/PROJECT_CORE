@@ -317,10 +317,26 @@ class Orchestrator:
 
     def _sections(self) -> dict:
         cfg_sections = self.config.get("collection", {}).get("sections", {})
-        if cfg_sections:
-            return cfg_sections
-        # No [collection.sections] in config — use built-in defaults
-        return _DEFAULT_SECTIONS
+        # No [collection.sections] in config — use built-in defaults verbatim.
+        if not cfg_sections:
+            return _DEFAULT_SECTIONS
+        # Merge defaults with the operator's config. The old behaviour was
+        # all-or-nothing: any [collection.sections] block made _DEFAULT_SECTIONS
+        # ignored entirely, so a section shipped in a newer agent build (e.g.
+        # developer_security) was NEVER scheduled on an agent whose agent.toml
+        # predated it — it silently required a config edit or pkg reinstall.
+        #
+        # Now the operator's explicit blocks stay authoritative (including
+        # `enabled = false` to opt out), and any default section that (a) the
+        # config doesn't mention and (b) has a registered collector on THIS
+        # platform is added — so new sections roll out on a binary update alone.
+        # Gating on COLLECTORS keeps a generic-registry (fallback) agent from
+        # being scheduled for a macOS-only section it cannot collect.
+        merged = dict(cfg_sections)
+        for name, default in _DEFAULT_SECTIONS.items():
+            if name not in merged and name in COLLECTORS:
+                merged[name] = dict(default)
+        return merged
 
     def _maybe_reseed_on_skew(self, now: float) -> bool:
         """Re-seed the schedule when the wall clock jumps BACKWARD past the skew

@@ -105,6 +105,31 @@ def setup_logging(
         root.addHandler(handler)
 
 
+async def _retry_init(operation, name: str, attempts: int = 20, delay: float = 3.0) -> None:
+    """Run an async init step, retrying transient failures.
+
+    ``depends_on: service_healthy`` gates container start on Postgres/RabbitMQ
+    being healthy, but a dependency can still blip in the seconds between the
+    healthcheck passing and the manager connecting (broker failover, a slow
+    first connection, a restart). Without this the manager would exit on the
+    first hiccup and Docker would churn it through the restart policy. Retrying
+    a bounded number of times turns those transients into a short wait.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await operation()
+            if attempt > 1:
+                log.info("%s initialised on attempt %d/%d", name, attempt, attempts)
+            return
+        except Exception as exc:  # noqa: BLE001 — surface after final attempt
+            last_error = exc
+            log.warning("%s init failed (attempt %d/%d): %s", name, attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+    raise RuntimeError(f"{name} failed to initialise after {attempts} attempts") from last_error
+
+
 def create_app() -> FastAPI:
     # ── Config from env ───────────────────────────────────────────────────────
     # API_KEY is now optional — used only for WebSocket token auth.
@@ -322,10 +347,10 @@ def create_app() -> FastAPI:
             logfile=os.environ.get("LOG_FILE", "manager/logs/manager.log"),
             level=os.environ.get("LOG_LEVEL", "INFO"),
         )
-        await db.init()
+        await _retry_init(db.init, "PostgreSQL (manager)")
         await _dev_bootstrap_agent_key()
-        await store.init()
-        await intel_db.init()
+        await _retry_init(store.init, "Data store")
+        await _retry_init(intel_db.init, "Intel database")
         if "detection" in roles:
             await engine.start()
         if investigations_enabled and roles & {"api", "detection"}:

@@ -12,6 +12,7 @@ import {
   Target, Radio, ExternalLink,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import DevSecurityView from "../components/devsec/DevSecurityView";
 
 const API = "/api/v1/raw";
 
@@ -75,6 +76,7 @@ const SM: Record<string, { label: string; icon: React.ElementType; dot: string }
   agent_health: { label: "Agent Health", icon: Activity,  dot: "#22c55e" },
   launchagents: { label: "Launch Agents",icon: Terminal,  dot: "#ef4444" },
   crontabs:     { label: "Crontabs",     icon: Clock,     dot: "#d97706" },
+  developer_security: { label: "Dev Security", icon: Radio, dot: "#E8581A" },
 };
 const sm = (s: string) => SM[s] ?? { label: s, icon: Database, dot: "#9ca3af" };
 
@@ -316,6 +318,13 @@ function renderSection(section: string, data: unknown) {
     return <Tbl cols={cols} rows={arr} render={r => <>{cols.map(c => <Td key={c} v={r[c]} mono/>)}</>} />;
   }
   if (obj) {
+    // developer_security: nested capabilities snapshot (editor extensions, MCP
+    // servers, browser extensions, listeners, …) — structured drill-down instead
+    // of the generic dict renderer stringifying `capabilities` into one cell.
+    if (section === "developer_security") {
+      return <DevSecurityView data={obj} />;
+    }
+
     // network: dict with interfaces array + wifi/dns/gateway metadata
     if (section === "network") {
       const ifaces = Array.isArray(obj.interfaces) ? obj.interfaces as Record<string,unknown>[] : [];

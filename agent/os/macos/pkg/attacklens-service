@@ -140,6 +140,44 @@ cmd_restart() {
     cmd_start
 }
 
+# Break a re-enrollment / key-rotation spiral by giving the agent a clean slate.
+# Symptom: agent.log repeats "Verification failed" (HTTP 401) + "re-enrolling"
+# forever, discarding envelopes. Cause: a stale API key and/or a spool of
+# envelopes sealed under a key the manager no longer holds (e.g. after the
+# manager's DB was reset). This drops both so the next start enrolls exactly once.
+cmd_reset_enrollment() {
+    need_root reset-enrollment
+    warn "Resetting agent enrollment (removes cached key + spool, then re-enrolls)…"
+    # Stop watchdog first so it can't resurrect the agent mid-reset.
+    svc_unload "$WATCHDOG_LABEL"
+    svc_unload "$AGENT_LABEL"
+
+    local removed=0
+    if [ -d "${INSTALL_DIR}/security" ]; then
+        rm -f "${INSTALL_DIR}/security/"*.key 2>/dev/null && removed=1
+        ok "cleared cached API key(s) in ${INSTALL_DIR}/security"
+    fi
+    if [ -d "${INSTALL_DIR}/spool" ]; then
+        rm -rf "${INSTALL_DIR}/spool/"* 2>/dev/null && removed=1
+        ok "cleared spool backlog in ${INSTALL_DIR}/spool"
+    fi
+    # Best-effort: drop a keychain-backed key if that backend was ever used.
+    security delete-generic-password -s "attacklens-agent" >/dev/null 2>&1 || true
+    [ "$removed" -eq 0 ] && info "nothing to clear — key/spool already absent"
+
+    info "starting services — agent will enroll fresh on first contact…"
+    svc_load "$AGENT_LABEL"    "$AGENT_PLIST"
+    svc_load "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"
+    sleep 3
+    echo ""
+    if [ -f "${LOG_DIR}/agent.log" ]; then
+        info "recent agent log (watch for a single 'Enrollment complete', no repeats):"
+        tail -n 6 "${LOG_DIR}/agent.log" | sed 's/^/  /'
+    fi
+    echo ""
+    ok "reset complete. Confirm with: attacklens-service diagnose"
+}
+
 cmd_logs() {
     local n="${1:-50}"
     for f in "${LOG_DIR}/agent.log" "${LOG_DIR}/agent-stderr.log" "${LOG_DIR}/watchdog.log"; do
@@ -409,6 +447,7 @@ Commands:
   config       print agent.toml
   diagnose     full health check: files, services, manager connectivity, errors
   repair       auto-fix all known install faults (config paths, plist, wrappers)
+  reset-enrollment  clear cached key + spool and re-enroll (fixes 401/"Verification failed" loops)
   uninstall    stop services and remove the agent completely
   version      show versions
 EOF
@@ -425,6 +464,7 @@ case "${1:-}" in
     config)    cmd_config ;;
     diagnose|doctor) cmd_diagnose ;;
     repair|fix|heal) cmd_repair ;;
+    reset-enrollment|reset-enroll|reenroll) cmd_reset_enrollment ;;
     uninstall) cmd_uninstall ;;
     version|--version|-v) cmd_version ;;
     ""|help|--help|-h) usage ;;
