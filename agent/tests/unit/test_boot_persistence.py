@@ -165,3 +165,60 @@ def test_touch_heartbeat_does_not_reset_clean_stop(marker):
     saved = _read(path)
     # Heartbeat updates last_seen but must leave clean_stop intact.
     assert saved["clean_stop"] is True
+
+
+# ── Periodic persistence guard (runtime tamper repair) ─────────────────────────
+
+def test_guard_interval_default_when_unset(monkeypatch):
+    monkeypatch.delenv("ATTACKLENS_PERSISTENCE_GUARD_SEC", raising=False)
+    assert bp._guard_interval_sec() == bp._PERSISTENCE_GUARD_DEFAULT_SEC
+
+
+def test_guard_interval_respects_env_override(monkeypatch):
+    monkeypatch.setenv("ATTACKLENS_PERSISTENCE_GUARD_SEC", "120")
+    assert bp._guard_interval_sec() == 120
+
+
+def test_guard_interval_floored_against_hot_loop(monkeypatch):
+    # A misconfigured tiny/zero interval must not let the guard hammer launchctl.
+    monkeypatch.setenv("ATTACKLENS_PERSISTENCE_GUARD_SEC", "1")
+    assert bp._guard_interval_sec() == 30
+    monkeypatch.setenv("ATTACKLENS_PERSISTENCE_GUARD_SEC", "not-a-number")
+    assert bp._guard_interval_sec() == bp._PERSISTENCE_GUARD_DEFAULT_SEC
+
+
+def test_guard_tick_repairs_via_ensure(monkeypatch):
+    """Each guard tick re-runs ensure_boot_persistence and surfaces its repairs."""
+    calls = []
+    monkeypatch.setattr(bp, "ensure_boot_persistence",
+                        lambda config_path=None: calls.append(config_path) or {"actions": ["enabled"]})
+    res = bp._persistence_guard_tick("/etc/agent.toml")
+    assert calls == ["/etc/agent.toml"]
+    assert res["actions"] == ["enabled"]
+
+
+def test_guard_tick_never_raises(monkeypatch):
+    """A failing repair must be swallowed — the guard cannot crash the agent."""
+    def _boom(config_path=None):
+        raise RuntimeError("launchctl exploded")
+    monkeypatch.setattr(bp, "ensure_boot_persistence", _boom)
+    res = bp._persistence_guard_tick()
+    assert res == {"error": "RuntimeError"}
+
+
+def test_guard_thread_is_idempotent(monkeypatch):
+    """Starting the guard twice must not spawn a second thread."""
+    monkeypatch.setattr(bp, "_persistence_guard_started", False)
+    started = []
+    import threading as _t
+    real = _t.Thread
+
+    class _Spy(real):  # type: ignore[misc,valid-type]
+        def start(self):
+            started.append(self.name)
+            # Do not actually run the infinite loop in a test.
+
+    monkeypatch.setattr(bp.threading, "Thread", _Spy)
+    bp._start_persistence_guard_thread()
+    bp._start_persistence_guard_thread()
+    assert started.count("boot-persistence-guard") == 1

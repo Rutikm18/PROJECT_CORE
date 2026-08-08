@@ -8,15 +8,18 @@ shut down and later powered back on, launchd re-loads the plist at boot and
 starts the agent on its own. This module hardens the gaps that RunAtLoad alone
 CANNOT cover — and which silently defeat boot-persistence in the field:
 
-  1. Persistence self-repair — on every agent startup (and on each periodic
-     self_heal cycle) verify the LaunchDaemon plist is present, well-formed
-     (RunAtLoad + KeepAlive + the right binary path + label), owned root:wheel
-     with 0644 perms, ENABLED in launchctl, and loaded. Repair any drift:
-     rewrite a deleted/edited plist, fix ownership/perms, `launchctl enable` a
-     disabled label, and (re)bootstrap an unloaded job. This defeats an attacker
-     — or a botched uninstall — that deletes or `launchctl disable`s the plist to
-     stop the agent from surviving the NEXT reboot (RunAtLoad never fires for a
-     disabled/absent job, so KeepAlive can't save it either).
+  1. Persistence self-repair — on every agent startup, AND periodically while the
+     agent runs (an in-process guard thread, see _start_persistence_guard_thread),
+     verify the LaunchDaemon plist is present, well-formed (RunAtLoad + KeepAlive
+     + the right binary path + label), owned root:wheel with 0644 perms, ENABLED
+     in launchctl, and loaded. Repair any drift: rewrite a deleted/edited plist,
+     fix ownership/perms, `launchctl enable` a disabled label, and (re)bootstrap
+     an unloaded job. This defeats an attacker — or a botched uninstall — that
+     deletes or `launchctl disable`s the plist to stop the agent from surviving
+     the NEXT reboot (RunAtLoad never fires for a disabled/absent job, so
+     KeepAlive can't save it either). The startup pass alone cannot catch tamper
+     that happens WHILE the agent is up — a disabled/deleted plist would then only
+     bite at the next power-off — so the periodic guard closes that window.
 
   2. Reboot detection — persist a small boot marker (kernel boot time + last
      heartbeat + a clean-stop flag). On startup, compare the stored kernel boot
@@ -392,6 +395,62 @@ def ensure_boot_persistence(
     return {"healthy": len(actions) > 0, "actions": actions, "report": report}
 
 
+# ── Periodic persistence guard (runtime tamper repair) ─────────────────────────
+# RunAtLoad only fires at boot for a plist that is still present + enabled, and
+# on_agent_startup repairs drift only ONCE when the agent launches. If the plist
+# is disabled or deleted WHILE the agent runs (tampering, or a botched admin
+# action), nothing fixes it before the next reboot — and a disabled/absent job
+# never auto-starts, permanently defeating boot-persistence. This guard re-runs
+# ensure_boot_persistence on a slow cadence so runtime drift is repaired long
+# before the machine is powered off. (ensure_boot_persistence itself throttles
+# re-bootstrap, so a tight interval can't thrash launchctl.)
+_PERSISTENCE_GUARD_DEFAULT_SEC = 900   # 15 min
+_persistence_guard_started = False
+
+
+def _guard_interval_sec() -> int:
+    """Guard cadence, overridable via ATTACKLENS_PERSISTENCE_GUARD_SEC. Floored so
+    a misconfiguration can't turn the guard into a launchctl hot-loop."""
+    try:
+        return max(30, int(os.environ.get(
+            "ATTACKLENS_PERSISTENCE_GUARD_SEC", _PERSISTENCE_GUARD_DEFAULT_SEC)))
+    except (TypeError, ValueError):
+        return _PERSISTENCE_GUARD_DEFAULT_SEC
+
+
+def _persistence_guard_tick(config_path: str | None = None) -> dict:
+    """One guard iteration: re-verify + repair boot persistence. NEVER raises —
+    returns the repair report (or an {"error": ...} dict) so the loop and tests
+    can inspect it without risk to the agent."""
+    try:
+        res = ensure_boot_persistence(config_path=config_path)
+        if res.get("actions"):
+            log.warning("boot-persistence guard repaired runtime drift: %s", res["actions"])
+        return res
+    except Exception as exc:  # noqa: BLE001 - guard must never crash the agent
+        log.debug("persistence guard cycle failed: %s", exc)
+        return {"error": type(exc).__name__}
+
+
+def _start_persistence_guard_thread(config_path: str | None = None) -> None:
+    """Start the background guard that periodically repairs boot persistence so
+    tampering done while the agent is running is fixed before the next shutdown.
+    Idempotent; macOS-only path (callers already gate on darwin)."""
+    global _persistence_guard_started
+    if _persistence_guard_started:
+        return
+    _persistence_guard_started = True
+    interval = _guard_interval_sec()
+
+    def _run() -> None:
+        while True:
+            time.sleep(interval)
+            _persistence_guard_tick(config_path)
+
+    threading.Thread(target=_run, daemon=True, name="boot-persistence-guard").start()
+    log.info("boot-persistence guard active — re-verifying every %ss", interval)
+
+
 # ── Startup integration ────────────────────────────────────────────────────────
 
 _heartbeat_started = False
@@ -460,6 +519,11 @@ def on_agent_startup(orch, config_path: str | None = None) -> None:
 
     # 3. Keep the marker warm.
     _start_heartbeat_thread()
+
+    # 4. Keep boot-persistence healthy against tampering done while the agent is
+    #    running — so the NEXT power-off still auto-starts even if someone
+    #    disabled/deleted the plist mid-run.
+    _start_persistence_guard_thread(config_path)
 
 
 # ── One-shot CLI (ops / periodic daemon) ───────────────────────────────────────
