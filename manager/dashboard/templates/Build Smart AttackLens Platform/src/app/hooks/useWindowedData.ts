@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTimeRange } from "../context/TimeRangeContext";
+import { useRefresh } from "../context/RefreshContext";
 import { rangeToParams, pollIntervalMs } from "../lib/timeRange";
 
 export function useWindowedData<T>(
   fetcher: (a: { qs: string; signal: AbortSignal }) => Promise<T>,
 ) {
   const { range } = useTimeRange();
+  const { refreshNonce } = useRefresh();
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
@@ -32,7 +34,7 @@ export function useWindowedData<T>(
       .finally(() => {
         if (!ac.signal.aborted) setLoading(false);
       });
-  }, [qs, fetcher]);
+  }, [qs, fetcher, refreshNonce]);
 
   useEffect(() => {
     run();

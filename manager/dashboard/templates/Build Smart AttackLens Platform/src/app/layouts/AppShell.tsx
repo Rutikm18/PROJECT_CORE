@@ -11,6 +11,7 @@ import { Outlet, useLocation } from "react-router";
 import { Sidebar } from "../components/Sidebar";
 import { TopHeader } from "../components/TopHeader";
 import { TimeRangeProvider } from "../context/TimeRangeContext";
+import { RefreshProvider } from "../context/RefreshContext";
 
 export default function AppShell() {
   const { pathname } = useLocation();
@@ -18,6 +19,7 @@ export default function AppShell() {
   // key forces page content to remount on route change, matching the old
   // behaviour of `key={activePage}` on <main>.
   return (
+    <RefreshProvider>
     <TimeRangeProvider>
       <div className="flex h-screen overflow-hidden" style={{ background: "#F4F6F9" }}>
         <Sidebar />
@@ -37,5 +39,6 @@ export default function AppShell() {
         </div>
       </div>
     </TimeRangeProvider>
+    </RefreshProvider>
   );
 }

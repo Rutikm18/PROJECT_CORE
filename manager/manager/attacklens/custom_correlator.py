@@ -11,6 +11,7 @@ Rule schema (stored as JSON in DB):
     "name":        "Human-readable rule name",
     "description": "Why this rule exists",
     "enabled":     true,
+    "layer":       "raw" | "correlation",   ← NEW
     "action":      "alert" | "suppress" | "elevate" | "tag",
     "severity":    "critical" | "high" | "medium" | "low" | "info",
     "conditions":  {
@@ -24,8 +25,8 @@ Rule schema (stored as JSON in DB):
         ...
       ]
     },
-    "required_count": 1,       # min number of matching findings to fire
-    "time_window_hours": 24,   # look back window
+    "required_count": 1,       # min number of matching items to fire (raw layer: items in the section)
+    "time_window_hours": 24,   # look back window (correlation layer only)
     "tags":        ["custom", "fp-reduction"],
     "attack_chain": [],        # optional MITRE chain for alert-type rules
     "created_by":  "analyst",
@@ -34,6 +35,16 @@ Rule schema (stored as JSON in DB):
     "hit_count":   0,          # incremented each time this rule fires
     "last_hit_at": null,
   }
+
+Layers
+------
+  correlation (default) — evaluates conditions over *existing findings* stored in DB.
+                          Runs during the correlation pass (CustomCorrelator.correlate).
+
+  raw                   — evaluates conditions directly against *incoming telemetry items*
+                          before findings are stored.  Conditions reference fields in the
+                          raw section payload (e.g. "process_name", "dest_port").
+                          Runs during the detection pass (CustomCorrelator.evaluate_raw).
 """
 from __future__ import annotations
 
@@ -128,9 +139,78 @@ class CustomCorrelator:
     def __init__(self, intel_db) -> None:
         self._idb = intel_db
 
+    async def evaluate_raw(
+        self,
+        agent_id: str,
+        section: str,
+        items: list[dict],
+    ) -> list[dict]:
+        """Evaluate raw-layer rules against incoming telemetry items.
+
+        Called once per payload section during the detection pass, before findings
+        are stored.  Conditions reference fields in the raw telemetry item dict.
+        Returns a list of finding dicts (same schema as rulepack findings).
+        """
+        rules = await self._load_rules(layer="raw")
+        if not rules:
+            return []
+
+        now = time.time()
+        results: list[dict] = []
+
+        for rule in rules:
+            conditions = rule.get("conditions") or {}
+            required_cnt = int(rule.get("required_count", 1))
+            section_filter = rule.get("section_filter", "")  # optional: restrict to specific sections
+            if section_filter and section.lower() != section_filter.lower():
+                continue
+
+            matched = [item for item in items if _matches_conditions(conditions, item)]
+            if len(matched) < required_cnt:
+                continue
+
+            severity = rule.get("severity", "medium")
+            score = {"critical": 9.5, "high": 7.5, "medium": 5.0, "low": 2.5, "info": 0.5}.get(severity, 5.0)
+            action = rule.get("action", "alert")
+
+            results.append({
+                "rule_id":          f"custom-raw:{rule['id']}",
+                "agent_id":         agent_id,
+                "category":         section,
+                "item_key":         f"custom-raw:{rule['id']}",
+                "severity":         severity,
+                "score":            score,
+                "confidence":       int(rule.get("confidence", 70)),
+                "title":            rule.get("name", "Custom raw detection rule"),
+                "description":      rule.get("description", ""),
+                "recommendation":   rule.get("recommendation", ""),
+                "attack_chain":     rule.get("attack_chain") or [],
+                "tags":             rule.get("tags") or [],
+                "evidence":         {"matched_items": matched[:10], "matched_count": len(matched)},
+                "source":           "custom_raw_rule",
+                "action":           action,
+                "custom_rule_id":   rule["id"],
+                "custom_rule_name": rule.get("name", ""),
+                "custom_rule_layer": "raw",
+                "detected_at":      now,
+            })
+
+            # Increment hit counter (best-effort)
+            try:
+                await self._idb._conn.execute(
+                    "UPDATE custom_correlation_rules "
+                    "SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?",
+                    (now, rule["id"]),
+                )
+                await self._idb._conn.commit()
+            except Exception:
+                pass
+
+        return results
+
     async def correlate(self, agent_id: str) -> list[dict]:
-        """Evaluate all enabled custom rules for an agent. Returns correlation dicts."""
-        rules = await self._load_rules()
+        """Evaluate all enabled correlation-layer custom rules for an agent."""
+        rules = await self._load_rules(layer="correlation")
         if not rules:
             return []
 
@@ -217,11 +297,17 @@ class CustomCorrelator:
             "detected_at":      now,
         }
 
-    async def _load_rules(self) -> list[dict]:
-        rows = await self._idb._fetchall(
-            "SELECT * FROM custom_correlation_rules WHERE enabled = 1 ORDER BY created_at DESC",
-            (),
-        )
+    async def _load_rules(self, layer: str | None = None) -> list[dict]:
+        if layer:
+            rows = await self._idb._fetchall(
+                "SELECT * FROM custom_correlation_rules WHERE enabled = 1 AND layer = ? ORDER BY created_at DESC",
+                (layer,),
+            )
+        else:
+            rows = await self._idb._fetchall(
+                "SELECT * FROM custom_correlation_rules WHERE enabled = 1 ORDER BY created_at DESC",
+                (),
+            )
         result = []
         for row in rows:
             r = dict(row)

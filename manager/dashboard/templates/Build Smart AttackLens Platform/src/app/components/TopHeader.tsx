@@ -16,13 +16,14 @@ import {
   Bell, ChevronDown, Clock, LogOut,
   Search, Users, X, LayoutDashboard,
   AlertTriangle, Zap, CheckCircle2,
-  Settings, ChevronRight,
+  Settings, ChevronRight, RefreshCw,
 } from "lucide-react";
 import { useRBAC, type Role } from "../context/RBACContext";
 import { useAuth } from "../context/AuthContext";
 import { cn } from "../../lib/utils";
 import { useTimezone, tzAbbr, fmtTime, fmtDate, initTimezone } from "../context/timezoneStore";
 import { TimeRangePicker, isTimeAwareRoute } from "./TimeRangePicker";
+import { useRefresh } from "../context/RefreshContext";
 
 // ── Breadcrumb ────────────────────────────────────────────────────────────────
 
@@ -116,6 +117,7 @@ function SevPill({ n, sev, loading }: { n: number; sev: "critical" | "high" | "m
 export function TopHeader() {
   const { user, setRole } = useRBAC();
   const { logout, user: authUser } = useAuth();
+  const { triggerRefresh, isRefreshing, refreshNonce } = useRefresh();
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -152,7 +154,7 @@ export function TopHeader() {
       const d = await r.json();
       setThreats(d);
     } catch { /* best-effort */ } finally { setThreatsLoading(false); }
-  }, []);
+  }, [refreshNonce]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { fetchThreats(); const t = setInterval(fetchThreats, 120_000); return () => clearInterval(t); }, [fetchThreats]);
 
@@ -168,7 +170,7 @@ export function TopHeader() {
       const online = list.filter(a => a.status === "online" || (a.last_seen && now - a.last_seen < 300)).length;
       setAgents({ online, total: list.length, loading: false });
     } catch { setAgents(p => ({ ...p, loading: false })); }
-  }, []);
+  }, [refreshNonce]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { fetchAgents(); const t = setInterval(fetchAgents, 30_000); return () => clearInterval(t); }, [fetchAgents]);
 
@@ -312,6 +314,16 @@ export function TopHeader() {
               <TimeRangePicker />
             </div>
           )}
+
+          {/* Refresh button */}
+          <button
+            onClick={triggerRefresh}
+            disabled={isRefreshing}
+            className="flex items-center gap-1 px-2 py-1.5 rounded-lg border border-gray-200 hover:border-orange-300 hover:bg-orange-50 text-gray-400 hover:text-orange-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Refresh all data"
+          >
+            <RefreshCw className={cn("w-3.5 h-3.5", isRefreshing && "animate-spin")} />
+          </button>
 
           {/* Live indicator */}
           <div className="flex items-center gap-1 px-2 py-1 rounded-lg mr-1"

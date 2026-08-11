@@ -383,3 +383,29 @@
 ### PyInstaller `--add-data` source paths resolve against `--specpath`, not the CWD
 **What:** `build_pkg.sh` bundled the SCA policy with a CWD-relative source (`agent/agent/sca/policies/sca_apple_macos.yml`) while also passing `--specpath "${BUILD_DIR}"`. PyInstaller resolves relative `datas` *source* paths relative to the spec file's directory, so it looked under `.../pkg/build/agent/…` and aborted the build with "Unable to find … when adding binary and data files". Fixed by making the source absolute (`${REPO_ROOT}/agent/agent/sca/policies/sca_apple_macos.yml:agent/agent/sca/policies`); the *destination* stays relative — that's where the SCA engine loads it inside the bundle at runtime.
 **Why:** The agent PKG build broke the moment `--specpath` moved the spec out of the repo root. An absolute source is `--specpath`-independent, so the 57-check macOS CIS policy is reliably bundled regardless of the build directory.
+
+## 2026-08-10
+
+### AttackLens detection → validation data flow (architecture review)
+**What:** Full pipeline: `engine.py` calls `rulepack.analyze(section, data)` → `custom_correlator.evaluate_raw(section, items)` → clusters signals → `validate_with_ai(cluster, enriched, idb, feeds, ai_analyst)`. Three separate code paths produce findings: (1) YAML-backed rule evaluators in `rulepack.py`, (2) inline section analyzers in `engine.py`, (3) custom rules from the DB split into `layer=raw` (against incoming telemetry) and `layer=correlation` (against existing findings). The correlation layer runs on a scheduler, not in the real-time ingest path.
+**Why:** Distinguishing the two custom-rule layers prevents a conceptual bug: raw-layer rules must fire in sub-second ingest time; correlation rules can afford DB reads. Mixing them into one path would either slow ingest or miss DB-resident pattern context.
+
+### AI validation is a weighted-factor gate, not an LLM-only gate
+**What:** `validate_with_ai` computes six factor scores (ti_corroboration, cross_layer, baseline_anomaly, asset_criticality, fp_history_damping, ai_verdict) and weights them. The LLM (35%) cannot alone approve or reject; KEV/hash ground truth can override a confident LLM FP veto. When the LLM is unavailable, `_factors_only_estimate` synthesises an AI-equivalent score from deterministic inputs to keep the threshold calibrated.
+**Why:** Pure LLM gating would create availability-coupled promotion — a key outage would either block all promotions (bad) or pass everything (dangerous). The weighted design degrades gracefully.
+
+### `_call_claude` vs `provider.chat()` — interface mismatch bug fixed
+**What:** `ai_validator._ai_evaluate_cluster` was calling `ai_analyst._call_claude(prompt)` (a method that does not exist on `FindingAnalyzer`). Fixed to `ai_analyst._get_provider()` → `provider.chat(prompt)` → `provider.parse_json(resp.text)`. Also fixed `raw.get("tokens_used")` which assumed a string was a dict; replaced with `resp.total_tokens`.
+**Why:** The AI validation path was silently broken — every cluster evaluation raised `AttributeError` which the outer `except Exception` caught and logged as `llm_error`, causing the LLM factor to always fall back to the deterministic estimate. The fix makes actual LLM calls happen.
+
+### OpenRouter as a fallback provider for rate-limited AI evaluation
+**What:** `_chat_with_fallback` wraps every AI verdict call. On 429/503/rate-limit errors, it cycles through three free OpenRouter models (`llama-3.3-70b`, `gemini-2.0-flash-exp`, `deepseek-chat-v3`) before raising. The fallback only activates on transient errors (pattern-matched on the exception message); auth and value errors propagate immediately.
+**Why:** Validation latency spikes and LLM provider outages are common. A three-model free-tier fallback costs nothing extra and keeps the precision pipeline running through rolling rate limits.
+
+### Custom rule dual-layer architecture: `layer=raw` vs `layer=correlation`
+**What:** Custom rules stored in `custom_correlation_rules` have a `layer` column (default `correlation`). `evaluate_raw(agent_id, section, items)` loads only `layer=raw` rules and evaluates conditions against individual telemetry items in the real-time ingest path. `correlate()` loads only `layer=correlation` rules and evaluates against aggregated DB findings in the scheduled correlation pass.
+**Why:** Prevents analysts from inadvertently writing rules that run DB queries in the hot ingest path, while still supporting rules that need cross-finding context (e.g. "three different MITRE techniques on the same host within 5 minutes").
+
+### Global refresh via `RefreshContext` nonce
+**What:** `RefreshProvider` holds a `refreshNonce: number` counter. Hooks include `refreshNonce` in their `useCallback`/`useEffect` deps so incrementing the nonce re-runs all fetches site-wide. The refresh button in `TopHeader` spins for 2 seconds via a timeout (no explicit fetch completion tracking).
+**Why:** Tracking individual fetch completions across all pages and hooks is complex and brittle. A 2-second spinner gives clear visual feedback; the actual data refetch completes within that window under normal network conditions.

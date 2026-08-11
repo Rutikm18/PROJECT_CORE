@@ -1676,6 +1676,27 @@ class AttackLensEngine:
         except Exception as exc:
             log.warning("rulepack analyze failed agent=%s section=%s: %s", agent_id, section, exc)
             detector_errors.append(("rulepack", exc))
+
+        # ── Raw-layer custom rules: evaluate against incoming telemetry items ──
+        try:
+            raw_items = data if isinstance(data, list) else (
+                [{"path": k, "content": v} for k, v in data.items()
+                 if isinstance(k, str) and isinstance(v, (str, bytes))]
+                if isinstance(data, dict) else []
+            )
+            raw_items = [i for i in raw_items if isinstance(i, dict)]
+            if raw_items:
+                raw_hits = await self._custom_corr.evaluate_raw(agent_id, section, raw_items)
+                for hit in raw_hits:
+                    hit.setdefault("category", _SECTION_CATEGORY.get(section, section))
+                    hit.setdefault("item_key", f"custom-raw:{hit.get('custom_rule_id', '')}:{section}")
+                    hit.setdefault("source", "custom_raw_rule")
+                    if "score" not in hit:
+                        hit["score"] = severity_to_score(hit.get("severity", "medium"))
+                findings.extend(raw_hits)
+        except Exception as exc:
+            log.warning("custom raw-rule eval failed agent=%s section=%s: %s", agent_id, section, exc)
+
         if detector_errors:
             source, first = detector_errors[0]
             raise RuntimeError(

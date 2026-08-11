@@ -1015,7 +1015,8 @@ def _containers_004(det: RulePackDetector, agent_id: str, item: dict, ctx: dict 
 
 
 def _containers_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
-    if (_as_int(_get(item, "process_uid")) or -1) == 0:
+    uid = _as_int(_get(item, "process_uid"))
+    if uid is not None and uid == 0:
         return _matched("process_uid == 0")
     return None
 

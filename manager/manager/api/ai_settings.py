@@ -52,7 +52,7 @@ def _idb(req: Request):
 # ── Request models ────────────────────────────────────────────────────────────
 
 class ProviderSetRequest(BaseModel):
-    provider: str  = Field(..., description="anthropic | openai | gemini | ollama")
+    provider: str  = Field(..., description="anthropic | openai | gemini | ollama | openrouter")
     api_key:  str  = Field(default="", description="API key (empty for ollama)")
     model:    str  = Field(default="", description="Model name; defaults to cheapest for provider")
     base_url: str  = Field(default="", description="Custom endpoint (ollama, Azure, proxies)")
@@ -180,9 +180,10 @@ async def list_models() -> dict:
             "claude-opus-4-8":           "Most capable — use for complex analysis",
         },
         "openai": {
-            "gpt-4o-mini": "Cheapest · fast — ideal for finding validation",
-            "gpt-4o":      "Balanced — recommended for remediation plans",
-            "gpt-4-turbo": "Most capable — use for complex analysis",
+            "gpt-4o-mini":        "Cheapest · fast — ideal for finding validation",
+            "gpt-4o":             "Balanced — recommended for remediation plans",
+            "gpt-4-turbo":        "Most capable — use for complex analysis",
+            "codex-mini-latest":  "Codex — optimised for code & structured output",
         },
         "gemini": {
             "gemini-1.5-flash":  "Fastest · cheapest — ideal for validation",
@@ -195,6 +196,16 @@ async def list_models() -> dict:
             "llama3.1:70b":  "Best local quality — requires 40GB+ RAM",
             "mistral:7b":    "Good reasoning — 4GB RAM",
             "qwen2.5:7b":    "Strong JSON output — 4GB RAM",
+        },
+        "openrouter": {
+            "meta-llama/llama-3.3-70b-instruct:free": "Llama 3.3 70B — FREE, fast, highly capable",
+            "google/gemini-2.0-flash-exp:free":        "Gemini 2.0 Flash — FREE, Google",
+            "deepseek/deepseek-chat-v3-0324:free":     "DeepSeek V3 — FREE, strong reasoning",
+            "mistralai/mistral-7b-instruct:free":      "Mistral 7B — FREE, lightweight",
+            "microsoft/phi-3-mini-128k-instruct:free": "Phi-3 Mini — FREE, 128k context",
+            "openai/gpt-4o-mini":                      "GPT-4o Mini via OpenRouter (paid)",
+            "anthropic/claude-haiku-20240307":         "Claude Haiku via OpenRouter (paid)",
+            "openai/codex-mini-latest":                "Codex Mini via OpenRouter (paid)",
         },
     }
     return {
@@ -213,6 +224,81 @@ async def list_models() -> dict:
             for p, models in PROVIDER_MODELS.items()
         }
     }
+
+
+# ── Per-task model selection ───────────────────────────────────────────────────
+# Stored as JSON in data/ai_task_models.json alongside the main provider config.
+# Tasks: "validation" (AI finding validation) | "remediation" (fix plans)
+
+import json as _json
+import pathlib as _pathlib
+
+_TASK_MODELS_PATH = _pathlib.Path("data/ai_task_models.json")
+_VALID_TASKS = {"validation", "remediation"}
+
+
+def _load_task_models() -> dict:
+    try:
+        return _json.loads(_TASK_MODELS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_task_models(models: dict) -> None:
+    _TASK_MODELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _TASK_MODELS_PATH.write_text(_json.dumps(models, indent=2))
+
+
+class TaskModelRequest(BaseModel):
+    task:     str = Field(..., description="validation | remediation")
+    provider: str = Field(..., description="Provider name (anthropic, openrouter, ...)")
+    model:    str = Field(..., description="Model ID for this task")
+
+
+@router.get("/task-models")
+async def get_task_models() -> dict:
+    """Return per-task model overrides (validation vs remediation)."""
+    task_models = _load_task_models()
+    summary = config_summary()
+    default_provider = summary["provider"] if summary else None
+    default_model = summary["model"] if summary else None
+    return {
+        "task_models": task_models,
+        "default_provider": default_provider,
+        "default_model": default_model,
+        "valid_tasks": list(_VALID_TASKS),
+    }
+
+
+@router.post("/task-models")
+async def set_task_model(body: TaskModelRequest) -> dict:
+    """Set the AI model to use for a specific task (validation or remediation)."""
+    if body.task not in _VALID_TASKS:
+        raise HTTPException(422, detail=f"Invalid task '{body.task}'. Valid: {sorted(_VALID_TASKS)}")
+    if body.provider not in _VALID_PROVIDERS:
+        raise HTTPException(422, detail=f"Invalid provider '{body.provider}'. Valid: {_VALID_PROVIDERS}")
+    valid_models = PROVIDER_MODELS.get(body.provider, [])
+    if body.model not in valid_models:
+        raise HTTPException(
+            422,
+            detail=f"Model '{body.model}' not in provider '{body.provider}' model list. "
+                   f"Valid: {valid_models}",
+        )
+    task_models = _load_task_models()
+    task_models[body.task] = {"provider": body.provider, "model": body.model}
+    _save_task_models(task_models)
+    return {"task": body.task, "provider": body.provider, "model": body.model, "saved": True}
+
+
+@router.delete("/task-models/{task}")
+async def reset_task_model(task: str) -> dict:
+    """Reset a task to use the default provider model."""
+    if task not in _VALID_TASKS:
+        raise HTTPException(422, detail=f"Invalid task '{task}'. Valid: {sorted(_VALID_TASKS)}")
+    task_models = _load_task_models()
+    task_models.pop(task, None)
+    _save_task_models(task_models)
+    return {"task": task, "reset": True}
 
 
 # ── Finding analysis endpoints ─────────────────────────────────────────────────

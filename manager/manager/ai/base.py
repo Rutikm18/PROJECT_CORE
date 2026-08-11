@@ -51,6 +51,7 @@ PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4o-mini",                  # cheapest — default for validation
         "gpt-4o",                       # balanced — default for remediation
         "gpt-4-turbo",                  # most capable
+        "codex-mini-latest",            # Codex (code-optimised, via OpenAI API)
     ],
     "gemini": [
         "gemini-1.5-flash",             # cheapest — default for validation
@@ -64,13 +65,26 @@ PROVIDER_MODELS: dict[str, list[str]] = {
         "mistral:7b",
         "qwen2.5:7b",
     ],
+    # OpenRouter — free tier models (":free" suffix = no cost, rate-limited)
+    "openrouter": [
+        "meta-llama/llama-3.3-70b-instruct:free",    # fast & capable, free
+        "google/gemini-2.0-flash-exp:free",           # Gemini 2.0, free
+        "deepseek/deepseek-chat-v3-0324:free",        # DeepSeek V3, free
+        "mistralai/mistral-7b-instruct:free",         # Mistral 7B, free
+        "microsoft/phi-3-mini-128k-instruct:free",    # Phi-3 Mini, free
+        # Paid OpenRouter models (requires credits):
+        "openai/gpt-4o-mini",
+        "anthropic/claude-haiku-20240307",
+        "openai/codex-mini-latest",                   # Codex via OpenRouter
+    ],
 }
 
 DEFAULT_MODELS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai":    "gpt-4o-mini",
-    "gemini":    "gemini-1.5-flash",
-    "ollama":    "llama3.2:3b",
+    "anthropic":  "claude-haiku-4-5-20251001",
+    "openai":     "gpt-4o-mini",
+    "gemini":     "gemini-1.5-flash",
+    "ollama":     "llama3.2:3b",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
 }
 
 

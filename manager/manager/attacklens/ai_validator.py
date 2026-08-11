@@ -78,6 +78,9 @@ class PrecisionResult:
     rejection_reason: Optional[str] = None       # populated when promoted=False
     ai_error:         Optional[str] = None       # populated when LLM call failed
     threshold_used:   Optional[float] = None     # echoed back for traceability
+    # Explainability: which factor contributed most / least to the decision
+    top_factor:    Optional[str] = None          # factor with highest weighted contribution
+    bottom_factor: Optional[str] = None          # factor with lowest weighted contribution (for promoted=True visibility)
 
 
 # ── Public entrypoint ───────────────────────────────────────────────────────
@@ -162,6 +165,7 @@ async def validate_with_ai(
         )
         if not deterministic_truth:
             score = _weighted_sum(factors)
+            _weighted_v = {k: PRECISION_WEIGHTS.get(k, 0.0) * v for k, v in factors.items()}
             return PrecisionResult(
                 score=round(score, 3),
                 promoted=False,
@@ -173,6 +177,8 @@ async def validate_with_ai(
                 ),
                 ai_error=ai_error,
                 threshold_used=threshold,
+                top_factor=max(_weighted_v, key=_weighted_v.get) if _weighted_v else None,
+                bottom_factor=min(_weighted_v, key=_weighted_v.get) if _weighted_v else None,
             )
 
     # 4. Weighted aggregate ──────────────────────────────────────────────────
@@ -205,6 +211,7 @@ async def validate_with_ai(
     #    is enthusiastic.
     base_conf = getattr(cluster, "confidence", None)
     if base_conf is not None and base_conf < 0.6 and score >= threshold:
+        _weighted_bc = {k: PRECISION_WEIGHTS.get(k, 0.0) * v for k, v in factors.items()}
         return PrecisionResult(
             score=round(score, 3),
             promoted=False,
@@ -216,10 +223,15 @@ async def validate_with_ai(
             ),
             ai_error=ai_error,
             threshold_used=threshold,
+            top_factor=max(_weighted_bc, key=_weighted_bc.get) if _weighted_bc else None,
+            bottom_factor=min(_weighted_bc, key=_weighted_bc.get) if _weighted_bc else None,
         )
 
     promoted = score >= threshold
     reason: Optional[str] = None
+    weighted = {k: PRECISION_WEIGHTS.get(k, 0.0) * v for k, v in factors.items()}
+    top_k    = max(weighted, key=weighted.get) if weighted else None
+    bot_k    = min(weighted, key=weighted.get) if weighted else None
     if not promoted:
         lowest = min(factors.items(), key=lambda kv: kv[1])
         reason = f"precision={score:.2f} < {threshold:.2f}; weakest={lowest[0]}={lowest[1]:.2f}"
@@ -232,6 +244,8 @@ async def validate_with_ai(
         rejection_reason=reason,
         ai_error=ai_error,
         threshold_used=threshold,
+        top_factor=top_k,
+        bottom_factor=bot_k,
     )
 
 
@@ -357,14 +371,83 @@ async def _fp_damping_score(cluster, enriched: dict, idb) -> float:
 
 # ── AI verdict ───────────────────────────────────────────────────────────────
 
+# Free fallback models tried in order when the primary provider is rate-limited
+# (429) or temporarily unavailable (503).  Only activated on transient errors.
+_FALLBACK_OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+    "deepseek/deepseek-chat-v3-0324:free",
+]
+
+_RATE_LIMIT_PATTERNS = ("429", "rate limit", "ratelimit", "quota", "503", "service unavailable")
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Return True for 429/503-class transient errors that warrant a fallback."""
+    msg = str(exc).lower()
+    return any(p in msg for p in _RATE_LIMIT_PATTERNS)
+
+
+async def _chat_with_fallback(primary_provider, prompt: str, max_tokens: int, ai_analyst):
+    """
+    Try the primary provider first.  On transient rate-limit/overload errors,
+    attempt fallback models from OpenRouter free tier in order.
+    Returns (AIResponse, provider_used_name).
+    """
+    from ..ai.base import ProviderConfig
+    from ..ai.providers import OpenRouterProvider
+
+    try:
+        resp = await primary_provider.chat(prompt, max_tokens=max_tokens)
+        return resp, primary_provider._cfg.provider
+    except Exception as exc:
+        if not _is_transient_error(exc):
+            raise
+        log.warning("Primary AI provider rate-limited, trying OpenRouter fallbacks: %s", exc)
+
+    # Attempt free OpenRouter fallbacks using the same key if configured,
+    # or skip gracefully if no openrouter key is stored.
+    from ..ai.key_store import load_config as _load_cfg
+    cfg = _load_cfg()
+    openrouter_key = cfg.api_key if cfg and cfg.provider == "openrouter" else ""
+    if not openrouter_key:
+        # Try to extract from the primary config if it's openrouter
+        if primary_provider._cfg.provider == "openrouter":
+            openrouter_key = primary_provider._cfg.api_key
+
+    if not openrouter_key:
+        raise RuntimeError("Primary provider rate-limited and no OpenRouter fallback key available")
+
+    last_exc: Exception = RuntimeError("all fallbacks exhausted")
+    for model in _FALLBACK_OPENROUTER_MODELS:
+        try:
+            fallback_cfg = ProviderConfig(
+                provider="openrouter",
+                api_key=openrouter_key,
+                model=model,
+            )
+            fb_provider = OpenRouterProvider(fallback_cfg)
+            resp = await fb_provider.chat(prompt, max_tokens=max_tokens)
+            log.info("AI fallback succeeded via openrouter/%s", model)
+            return resp, f"openrouter/{model}"
+        except Exception as fb_exc:
+            log.debug("Fallback model %s failed: %s", model, fb_exc)
+            last_exc = fb_exc
+
+    raise last_exc
+
+
 async def _ai_evaluate_cluster(cluster, enriched: dict, ai_analyst) -> AiVerdict:
     """
     Ask the LLM to act as a senior SOC analyst and emit a structured TP/FP/uncertain
     verdict.  The prompt is heavily constrained: JSON only, exact schema, no prose.
+    Uses a fallback chain on 429/503 errors.
     """
+    from ..ai.base import AIProvider
     prompt = _build_ai_prompt(cluster, enriched)
-    raw = await ai_analyst._call_claude(prompt, max_tokens=900)
-    parsed = ai_analyst._parse_json_response(raw)
+    provider = ai_analyst._get_provider()
+    resp, _provider_used = await _chat_with_fallback(provider, prompt, 900, ai_analyst)
+    parsed = AIProvider.parse_json(resp.text) if resp.text.strip() else {}
     label = str(parsed.get("verdict", "uncertain")).lower()
     if label not in ("tp", "fp", "uncertain"):
         label = "uncertain"
@@ -372,14 +455,24 @@ async def _ai_evaluate_cluster(cluster, enriched: dict, ai_analyst) -> AiVerdict
         confidence = float(parsed.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
+    try:
+        key_evidence = list(parsed.get("key_evidence", []))[:8]
+        key_evidence = [str(e) for e in key_evidence if e]
+    except (TypeError, AttributeError):
+        key_evidence = []
+    try:
+        risk_factors = list(parsed.get("risk_factors", []))[:8]
+        risk_factors = [str(r) for r in risk_factors if r]
+    except (TypeError, AttributeError):
+        risk_factors = []
     return AiVerdict(
         label=label,
         confidence=max(0.0, min(1.0, confidence)),
         reasoning=str(parsed.get("reasoning", ""))[:600],
-        key_evidence=list(parsed.get("key_evidence", []))[:8],
-        risk_factors=list(parsed.get("risk_factors", []))[:8],
+        key_evidence=key_evidence,
+        risk_factors=risk_factors,
         used_llm=True,
-        tokens_used=int(raw.get("tokens_used", 0)),
+        tokens_used=resp.total_tokens,
     )
 
 

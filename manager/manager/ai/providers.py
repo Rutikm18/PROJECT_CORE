@@ -234,11 +234,72 @@ class OllamaProvider(AIProvider):
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
+# ── OpenRouter ────────────────────────────────────────────────────────────────
+
+class OpenRouterProvider(OpenAIProvider):
+    """OpenRouter — OpenAI-compatible gateway to 200+ models.
+
+    Uses the OpenAI Chat Completions schema with an OpenRouter base URL.
+    Free models are identified by the `:free` suffix in the model ID.
+
+    Required headers (OpenRouter ToS):
+      HTTP-Referer — identifies your app
+      X-Title      — human-readable app name shown in openrouter.ai dashboard
+    """
+
+    _DEFAULT_BASE = "https://openrouter.ai/api/v1"
+
+    async def chat(self, user_prompt: str, *, max_tokens: int = 1500) -> AIResponse:
+        t0 = time.monotonic()
+        headers = {
+            "Authorization": f"Bearer {self._cfg.api_key}",
+            "Content-Type":  "application/json",
+            "HTTP-Referer":  "https://attacklens.ai",
+            "X-Title":       "AttackLens",
+        }
+        payload = {
+            "model":       self._cfg.model,
+            "max_tokens":  max_tokens,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+        }
+        body = await self._http.request_json(
+            "POST", f"{self._base}/chat/completions", headers=headers, json_body=payload
+        )
+        # OpenRouter wraps errors in {"error": {...}} even on 200
+        if "error" in body:
+            err = body["error"]
+            raise RuntimeError(f"OpenRouter error {err.get('code', '?')}: {err.get('message', err)}")
+        text = body["choices"][0]["message"]["content"]
+        usage = body.get("usage", {})
+        return AIResponse(
+            text=text,
+            model=self._cfg.model,
+            provider="openrouter",
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+            latency_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    async def health_check(self) -> tuple[bool, str]:
+        try:
+            resp = await self.chat(
+                'Reply with valid JSON only: {"status": "ok"}',
+                max_tokens=30,
+            )
+            return True, f"OpenRouter connected — model {self._cfg.model} ({resp.total_tokens} tokens)"
+        except Exception as exc:
+            return False, str(exc)
+
+
 _PROVIDER_MAP = {
-    "anthropic": AnthropicProvider,
-    "openai":    OpenAIProvider,
-    "gemini":    GeminiProvider,
-    "ollama":    OllamaProvider,
+    "anthropic":  AnthropicProvider,
+    "openai":     OpenAIProvider,
+    "gemini":     GeminiProvider,
+    "ollama":     OllamaProvider,
+    "openrouter": OpenRouterProvider,
 }
 
 

@@ -9,15 +9,20 @@ Routes (prefix /api/v1/custom-correlations):
   DELETE /{id}           delete rule
   POST   /{id}/toggle    enable / disable
   POST   /{id}/test      dry-run against recent findings (no side effects)
+  POST   /import-yaml    import rules from a YAML file body
+  POST   /reload-rules   reload rulepack YAML from disk (pull-all for fresh deployments)
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+import yaml
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Any, Optional
 
@@ -41,6 +46,7 @@ class CustomRuleBody(BaseModel):
     name: str
     description: str = ""
     enabled: bool = True
+    layer: str = "correlation"     # raw | correlation
     action: str = "alert"          # alert | suppress | elevate | tag
     severity: str = "medium"
     confidence: int = Field(70, ge=0, le=99)
@@ -50,6 +56,10 @@ class CustomRuleBody(BaseModel):
     tags: list[str] = []
     attack_chain: list[dict] = []
     recommendation: str = ""
+
+    def validate_layer(self) -> None:
+        if self.layer not in {"raw", "correlation"}:
+            raise ValueError(f"layer must be 'raw' or 'correlation', got {self.layer!r}")
 
 
 # ── Router factory ────────────────────────────────────────────────────────────
@@ -101,18 +111,22 @@ def make_custom_correlations_router(intel_db) -> APIRouter:
     # ── POST /  ───────────────────────────────────────────────────────────────
     @router.post("")
     async def create_rule(body: CustomRuleBody):
+        try:
+            body.validate_layer()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         now     = time.time()
         rule_id = str(uuid.uuid4())
         try:
             await _write(
                 """INSERT INTO custom_correlation_rules
-                   (id, name, description, enabled, action, severity, confidence,
+                   (id, name, description, enabled, layer, action, severity, confidence,
                     conditions, required_count, time_window_hours, tags, attack_chain,
                     recommendation, created_by, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rule_id, body.name, body.description, int(body.enabled),
-                    body.action, body.severity, body.confidence,
+                    body.layer, body.action, body.severity, body.confidence,
                     json.dumps(body.conditions.model_dump()),
                     body.required_count, body.time_window_hours,
                     json.dumps(body.tags), json.dumps(body.attack_chain),
@@ -134,18 +148,22 @@ def make_custom_correlations_router(intel_db) -> APIRouter:
     # ── PUT /{id}  ────────────────────────────────────────────────────────────
     @router.put("/{rule_id}")
     async def update_rule(rule_id: str, body: CustomRuleBody):
+        try:
+            body.validate_layer()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         await _get_or_404(rule_id)
         now = time.time()
         try:
             await _write(
                 """UPDATE custom_correlation_rules SET
-                   name=?, description=?, enabled=?, action=?, severity=?, confidence=?,
+                   name=?, description=?, enabled=?, layer=?, action=?, severity=?, confidence=?,
                    conditions=?, required_count=?, time_window_hours=?, tags=?,
                    attack_chain=?, recommendation=?, updated_at=?
                    WHERE id=?""",
                 (
-                    body.name, body.description, int(body.enabled), body.action,
-                    body.severity, body.confidence,
+                    body.name, body.description, int(body.enabled), body.layer,
+                    body.action, body.severity, body.confidence,
                     json.dumps(body.conditions.model_dump()),
                     body.required_count, body.time_window_hours,
                     json.dumps(body.tags), json.dumps(body.attack_chain),
@@ -240,5 +258,135 @@ def make_custom_correlations_router(intel_db) -> APIRouter:
         except Exception as exc:
             log.error("test_rule error: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
+
+    # ── POST /import-yaml  ───────────────────────────────────────────────────
+    @router.post("/import-yaml")
+    async def import_yaml_rules(request: Request):
+        """Import custom rules from a YAML body.
+
+        Accepts:
+          - A single rule object (dict)
+          - A list of rule objects
+          - A dict with a 'rules' key containing a list
+
+        Each rule follows the same schema as CustomRuleBody.  Existing rules
+        with the same name are skipped (idempotent).  Returns a summary.
+        """
+        try:
+            raw_bytes = await request.body()
+            payload = yaml.safe_load(raw_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid YAML: {exc}")
+
+        if isinstance(payload, dict) and "rules" in payload:
+            rule_list = payload["rules"]
+        elif isinstance(payload, list):
+            rule_list = payload
+        elif isinstance(payload, dict):
+            rule_list = [payload]
+        else:
+            raise HTTPException(status_code=400, detail="YAML must be a rule dict, list, or {rules: [...]}")
+
+        if not isinstance(rule_list, list):
+            raise HTTPException(status_code=400, detail="Expected a list of rules")
+
+        created, skipped, errors = 0, 0, []
+
+        # Build set of existing rule names to skip duplicates
+        existing_rows = await intel_db._fetchall(
+            "SELECT name FROM custom_correlation_rules", ()
+        )
+        existing_names = {r["name"] for r in existing_rows}
+
+        now = time.time()
+        for entry in rule_list:
+            if not isinstance(entry, dict):
+                errors.append(f"Skipped non-dict entry: {entry!r}")
+                continue
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                errors.append("Skipped entry with missing name")
+                continue
+            if name in existing_names:
+                skipped += 1
+                continue
+            try:
+                body = CustomRuleBody(
+                    name=name,
+                    description=str(entry.get("description", "")),
+                    enabled=bool(entry.get("enabled", True)),
+                    layer=str(entry.get("layer", "correlation")),
+                    action=str(entry.get("action", "alert")),
+                    severity=str(entry.get("severity", "medium")),
+                    confidence=int(entry.get("confidence", 70)),
+                    required_count=int(entry.get("required_count", 1)),
+                    time_window_hours=int(entry.get("time_window_hours", 24)),
+                    tags=list(entry.get("tags") or []),
+                    recommendation=str(entry.get("recommendation", "")),
+                )
+                body.validate_layer()
+                conditions_raw = entry.get("conditions") or {}
+                if isinstance(conditions_raw, str):
+                    conditions_raw = json.loads(conditions_raw)
+
+                rule_id = str(uuid.uuid4())
+                await _write(
+                    """INSERT INTO custom_correlation_rules
+                       (id, name, description, enabled, layer, action, severity, confidence,
+                        conditions, required_count, time_window_hours, tags, attack_chain,
+                        recommendation, created_by, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        rule_id, body.name, body.description, int(body.enabled),
+                        body.layer, body.action, body.severity, body.confidence,
+                        json.dumps(conditions_raw),
+                        body.required_count, body.time_window_hours,
+                        json.dumps(body.tags), "[]",
+                        body.recommendation, "yaml_import", now, now,
+                    ),
+                )
+                existing_names.add(name)
+                created += 1
+            except Exception as exc:
+                errors.append(f"Rule '{name}': {exc}")
+
+        return {
+            "imported": created,
+            "skipped_duplicates": skipped,
+            "errors": errors,
+            "total_processed": len(rule_list),
+        }
+
+    # ── POST /reload-rules  ──────────────────────────────────────────────────
+    @router.post("/reload-rules")
+    async def reload_rules():
+        """Reload the built-in YAML rule packs from disk.
+
+        Call this after dropping new YAML files into the rulepacks directory,
+        or on a fresh deployment to pull the full current rule set.
+        Returns a summary of loaded packs and rule counts.
+        """
+        try:
+            from ..attacklens.rulepack import RulePackDetector, default_rulepack_dir
+            detector = RulePackDetector.load()
+            rulepack_dir = str(default_rulepack_dir())
+            yaml_files = list(Path(rulepack_dir).glob("*.yml")) + list(Path(rulepack_dir).glob("*.yaml"))
+            total_rules = sum(len(rules) for rules in detector._rules.values())
+            executable_rules = sum(
+                1 for section_rules in detector._rules.values()
+                for r in section_rules if detector.has_executable_rules(section_rules[0].id.split("-")[0].lower())
+            )
+            return {
+                "status": "ok",
+                "rulepack_dir": rulepack_dir,
+                "yaml_files_found": len(yaml_files),
+                "yaml_files": [f.name for f in yaml_files],
+                "sections_loaded": len(detector._rules),
+                "total_yaml_rules": total_rules,
+                "reloaded_at": time.time(),
+            }
+        except Exception as exc:
+            log.error("reload_rules error: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Reload failed: {exc}")
 
     return router

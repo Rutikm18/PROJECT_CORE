@@ -616,6 +616,7 @@ CREATE TABLE IF NOT EXISTS custom_correlation_rules (
     name               TEXT NOT NULL DEFAULT '',
     description        TEXT NOT NULL DEFAULT '',
     enabled            INTEGER NOT NULL DEFAULT 1,
+    layer              TEXT NOT NULL DEFAULT 'correlation',
     action             TEXT NOT NULL DEFAULT 'alert',
     severity           TEXT NOT NULL DEFAULT 'medium',
     confidence         INTEGER NOT NULL DEFAULT 70,
@@ -760,6 +761,8 @@ _SOC_MIGRATIONS = [
     # Ingest dedup tracking — when content last changed vs just re-seen
     ("findings", "content_changed_at",   "DOUBLE PRECISION DEFAULT 0"),
     ("findings", "consecutive_unchanged", "INTEGER DEFAULT 0"),
+    # Custom rule pipeline layer (raw-telemetry vs findings-correlation)
+    ("custom_correlation_rules", "layer", "TEXT DEFAULT 'correlation'"),
 ]
 
 
