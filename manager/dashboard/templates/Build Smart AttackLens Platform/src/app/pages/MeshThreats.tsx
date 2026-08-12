@@ -105,22 +105,19 @@ export default function MeshThreats() {
 
   const { findings: raw } = useDetectionData(statsUrl);
 
-  const countForCap = (cap: Capability) =>
-    raw.filter(f => cap.rules.includes(f.rule_id ?? "")).length;
-
-  const stats = useMemo(() => {
-    const byCap = (key: string) => {
-      const cap = CAPABILITIES.find(c => c.key === key);
-      return cap ? raw.filter(f => cap.rules.includes(f.rule_id ?? "")).length : 0;
-    };
-    return {
-      total:       raw.length,
-      criticalHigh: raw.filter(f => f.severity === "critical" || f.severity === "high").length,
-      agentTooling: byCap("mcp") + byCap("extension"),
-      credentials:  byCap("credential"),
-      listeners:    byCap("listener"),
-    };
+  const capCounts = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const c of CAPABILITIES) m[c.key] = raw.filter(f => c.rules.includes(f.rule_id ?? "")).length;
+    return m;
   }, [raw]);
+
+  const stats = useMemo(() => ({
+    total:        raw.length,
+    criticalHigh: raw.filter(f => f.severity === "critical" || f.severity === "high").length,
+    agentTooling: (capCounts["mcp"] ?? 0) + (capCounts["extension"] ?? 0),
+    credentials:  capCounts["credential"] ?? 0,
+    listeners:    capCounts["listener"] ?? 0,
+  }), [raw, capCounts]);
 
   const selectedCap = CAPABILITIES.find(c => c.key === capFilter);
   const pageKey = `${validatedOnly}:${capFilter}`;
@@ -183,7 +180,7 @@ export default function MeshThreats() {
               All
             </button>
             {CAPABILITIES.map(c => {
-              const count = countForCap(c);
+              const count = capCounts[c.key] ?? 0;
               if (count === 0) return null;
               return (
                 <button
