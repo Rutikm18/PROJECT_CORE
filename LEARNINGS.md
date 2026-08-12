@@ -409,3 +409,21 @@
 ### Global refresh via `RefreshContext` nonce
 **What:** `RefreshProvider` holds a `refreshNonce: number` counter. Hooks include `refreshNonce` in their `useCallback`/`useEffect` deps so incrementing the nonce re-runs all fetches site-wide. The refresh button in `TopHeader` spins for 2 seconds via a timeout (no explicit fetch completion tracking).
 **Why:** Tracking individual fetch completions across all pages and hooks is complex and brittle. A 2-second spinner gives clear visual feedback; the actual data refetch completes within that window under normal network conditions.
+
+## 2026-08-12
+
+### `mesh` terrain registration for `developer_security` findings
+**What:** Added `"mesh": ["developer_security"]` to `CATEGORY_TO_TERRAIN` in `terrain_validators.py` and the three mirrored settings constants (`VALIDATION_TERRAINS`, `VALIDATION_TERRAIN_CATEGORIES`, `VALIDATION_TERRAIN_LABELS`) in `settings.py`. Also updated the FastAPI param doc on `detection.py:468` to include `|mesh`.
+**Why:** `developer_security` findings (deep-mesh data) were previously unmapped and fell through to the `"origin"` terrain default. Registering the `mesh` terrain entry routes them correctly without changing existing terrain logic or scoring criteria (mesh falls back to `ORIGIN_CRITERIA` in `TERRAIN_CRITERIA` until a future task adds mesh-specific criteria).
+
+### Brief import paths may diverge from actual package layout
+**What:** The task brief showed `from manager.api.settings import ...` but all sibling tests in `manager/tests/unit/` use `from manager.manager.api.settings import ...`. The package root is one level deeper than the brief assumed.
+**Why:** Always cross-check brief import paths against sibling test files in the same directory before writing a new test — the siblings reflect the live package layout and avoid `ModuleNotFoundError` during collection.
+
+### MeshThreats frontend page: capability model over category
+**What:** Created `MeshThreats.tsx` mirroring `ExecutionThreats.tsx` but subdividing by `rule_id` (capability) instead of `category`, because all `developer_security` findings share one category. `CAPABILITIES[]` maps AL-DEV-00x rules to labelled capability groups; `capabilityForRule()` is a named export that the test suite asserts against. `initialSearch` (not `initialCategoryFilter`) drives chip-click table filtering since the search term appears in rule titles.
+**Why:** When all findings share a single category, per-category chips are useless. A capability model keyed on `rule_id` gives meaningful grouping (extensions, MCP, CLI/PATH, browser, git, credentials, listeners, runtime) and keeps the TDD surface narrow — only pure-logic exports need unit tests; the JSX is covered by the existing `DetectionShared` table tests.
+
+### Partial-data badge pattern for truncated snapshots
+**What:** Exported a pure helper `countPartialHosts(rows?)` that filters on `summary.partial === true`, added a `useEffect` fetch to `GET /api/v1/raw/query?section=developer_security&include_data=false&limit=50` using the dead-flag cleanup pattern, and conditionally rendered an amber `AlertTriangle` banner before the filter controls when `partialHosts > 0`.
+**Why:** Deep-mesh snapshots are capped at ~6 MB at the agent; when trimmed, `summary.partial = true` is set. Without a banner, incident counts silently under-count on large hosts. Using `include_data=false` keeps the fetch cheap (metadata-only). The dead-flag (`let dead = false; return () => { dead = true; }`) prevents state updates on unmounted components.
