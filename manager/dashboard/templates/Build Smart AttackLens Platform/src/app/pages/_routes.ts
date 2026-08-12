@@ -62,6 +62,7 @@ export const ROUTES = {
     origin:      "/terrain/origin",
     vector:      "/terrain/vector",
     citadels:    "/terrain/citadels",
+    mesh:        "/terrain/mesh",
     persistence: "/terrain/persistence",
     identity:    "/terrain/identity",
   },

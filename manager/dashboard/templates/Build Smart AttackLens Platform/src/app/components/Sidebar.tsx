@@ -58,6 +58,8 @@ const CAT_MAP: Record<string, string> = {
   security: "/posture/overview",  posture: "/posture/overview",
   sip: "/posture/overview",       firewall: "/posture/overview",
   gatekeeper: "/posture/overview",
+  developer_security: "/terrain/mesh", mcp: "/terrain/mesh",
+  extension: "/terrain/mesh",          agent: "/terrain/mesh",
 };
 
 function catToPath(category: string): string {
@@ -83,6 +85,7 @@ const GROUPS: NavGroup[] = [
       { label: "Origin",    to: "/terrain/origin",      icon: PackageOpen, badgeColor: "amber" },
       { label: "Vector",    to: "/terrain/vector",      icon: Globe,       badgeColor: "red"   },
       { label: "Citadels",  to: "/terrain/citadels",    icon: Terminal,    badgeColor: "red"   },
+      { label: "Mesh",      to: "/terrain/mesh",        icon: Radio,       badgeColor: "red"   },
       // { label: "Persistence & Backdoors", to: "/terrain/persistence", icon: Server },
       // { label: "Identity & Access", to: "/terrain/identity", icon: ShieldCheck },
     ],
