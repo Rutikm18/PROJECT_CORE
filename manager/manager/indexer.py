@@ -1081,6 +1081,19 @@ class IntelDB:
         except Exception:
             await self._conn.rollback()
 
+        # 6b. Corrective backfill: developer_security findings were historically
+        # defaulted into the 'origin' terrain (before the mesh terrain existed).
+        # Move them to their own 'mesh' terrain. Idempotent — only touches rows
+        # still tagged origin/''.
+        try:
+            await self._conn.execute(
+                "UPDATE findings SET terrain_id='mesh' "
+                "WHERE category='developer_security' AND terrain_id IN ('origin', '')"
+            )
+            await self._conn.commit()
+        except Exception:
+            await self._conn.rollback()
+
         # 7. Backfill terrain_source for existing findings from their category.
         try:
             async with self._conn.execute(
