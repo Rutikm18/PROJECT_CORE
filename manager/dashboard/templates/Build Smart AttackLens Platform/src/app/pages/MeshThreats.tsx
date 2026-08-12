@@ -33,7 +33,7 @@ export const CAPABILITIES: Capability[] = [
   { key: "git",        label: "Git",         rules: ["AL-DEV-006"],               search: "Git execution" },
   { key: "credential", label: "Credentials", rules: ["AL-DEV-007"],               search: "Credential file" },
   { key: "listener",   label: "Listeners",   rules: ["AL-DEV-008"],               search: "listens on all" },
-  { key: "runtime",    label: "Runtime",     rules: ["AL-DEV-009"],               search: "container" },
+  { key: "runtime",    label: "Runtime",     rules: ["AL-DEV-009"],               search: "host-control" },
 ];
 
 const RULE_TO_CAP: Record<string, Capability> = {};
@@ -250,7 +250,7 @@ export default function MeshThreats() {
             </button>
           </div>
 
-          {stats.credentials > 0 && (
+          {stats.credentials > 0 && (capFilter === "all" || capFilter === "credential") && (
             <div className="flex items-start gap-2.5 px-3 py-2 bg-red-50 border border-red-200 rounded-xl ml-auto">
               <Shield className="w-3.5 h-3.5 text-red-600 flex-shrink-0 mt-0.5" />
               <div className="text-[10px] text-red-900 leading-relaxed">
