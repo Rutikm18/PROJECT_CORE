@@ -11,7 +11,7 @@
  * precisely from rule_id; a chip click filters the shared table via
  * initialSearch (each AL-DEV rule title contains its capability keyword).
  */
-import { useState, useMemo, type ReactNode } from "react";
+import { useState, useMemo, useEffect, type ReactNode } from "react";
 import {
   Radio, CheckCircle2, AlertTriangle, Shield, Database,
   ExternalLink, KeyRound, Puzzle, Activity,
@@ -41,6 +41,13 @@ for (const c of CAPABILITIES) for (const r of c.rules) RULE_TO_CAP[r] = c;
 
 export function capabilityForRule(ruleId?: string): Capability | undefined {
   return ruleId ? RULE_TO_CAP[ruleId] : undefined;
+}
+
+export function countPartialHosts(
+  rows?: { summary: { partial?: boolean } | null }[],
+): number {
+  if (!rows) return 0;
+  return rows.filter(r => r.summary?.partial === true).length;
 }
 
 // ── Cell renderers ──────────────────────────────────────────────────────────
@@ -105,6 +112,18 @@ export default function MeshThreats() {
 
   const { findings: raw } = useDetectionData(statsUrl);
 
+  const [partialHosts, setPartialHosts] = useState(0);
+  useEffect(() => {
+    let dead = false;
+    fetch("/api/v1/raw/query?section=developer_security&include_data=false&limit=50", { credentials: "include" })
+      .then(r => (r.ok ? r.json() : Promise.reject(r.status)))
+      .then((d: { rows?: { summary: { partial?: boolean } | null }[] }) => {
+        if (!dead) setPartialHosts(countPartialHosts(d.rows));
+      })
+      .catch(() => { /* silent — badge simply won't show */ });
+    return () => { dead = true; };
+  }, []);
+
   const capCounts = useMemo(() => {
     const m: Record<string, number> = {};
     for (const c of CAPABILITIES) m[c.key] = raw.filter(f => c.rules.includes(f.rule_id ?? "")).length;
@@ -164,6 +183,17 @@ export default function MeshThreats() {
             valueClass={stats.listeners > 0 ? "text-orange-600" : "text-gray-600"} />
         </div>
       </div>
+
+      {/* ── Partial-data banner ──────────────────────────────────────────── */}
+      {partialHosts > 0 && (
+        <div className="flex items-center gap-3 px-5 py-2 bg-amber-50 border-b border-amber-200">
+          <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+          <span className="text-[11px] text-amber-900 font-semibold">
+            {partialHosts} {partialHosts === 1 ? "host" : "hosts"} reported truncated deep-mesh telemetry —
+            some tooling was dropped at collection, so incident counts may be incomplete for those hosts.
+          </span>
+        </div>
+      )}
 
       {/* ── Filter controls ──────────────────────────────────────────────── */}
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-3 space-y-3">
