@@ -57,6 +57,7 @@ for _t, _cats in {
     "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app","open_file","storage"],
     "identity": ["user","identity","account","credential"],
     "posture":  ["security","posture","sip","firewall","agent_health","battery","hardware"],
+    "mesh":     ["developer_security"],
 }.items():
     for _c in _cats:
         CATEGORY_TO_TERRAIN[_c] = _t

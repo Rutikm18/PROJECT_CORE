@@ -465,7 +465,7 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
     @router.get("/all")
     async def all_findings(
         agent_id:  Optional[str] = Query(None),
-        terrain_id: Optional[str] = Query(None, description="citadels|vector|origin|identity|posture"),
+        terrain_id: Optional[str] = Query(None, description="citadels|vector|origin|identity|posture|mesh"),
         category:  Optional[str] = Query(None),
         severity:  Optional[str] = Query(None),
         status:    Optional[str] = Query(None),

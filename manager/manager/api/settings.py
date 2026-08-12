@@ -160,13 +160,14 @@ ALL_DEFAULTS: dict[str, str] = {**DEFAULTS, **VALIDATION_DEFAULTS}
 
 # Terrains shown in the dashboard sidebar. Order matters — UI renders them
 # in the same order.  Each maps to one or more finding categories.
-VALIDATION_TERRAINS: list[str] = ["citadels", "vector", "origin", "identity", "posture"]
+VALIDATION_TERRAINS: list[str] = ["citadels", "vector", "origin", "identity", "posture", "mesh"]
 VALIDATION_TERRAIN_CATEGORIES: dict[str, list[str]] = {
     "citadels": ["execution","process","script","container","persistence","service","task","malware"],
     "vector":   ["network","connection","port","arp","covert","lateral","mount"],
     "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app","open_file","storage"],
     "identity": ["user","identity","account","credential"],
     "posture":  ["security","posture","sip","firewall","agent_health","battery","hardware"],
+    "mesh":     ["developer_security"],
 }
 VALIDATION_TERRAIN_LABELS: dict[str, str] = {
     "citadels": "Citadels (Execution & Persistence)",
@@ -174,6 +175,7 @@ VALIDATION_TERRAIN_LABELS: dict[str, str] = {
     "origin":   "Origin (Surface, Packages, Configs)",
     "identity": "Identity (Accounts & Credentials)",
     "posture":  "Posture (Security Controls)",
+    "mesh":     "Mesh (Developer & Agent Tooling)",
 }
 VALIDATION_THRESHOLD_BOUNDS = (0.50, 1.00)   # inclusive — 0.50 floor prevents footgun
 
