@@ -395,6 +395,7 @@ const _TERRAIN_CHIP: Record<string, { label: string; cls: string }> = {
   citadels: { label: "Citadels", cls: "bg-red-50 text-red-700 border-red-200" },
   identity: { label: "Identity", cls: "bg-purple-50 text-purple-700 border-purple-200" },
   posture:  { label: "Posture",  cls: "bg-teal-50 text-teal-700 border-teal-200" },
+  mesh:     { label: "Mesh",     cls: "bg-violet-50 text-violet-700 border-violet-200" },
 };
 
 export function TerrainChip({ terrain }: { terrain?: string }) {
@@ -1178,6 +1179,7 @@ const TERRAIN_META: Record<string, { label: string; color: string; bg: string; b
   citadels: { label: "Citadels (Execution)",   color: "text-red-700",    bg: "bg-red-50",    border: "border-red-200" },
   identity: { label: "Identity (Accounts)",    color: "text-indigo-700", bg: "bg-indigo-50", border: "border-indigo-200" },
   posture:  { label: "Posture (Controls)",     color: "text-emerald-700",bg: "bg-emerald-50",border: "border-emerald-200" },
+  mesh:     { label: "Mesh (Developer & Agent)",color: "text-violet-700", bg: "bg-violet-50", border: "border-violet-200" },
 };
 
 function _parseTerrainValidation(raw: unknown):

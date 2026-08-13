@@ -30,7 +30,7 @@ import { useRefresh } from "../context/RefreshContext";
 const SEG: Record<string, string> = {
   dashboard: "Security Dashboard", findings: "Validated Findings",
   incidents: "All Incidents", terrain: "Attack Terrain",
-  origin: "Origin", vector: "Vector", citadels: "Citadels",
+  origin: "Origin", vector: "Vector", citadels: "Citadels", mesh: "Mesh",
   persistence: "Persistence & Backdoors", identity: "Identity & Access",
   posture: "Posture", overview: "Security Posture", compliance: "CIS Compliance",
   intelligence: "Threat Intelligence", ioc: "IOC Triage", cve: "CVE Intel",
@@ -55,6 +55,7 @@ const CMD = [
   { label: "Origin — Packages",     path: "/terrain/origin",        group: "Attack Terrain" },
   { label: "Vector — Network",      path: "/terrain/vector",        group: "Attack Terrain" },
   { label: "Citadels — Execution",  path: "/terrain/citadels",      group: "Attack Terrain" },
+  { label: "Mesh — Developer & Agent", path: "/terrain/mesh",       group: "Attack Terrain" },
   { label: "Identity & Access",     path: "/identity",              group: "Navigate" },
   { label: "Security Posture",      path: "/posture/overview",      group: "Navigate" },
   { label: "CIS Compliance",        path: "/posture/compliance",    group: "Navigate" },
