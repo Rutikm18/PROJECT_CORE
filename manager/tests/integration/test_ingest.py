@@ -110,10 +110,11 @@ def test_developer_security_payload_is_received_and_queryable(client):
     """Pin the new hourly snapshot's complete encrypted agent→manager path."""
     snapshot = {
         "schema_version": 1,
+        "collector_version": "macos-developer-security/2",
         "platform": "macos",
         "privacy": {"credential_values_collected": False},
         "capabilities": {"mcp_servers": {"servers": []}},
-        "collection": {"partial": False, "errors": []},
+        "collection": {"state": "complete", "partial": False, "errors": []},
     }
     sent = client.post(
         "/api/v1/ingest", json=_envelope("developer_security", snapshot)

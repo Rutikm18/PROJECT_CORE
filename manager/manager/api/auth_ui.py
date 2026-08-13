@@ -143,7 +143,9 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (pad % 4))
 
 
-def _make_token(email: str, role: str) -> tuple[str, str, float]:
+def _make_token(
+    email: str, role: str, tenant_id: str = "default",
+) -> tuple[str, str, float]:
     """Return (token, jti, exp_epoch)."""
     now  = time.time()
     exp  = now + _JWT_TTL_HOURS * 3600
@@ -152,6 +154,7 @@ def _make_token(email: str, role: str) -> tuple[str, str, float]:
     pay  = _b64url(json.dumps({
         "sub":  email,
         "role": role,
+        "tenant_id": str(tenant_id or "default")[:120],
         "jti":  jti,
         "iat":  int(now),
         "exp":  int(exp),

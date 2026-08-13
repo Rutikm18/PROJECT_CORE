@@ -10,6 +10,7 @@ is clamped to `now` rather than rejected, so mild client-clock skew is tolerated
 """
 from __future__ import annotations
 
+import math
 import time
 
 from shared.wire import WINDOW_SECONDS
@@ -25,9 +26,12 @@ def resolve_window(
     window: str | None = "1h",
     start: int | None = None,
     end: int | None = None,
-    now: int | None = None,
+    now: int | float | None = None,
 ) -> tuple[int, int]:
-    now = int(now if now is not None else time.time())
+    # Finding timestamps retain fractional seconds. Flooring `now` could make a
+    # just-created row newer than the relative window's end until the next
+    # clock tick, producing an intermittent empty dashboard after refresh.
+    now = math.ceil(now if now is not None else time.time())
 
     # Absolute mode wins when both bounds are given.
     if start is not None and end is not None:

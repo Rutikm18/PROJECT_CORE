@@ -339,6 +339,7 @@ SCHEMAS: dict[str, dict] = {
     "configs":     CONFIGS_RECORD,
     "developer_security": {
         "schema_version": int,
+        "collector_version": str,
         "platform": str,
         "scope": dict,
         "privacy": dict,

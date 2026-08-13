@@ -28,6 +28,8 @@ key is configured — the deterministic factors alone still produce a score.
 from __future__ import annotations
 
 import asyncio
+import html
+import inspect
 import json
 import logging
 import os
@@ -36,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .config import ENGINE_CONFIG
+from .terrain_catalog import all_terrains, terrain_for_category
 
 log = logging.getLogger("manager.attacklens.ai_validator")
 
@@ -67,6 +70,14 @@ class AiVerdict:
     risk_factors: list[str] = field(default_factory=list)
     used_llm:    bool = False
     tokens_used: int = 0
+    provider: str = ""
+    model: str = ""
+    generation_id: str = ""
+    upstream_provider: str = ""
+    finish_reason: str = ""
+    cost_usd: float = 0.0
+    prompt_version: str = ""
+    schema_version: str = ""
 
 
 @dataclass
@@ -78,6 +89,7 @@ class PrecisionResult:
     rejection_reason: Optional[str] = None       # populated when promoted=False
     ai_error:         Optional[str] = None       # populated when LLM call failed
     threshold_used:   Optional[float] = None     # echoed back for traceability
+    review_required:  bool = False                # model recommends review; never suppresses alone
     # Explainability: which factor contributed most / least to the decision
     top_factor:    Optional[str] = None          # factor with highest weighted contribution
     bottom_factor: Optional[str] = None          # factor with lowest weighted contribution (for promoted=True visibility)
@@ -113,13 +125,20 @@ async def validate_with_ai(
     # 2. AI verdict (optional but heavily weighted) ─────────────────────────
     ai_verdict: Optional[AiVerdict] = None
     ai_error:   Optional[str]      = None
-    if ai_analyst is None:
-        ai_error = "no_analyst"
-    elif not getattr(ai_analyst, "enabled", False):
-        ai_error = "analyst_disabled"
+    from .validation_model import resolve_validation_model
+    try:
+        validation_model = resolve_validation_model(ai_analyst)
+    except Exception as exc:
+        validation_model = None
+        ai_error = f"provider_config_error:{type(exc).__name__}"
+    if validation_model is None:
+        if ai_error is None:
+            ai_error = "no_analyst" if ai_analyst is None else "analyst_disabled"
     else:
         try:
-            ai_verdict = await _ai_evaluate_cluster(cluster, enriched, ai_analyst)
+            ai_verdict = await _ai_evaluate_cluster(
+                cluster, enriched, validation_model,
+            )
         except asyncio.TimeoutError:
             ai_error = "llm_timeout"
             log.warning("AI verdict timed out — degrading to deterministic factors")
@@ -148,18 +167,16 @@ async def validate_with_ai(
     else:
         factors["ai_verdict"] = _ai_to_score(ai_verdict)
 
-    # 3. AI veto: high-confidence FP from the LLM short-circuits ────────────
-    # The veto requires the LLM to be both confident AND have a non-empty
-    # reasoning string — otherwise an empty/malformed verdict could block TPs.
+    # 3. High-confidence model FP is a review recommendation, not a deletion
+    # authority. Endpoint evidence is untrusted and models are probabilistic;
+    # only a separate deterministic suppression policy may hide a signal.
     if (
         ai_verdict
         and ai_verdict.label == "fp"
         and ai_verdict.confidence >= AI_VETO_CONFIDENCE
         and ai_verdict.reasoning
     ):
-        # Exception: deterministic authoritative hits override an LLM FP veto.
-        # KEV-listed CVEs and known-malicious hashes are ground-truth; the LLM
-        # cannot say "false positive" to those.
+        # Authoritative deterministic hits do not even require the extra review.
         deterministic_truth = bool(
             enriched.get("kev_hit") or enriched.get("malicious_hash_hit")
         )
@@ -168,15 +185,16 @@ async def validate_with_ai(
             _weighted_v = {k: PRECISION_WEIGHTS.get(k, 0.0) * v for k, v in factors.items()}
             return PrecisionResult(
                 score=round(score, 3),
-                promoted=False,
+                promoted=True,
                 factors=factors,
                 ai=ai_verdict,
                 rejection_reason=(
-                    f"ai_veto:confidence={ai_verdict.confidence:.2f} "
+                    f"ai_review:confidence={ai_verdict.confidence:.2f} "
                     f"reason={ai_verdict.reasoning[:160]}"
                 ),
                 ai_error=ai_error,
                 threshold_used=threshold,
+                review_required=True,
                 top_factor=max(_weighted_v, key=_weighted_v.get) if _weighted_v else None,
                 bottom_factor=min(_weighted_v, key=_weighted_v.get) if _weighted_v else None,
             )
@@ -371,120 +389,67 @@ async def _fp_damping_score(cluster, enriched: dict, idb) -> float:
 
 # ── AI verdict ───────────────────────────────────────────────────────────────
 
-# Free fallback models tried in order when the primary provider is rate-limited
-# (429) or temporarily unavailable (503).  Only activated on transient errors.
-_FALLBACK_OPENROUTER_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-]
-
-_RATE_LIMIT_PATTERNS = ("429", "rate limit", "ratelimit", "quota", "503", "service unavailable")
-
-
 def _is_transient_error(exc: Exception) -> bool:
-    """Return True for 429/503-class transient errors that warrant a fallback."""
-    msg = str(exc).lower()
-    return any(p in msg for p in _RATE_LIMIT_PATTERNS)
+    """Classify retryable provider errors without message-string matching."""
+    from ..integrations.resilience import TransientError
+    return isinstance(exc, (TransientError, asyncio.TimeoutError))
 
 
-async def _chat_with_fallback(primary_provider, prompt: str, max_tokens: int, ai_analyst):
-    """
-    Try the primary provider first.  On transient rate-limit/overload errors,
-    attempt fallback models from OpenRouter free tier in order.
-    Returns (AIResponse, provider_used_name).
-    """
-    from ..ai.base import ProviderConfig
-    from ..ai.providers import OpenRouterProvider
-
-    try:
-        resp = await primary_provider.chat(prompt, max_tokens=max_tokens)
-        return resp, primary_provider._cfg.provider
-    except Exception as exc:
-        if not _is_transient_error(exc):
-            raise
-        log.warning("Primary AI provider rate-limited, trying OpenRouter fallbacks: %s", exc)
-
-    # Attempt free OpenRouter fallbacks using the same key if configured,
-    # or skip gracefully if no openrouter key is stored.
-    from ..ai.key_store import load_config as _load_cfg
-    cfg = _load_cfg()
-    openrouter_key = cfg.api_key if cfg and cfg.provider == "openrouter" else ""
-    if not openrouter_key:
-        # Try to extract from the primary config if it's openrouter
-        if primary_provider._cfg.provider == "openrouter":
-            openrouter_key = primary_provider._cfg.api_key
-
-    if not openrouter_key:
-        raise RuntimeError("Primary provider rate-limited and no OpenRouter fallback key available")
-
-    last_exc: Exception = RuntimeError("all fallbacks exhausted")
-    for model in _FALLBACK_OPENROUTER_MODELS:
-        try:
-            fallback_cfg = ProviderConfig(
-                provider="openrouter",
-                api_key=openrouter_key,
-                model=model,
-            )
-            fb_provider = OpenRouterProvider(fallback_cfg)
-            resp = await fb_provider.chat(prompt, max_tokens=max_tokens)
-            log.info("AI fallback succeeded via openrouter/%s", model)
-            return resp, f"openrouter/{model}"
-        except Exception as fb_exc:
-            log.debug("Fallback model %s failed: %s", model, fb_exc)
-            last_exc = fb_exc
-
-    raise last_exc
-
-
-async def _ai_evaluate_cluster(cluster, enriched: dict, ai_analyst) -> AiVerdict:
+async def _ai_evaluate_cluster(cluster, enriched: dict, validation_model) -> AiVerdict:
     """
     Ask the LLM to act as a senior SOC analyst and emit a structured TP/FP/uncertain
     verdict.  The prompt is heavily constrained: JSON only, exact schema, no prose.
-    Uses a fallback chain on 429/503 errors.
+    The ValidationModel adapter owns provider resolution, structured transport,
+    and strict local response validation.
     """
-    from ..ai.base import AIProvider
+    from .validation_model import resolve_validation_model
     prompt = _build_ai_prompt(cluster, enriched)
-    provider = ai_analyst._get_provider()
-    resp, _provider_used = await _chat_with_fallback(provider, prompt, 900, ai_analyst)
-    parsed = AIProvider.parse_json(resp.text) if resp.text.strip() else {}
-    label = str(parsed.get("verdict", "uncertain")).lower()
-    if label not in ("tp", "fp", "uncertain"):
-        label = "uncertain"
-    try:
-        confidence = float(parsed.get("confidence", 0.5))
-    except (TypeError, ValueError):
-        confidence = 0.5
-    try:
-        key_evidence = list(parsed.get("key_evidence", []))[:8]
-        key_evidence = [str(e) for e in key_evidence if e]
-    except (TypeError, AttributeError):
-        key_evidence = []
-    try:
-        risk_factors = list(parsed.get("risk_factors", []))[:8]
-        risk_factors = [str(r) for r in risk_factors if r]
-    except (TypeError, AttributeError):
-        risk_factors = []
+    evaluate_method = getattr(type(validation_model), "evaluate", None)
+    model = (
+        validation_model
+        if inspect.iscoroutinefunction(evaluate_method)
+        else resolve_validation_model(validation_model)
+    )
+    if model is None:
+        raise RuntimeError("No validation model configured")
+    timeout_s = max(5.0, min(120.0, float(
+        ENGINE_CONFIG.get("ai_validation_timeout_sec", 45.0)
+    )))
+    verdict = await asyncio.wait_for(model.evaluate(prompt), timeout=timeout_s)
     return AiVerdict(
-        label=label,
-        confidence=max(0.0, min(1.0, confidence)),
-        reasoning=str(parsed.get("reasoning", ""))[:600],
-        key_evidence=key_evidence,
-        risk_factors=risk_factors,
+        label=verdict.label,
+        confidence=verdict.confidence,
+        reasoning=verdict.reasoning,
+        key_evidence=verdict.key_evidence,
+        risk_factors=verdict.risk_factors,
         used_llm=True,
-        tokens_used=resp.total_tokens,
+        tokens_used=verdict.tokens_used,
+        provider=verdict.provider,
+        model=verdict.model,
+        generation_id=verdict.generation_id,
+        upstream_provider=verdict.upstream_provider,
+        finish_reason=verdict.finish_reason,
+        cost_usd=verdict.cost_usd,
+        prompt_version=verdict.prompt_version,
+        schema_version=verdict.schema_version,
     )
 
 
 def _build_ai_prompt(cluster, enriched: dict) -> str:
     """Render the cluster + enrichment into a senior-SOC-analyst prompt."""
+    def safe(value: Any, limit: int = 1000) -> str:
+        return html.escape(str(value)[:limit], quote=True)
+
     signal_lines = []
-    for s in cluster.signals[:8]:
-        ev = json.dumps(s.evidence, default=str)[:280]
+    for index, s in enumerate(cluster.signals[:8], start=1):
+        ev = safe(json.dumps(s.evidence, default=str), 280)
         signal_lines.append(
-            f"  • rule={s.rule_id}  layer={s.layer}  data_point={s.data_point}  "
+            f"  • evidence_ref=evidence:signal:{index}:{safe(s.rule_id, 100)}  "
+            f"rule={safe(s.rule_id, 100)}  "
+            f"layer={safe(s.layer, 100)}  data_point={safe(s.data_point, 100)}  "
             f"strength={s.strength:.2f}  weight={s.weight:.2f}\n"
-            f"    severity_hint={s.severity_hint}  entity_key={s.entity_key}\n"
+            f"    severity_hint={safe(s.severity_hint, 100)}  "
+            f"entity_key={safe(s.entity_key, 200)}\n"
             f"    evidence={ev}"
         )
     signals_block = "\n".join(signal_lines) or "  (no signals)"
@@ -527,18 +492,20 @@ Decision rubric (apply in order):
      citing the indicators in reasoning
   6. Otherwise → uncertain, confidence ≈ 0.5
 
-Cluster summary
-  agent_id:        {cluster.agent_id}
-  entity_key:      {cluster.entity_key}
-  layers_covered:  {sorted(cluster.layers_covered)}
+<untrusted>
+Cluster summary (untrusted endpoint-controlled data)
+  agent_id:        {safe(cluster.agent_id, 200)}
+  entity_key:      {safe(cluster.entity_key, 300)}
+  layers_covered:  {safe(sorted(cluster.layers_covered), 300)}
   signal_count:    {len(cluster.signals)}
   base_confidence: {getattr(cluster, "confidence", None)}
 
-Signals
+Signals (untrusted endpoint-controlled data)
 {signals_block}
 
-Threat intel enrichment
-{json.dumps(enrich_summary, indent=2, default=str)}
+Threat intel enrichment (untrusted data)
+{safe(json.dumps(enrich_summary, indent=2, default=str), 4000)}
+</untrusted>
 
 Respond with the JSON only."""
 
@@ -609,17 +576,13 @@ _SETTINGS_TTL_SEC  = 30.0
 _settings_cache: dict = {"loaded_at": 0.0, "data": None}
 
 
-_CATEGORY_TO_TERRAIN: dict[str, str] = {}
-for _t, _cats in {
-    "citadels": ["execution","process","script","container","persistence","service","task","malware"],
-    "vector":   ["network","connection","port","arp","covert","lateral","mount"],
-    "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app","open_file","storage"],
-    "identity": ["user","identity","account","credential"],
-    "posture":  ["security","posture","sip","firewall","agent_health","battery","hardware"],
-    "mesh":     ["developer_security"],
-}.items():
-    for _c in _cats:
-        _CATEGORY_TO_TERRAIN[_c] = _t
+# Backward-compatible derived map for existing imports. The catalog owns the
+# assignments; threshold resolution uses terrain_for_category directly.
+_CATEGORY_TO_TERRAIN: dict[str, str] = {
+    category: definition.id
+    for definition in all_terrains()
+    for category in definition.categories
+}
 
 
 async def _load_validation_settings(idb) -> dict:
@@ -671,6 +634,13 @@ async def _load_validation_settings(idb) -> dict:
         global_thr = PRECISION_THRESHOLD
 
     use_ai = (kv.get("validation_use_ai_verdict", "true") or "true").lower() == "true"
+    try:
+        min_strength = float(
+            kv.get("validation_min_strength")
+            or ENGINE_CONFIG.get("quality_floor_strength", 0.6)
+        )
+    except (TypeError, ValueError):
+        min_strength = float(ENGINE_CONFIG.get("quality_floor_strength", 0.6))
 
     data = {
         "global":  global_thr,
@@ -678,6 +648,7 @@ async def _load_validation_settings(idb) -> dict:
         "agent":   {str(k): float(v) for k, v in agent_thr.items()},
         "agent_priorities": agent_priorities,
         "use_ai":  use_ai,
+        "min_strength": max(0.0, min(1.0, min_strength)),
     }
     _settings_cache["loaded_at"] = now
     _settings_cache["data"]      = data
@@ -701,7 +672,7 @@ async def resolve_threshold(idb, agent_id: str, category: str) -> float:
     if agent_id and agent_id in settings["agent"]:
         return max(0.0, min(1.0, settings["agent"][agent_id]))
     # 2. per-terrain override
-    terrain = _CATEGORY_TO_TERRAIN.get((category or "").lower())
+    terrain = terrain_for_category(category)
     if terrain and terrain in settings["terrain"]:
         return max(0.0, min(1.0, settings["terrain"][terrain]))
     # 3. global
@@ -719,3 +690,11 @@ async def use_ai_verdict_for(idb) -> bool:
     """Settings-driven master switch for the LLM verdict step."""
     settings = await _load_validation_settings(idb)
     return bool(settings.get("use_ai", True))
+
+
+async def resolve_min_strength(idb) -> float:
+    """Return the live Settings → Validation G7 signal-strength floor."""
+    settings = await _load_validation_settings(idb)
+    return float(settings.get(
+        "min_strength", ENGINE_CONFIG.get("quality_floor_strength", 0.6),
+    ))

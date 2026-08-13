@@ -21,6 +21,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTimeRange } from "../context/TimeRangeContext";
+import { useRefresh } from "../context/RefreshContext";
 import { rangeToParams } from "../lib/timeRange";
 import { createPortal } from "react-dom";
 import {
@@ -46,6 +47,46 @@ import {
 } from "./DetectionShared";
 
 const SOC = "/api/v1/soc";
+export const VALIDATED_FINDINGS_URL = "/api/v1/detection/all";
+
+type ValidatedView = "active" | "closed" | "all";
+
+export function validatedFindingsQuery(view: ValidatedView): URLSearchParams {
+  return new URLSearchParams({ view, validated_only: "true" });
+}
+
+export interface ValidationRecomputeProgress {
+  job_uid: string;
+  state: "queued" | "running" | "completed" | "cancelled" | "error";
+  scanned: number;
+  updated: number;
+  histogram: Record<string, number>;
+  error?: string;
+}
+
+export async function runValidationRecompute(
+  request: typeof fetch = fetch,
+  onProgress?: (progress: ValidationRecomputeProgress) => void,
+): Promise<ValidationRecomputeProgress> {
+  let response = await request(
+    "/api/v1/settings/validation/recompute?batch_size=250",
+    { method: "POST" },
+  );
+  if (!response.ok) throw new Error(`Recompute failed (${response.status})`);
+  let progress = await response.json() as ValidationRecomputeProgress;
+  onProgress?.(progress);
+  for (let batches = 0; progress.state === "running" && batches < 400; batches++) {
+    response = await request(
+      `/api/v1/settings/validation/recompute/${progress.job_uid}/resume?batch_size=250`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new Error(`Recompute resume failed (${response.status})`);
+    progress = await response.json() as ValidationRecomputeProgress;
+    onProgress?.(progress);
+  }
+  if (progress.state === "error") throw new Error(progress.error || "Recompute job failed");
+  return progress;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -756,6 +797,7 @@ function FindingDetailPanel({
 export default function ThreatQueue() {
   const { can } = useRBAC();
   const { range } = useTimeRange();
+  const { refreshRevision, registerRefreshRequest } = useRefresh();
   const qs = rangeToParams(range).toString();
 
   // Data
@@ -795,7 +837,7 @@ export default function ThreatQueue() {
   const [detailId, setDetailId]   = useState<number | null>(null);
 
   // View mode — controls active_only / view param
-  const [viewMode, setViewMode]   = useState<"active" | "closed" | "all">("active");
+  const [viewMode, setViewMode]   = useState<ValidatedView>("active");
 
   // Filters
   const [catTab,   setCatTab]     = useState("all");
@@ -820,35 +862,46 @@ export default function ThreatQueue() {
 
 
   const load = useCallback(async () => {
-    const p = new URLSearchParams({ limit: "500", sort_by: sortKey, view: viewMode });
+    const settleRefresh = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
+    const p = validatedFindingsQuery(viewMode);
+    p.set("limit", "500");
+    p.set("sort_by", sortKey);
     if (severity) p.set("severity", severity);
     if (agentId)  p.set("agent_id", agentId);
     // Don't send status param when view=closed (backend handles terminal states)
     if (status && viewMode !== "closed") p.set("status", status);
     if (slaOnly)  p.set("sla_breached", "true");
     if (search)   p.set("search",   search);
-    // Validated Findings page — apply the user-configured threshold
-    // resolution (per-agent → per-terrain → global from Settings →
-    // Validation).  Closed/historical views skip it so analysts can audit
-    // past decisions even if thresholds were tightened later.
-    if (viewMode !== "closed") p.set("validated_only", "true");
+    // Validated Findings is always the validated projection. Historical
+    // review remains available by selecting a closed/all view within it.
     // Append global time window (first_detected_at filter).
     for (const [k, v] of new URLSearchParams(qs)) p.set(k, v);
     try {
-      const r = await fetch(`${SOC}/findings?${p}`);
+      const r = await fetch(`${VALIDATED_FINDINGS_URL}?${p}`);
       if (!r.ok) throw new Error(`${r.status}`);
       const d = await r.json();
       setFindings(d.findings ?? []);
       setEffectiveThresholds(d.effective_thresholds ?? null);
       setGlobalThreshold(typeof d.global_threshold === "number" ? d.global_threshold : null);
-      setFilterStats(d.stats ?? null);
+      setFilterStats(d.validation_filter_stats ?? null);
       setError(null);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); setLastSync(Math.floor(Date.now() / 1000)); }
-  }, [severity, status, agentId, slaOnly, search, sortKey, viewMode, qs]);
+    } catch (caught) {
+      requestError = caught;
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+      setLastSync(Math.floor(Date.now() / 1000));
+      settleRefresh(requestError);
+    }
+  }, [severity, status, agentId, slaOnly, search, sortKey, viewMode, qs, refreshRevision, registerRefreshRequest]);
 
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => { const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    if (range.kind === "absolute") return;
+    const timer = window.setInterval(() => void load(), 30_000);
+    return () => window.clearInterval(timer);
+  }, [load, range.kind]);
 
   const handleSearch = (v: string) => {
     setRawSearch(v);
@@ -1116,12 +1169,8 @@ export default function ThreatQueue() {
                   onClick={async () => {
                     setRescoring(true); setRescoreReport(null);
                     try {
-                      const r = await fetch("/api/v1/settings/validation/recompute", { method: "POST" });
-                      if (r.ok) {
-                        const d = await r.json();
-                        setRescoreReport(d);
-                        await load();
-                      }
+                      await runValidationRecompute(fetch, setRescoreReport);
+                      await load();
                     } finally { setRescoring(false); }
                   }}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300 text-white text-[10px] font-bold rounded-lg transition-colors">

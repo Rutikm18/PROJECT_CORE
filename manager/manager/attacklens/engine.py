@@ -1243,11 +1243,27 @@ class AttackLensEngine:
             from .terrain_validators import evaluate_finding
             tv = evaluate_finding(f, enriched, ai_verdict=None)
             f["terrain_validation"] = tv
+            f["terrain_score"] = tv["score"]
+            f["validation_score"] = tv["score"]
             # Replace the factor-only score with the terrain percentage so
             # the threshold filter (Settings → Validation) gates on the same
             # number the analyst sees in the UI checklist.
             score = tv["score"]
+            threshold = await resolve_threshold(
+                self._idb, agent_id, str(f.get("category") or ""),
+            )
+            f["effective_validation_threshold"] = round(float(threshold), 3)
+            f["validation_policy_version"] = "terrain-v1"
+            if score >= threshold:
+                f["validation_state"] = "validated"
+                f["validated_at"] = time.time()
+            else:
+                f["validation_state"] = "needs_review"
+                f["validated_at"] = 0
         except Exception as exc:
+            f["validation_state"] = "error"
+            f["validation_policy_version"] = "terrain-v1"
+            f["validated_at"] = 0
             log.debug("terrain_validation legacy error: %s", exc)
 
         f["precision_score"]    = round(score, 3)
@@ -1259,6 +1275,8 @@ class AttackLensEngine:
 
     async def _enrich_cluster(self, cluster) -> dict:
         """Gather threat-intel context using existing FeedManager + CVELookup."""
+        observed_at = time.time()
+        source_errors: dict[str, str] = {}
         cve_ids: set[str] = set()
         ips:     set[str] = set()
         hashes:  set[str] = set()
@@ -1314,6 +1332,7 @@ class AttackLensEngine:
                 kev_hit = any(self._feeds.is_kev_cve(c) for c in cve_ids)
             except Exception as exc:
                 log.debug("KEV lookup error: %s", exc)
+                source_errors["kev"] = type(exc).__name__
 
         # EPSS scores — bulk cache lookup first, then per-CVE live fetch only for misses.
         epss_scores: list[float] = []
@@ -1322,6 +1341,7 @@ class AttackLensEngine:
                 bulk = await self._feeds.bulk_epss(sorted(cve_ids))
             except Exception as exc:
                 log.debug("EPSS bulk lookup error: %s", exc)
+                source_errors["epss"] = type(exc).__name__
                 bulk = {}
             missing = [c for c in cve_ids if c not in bulk]
             for c, score in bulk.items():
@@ -1338,6 +1358,7 @@ class AttackLensEngine:
                         epss_scores.append(float(rec["epss"]))
                 except Exception as exc:
                     log.debug("EPSS lookup error for %s: %s", c, exc)
+                    source_errors.setdefault("epss", type(exc).__name__)
 
         # Malicious IP / hash IOC checks
         mal_ip = False
@@ -1346,6 +1367,7 @@ class AttackLensEngine:
                 mal_ip = any(self._feeds.is_malicious_ip(ip) for ip in ips)
             except Exception as exc:
                 log.debug("malicious IP lookup error: %s", exc)
+                source_errors["malicious_ip"] = type(exc).__name__
 
         mal_hash = False
         for h in hashes:
@@ -1355,6 +1377,7 @@ class AttackLensEngine:
                     break
             except Exception as exc:
                 log.debug("malicious hash lookup error for %s: %s", h, exc)
+                source_errors.setdefault("malicious_hash", type(exc).__name__)
 
         # Threat-intel source count: each independent corroborating source
         ti_count = (
@@ -1382,6 +1405,37 @@ class AttackLensEngine:
             "cve_ids":                   sorted(cve_ids),
             "malicious_ips":             sorted(ips) if mal_ip else [],
             "malicious_hashes":          sorted(hashes) if mal_hash else [],
+        }
+        source_hits = {
+            "kev": kev_hit,
+            "epss": bool(epss_scores),
+            "malicious_ip": mal_ip,
+            "malicious_hash": mal_hash,
+            "public_exploit": exploit_available,
+        }
+        source_freshness = {
+            name: {
+                "status": (
+                    "error" if name in source_errors
+                    else "available" if hit
+                    else "not_found"
+                ),
+                "observed_at": observed_at,
+                "source_updated_at": observed_at,
+                "age_seconds": 0.0,
+                "stale": False,
+                "error": source_errors.get(name, ""),
+            }
+            for name, hit in source_hits.items()
+        }
+        enriched["_source_errors"] = source_errors
+        enriched["_source_freshness"] = source_freshness
+        enriched["_corroboration_stage"] = {
+            "name": "authoritative_corroboration",
+            "status": "partial" if source_errors else "complete",
+            "sources_used": sorted(name for name, hit in source_hits.items() if hit),
+            "source_errors": source_errors,
+            "freshness": source_freshness,
         }
         try:
             priority = await resolve_agent_priority(self._idb, cluster.agent_id)
@@ -1435,6 +1489,7 @@ class AttackLensEngine:
             "asset_importance":      enriched.get("asset_importance", 0),
             "kev":                   enriched.get("kev_hit", False),
             "epss_score":            max(enriched.get("epss_scores") or [0]),
+            "validation_corroboration": enriched.get("_corroboration_stage", {}),
         }
         if enriched.get("asset_priority_level"):
             f["precision_factors"] = {
@@ -1447,7 +1502,7 @@ class AttackLensEngine:
         # Stamp the AI precision verdict and per-factor breakdown so analysts
         # and the dashboard can audit *why* this finding was promoted.
         if precision is not None:
-            f["precision_score"]   = precision.score
+            f["model_precision_score"] = precision.score
             factors = dict(precision.factors)
             if enriched.get("asset_priority_level"):
                 factors.update({
@@ -1465,6 +1520,14 @@ class AttackLensEngine:
                     "key_evidence": precision.ai.key_evidence,
                     "risk_factors": precision.ai.risk_factors,
                     "tokens_used":  precision.ai.tokens_used,
+                    "provider":     precision.ai.provider,
+                    "model":        precision.ai.model,
+                    "generation_id": precision.ai.generation_id,
+                    "upstream_provider": precision.ai.upstream_provider,
+                    "finish_reason": precision.ai.finish_reason,
+                    "cost_usd":     precision.ai.cost_usd,
+                    "prompt_version": precision.ai.prompt_version,
+                    "schema_version": precision.ai.schema_version,
                 }
                 # Add a structured tag so the UI can filter for AI-validated findings.
                 f["tags"] = list(f["tags"]) + [f"ai:{precision.ai.label}"]
@@ -1481,6 +1544,10 @@ class AttackLensEngine:
                     ),
                 }
             f["evidence"] = ev
+            if precision.ai_error:
+                error_class, _, error_detail = precision.ai_error.partition(":")
+                f["validation_error_class"] = error_class
+                f["validation_error"] = error_detail or precision.ai_error
 
         # ── Terrain validation — the analyst-facing per-criterion checklist.
         # This is what the Validated Findings page filters on (precision_score
@@ -1490,10 +1557,74 @@ class AttackLensEngine:
             ai_dict = f.get("ai_verdict") if isinstance(f.get("ai_verdict"), dict) else None
             tv = evaluate_finding(f, enriched, ai_dict)
             f["terrain_validation"] = tv
-            # Make terrain score the canonical precision number so the
-            # Validated Findings threshold filter "just works".
+            f["terrain_score"] = tv["score"]
+            f["validation_score"] = tv["score"]
+            # Keep precision_score as a compatibility projection while new
+            # callers migrate to the explicitly named score fields.
             f["precision_score"] = tv["score"]
+            threshold = (
+                precision.threshold_used
+                if precision is not None and precision.threshold_used is not None
+                else None
+            )
+            if threshold is None:
+                try:
+                    threshold = await resolve_threshold(
+                        self._idb, cluster.agent_id, f["category"],
+                    )
+                except Exception:
+                    threshold = float(ENGINE_CONFIG.get("ai_precision_threshold", 0.90))
+            f["effective_validation_threshold"] = round(float(threshold), 3)
+            f["validation_policy_version"] = "terrain-v1"
+            if tv["score"] >= float(threshold):
+                f["validation_state"] = "validated"
+                f["validated_at"] = ts
+            else:
+                f["validation_state"] = "needs_review"
+                f["validated_at"] = 0
+            if precision is not None and precision.review_required:
+                f["validation_state"] = "needs_review"
+                f["validated_at"] = 0
+                f["validation_review_reason"] = precision.rejection_reason or "ai_review"
+            from .validation_error_policy import decide_validation_error
+            authoritative = bool(
+                enriched.get("kev_hit") or enriched.get("malicious_hash_hit")
+            )
+            if precision is not None and precision.ai_error:
+                model_policy = decide_validation_error(
+                    "model", sev, precision.ai_error,
+                    authoritative_evidence=authoritative,
+                )
+                f["validation_error_policy"] = {
+                    "stage": "model",
+                    "state": model_policy.state,
+                    "action": model_policy.action,
+                    "reason": model_policy.reason,
+                }
+                if model_policy.state == "needs_review":
+                    f["validation_state"] = "needs_review"
+                    f["validated_at"] = 0
+                    f["validation_review_reason"] = model_policy.reason
+            if enriched.get("_source_errors"):
+                corroboration_policy = decide_validation_error(
+                    "corroboration", sev, "source_unavailable",
+                    authoritative_evidence=authoritative,
+                )
+                f["validation_corroboration"]["error_policy"] = {
+                    "state": corroboration_policy.state,
+                    "action": corroboration_policy.action,
+                    "reason": corroboration_policy.reason,
+                }
+                if corroboration_policy.state == "needs_review":
+                    f["validation_state"] = "needs_review"
+                    f["validated_at"] = 0
+                    f["validation_review_reason"] = corroboration_policy.reason
         except Exception as exc:
+            f["validation_state"] = "error"
+            f["validation_policy_version"] = "terrain-v1"
+            f["validated_at"] = 0
+            f["validation_error_class"] = "terrain_evaluation_error"
+            f["validation_error"] = type(exc).__name__
             log.warning("terrain_validation error agent=%s: %s", cluster.agent_id, exc)
 
         composite = score_matrix.compute(f, agent_id=cluster.agent_id, collected_ts=ts)

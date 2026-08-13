@@ -53,25 +53,14 @@ from pathlib import Path
 from typing import Any
 
 from .index import TelemetryIndex
+from shared.wire import WINDOW_SECONDS
 
 log = logging.getLogger("manager.store")
 
-# ── Time window → tier mapping ───────────────────────────────────────────────
-WINDOW_SECONDS: dict[str, int] = {
-    "5m":  300,
-    "15m": 900,
-    "1h":  3600,
-    "8h":  28800,
-    "1d":  86400,
-    "7d":  604800,
-    "30d": 2592000,
-    "90d": 7776000,
-}
-
 # Windows where we query only hot tier
-_HOT_WINDOWS  = {"5m", "15m"}
+_HOT_WINDOWS  = {"30s", "1m", "5m", "15m"}
 # Windows where we query warm tier (hourly rollup data)
-_WARM_WINDOWS = {"1h", "8h", "1d", "7d", "30d"}
+_WARM_WINDOWS = {"1h", "6h", "8h", "1d", "7d", "15d", "30d"}
 # Windows where we query cold tier (daily rollup data)
 _COLD_WINDOWS = {"30d", "90d"}
 

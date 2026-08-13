@@ -6,71 +6,183 @@
  *   • Status filter row: All | New | Triaging | Investigating | In Remediation | Remediated
  *   • View toggle: List (table) | Timeline (day-grouped chronological)
  *   • Validated / All toggle
- *   • Case Management slide-over (localStorage-backed ALCase objects)
+ *   • Case Management slide-over (transactional backend + legacy import)
  *   • Severity distribution strip across all findings
  */
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useEffect } from "react";
+import { useSearchParams } from "react-router";
 import {
   Layers, CheckCircle2, Globe, Network, Shield, User, Activity,
   Clock, LayoutList, GitBranch, Plus, X, ChevronDown, ChevronRight,
   AlertTriangle, Briefcase, Tag, Calendar, Database, Radio,
-  TrendingUp, Zap,
+  Share2, TrendingUp, Zap,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { useTerrainCatalog, type TerrainMeta } from "../lib/terrainCatalog";
 import { TerrainDetectionPage, TerrainChip, useDetectionData, type DetectionFinding } from "./DetectionShared";
+import {
+  createCase as createCaseRecord,
+  importLegacyCases as importLegacyCaseRecords,
+  listCases as listCaseRecords,
+  updateCase as updateCaseRecord,
+} from "../lib/caseClient";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type TerrainTab = "all" | "origin" | "vector" | "citadels" | "identity" | "posture";
+type TerrainTab = string;
 type StatusTab  = "all" | "new" | "triaging" | "investigating" | "in_remediation" | "remediated";
 type ViewMode   = "list" | "timeline";
+
+export interface IncidentQueryState {
+  terrain: TerrainTab;
+  status: StatusTab;
+  validated: boolean;
+  view: ViewMode;
+}
+
+export function parseIncidentQuery(params: URLSearchParams): IncidentQueryState {
+  const status = params.get("status");
+  const view = params.get("view");
+  return {
+    terrain: params.get("terrain") || "all",
+    status: (["all", "new", "triaging", "investigating", "in_remediation", "remediated"].includes(status || "")
+      ? status : "all") as StatusTab,
+    validated: params.get("validated") === "1",
+    view: view === "timeline" ? "timeline" : "list",
+  };
+}
+
+export function updateIncidentQuery(
+  current: URLSearchParams,
+  state: IncidentQueryState,
+): URLSearchParams {
+  const next = new URLSearchParams(current);
+  const setOrDelete = (key: string, value: string, defaultValue: string) => {
+    if (value === defaultValue) next.delete(key); else next.set(key, value);
+  };
+  setOrDelete("terrain", state.terrain, "all");
+  setOrDelete("status", state.status, "all");
+  setOrDelete("view", state.view, "list");
+  if (state.validated) next.set("validated", "1"); else next.delete("validated");
+  return next;
+}
 
 type CasePriority = "critical" | "high" | "medium" | "low";
 type CaseStatus   = "open" | "in_progress" | "resolved" | "closed";
 
 export interface ALCase {
-  id:          string;
+  id:          number | string;
+  external_id?: string;
   title:       string;
   description: string;
   priority:    CasePriority;
   status:      CaseStatus;
   assignee:    string;
+  owner_user_id?: string;
   tags:        string[];
   findings:    number[];
   created_at:  number;
   updated_at:  number;
+  version?:     number;
 }
 
 // ── Case management helpers ────────────────────────────────────────────────────
 
-function loadCases(): ALCase[] {
+function loadLegacyCases(): ALCase[] {
   try { return JSON.parse(localStorage.getItem("al_cases") ?? "[]"); }
   catch { return []; }
 }
-function saveCases(cases: ALCase[]) {
-  localStorage.setItem("al_cases", JSON.stringify(cases));
+
+export function parseCaseList(value: unknown): ALCase[] {
+  if (!value || typeof value !== "object") return [];
+  const rows = (value as { cases?: unknown }).cases;
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row): row is Record<string, unknown> => !!row && typeof row === "object")
+    .map((row) => ({
+      id: (typeof row.id === "number" || typeof row.id === "string") ? row.id : "",
+      external_id: typeof row.external_id === "string" ? row.external_id : "",
+      title: typeof row.title === "string" ? row.title : "Untitled case",
+      description: typeof row.description === "string" ? row.description : "",
+      priority: (["critical", "high", "medium", "low"].includes(String(row.priority))
+        ? row.priority : "medium") as CasePriority,
+      status: (["open", "in_progress", "resolved", "closed"].includes(String(row.status))
+        ? row.status : "open") as CaseStatus,
+      assignee: typeof row.owner_user_id === "string" ? row.owner_user_id : "",
+      owner_user_id: typeof row.owner_user_id === "string" ? row.owner_user_id : "",
+      tags: Array.isArray(row.tags) ? row.tags.filter((tag): tag is string => typeof tag === "string") : [],
+      findings: Array.isArray(row.findings) ? row.findings.filter((id): id is number => typeof id === "number") : [],
+      created_at: typeof row.created_at === "number" ? row.created_at * 1000 : 0,
+      updated_at: typeof row.updated_at === "number" ? row.updated_at * 1000 : 0,
+      version: typeof row.version === "number" ? row.version : 1,
+    }));
 }
-function createCase(draft: Omit<ALCase, "id" | "created_at" | "updated_at">): ALCase {
-  const now = Date.now();
-  const id  = `CASE-${now.toString(36).toUpperCase()}`;
-  const c: ALCase = { ...draft, id, created_at: now, updated_at: now };
-  saveCases([...loadCases(), c]);
-  return c;
+
+export function countOpenCases(value: unknown): number {
+  return parseCaseList(value).filter((record) => record.status !== "closed").length;
+}
+
+type CaseDraft = Omit<ALCase, "id" | "external_id" | "created_at" | "updated_at" | "version" | "owner_user_id">;
+
+export function buildCaseCreatePayload(draft: CaseDraft) {
+  return {
+    title: draft.title,
+    description: draft.description,
+    priority: draft.priority,
+    status: draft.status,
+    owner_user_id: draft.assignee,
+    tags: draft.tags,
+    finding_ids: draft.findings,
+  };
+}
+
+export function buildLegacyCaseImport(values: unknown[]) {
+  return {
+    cases: values.filter((value): value is Record<string, unknown> => (
+      !!value && typeof value === "object"
+      && typeof (value as Record<string, unknown>).title === "string"
+      && Boolean(String((value as Record<string, unknown>).title).trim())
+    )),
+  };
 }
 
 // ── Terrain tab config ─────────────────────────────────────────────────────────
 
-const TERRAIN_TABS: {
-  key: TerrainTab; label: string; icon: React.ReactNode;
-  activeCls: string; dotCls: string;
-}[] = [
-  { key: "all",      label: "All",      icon: <Layers  className="w-3 h-3" />,  activeCls: "bg-orange-500 text-white border-orange-500", dotCls: "bg-orange-400" },
-  { key: "origin",   label: "Origin",   icon: <Globe   className="w-3 h-3" />,  activeCls: "bg-amber-500 text-white border-amber-500",  dotCls: "bg-amber-400"  },
-  { key: "vector",   label: "Vector",   icon: <Network className="w-3 h-3" />,  activeCls: "bg-blue-600 text-white border-blue-600",   dotCls: "bg-blue-400"   },
-  { key: "citadels", label: "Citadels", icon: <Shield  className="w-3 h-3" />,  activeCls: "bg-red-600 text-white border-red-600",     dotCls: "bg-red-400"    },
-  { key: "identity", label: "Identity", icon: <User    className="w-3 h-3" />,  activeCls: "bg-indigo-600 text-white border-indigo-600", dotCls: "bg-indigo-400" },
-  { key: "posture",  label: "Posture",  icon: <Activity className="w-3 h-3" />, activeCls: "bg-emerald-600 text-white border-emerald-600", dotCls: "bg-emerald-400" },
-];
+const TERRAIN_PRESENTATION: Record<string, {
+  icon: React.ReactNode; activeCls: string; dotCls: string;
+}> = {
+  origin:   { icon: <Globe className="w-3 h-3" />, activeCls: "bg-amber-500 text-white border-amber-500", dotCls: "bg-amber-400" },
+  vector:   { icon: <Network className="w-3 h-3" />, activeCls: "bg-blue-600 text-white border-blue-600", dotCls: "bg-blue-400" },
+  citadels: { icon: <Shield className="w-3 h-3" />, activeCls: "bg-red-600 text-white border-red-600", dotCls: "bg-red-400" },
+  identity: { icon: <User className="w-3 h-3" />, activeCls: "bg-indigo-600 text-white border-indigo-600", dotCls: "bg-indigo-400" },
+  posture:  { icon: <Activity className="w-3 h-3" />, activeCls: "bg-emerald-600 text-white border-emerald-600", dotCls: "bg-emerald-400" },
+  mesh:     { icon: <Share2 className="w-3 h-3" />, activeCls: "bg-cyan-600 text-white border-cyan-600", dotCls: "bg-cyan-400" },
+};
+
+export function buildIncidentTerrainTabs(terrains: TerrainMeta[]) {
+  return [{
+    key: "all", label: "All", icon: <Layers className="w-3 h-3" />,
+    activeCls: "bg-orange-500 text-white border-orange-500", dotCls: "bg-orange-400",
+  }, ...terrains.map((terrain) => ({
+    key: terrain.id,
+    label: terrain.label,
+    ...(TERRAIN_PRESENTATION[terrain.id] ?? {
+      icon: <Layers className="w-3 h-3" />,
+      activeCls: "bg-gray-700 text-white border-gray-700",
+      dotCls: "bg-gray-400",
+    }),
+  }))];
+}
+
+export function countIncidentsByTerrain(
+  findings: Array<{ terrain_id?: string; terrain?: string }>,
+): Record<string, number> {
+  const counts: Record<string, number> = {};
+  findings.forEach((finding) => {
+    const terrain = finding.terrain_id || finding.terrain;
+    if (terrain) counts[terrain] = (counts[terrain] ?? 0) + 1;
+  });
+  return counts;
+}
 
 const STATUS_TABS: { key: StatusTab; label: string; dotCls: string }[] = [
   { key: "all",            label: "All",            dotCls: "bg-gray-400"   },
@@ -360,30 +472,81 @@ const STATUS_LABEL: Record<CaseStatus, string> = {
 };
 
 function CaseManagementPanel({ onClose }: { onClose: () => void }) {
-  const [cases,    setCases]   = useState<ALCase[]>(loadCases);
+  const [cases,    setCases]   = useState<ALCase[]>([]);
   const [showNew,  setShowNew] = useState(false);
   const [tagInput, setTagInput] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [legacyCases, setLegacyCases] = useState<ALCase[]>(() => (
+    localStorage.getItem("al_cases_migrated") ? [] : loadLegacyCases()
+  ));
   const [draft, setDraft] = useState({
     title: "", description: "", priority: "high" as CasePriority,
     status: "open" as CaseStatus, assignee: "", tags: [] as string[], findings: [] as number[],
   });
 
-  const refresh = () => setCases(loadCases());
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const records = await listCaseRecords({ limit: 100 });
+      setCases(records.map(row => ({
+        ...row,
+        assignee: row.owner_user_id,
+        created_at: row.created_at * 1000,
+        updated_at: row.updated_at * 1000,
+      })));
+      setError("");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to load cases");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
-  const submit = () => {
-    if (!draft.title.trim()) return;
-    createCase(draft);
-    setDraft({ title: "", description: "", priority: "high", status: "open", assignee: "", tags: [], findings: [] });
-    setTagInput("");
-    setShowNew(false);
-    refresh();
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const submit = async () => {
+    if (!draft.title.trim() || saving) return;
+    setSaving(true);
+    try {
+      await createCaseRecord(buildCaseCreatePayload(draft));
+      setDraft({ title: "", description: "", priority: "high", status: "open", assignee: "", tags: [], findings: [] });
+      setTagInput("");
+      setShowNew(false);
+      await refresh();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to create case");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const closeCase = (id: string) => {
-    saveCases(loadCases().map(c =>
-      c.id === id ? { ...c, status: "closed" as CaseStatus, updated_at: Date.now() } : c
-    ));
-    refresh();
+  const closeCase = async (caseRecord: ALCase) => {
+    if (typeof caseRecord.id !== "number") return;
+    try {
+      await updateCaseRecord(caseRecord.id, caseRecord.version ?? 1, { status: "closed" });
+      await refresh();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to close case");
+    }
+  };
+
+  const importLegacy = async () => {
+    if (!legacyCases.length || saving) return;
+    setSaving(true);
+    try {
+      localStorage.setItem("al_cases_migration_backup", JSON.stringify(legacyCases));
+      await importLegacyCaseRecords(buildLegacyCaseImport(legacyCases).cases);
+      localStorage.setItem("al_cases_migrated", new Date().toISOString());
+      localStorage.removeItem("al_cases");
+      setLegacyCases([]);
+      await refresh();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to import local cases");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const openCases = cases.filter(c => c.status !== "closed");
@@ -394,7 +557,7 @@ function CaseManagementPanel({ onClose }: { onClose: () => void }) {
       <div className="flex-1 bg-black/40 backdrop-blur-[1px]" onClick={onClose} />
 
       {/* Panel */}
-      <div className="w-[460px] bg-white shadow-2xl flex flex-col h-full overflow-hidden">
+      <div className="w-full sm:w-[min(460px,100vw)] max-w-full bg-white shadow-2xl flex flex-col h-dvh overflow-hidden">
 
         {/* Header gradient */}
         <div className="h-1 bg-gradient-to-r from-orange-400 via-amber-400 to-orange-500 flex-shrink-0" />
@@ -421,6 +584,25 @@ function CaseManagementPanel({ onClose }: { onClose: () => void }) {
             </button>
           </div>
         </div>
+
+        {legacyCases.length > 0 && (
+          <div className="mx-5 mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 flex items-center justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-bold text-amber-800">{legacyCases.length} local case{legacyCases.length === 1 ? "" : "s"} found</p>
+              <p className="text-[9px] text-amber-700">Import to the backend; a browser backup is kept.</p>
+            </div>
+            <button onClick={() => void importLegacy()} disabled={saving} className="text-[9px] font-bold rounded-md bg-amber-600 text-white px-2.5 py-1.5 disabled:opacity-50">
+              Import
+            </button>
+          </div>
+        )}
+
+        {error && (
+          <div className="mx-5 mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[10px] text-red-700 flex items-center justify-between gap-2">
+            <span>{error}</span>
+            <button onClick={() => void refresh()} className="font-bold underline">Retry</button>
+          </div>
+        )}
 
         {/* New case form */}
         {showNew && (
@@ -499,10 +681,11 @@ function CaseManagementPanel({ onClose }: { onClose: () => void }) {
                 Cancel
               </button>
               <button
-                onClick={submit}
-                className="px-4 py-1.5 text-[10px] font-bold bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-all shadow-sm"
+                onClick={() => void submit()}
+                disabled={saving}
+                className="px-4 py-1.5 text-[10px] font-bold bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-all shadow-sm disabled:opacity-50"
               >
-                Create Case
+                {saving ? "Saving…" : "Create Case"}
               </button>
             </div>
           </div>
@@ -510,7 +693,9 @@ function CaseManagementPanel({ onClose }: { onClose: () => void }) {
 
         {/* Case list */}
         <div className="flex-1 overflow-y-auto">
-          {cases.length === 0 ? (
+          {loading ? (
+            <div className="flex items-center justify-center h-40 text-[10px] text-gray-400">Loading cases…</div>
+          ) : cases.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-48 text-gray-400">
               <Briefcase className="w-8 h-8 mb-2 opacity-20" />
               <p className="text-[11px] font-semibold">No cases yet</p>
@@ -543,7 +728,7 @@ function CaseManagementPanel({ onClose }: { onClose: () => void }) {
                       )}
 
                       <div className="flex items-center gap-3 mt-2 flex-wrap">
-                        <span className="text-[9px] font-mono text-gray-400">{c.id}</span>
+                        <span className="text-[9px] font-mono text-gray-400">{c.external_id || c.id}</span>
                         {c.assignee && (
                           <span className="flex items-center gap-1 text-[9px] text-gray-400">
                             <User className="w-2.5 h-2.5" />{c.assignee}
@@ -560,7 +745,7 @@ function CaseManagementPanel({ onClose }: { onClose: () => void }) {
 
                     {c.status !== "closed" && (
                       <button
-                        onClick={() => closeCase(c.id)}
+                        onClick={() => void closeCase(c)}
                         className="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0 px-2 py-1 text-[9px] font-bold text-gray-500 hover:text-red-600 border border-gray-200 hover:border-red-200 rounded-lg"
                       >
                         Close
@@ -617,19 +802,63 @@ function TimelineViewWrapper({
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
-export default function Incidents() {
-  const [terrain,       setTerrain]       = useState<TerrainTab>("all");
-  const [statusTab,     setStatusTab]     = useState<StatusTab>("all");
-  const [validatedOnly, setValidatedOnly] = useState(false);
-  const [viewMode,      setViewMode]      = useState<ViewMode>("list");
+function IncidentsPage() {
+  const [incidentParams, setIncidentParams] = useSearchParams();
+  const initialQuery = useMemo(() => parseIncidentQuery(incidentParams), []); // URL at mount
+  const terrainCatalog = useTerrainCatalog();
+  const terrainTabs = useMemo(
+    () => buildIncidentTerrainTabs(terrainCatalog),
+    [terrainCatalog],
+  );
+  const [terrain,       setTerrain]       = useState<TerrainTab>(initialQuery.terrain);
+  const [statusTab,     setStatusTab]     = useState<StatusTab>(initialQuery.status);
+  const [validatedOnly, setValidatedOnly] = useState(initialQuery.validated);
+  const [viewMode,      setViewMode]      = useState<ViewMode>(initialQuery.view);
   const [showCases,     setShowCases]     = useState(false);
+  const [openCaseCount, setOpenCaseCount] = useState(0);
+
+  const selectQuery = useCallback((patch: Partial<IncidentQueryState>) => {
+    const next = {
+      terrain, status: statusTab, validated: validatedOnly, view: viewMode, ...patch,
+    };
+    setTerrain(next.terrain);
+    setStatusTab(next.status);
+    setValidatedOnly(next.validated);
+    setViewMode(next.view);
+    setIncidentParams(updateIncidentQuery(incidentParams, next));
+  }, [incidentParams, setIncidentParams, statusTab, terrain, validatedOnly, viewMode]);
+
+  // Browser back/forward and shared links are authoritative.
+  useEffect(() => {
+    const next = parseIncidentQuery(incidentParams);
+    setTerrain(next.terrain);
+    setStatusTab(next.status);
+    setValidatedOnly(next.validated);
+    setViewMode(next.view);
+  }, [incidentParams]);
+
+  // Case badges must never block the incident page. The old implementation
+  // called an undefined synchronous `loadCases()` during render, which caused
+  // a ReferenceError before the queue could open. Load the count defensively;
+  // the case drawer performs the authoritative refresh when opened.
+  useEffect(() => {
+    let cancelled = false;
+    void listCaseRecords({ limit: 100 })
+      .then((records) => {
+        if (!cancelled) setOpenCaseCount(records.filter((record) => record.status !== "closed").length);
+      })
+      .catch(() => {
+        if (!cancelled) setOpenCaseCount(0);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   // Fetch all findings for domain stats + terrain counts
   const statsUrl  = validatedOnly
     ? "/api/v1/detection/all?validated_only=true"
     : "/api/v1/detection/all";
   const statsSep = statsUrl.includes("?") ? "&" : "?";
-  const { findings: allRaw } = useDetectionData(`${statsUrl}${statsSep}limit=1000`);
+  const { findings: allRaw, error: statsError, refetch: refetchStats } = useDetectionData(`${statsUrl}${statsSep}limit=1000`);
 
   // Domain-level stats
   const stats = useMemo(() => ({
@@ -641,14 +870,7 @@ export default function Incidents() {
   }), [allRaw]);
 
   // Per-terrain counts for chip badges
-  const terrainCounts = useMemo(() => {
-    const counts: Record<string, number> = { origin: 0, vector: 0, citadels: 0, identity: 0, posture: 0 };
-    allRaw.forEach(f => {
-      const t = (f as any).terrain as string;
-      if (t && t in counts) counts[t]++;
-    });
-    return counts;
-  }, [allRaw]);
+  const terrainCounts = useMemo(() => countIncidentsByTerrain(allRaw), [allRaw]);
 
   // Table API URL
   const apiUrl = validatedOnly
@@ -658,8 +880,6 @@ export default function Incidents() {
   const terrainFilter = terrain === "all" ? "" : terrain;
   const statusFilter  = statusTab === "all" ? "" : statusTab;
   const pageKey = `${terrain}:${statusTab}:${validatedOnly}`;
-
-  const openCaseCount = loadCases().filter(c => c.status !== "closed").length;
 
   return (
     <div className="space-y-0 pb-6">
@@ -680,14 +900,14 @@ export default function Incidents() {
             {/* View toggle */}
             <div className="inline-flex bg-gray-100 rounded-lg p-0.5">
               <button
-                onClick={() => setViewMode("list")}
+                onClick={() => selectQuery({ view: "list" })}
                 className={cn("inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-[10px] font-bold transition-all",
                   viewMode === "list" ? "bg-white text-orange-600 shadow-sm" : "text-gray-500 hover:text-gray-700")}
               >
                 <LayoutList className="w-3 h-3" />List
               </button>
               <button
-                onClick={() => setViewMode("timeline")}
+                onClick={() => selectQuery({ view: "timeline" })}
                 className={cn("inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-[10px] font-bold transition-all",
                   viewMode === "timeline" ? "bg-white text-orange-600 shadow-sm" : "text-gray-500 hover:text-gray-700")}
               >
@@ -723,18 +943,28 @@ export default function Incidents() {
         {allRaw.length > 0 && <SeverityBar findings={allRaw} />}
       </div>
 
+      {statsError && (
+        <div className="mx-5 mt-3 flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[10px] text-red-700">
+          <span className="flex items-center gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+            Incident summary could not be loaded. Existing results are preserved; retry to refresh.
+          </span>
+          <button type="button" onClick={refetchStats} className="font-bold underline">Retry</button>
+        </div>
+      )}
+
       {/* ── Filter controls ───────────────────────────────────────────────────── */}
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-3 space-y-3">
 
         {/* Row 1 — Terrain chips with counts */}
         <div className="flex items-center gap-2 flex-wrap">
-          {TERRAIN_TABS.map(t => {
+          {terrainTabs.map(t => {
             const count = t.key === "all" ? allRaw.length : (terrainCounts[t.key] ?? 0);
             const isActive = terrain === t.key;
             return (
               <button
                 key={t.key}
-                onClick={() => setTerrain(t.key)}
+                onClick={() => selectQuery({ terrain: t.key })}
                 className={cn(
                   "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-bold border transition-all",
                   isActive ? t.activeCls + " shadow-sm" : "bg-white text-gray-600 border-gray-200 hover:border-gray-300 hover:bg-gray-50"
@@ -766,7 +996,7 @@ export default function Incidents() {
               return (
                 <button
                   key={s.key}
-                  onClick={() => setStatusTab(s.key)}
+                  onClick={() => selectQuery({ status: s.key })}
                   className={cn(
                     "flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-semibold border transition-all",
                     isActive
@@ -793,13 +1023,13 @@ export default function Incidents() {
 
           <div className="ml-auto inline-flex bg-gray-100 rounded-lg p-0.5">
             <button
-              onClick={() => setValidatedOnly(false)}
+              onClick={() => selectQuery({ validated: false })}
               className={cn("px-3 py-1.5 rounded-md text-[10px] font-bold transition-all", !validatedOnly ? "bg-white text-orange-600 shadow-sm" : "text-gray-500 hover:text-gray-700")}
             >
               All Incidents
             </button>
             <button
-              onClick={() => setValidatedOnly(true)}
+              onClick={() => selectQuery({ validated: true })}
               className={cn("flex items-center gap-1 px-3 py-1.5 rounded-md text-[10px] font-bold transition-all", validatedOnly ? "bg-white text-emerald-600 shadow-sm" : "text-gray-500 hover:text-gray-700")}
             >
               <CheckCircle2 className="w-3 h-3" />Validated
@@ -812,7 +1042,7 @@ export default function Incidents() {
       {viewMode === "list" ? (
         <TerrainDetectionPage
           key={pageKey}
-          title={terrain === "all" ? "All Incidents" : `${TERRAIN_TABS.find(t => t.key === terrain)?.label} Incidents`}
+          title={terrain === "all" ? "All Incidents" : `${terrainTabs.find(t => t.key === terrain)?.label ?? terrain} Incidents`}
           subtitle={
             validatedOnly
               ? "Findings that passed the configured validation threshold"
@@ -846,5 +1076,44 @@ export default function Incidents() {
       {/* ── Case panel ────────────────────────────────────────────────────────── */}
       {showCases && <CaseManagementPanel onClose={() => setShowCases(false)} />}
     </div>
+  );
+}
+
+class IncidentsErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-6 text-center">
+        <AlertTriangle className="h-8 w-8 text-red-500" />
+        <div>
+          <h2 className="text-sm font-bold text-red-800">All Incidents could not open</h2>
+          <p className="mt-1 max-w-md text-[11px] text-red-700">The queue hit an unexpected UI error. Reload the page to retry the current incident view.</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="rounded-xl bg-red-600 px-3 py-2 text-[10px] font-bold text-white hover:bg-red-700"
+        >
+          Reload All Incidents
+        </button>
+      </div>
+    );
+  }
+}
+
+export default function Incidents() {
+  return (
+    <IncidentsErrorBoundary>
+      <IncidentsPage />
+    </IncidentsErrorBoundary>
   );
 }

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 import uuid
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +15,18 @@ _SENSITIVE_ENV = re.compile(
 )
 _TEMP_PATH = re.compile(r"^/(?:tmp|private/tmp|var/tmp)(?:/|$)", re.I)
 _SHELL_EXEC = {"child_process", "exec", "spawn", "shell", "eval"}
+
+RULE_SPECS: dict[str, dict[str, str]] = {
+    "AL-DEV-001": {"asset": "editor extension", "condition": "auto activation AND command execution AND side-loaded/unverified publisher", "boundary": "all three anchors are required"},
+    "AL-DEV-002": {"asset": "MCP server", "condition": "mutable @latest reference OR unpinned ephemeral runner with sensitive/capability access", "boundary": "an ephemeral runner alone is not sufficient"},
+    "AL-DEV-003": {"asset": "PATH directory", "condition": "world-writable executable search path entry", "boundary": "unknown or non-world-writable modes are silent"},
+    "AL-DEV-004": {"asset": "browser extension", "condition": "native messaging AND at least one dangerous browser/host permission", "boundary": "both anchors are required"},
+    "AL-DEV-005": {"asset": "native messaging host", "condition": "temporary executable path OR group/world-writable executable", "boundary": "ordinary 0755 read/execute access is safe"},
+    "AL-DEV-006": {"asset": "Git configuration", "condition": "core.hooksPath or core.sshCommand execution override", "boundary": "unrelated Git settings are silent"},
+    "AL-DEV-007": {"asset": "credential location", "condition": "group/other read or write permission on a credential-related file", "boundary": "owner-only 0600 and directories are silent"},
+    "AL-DEV-008": {"asset": "developer listener", "condition": "interesting developer/AI process AND wildcard bind", "boundary": "loopback or unrelated wildcard listeners are silent"},
+    "AL-DEV-009": {"asset": "developer container", "condition": "privileged, host network, Docker socket/root bind, or SYS_ADMIN posture", "boundary": "ordinary bridge containers are silent"},
+}
 
 
 def _items(capabilities: dict[str, Any], name: str, key: str = "items") -> list[dict[str, Any]]:
@@ -30,6 +44,11 @@ def _mode_exposes_secret(mode: Any) -> bool:
     return any(text[index] != "-" for index in (4, 5, 7, 8))
 
 
+def _mode_is_group_or_world_writable(mode: Any) -> bool:
+    text = str(mode or "")
+    return len(text) >= 10 and text[0] != "d" and any(text[index] == "w" for index in (5, 8))
+
+
 def _hit(
     rule_id: str,
     severity: str,
@@ -43,6 +62,12 @@ def _hit(
     item_key: str,
 ) -> dict[str, Any]:
     score = {"critical": 9.5, "high": 8.0, "medium": 5.5, "low": 3.0}[severity]
+    fingerprint_payload = json.dumps(
+        {"rule_id": rule_id, "item_key": item_key, "evidence": evidence},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return {
         "alert_id": str(uuid.uuid4()),
         "rule_id": rule_id,
@@ -69,6 +94,7 @@ def _hit(
         "cve_ids": [],
         "cvss_score": None,
         "cvss_vector": None,
+        "detection_fingerprint": hashlib.sha256(fingerprint_payload.encode()).hexdigest(),
     }
 
 
@@ -89,7 +115,9 @@ def _extension_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
             "A side-loaded or unverified editor extension automatically activates and contains command-execution indicators.",
             {"id": extension_id, "editor": row.get("editor"), "user": row.get("user"),
              "auto_activates": True, "indicators": sorted(indicators),
-             "installed_from_vsix": bool(row.get("installed_from_vsix"))},
+             "installed_from_vsix": bool(row.get("installed_from_vsix")),
+             "unknown_publisher": bool(row.get("unknown_publisher")),
+             "side_loaded": side_loaded},
             technique="T1204.002", tactic="Execution",
             action="Disable the extension, verify its publisher and source, and review its entrypoint before re-enabling it.",
             item_key=f"extension:{row.get('user')}:{row.get('editor')}:{extension_id}",
@@ -152,7 +180,7 @@ def _browser_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
             "AL-DEV-004", "high", "Browser extension combines native messaging with broad permissions",
             "The extension can access native applications and has sensitive browser or host permissions.",
             {"id": extension_id, "browser": row.get("browser"), "user": row.get("user"),
-             "dangerous_permissions": permissions},
+             "native_messaging": True, "dangerous_permissions": permissions},
             technique="T1176", tactic="Persistence",
             action="Verify the extension ID and native host pairing, then remove permissions that are not required.",
             item_key=f"browser_extension:{row.get('user')}:{row.get('browser')}:{extension_id}",
@@ -160,7 +188,11 @@ def _browser_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
     for row in _items(capabilities, "native_messaging"):
         executable = str(row.get("executable") or "")
         meta = row.get("executable_meta") if isinstance(row.get("executable_meta"), dict) else {}
-        if not executable or (not _TEMP_PATH.search(executable) and not _mode_exposes_secret(meta.get("mode"))):
+        if not executable or (
+            not row.get("executable_temporary")
+            and not _TEMP_PATH.search(executable)
+            and not _mode_is_group_or_world_writable(meta.get("mode"))
+        ):
             continue
         hits.append(_hit(
             "AL-DEV-005", "high", "Native messaging host uses an unsafe executable",
@@ -240,7 +272,8 @@ def _runtime_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
             "AL-DEV-009", "critical", "Developer container has host-control capabilities",
             "A developer container is privileged, uses host networking, mounts the Docker socket or host root, or adds SYS_ADMIN.",
             {"id": container_id, "name": row.get("name"), "privileged": row.get("privileged"),
-             "network_mode": row.get("network_mode"), "binds": row.get("binds"), "cap_add": row.get("cap_add")},
+             "network_mode": row.get("network_mode"), "binds": row.get("binds"),
+             "cap_add": row.get("cap_add"), "high_risk": True},
             technique="T1611", tactic="Privilege Escalation",
             action="Recreate the container without privileged mode, host networking, sensitive binds, or SYS_ADMIN.",
             item_key=f"developer_container:{container_id}",
@@ -276,4 +309,4 @@ async def analyze(
     return hits
 
 
-__all__ = ["analyze"]
+__all__ = ["RULE_SPECS", "analyze"]

@@ -175,6 +175,11 @@ def make_accuracy_router(intel_db: "IntelDB") -> APIRouter:
         """
         return await intel_db.compute_confidence_metrics()
 
+    @router.get("/validation")
+    async def validation_metrics(hours: int = Query(24, ge=1, le=2160)):
+        """Validation states, errors, model cost/latency, FP rate, and alerts."""
+        return await intel_db.get_validation_observability(hours=hours)
+
     return router
 
 

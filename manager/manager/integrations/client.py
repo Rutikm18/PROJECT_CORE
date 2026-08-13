@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
@@ -186,10 +188,16 @@ class ResilientHTTPClient:
 
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
-    """Parse a Retry-After header (seconds form; HTTP-date form ignored)."""
+    """Parse Retry-After delta-seconds or the RFC HTTP-date form."""
     if not value:
         return None
     try:
-        return float(value)
+        return max(0.0, float(value))
     except (ValueError, TypeError):
-        return None
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            return max(0.0, when.timestamp() - datetime.now(UTC).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            return None

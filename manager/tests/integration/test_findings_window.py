@@ -6,7 +6,9 @@ Run: python3 -m pytest manager/tests/integration/test_findings_window.py -v
 """
 import time
 import pytest
-from fastapi.testclient import TestClient
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+from manager.manager.api.findings import make_findings_router
 from manager.manager.indexer import IntelDB
 
 
@@ -34,12 +36,12 @@ async def seed_findings(intel_db):
         row = await intel_db._fetchone(
             """
             INSERT INTO findings
-              (fingerprint, agent_id, category, title, severity, score,
+              (external_id, fingerprint, agent_id, category, item_key, title, severity, score,
                first_detected_at, last_detected_at, is_active, status, terrain_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$7,1,'new','origin')
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,1,'new','origin')
             RETURNING id
             """,
-            (f"fp-{title}", "agent-test", "test", title, "medium", 0.5, ts),
+            (f"test-{title}", f"fp-{title}", "agent-test", "test", title, title, "medium", 0.5, ts),
         )
         return row["id"]
 
@@ -50,12 +52,12 @@ async def seed_findings(intel_db):
         row = await intel_db._fetchone(
             """
             INSERT INTO findings
-              (fingerprint, agent_id, category, title, severity, score,
+              (external_id, fingerprint, agent_id, category, item_key, title, severity, score,
                first_detected_at, last_detected_at, is_active, status, terrain_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'new','origin')
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1,'new','origin')
             RETURNING id
             """,
-            (f"fp-{title}", "agent-test", "test", title, "medium", 0.5, first_ts, last_ts),
+            (f"test-{title}", f"fp-{title}", "agent-test", "test", title, title, "medium", 0.5, first_ts, last_ts),
         )
         return row["id"]
 
@@ -70,44 +72,44 @@ async def seed_findings(intel_db):
 
 
 @pytest.fixture
-def client(intel_db):
-    from manager.manager.server import create_app
-    from manager.manager.db import Database
-    # Create a minimal app with just the findings router wired to our test intel_db.
-    # We reuse the app-factory pattern and override the intel_db dependency.
-    app = create_app.__wrapped__(intel_db=intel_db)  # best-effort; adjust if create_app signature differs
-    return TestClient(app)
+async def client(intel_db):
+    app = FastAPI()
+    app.include_router(make_findings_router(intel_db), prefix="/api/v1/soc")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as value:
+        yield value
 
 
-def test_findings_list_filters_by_window(client, seed_findings):
+async def test_findings_list_filters_by_window(client, seed_findings):
     now = seed_findings["now"]
-    r = client.get("/api/v1/soc/findings", params={"window": "1h"})
+    r = await client.get("/api/v1/soc/findings", params={"window": "1h"})
     assert r.status_code == 200
     ids = {f["id"] for f in r.json()["findings"]}
     assert seed_findings["recent_id"] in ids
     assert seed_findings["old_id"] not in ids
 
 
-def test_old_but_active_finding_shows_in_short_window(client, seed_findings):
+async def test_old_but_active_finding_shows_in_short_window(client, seed_findings):
     """Interval-overlap: a finding first seen long ago but re-detected seconds
     ago is a live threat and MUST appear in a 1h window (regression: the old
     first_detected_at-only filter hid it, emptying short windows)."""
-    r = client.get("/api/v1/soc/findings", params={"window": "1h"})
+    r = await client.get("/api/v1/soc/findings", params={"window": "1h"})
     assert r.status_code == 200
     ids = {f["id"] for f in r.json()["findings"]}
     assert seed_findings["old_active_id"] in ids
 
 
-def test_findings_list_absolute_range(client, seed_findings):
+async def test_findings_list_absolute_range(client, seed_findings):
     now = seed_findings["now"]
-    r = client.get("/api/v1/soc/findings",
-                   params={"start": now - 5000, "end": now - 3000})
+    r = await client.get("/api/v1/soc/findings",
+                         params={"start": now - 5000, "end": now - 3000})
     assert r.status_code == 200
     ids = {f["id"] for f in r.json()["findings"]}
     assert seed_findings["mid_id"] in ids
     assert seed_findings["recent_id"] not in ids
 
 
-def test_findings_list_bad_range_422(client):
-    r = client.get("/api/v1/soc/findings", params={"start": 100, "end": 50})
+async def test_findings_list_bad_range_422(client):
+    r = await client.get("/api/v1/soc/findings", params={"start": 100, "end": 50})
     assert r.status_code == 422

@@ -3,7 +3,7 @@ manager/manager/attacklens/terrain_validators.py — Terrain-aware Validated
 Findings scoring.
 
 Each finding belongs to exactly one *attack terrain* (Citadels / Vector /
-Origin / Identity / Posture).  Within that terrain we evaluate a fixed,
+Origin / Identity / Posture / Mesh).  Within that terrain we evaluate a fixed,
 named list of criteria — KEV listing, AI verdict, exploitability, posture
 status, etc. — and compute a weighted percentage.  The Validated Findings
 page filters at the analyst-configured threshold (Settings → Validation).
@@ -45,27 +45,31 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from .terrain_catalog import (
+    UNCLASSIFIED_TERRAIN_ID,
+    all_terrains,
+    terrain_for_category,
+)
+
 log = logging.getLogger("manager.attacklens.terrain_validators")
 
 
-# ── Terrain mapping (mirrors api/settings.py) ───────────────────────────────
-
-CATEGORY_TO_TERRAIN: dict[str, str] = {}
-for _t, _cats in {
-    "citadels": ["execution","process","script","container","persistence","service","task","malware"],
-    "vector":   ["network","connection","port","arp","covert","lateral","mount"],
-    "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app","open_file","storage"],
-    "identity": ["user","identity","account","credential"],
-    "posture":  ["security","posture","sip","firewall","agent_health","battery","hardware"],
-    "mesh":     ["developer_security"],
-}.items():
-    for _c in _cats:
-        CATEGORY_TO_TERRAIN[_c] = _t
+# Backward-compatible export for callers that iterate category assignments.
+# The source of truth lives in terrain_catalog.py.
+CATEGORY_TO_TERRAIN: dict[str, str] = {
+    category: definition.id
+    for definition in all_terrains()
+    for category in definition.categories
+}
 
 
 def terrain_for(finding: dict) -> str:
+    explicit = str(finding.get("terrain_id") or "").strip().lower()
+    known_ids = {definition.id for definition in all_terrains()}
+    if explicit in known_ids or explicit == UNCLASSIFIED_TERRAIN_ID:
+        return explicit
     cat = (finding.get("category") or "").lower()
-    return CATEGORY_TO_TERRAIN.get(cat, "origin")   # default → most permissive
+    return terrain_for_category(cat) or UNCLASSIFIED_TERRAIN_ID
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -508,12 +512,153 @@ POSTURE_CRITERIA: list[dict] = [
 ]
 
 
+def _mesh_rule_id(f: dict) -> str:
+    """Return the stable DeepMesh rule ID from either persisted field."""
+    rule_id = str(f.get("rule_id") or "")
+    if rule_id.startswith("AL-DEV-"):
+        return rule_id
+    source = str(f.get("source") or "")
+    return source if source.startswith("AL-DEV-") else ""
+
+
+def _mesh_rule_evidence_complete(f: dict) -> float:
+    """Check the minimum persisted evidence required to reproduce each rule."""
+    rule_id = _mesh_rule_id(f)
+    ev = _ev(f)
+    checks = {
+        "AL-DEV-001": lambda: ev.get("auto_activates") is True and bool(ev.get("indicators")),
+        "AL-DEV-002": lambda: bool(ev.get("name")) and bool(
+            ev.get("uses_latest") or ev.get("uses_unpinned_ephemeral_runner")
+        ),
+        "AL-DEV-003": lambda: bool(ev.get("paths")),
+        "AL-DEV-004": lambda: bool(ev.get("id")) and bool(ev.get("dangerous_permissions")),
+        "AL-DEV-005": lambda: bool(ev.get("executable")) and bool(ev.get("manifest")),
+        "AL-DEV-006": lambda: bool(ev.get("settings")) and bool(ev.get("keys")),
+        "AL-DEV-007": lambda: bool(ev.get("path")) and bool(ev.get("mode")),
+        "AL-DEV-008": lambda: bool(ev.get("endpoint") or ev.get("port")),
+        "AL-DEV-009": lambda: bool(ev.get("id") or ev.get("name")) and bool(
+            ev.get("privileged")
+            or ev.get("network_mode") == "host"
+            or ev.get("binds")
+            or ev.get("cap_add")
+        ),
+    }
+    check = checks.get(rule_id)
+    return 1.0 if check is not None and check() else 0.0
+
+
+def _mesh_execution_capability(f: dict) -> float:
+    ev = _ev(f)
+    if _mesh_rule_id(f) == "AL-DEV-001" and ev.get("auto_activates") and ev.get("indicators"):
+        return 1.0
+    if _mesh_rule_id(f) in {"AL-DEV-002", "AL-DEV-005", "AL-DEV-006"}:
+        return 1.0
+    return 0.0
+
+
+def _mesh_mutable_or_untrusted(f: dict) -> float:
+    ev = _ev(f)
+    if ev.get("uses_latest") or ev.get("uses_unpinned_ephemeral_runner"):
+        return 1.0
+    if ev.get("installed_from_vsix") or ev.get("unknown_publisher"):
+        return 1.0
+    if str(ev.get("executable") or "").startswith(("/tmp/", "/private/tmp/", "/var/tmp/")):
+        return 0.8
+    return 0.0
+
+
+def _mesh_sensitive_access(f: dict) -> float:
+    ev = _ev(f)
+    if ev.get("sensitive_env_keys") or _mesh_rule_id(f) == "AL-DEV-007":
+        return 1.0
+    if ev.get("dangerous_permissions") or ev.get("binds"):
+        return 0.7
+    return 0.0
+
+
+def _mesh_unsafe_permissions_or_privilege(f: dict) -> float:
+    ev = _ev(f)
+    if ev.get("privileged") or ev.get("network_mode") == "host":
+        return 1.0
+    if ev.get("paths") or ev.get("binds") or ev.get("cap_add"):
+        return 0.8
+    if _mesh_rule_id(f) in {"AL-DEV-005", "AL-DEV-007"} and ev.get("mode"):
+        return 0.8
+    return 0.0
+
+
+def _mesh_external_exposure(f: dict) -> float:
+    ev = _ev(f)
+    if _mesh_rule_id(f) == "AL-DEV-008":
+        return 1.0
+    if ev.get("network_mode") == "host":
+        return 0.8
+    if _mesh_rule_id(f) == "AL-DEV-004" and ev.get("dangerous_permissions"):
+        return 0.5
+    return 0.0
+
+
+MESH_CRITERIA: list[dict] = [
+    {
+        "name": "rule_evidence_complete",
+        "label": "Rule evidence complete",
+        "description": "The persisted evidence contains the minimum fields required to reproduce the DeepMesh rule decision.",
+        "weight": 0.35,
+        "anchor": True,
+        "evaluate": lambda f, e: _mesh_rule_evidence_complete(f),
+    },
+    {
+        "name": "execution_capability",
+        "label": "Effective execution capability",
+        "description": "The developer component can automatically or indirectly execute commands on the endpoint.",
+        "weight": 0.15,
+        "evaluate": lambda f, e: _mesh_execution_capability(f),
+    },
+    {
+        "name": "mutable_or_untrusted_source",
+        "label": "Mutable or untrusted source",
+        "description": "The component is unpinned, side-loaded, unverified, or launched from a mutable location.",
+        "weight": 0.15,
+        "evaluate": lambda f, e: _mesh_mutable_or_untrusted(f),
+    },
+    {
+        "name": "sensitive_access",
+        "label": "Sensitive data access",
+        "description": "The component can receive credentials, broad browser permissions, or sensitive host mounts.",
+        "weight": 0.15,
+        "evaluate": lambda f, e: _mesh_sensitive_access(f),
+    },
+    {
+        "name": "unsafe_permissions_or_privilege",
+        "label": "Unsafe permissions or privilege",
+        "description": "File permissions, container privileges, capabilities, or host mounts expand control beyond the intended boundary.",
+        "weight": 0.10,
+        "evaluate": lambda f, e: _mesh_unsafe_permissions_or_privilege(f),
+    },
+    {
+        "name": "external_exposure",
+        "label": "External exposure",
+        "description": "A developer service or native bridge is reachable outside its expected local trust boundary.",
+        "weight": 0.05,
+        "evaluate": lambda f, e: _mesh_external_exposure(f),
+    },
+    {
+        "name": "ai_verdict_tp",
+        "label": "AI analyst verdict",
+        "description": "An optional LLM review agrees that the observed DeepMesh evidence is actionable.",
+        "weight": 0.05,
+        "evaluate": lambda f, e, ai=None: _ai_score(ai),
+    },
+]
+
+
 TERRAIN_CRITERIA: dict[str, list[dict]] = {
     "origin":   ORIGIN_CRITERIA,
     "vector":   VECTOR_CRITERIA,
     "citadels": CITADELS_CRITERIA,
     "identity": IDENTITY_CRITERIA,
     "posture":  POSTURE_CRITERIA,
+    "mesh":     MESH_CRITERIA,
 }
 
 
@@ -542,7 +687,7 @@ def evaluate_finding(
     """
     enriched = enriched or {}
     terrain  = terrain_for(finding)
-    criteria = TERRAIN_CRITERIA.get(terrain, ORIGIN_CRITERIA)
+    criteria = TERRAIN_CRITERIA.get(terrain, [])
 
     items: list[dict] = []
     total_score    = 0.0

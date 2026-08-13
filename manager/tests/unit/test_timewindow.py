@@ -27,6 +27,9 @@ def test_relative_preset_resolves_to_now_minus_seconds():
 def test_default_window_is_1h():
     assert resolve_window(None, now=NOW) == (NOW - 3600, NOW)
 
+def test_relative_window_includes_the_current_fractional_second():
+    assert resolve_window("30s", now=NOW + 0.75) == (NOW - 29, NOW + 1)
+
 def test_unknown_preset_raises():
     with pytest.raises(WindowError):
         resolve_window("13h", now=NOW)

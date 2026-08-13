@@ -39,6 +39,41 @@ from .scorer    import EnhancedScorer
 
 log = logging.getLogger("manager.intel.pipeline")
 
+_SOURCE_MAX_AGE_SECONDS = {
+    "exploitdb": 7 * 86400,
+    "metasploit": 7 * 86400,
+}
+
+
+def build_source_freshness(
+    source_names: list[str],
+    sources: dict[str, Any],
+    errors: dict[str, str],
+    *,
+    observed_at: float,
+    source_health: Optional[dict] = None,
+) -> dict[str, dict]:
+    """Build source provenance without treating a miss as a source failure."""
+    health = source_health or {}
+    freshness: dict[str, dict] = {}
+    for name in source_names:
+        details = health.get(name) if isinstance(health.get(name), dict) else {}
+        source_updated_at = float(details.get("loaded_at") or observed_at)
+        age_seconds = max(0.0, observed_at - source_updated_at)
+        max_age = _SOURCE_MAX_AGE_SECONDS.get(name)
+        error = str(errors.get(name) or "")
+        freshness[name] = {
+            "status": (
+                "error" if error else "available" if name in sources else "not_found"
+            ),
+            "observed_at": observed_at,
+            "source_updated_at": source_updated_at,
+            "age_seconds": round(age_seconds, 3),
+            "stale": bool(max_age is not None and age_seconds > max_age),
+            "error": error,
+        }
+    return freshness
+
 
 class IntelPipeline:
     """
@@ -133,8 +168,16 @@ class IntelPipeline:
 
         validation = self._validator.cross_validate(cid, sources)
         enriched   = self._merge(cid, sources, validation)
+        fetched_at = time.time()
         enriched["_source_errors"] = s_errors
-        enriched["_fetched_at"]    = time.time()
+        enriched["_fetched_at"]    = fetched_at
+        enriched["_source_freshness"] = build_source_freshness(
+            keys,
+            sources,
+            s_errors,
+            observed_at=fetched_at,
+            source_health=self.get_source_health(),
+        )
         return enriched
 
     async def bulk_enrich(self, cve_ids: list[str], concurrency: int = 5) -> list[dict]:

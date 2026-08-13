@@ -277,6 +277,20 @@ async def set_task_model(body: TaskModelRequest) -> dict:
         raise HTTPException(422, detail=f"Invalid task '{body.task}'. Valid: {sorted(_VALID_TASKS)}")
     if body.provider not in _VALID_PROVIDERS:
         raise HTTPException(422, detail=f"Invalid provider '{body.provider}'. Valid: {_VALID_PROVIDERS}")
+    saved_config = load_config()
+    if saved_config is None:
+        raise HTTPException(
+            422,
+            detail="Configure and test a provider credential before assigning a task model",
+        )
+    if body.provider != saved_config.provider:
+        raise HTTPException(
+            422,
+            detail=(
+                f"The saved credential belongs to '{saved_config.provider}', not "
+                f"'{body.provider}'. Configure that provider credential first."
+            ),
+        )
     valid_models = PROVIDER_MODELS.get(body.provider, [])
     if body.model not in valid_models:
         raise HTTPException(

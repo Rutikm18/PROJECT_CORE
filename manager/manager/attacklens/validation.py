@@ -186,9 +186,13 @@ async def _g6_recent_fp(cluster, enriched: dict, idb, _feeds, _manager_db) -> Va
     return ValidationResult(True)
 
 
-async def _g7_quality_floor(cluster, _enriched: dict, _idb, _feeds, _manager_db) -> ValidationResult:
+async def _g7_quality_floor(cluster, _enriched: dict, idb, _feeds, _manager_db) -> ValidationResult:
     """At least one signal must meet the minimum strength floor."""
-    floor = ENGINE_CONFIG["quality_floor_strength"]
+    try:
+        from .ai_validator import resolve_min_strength
+        floor = await resolve_min_strength(idb)
+    except Exception:
+        floor = float(ENGINE_CONFIG["quality_floor_strength"])
     strong = [s for s in cluster.signals if s.strength >= floor]
     if not strong:
         return ValidationResult(

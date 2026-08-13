@@ -7,7 +7,7 @@ export function useWindowedData<T>(
   fetcher: (a: { qs: string; signal: AbortSignal }) => Promise<T>,
 ) {
   const { range } = useTimeRange();
-  const { refreshNonce } = useRefresh();
+  const { refreshRevision, registerRefreshRequest } = useRefresh();
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
@@ -19,6 +19,8 @@ export function useWindowedData<T>(
     acRef.current?.abort();
     const ac = new AbortController();
     acRef.current = ac;
+    const settleRefresh = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     setLoading(true);
     fetcher({ qs, signal: ac.signal })
       .then((d) => {
@@ -29,12 +31,16 @@ export function useWindowedData<T>(
         }
       })
       .catch((e) => {
-        if (!ac.signal.aborted) setError(e);
+        if (!ac.signal.aborted) {
+          requestError = e;
+          setError(e);
+        }
       })
       .finally(() => {
         if (!ac.signal.aborted) setLoading(false);
+        settleRefresh(requestError);
       });
-  }, [qs, fetcher, refreshNonce]);
+  }, [qs, fetcher, refreshRevision, registerRefreshRequest]);
 
   useEffect(() => {
     run();

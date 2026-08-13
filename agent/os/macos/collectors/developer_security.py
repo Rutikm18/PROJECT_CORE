@@ -32,6 +32,7 @@ from .base import BaseCollector, _get_env, run_budget_remaining
 
 
 _SCHEMA_VERSION = 1
+_COLLECTOR_VERSION = "macos-developer-security/2"
 _MAX_ITEMS = 500
 _MAX_FILES = 400
 _MAX_TEXT = 512 * 1024
@@ -68,6 +69,7 @@ _DANGEROUS_BROWSER_PERMS = {
     "nativemessaging", "debugger", "management", "webrequest", "downloads",
 }
 _SECRET_FILE = re.compile(r"^\.env($|\.)|credential|token|secret|config\.json$", re.I)
+_TEMP_PATH = re.compile(r"^/(?:tmp|private/tmp|var/tmp)(?:/|$)", re.I)
 
 
 def _clip(value: Any, limit: int = _MAX_FIELD) -> str:
@@ -124,13 +126,37 @@ def _hash_line(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
 
 
+def _privacy_path(value: Any) -> str:
+    """Apply the configured reversible-by-operator path minimization policy."""
+    text = str(value or "")
+    mode = str(_get_env().get("ATTACKLENS_DEVSEC_PATH_MODE", "full")).lower()
+    if not text or mode == "full":
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    if mode == "basename":
+        return f"…/{Path(text).name}#{digest[:12]}"
+    if mode == "hash":
+        return f"path:sha256:{digest}"
+    return text
+
+
+def _privacy_identity(value: Any) -> str:
+    text = str(value or "")
+    mode = str(_get_env().get("ATTACKLENS_DEVSEC_IDENTITY_MODE", "full")).lower()
+    if not text or mode == "full":
+        return text
+    return "identity:sha256:" + hashlib.sha256(
+        text.encode("utf-8", "replace")
+    ).hexdigest()
+
+
 def _file_meta(path: Path) -> dict[str, Any] | None:
     try:
         st = path.stat()
     except OSError:
         return None
     return {
-        "path": str(path),
+        "path": _privacy_path(path),
         "mode": stat.filemode(st.st_mode),
         "uid": st.st_uid,
         "gid": st.st_gid,
@@ -467,7 +493,9 @@ def _bounded_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         # This should be unreachable with bounded strings/dicts, but report it
         # explicitly rather than claiming a healthy bounded snapshot.
         collection["payload_limit_unmet"] = True
+        collection["state"] = "error"
     if truncations:
+        collection["state"] = "partial"
         collection["partial"] = True
         collection["payload_truncated"] = True
         collection["payload_truncation_path_count"] = len(truncations)
@@ -518,21 +546,42 @@ class DeveloperSecurityCollector(BaseCollector):
             "docker": part("docker", self._docker),
         }
         issues, nested_truncated = _walk_status(capabilities)
+        capability_states: dict[str, str] = {}
+        for name, value in capabilities.items():
+            cap_issues, cap_truncated = _walk_status(value, name)
+            if not isinstance(value, dict) or "error" in value:
+                capability_states[name] = "error"
+            elif cap_issues or cap_truncated:
+                capability_states[name] = "partial"
+            else:
+                capability_states[name] = "complete"
+        complete_count = sum(state == "complete" for state in capability_states.values())
+        if complete_count == 0 and capability_states:
+            collection_state = "error"
+        elif errors or issues or nested_truncated:
+            collection_state = "partial"
+        else:
+            collection_state = "complete"
         snapshot = {
             "schema_version": _SCHEMA_VERSION,
+            "collector_version": _COLLECTOR_VERSION,
             "platform": "macos",
-            "scope": {"users": [user for user, _ in homes], "system_context": os.geteuid() == 0},
+            "scope": {"users": [_privacy_identity(user) for user, _ in homes], "system_context": os.geteuid() == 0},
             "privacy": {
                 "secret_contents_collected": False,
                 "credential_values_collected": False,
                 "sensitive_values_redacted": True,
                 "collection_bounded": True,
+                "path_mode": str(_get_env().get("ATTACKLENS_DEVSEC_PATH_MODE", "full")).lower(),
+                "identity_mode": str(_get_env().get("ATTACKLENS_DEVSEC_IDENTITY_MODE", "full")).lower(),
             },
             "capabilities": capabilities,
             "collection": {
-                "partial": bool(errors) or bool(issues) or nested_truncated,
+                "state": collection_state,
+                "partial": collection_state != "complete",
                 "errors": errors,
                 "issues": issues,
+                "capability_states": capability_states,
                 "duration_ms": int((time.monotonic() - started) * 1000),
             },
         }
@@ -551,7 +600,7 @@ class DeveloperSecurityCollector(BaseCollector):
                                    home=home, max_output=128 * 1024,
                                    run_as_user=user)
                 cli_inventory.append({
-                    "user": user, "editor": editor,
+                    "user": _privacy_identity(user), "editor": editor,
                     "extensions": [_clip(line.strip(), 512)
                                    for line in cli.get("stdout", "").splitlines()
                                    if line.strip()][:_MAX_ITEMS],
@@ -579,7 +628,7 @@ class DeveloperSecurityCollector(BaseCollector):
                     manifest_path = directory / "package.json"
                     manifest = _read_json(manifest_path)
                     if not isinstance(manifest, dict):
-                        rows.append({"user": user, "editor": editor, "directory": directory.name,
+                        rows.append({"user": _privacy_identity(user), "editor": editor, "directory": directory.name,
                                      "manifest_valid": False})
                         continue
                     publisher = str(manifest.get("publisher") or "")
@@ -602,7 +651,7 @@ class DeveloperSecurityCollector(BaseCollector):
                     metadata = install_meta.get(extension_id.lower(), {})
                     source = str(metadata.get("source") or "")
                     rows.append({
-                        "user": user, "editor": editor, "id": extension_id,
+                        "user": _privacy_identity(user), "editor": editor, "id": extension_id,
                         "version": manifest.get("version"), "publisher": publisher or None,
                         "directory": directory.name,
                         "interesting": bool(_INTERESTING.search(extension_id)),
@@ -659,7 +708,7 @@ class DeveloperSecurityCollector(BaseCollector):
         configs: list[dict[str, Any]] = []
         servers: list[dict[str, Any]] = []
         for path in files:
-            meta = _file_meta(path) or {"path": str(path)}
+            meta = _file_meta(path) or {"path": _privacy_path(path)}
             text, text_truncated = _read_text(path)
             doc = _read_structured(path)
             discovered = self._extract_mcp_servers(doc)
@@ -677,7 +726,7 @@ class DeveloperSecurityCollector(BaseCollector):
                 env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
                 combined = " ".join([command, *args])
                 servers.append({
-                    "config_path": str(path), "name": _clip(server_name, 256),
+                    "config_path": _privacy_path(path), "name": _clip(server_name, 256),
                     "command": command or None, "args": args[:100],
                     "env_keys": sorted(_clip(k, 256) for k in env)[:100],
                     "env_value_presence": {str(k)[:256]: bool(v) for k, v in list(env.items())[:100]},
@@ -765,7 +814,7 @@ class DeveloperSecurityCollector(BaseCollector):
                 "yarn": self._yarn(home, None if user == "system" else user),
                 "bun": self._bun(home, None if user == "system" else user),
             }
-            results.append({"user": user, "managers": managers, "config": cfg})
+            results.append({"user": _privacy_identity(user), "managers": managers, "config": cfg})
         return {"users": results, "truncated": any(
             manager.get("package_count", 0) > _MAX_ITEMS
             for result in results for manager in result["managers"].values()
@@ -873,7 +922,7 @@ class DeveloperSecurityCollector(BaseCollector):
                  "interesting": bool(_INTERESTING.search(str(item.get("name", ""))))}
                 for item in package_rows[:_MAX_ITEMS] if isinstance(item, dict)
             ]
-            results.append({"user": user, "status": status, "editable_status": editable_status,
+            results.append({"user": _privacy_identity(user), "status": status, "editable_status": editable_status,
                             "inspect_status": inspect_status, "packages": rows,
                             "package_count": len(package_rows), "provenance": provenance,
                             "config": config})
@@ -926,7 +975,7 @@ class DeveloperSecurityCollector(BaseCollector):
                 continue
             for app in apps[:_MAX_ITEMS - len(rows)]:
                 if _INTERESTING.search(app.name):
-                    rows.append({"owner": owner, **(_file_meta(app) or {"path": str(app)}),
+                    rows.append({"owner": _privacy_identity(owner), **(_file_meta(app) or {"path": _privacy_path(app)}),
                                  "name": app.stem})
         return {"items": rows, "count": len(rows), "filtered": True}
 
@@ -951,7 +1000,7 @@ class DeveloperSecurityCollector(BaseCollector):
                           "resolved": resolved[0] if resolved else None,
                           "all_resolutions": resolved[:20], "shadowed": len(resolved) > 1})
         return {"items": items, "path": [
-            {"position": i, "path": p, "exists": _is_dir(Path(p)),
+            {"position": i, "path": _privacy_path(p), "exists": _is_dir(Path(p)),
              "world_writable": self._world_writable(Path(p))}
             for i, p in enumerate(path_entries[:100])
         ]}
@@ -978,7 +1027,7 @@ class DeveloperSecurityCollector(BaseCollector):
                     if indicators:
                         matches.append({"line": number, "sha256": _hash_line(line),
                                         "indicators": indicators})
-                rows.append({"user": user, **(_file_meta(path) or {"path": str(path)}),
+                rows.append({"user": _privacy_identity(user), **(_file_meta(path) or {"path": _privacy_path(path)}),
                              "matches": matches[:100], "truncated": truncated or len(matches) > 100})
         return {"files": rows, "count": len(rows), "contents_transmitted": False}
 
@@ -998,7 +1047,7 @@ class DeveloperSecurityCollector(BaseCollector):
             program = doc.get("Program") if isinstance(doc, dict) else None
             command = " ".join([str(program or ""), *[str(v) for v in args]])
             rows.append({
-                **(_file_meta(path) or {"path": str(path)}),
+                **(_file_meta(path) or {"path": _privacy_path(path)}),
                 "label": _clip(doc.get("Label"), 256) if isinstance(doc, dict) else None,
                 "program": _redact(program) if program else None,
                 "arguments": self._sanitize_args(args)[:100],
@@ -1029,7 +1078,7 @@ class DeveloperSecurityCollector(BaseCollector):
                                 "sha256": _hash_line(stripped),
                                 "indicators": _risk_indicators(stripped, _SHELL_INDICATOR)})
             if result.get("available"):
-                rows.append({"user": user, "entries": entries[:100],
+                rows.append({"user": _privacy_identity(user), "entries": entries[:100],
                              "status": {k: v for k, v in result.items() if k != "stdout"}})
         cron_files, truncated = _walk(
             [Path("/etc")], lambda p: p.name.startswith("cron") or "periodic" in p.parts,
@@ -1048,7 +1097,7 @@ class DeveloperSecurityCollector(BaseCollector):
             command = match.group(4)
             if _INTERESTING.search(command) or re.search(r"\b(node|python(?:3)?|npx|uvx)\b", command, re.I):
                 rows.append({"pid": int(match.group(1)), "ppid": int(match.group(2)),
-                             "user": match.group(3), "command": _redact(command),
+                             "user": _privacy_identity(match.group(3)), "command": _redact(command),
                              "interesting": bool(_INTERESTING.search(command))})
                 if len(rows) >= _MAX_ITEMS:
                     break
@@ -1067,7 +1116,7 @@ class DeveloperSecurityCollector(BaseCollector):
             host, sep, port = bind.rpartition(":")
             wildcard = host in {"*", "0.0.0.0", "[::]", "::"} or host.endswith("->*")
             rows.append({"process": parts[0], "pid": int(parts[1]) if parts[1].isdigit() else None,
-                         "user": parts[2], "endpoint": _clip(bind, 512),
+                         "user": _privacy_identity(parts[2]), "endpoint": _clip(bind, 512),
                          "port": int(port) if sep and port.isdigit() else None,
                          "wildcard": wildcard,
                          "interesting": bool(_INTERESTING.search(parts[0]))})
@@ -1100,7 +1149,7 @@ class DeveloperSecurityCollector(BaseCollector):
                 extension_id = next((part for part in reversed(path.parts[:-1])
                                      if re.fullmatch(r"[a-z]{32}", part)), None)
                 rows.append({
-                    "user": user, "browser": browser, "id": extension_id,
+                    "user": _privacy_identity(user), "browser": browser, "id": extension_id,
                     "name": _clip(doc.get("name"), 256), "version": _clip(doc.get("version"), 128),
                     "manifest_version": doc.get("manifest_version"),
                     "permissions": all_perms[:200],
@@ -1109,7 +1158,7 @@ class DeveloperSecurityCollector(BaseCollector):
                         or p.lower() in {"http://*/*", "https://*/*", "*://*/*"}
                     }),
                     "native_messaging": any(p.lower() == "nativemessaging" for p in all_perms),
-                    "path": str(path),
+                    "path": _privacy_path(path),
                 })
                 if len(rows) >= _MAX_ITEMS:
                     truncated = True
@@ -1130,11 +1179,13 @@ class DeveloperSecurityCollector(BaseCollector):
             if not isinstance(doc, dict):
                 continue
             executable = Path(str(doc.get("path") or ""))
-            rows.append({**(_file_meta(path) or {"path": str(path)}),
+            executable_text = str(executable)
+            rows.append({**(_file_meta(path) or {"path": _privacy_path(path)}),
                          "name": _clip(doc.get("name"), 256),
                          "description": _clip(doc.get("description"), 512),
-                         "executable": str(executable) if str(executable) else None,
-                         "executable_meta": _file_meta(executable) if str(executable) else None,
+                         "executable": _privacy_path(executable) if executable_text else None,
+                         "executable_temporary": bool(_TEMP_PATH.search(executable_text)) if executable_text else False,
+                         "executable_meta": _file_meta(executable) if executable_text else None,
                          "allowed_origins": (doc.get("allowed_origins") or [])[:100],
                          "allowed_extensions": (doc.get("allowed_extensions") or [])[:100]})
         return {"items": rows, "count": len(rows), "truncated": truncated}
@@ -1158,7 +1209,7 @@ class DeveloperSecurityCollector(BaseCollector):
                 ["git", "config", "--global", "--show-origin", "--list"],
                 home=home, run_as_user=None if user == "system" else user,
             )
-            rows.append({"user": user, "settings": settings(result),
+            rows.append({"user": _privacy_identity(user), "settings": settings(result),
                          "status": {k: v for k, v in result.items() if k != "stdout"}})
         system = _run_command(["git", "config", "--system", "--show-origin", "--list"])
         current = Path.cwd()
@@ -1183,7 +1234,7 @@ class DeveloperSecurityCollector(BaseCollector):
             "users": rows,
             "system": {"settings": settings(system),
                        "status": {k: v for k, v in system.items() if k != "stdout"}},
-            "local": {"repository": str(current), "settings": settings(local),
+            "local": {"repository": _privacy_path(current), "settings": settings(local),
                       "hooks": hooks,
                       "review_files": [m for rel in review_files
                                        if (m := _file_meta(current / rel))],
@@ -1199,14 +1250,14 @@ class DeveloperSecurityCollector(BaseCollector):
                 path = home / rel
                 meta = _file_meta(path)
                 if meta:
-                    rows.append({"user": user, "kind": "common_location", **meta})
+                    rows.append({"user": _privacy_identity(user), "kind": "common_location", **meta})
             files, cut = _walk([home], lambda p: bool(_SECRET_FILE.search(p.name)), max_depth=4,
                                max_files=max(1, _MAX_FILES - len(rows)))
             truncated = truncated or cut
             for path in files:
                 meta = _file_meta(path)
                 if meta:
-                    rows.append({"user": user, "kind": "name_match", **meta})
+                    rows.append({"user": _privacy_identity(user), "kind": "name_match", **meta})
                 if len(rows) >= _MAX_FILES:
                     truncated = True
                     break
@@ -1214,9 +1265,9 @@ class DeveloperSecurityCollector(BaseCollector):
         default = _run_command(["security", "default-keychain"], max_output=4 * 1024)
         return {"locations": rows[:_MAX_FILES], "count": len(rows), "truncated": truncated,
                 "contents_transmitted": False,
-                "keychains": [_clip(line.strip().strip('"'), 1024)
+                "keychains": [_privacy_path(_clip(line.strip().strip('"'), 1024))
                               for line in keychains.get("stdout", "").splitlines() if line.strip()],
-                "default_keychain": _clip(default.get("stdout", "").strip().strip('"'), 1024) or None}
+                "default_keychain": _privacy_path(_clip(default.get("stdout", "").strip().strip('"'), 1024)) or None}
 
     def _docker(self) -> dict[str, Any]:
         raw = _run_command(["docker", "ps", "-a", "--format", "{{json .}}"])

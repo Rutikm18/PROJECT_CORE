@@ -30,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from .. import finding_lifecycle as lc
+from ..attacklens.terrain_catalog import UNCLASSIFIED_TERRAIN_ID
 from manager.manager.timewindow import resolve_window, WindowError
 
 log = logging.getLogger("manager.findings")
@@ -71,7 +72,7 @@ def _with_lifecycle(f: dict) -> dict:
             from ..attacklens.terrain_validators import terrain_for
             terrain = terrain_for(f)
         except Exception:
-            terrain = "origin"
+            terrain = UNCLASSIFIED_TERRAIN_ID
     f["terrain"] = terrain
     f["terrain_id"] = terrain
     f["terrain_source"] = f.get("terrain_source") or f.get("category", "")
@@ -199,7 +200,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
     async def smart_search(
         q:           str             = Query(..., description="Search query (websearch syntax: \"phrase\", -exclude, OR)"),
         agent_id:    Optional[str]   = Query(None, description="Filter by agent"),
-        terrain_id:  Optional[str]   = Query(None, description="citadels|vector|origin|identity|posture"),
+        terrain_id:  Optional[str]   = Query(None, description="citadels|vector|origin|identity|posture|mesh|unclassified"),
         severity:    Optional[str]   = Query(None, description="critical|high|medium|low|info"),
         category:    Optional[str]   = Query(None, description="Finding category"),
         limit:       int             = Query(50, ge=1, le=200),
@@ -270,7 +271,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
     @router.get("/findings")
     async def list_findings(
         agent_id:     Optional[str]   = Query(None,  description="Filter by agent"),
-        terrain_id:   Optional[str]   = Query(None,  description="citadels|vector|origin|identity|posture"),
+        terrain_id:   Optional[str]   = Query(None,  description="citadels|vector|origin|identity|posture|mesh|unclassified"),
         severity:     Optional[str]   = Query(None,  description="critical|high|medium|low|info"),
         status:       Optional[str]   = Query(None,  description="SOC workflow status"),
         category:     Optional[str]   = Query(None,  description="Finding category"),
@@ -324,16 +325,15 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
         elif view == "all":
             active_only = False
 
-        # If validated_only is set we apply the user-configured threshold
-        # resolution per row.  Pull the configured global as a coarse SQL
-        # pre-filter to keep the result set small; the precise per-agent /
-        # per-terrain threshold is enforced in Python below.
+        # Validated Findings is an explicit persisted projection. Threshold
+        # changes schedule recomputation; reads never reinterpret history from
+        # an overloaded score column.
         effective_global: Optional[float] = None
         effective_thresholds: dict = {}
         if validated_only:
             try:
                 from ..attacklens.ai_validator import (
-                    _load_validation_settings, resolve_threshold,
+                    _load_validation_settings,
                 )
                 vsettings = await _load_validation_settings(intel_db)
                 effective_global = float(vsettings.get("global", 0.90))
@@ -342,19 +342,10 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
                     "terrain": dict(vsettings.get("terrain") or {}),
                     "agent":   dict(vsettings.get("agent") or {}),
                 }
-                # SQL pre-filter at the lowest possible threshold so per-agent
-                # overrides set BELOW the global still see their findings.
-                floor_candidates = [effective_global]
-                floor_candidates.extend(vsettings.get("terrain", {}).values())
-                floor_candidates.extend(vsettings.get("agent", {}).values())
-                pre_filter = min(floor_candidates) if floor_candidates else effective_global
-                # Combine with any explicit min_precision the caller passed
-                if min_precision is not None:
-                    pre_filter = min(pre_filter, float(min_precision))
-                min_precision_sql: Optional[float] = pre_filter
+                min_precision_sql = None
             except Exception as exc:
-                log.warning("validated_only: failed to load settings: %s — falling back to 0.9 floor", exc)
-                min_precision_sql = 0.9
+                log.warning("validated_only: failed to load settings: %s", exc)
+                min_precision_sql = None
                 effective_thresholds = {"global": 0.9, "terrain": {}, "agent": {}}
                 effective_global = 0.9
         else:
@@ -375,6 +366,7 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
                 limit=limit,
                 offset=offset,
                 min_precision=min_precision_sql,
+                validation_state="validated" if validated_only else None,
                 live_agent_ids=await _live_agent_ids(),
                 window_start=window_start,
                 window_end=window_end,
@@ -383,24 +375,18 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             log.exception("list_findings failed")
             raise HTTPException(500, f"Failed to load findings: {exc}")
 
-        # Apply per-row resolution when validated_only=true.
-        precision_meta: list[dict] = []
+        # Attach the persisted threshold that produced each decision.
         if validated_only and rows:
-            from ..attacklens.ai_validator import resolve_threshold
-            keep: list[dict] = []
             for r in rows:
-                # Re-use the same resolution the engine uses (per-agent →
-                # per-terrain → global), so analysts see exactly the same
-                # bar that promoted the finding in the first place.
-                thr = await resolve_threshold(
-                    intel_db, r.get("agent_id", ""), r.get("category", ""),
+                r["effective_threshold"] = round(
+                    float(
+                        r.get("effective_validation_threshold")
+                        or effective_global
+                        or 0.90
+                    ),
+                    3,
                 )
-                row_score = float(r.get("precision_score") or 0.0)
-                r["effective_threshold"] = round(thr, 3)
-                r["is_validated"] = row_score >= thr
-                if row_score >= thr:
-                    keep.append(r)
-            rows = keep
+                r["is_validated"] = r.get("validation_state") == "validated"
 
         body: dict = {
             "findings": [_with_lifecycle(r) for r in rows],
@@ -446,10 +432,10 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             # bar lands relative to existing findings.
             try:
                 near_rows = await intel_db._fetchall(
-                    "SELECT id, agent_id, category, title, precision_score "
+                    "SELECT id, agent_id, category, title, validation_score "
                     "FROM findings "
-                    f"WHERE {stats_where} AND precision_score > 0 "
-                    "ORDER BY precision_score DESC LIMIT 5",
+                    f"WHERE {stats_where} AND validation_score > 0 "
+                    "ORDER BY validation_score DESC LIMIT 5",
                     tuple(stats_args),
                 )
                 top5 = [
@@ -458,7 +444,9 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
                         "title":           r["title"],
                         "agent_id":        r["agent_id"],
                         "category":        r["category"],
-                        "precision_score": float(r["precision_score"]),
+                        # Compatibility key for the existing UI; the value is
+                        # the persisted final validation decision score.
+                        "precision_score": float(r["validation_score"]),
                     }
                     for r in near_rows
                 ]
@@ -473,24 +461,16 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             }
             try:
                 all_rows = await intel_db._fetchall(
-                    "SELECT agent_id, category, precision_score, terrain_validation "
+                    "SELECT agent_id, category, validation_state, validation_score, "
+                    "       terrain_validation "
                     f"FROM findings WHERE {stats_where} LIMIT 100000",
                     tuple(stats_args),
                 )
                 for r in all_rows:
                     f_lite = {"agent_id": r["agent_id"], "category": r["category"]}
                     terrain = terrain_for(f_lite)
-                    score   = float(r["precision_score"] or 0)
-                    # Re-resolve threshold per row (uses the same hierarchy)
-                    if validated_only:
-                        try:
-                            thr = await resolve_threshold(intel_db, r["agent_id"] or "", r["category"] or "")
-                        except Exception:
-                            thr = effective_global or 0.90
-                    else:
-                        thr = effective_global or 0.90
                     bucket = terrain_counts.setdefault(terrain, {"validated":0,"below":0})
-                    if score >= thr:
+                    if r.get("validation_state") == "validated":
                         bucket["validated"] += 1
                     else:
                         bucket["below"] += 1
@@ -621,6 +601,18 @@ def make_findings_router(intel_db, db=None) -> APIRouter:
             raise HTTPException(404, "Finding not found")
         activity = await intel_db.get_activity(finding_id)
         return {"activity": activity, "count": len(activity)}
+
+    @router.get("/findings/{finding_id}/validation-runs")
+    async def get_validation_runs(
+        finding_id: int,
+        limit: int = Query(100, ge=1, le=500),
+    ):
+        """Return the append-only validation decision history for a finding."""
+        finding = await intel_db.get_finding_by_id(finding_id)
+        if not finding:
+            raise HTTPException(404, "Finding not found")
+        runs = await intel_db.get_validation_runs(finding_id, limit=limit)
+        return {"validation_runs": runs, "count": len(runs)}
 
     @router.get("/findings/{finding_id}/timeline")
     async def get_finding_timeline(finding_id: int):

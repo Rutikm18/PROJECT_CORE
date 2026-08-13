@@ -115,7 +115,8 @@ class CVEValidation:
     exploit_available: bool                    # ExploitDB or Metasploit hit
     epss_score:       Optional[float]
     sources_used:     list[str] = field(default_factory=list)
-    source_errors:    list[str] = field(default_factory=list)
+    source_errors:    dict[str, str] = field(default_factory=dict)
+    source_freshness: dict[str, dict] = field(default_factory=dict)
     raw:              dict      = field(default_factory=dict)
 
 
@@ -136,6 +137,7 @@ class FindingValidationReport:
     cve_validations:   list[CVEValidation]        # one per CVE ID
     recommended_action: Optional[str]             # canonical action key or None
     recommended_label:  Optional[str]             # human-readable label
+    corroboration_stage: dict = field(default_factory=dict)
     auto_applied:      bool = False               # True if we mutated the finding
     notes:             str  = ""
 
@@ -313,6 +315,7 @@ class FindingValidator:
             cve_validations   = list(cve_results),
             recommended_action = rec_action,
             recommended_label  = rec_label,
+            corroboration_stage = self._corroboration_stage(cve_results),
             notes             = self._build_notes(verdict, cve_results),
         )
 
@@ -362,7 +365,7 @@ class FindingValidator:
                 in_kev=False,
                 exploit_available=False,
                 epss_score=None,
-                source_errors=[str(exc)],
+                source_errors={"pipeline": str(exc)},
             )
 
         nvd   = enriched.get("nvd") or {}
@@ -412,6 +415,16 @@ class FindingValidator:
         ]
 
         source_errors = enriched.get("_source_errors") or []
+        if isinstance(source_errors, list):
+            source_errors = {
+                f"source_{index}": str(error)
+                for index, error in enumerate(source_errors, start=1)
+            }
+        elif not isinstance(source_errors, dict):
+            source_errors = {"pipeline": str(source_errors)}
+        source_freshness = enriched.get("_source_freshness") or {}
+        if not isinstance(source_freshness, dict):
+            source_freshness = {}
 
         return CVEValidation(
             cve_id           = cve_id,
@@ -422,7 +435,8 @@ class FindingValidator:
             exploit_available= exploit_available,
             epss_score       = epss_score,
             sources_used     = sources_used,
-            source_errors    = list(source_errors) if isinstance(source_errors, list) else [],
+            source_errors    = {str(k): str(v) for k, v in source_errors.items()},
+            source_freshness = source_freshness,
             raw              = {
                 "nvd":        nvd,
                 "kev":        kev,
@@ -450,6 +464,7 @@ class FindingValidator:
             updated["confidence"] = report.confidence_after
             updated["validation_verdict"] = report.verdict
             updated["validated_at"]       = report.validated_at
+            updated["validation_corroboration"] = report.corroboration_stage
 
             # Persist status transition if the action is valid
             if action and lc.can_transition(finding.get("status"), action):
@@ -465,6 +480,35 @@ class FindingValidator:
 
         except Exception as exc:
             log.warning("Failed to auto-apply validation to finding %s: %s", finding_id, exc)
+
+    @staticmethod
+    def _corroboration_stage(cve_results: list[CVEValidation]) -> dict:
+        if not cve_results:
+            return {
+                "name": "authoritative_corroboration",
+                "status": "not_applicable",
+                "sources_used": [],
+                "source_errors": {},
+                "freshness": {},
+            }
+        sources = sorted({source for result in cve_results for source in result.sources_used})
+        errors = {
+            f"{result.cve_id}:{source}": error
+            for result in cve_results
+            for source, error in result.source_errors.items()
+        }
+        status = "partial" if errors else "complete"
+        if errors and not sources:
+            status = "error"
+        return {
+            "name": "authoritative_corroboration",
+            "status": status,
+            "sources_used": sources,
+            "source_errors": errors,
+            "freshness": {
+                result.cve_id: result.source_freshness for result in cve_results
+            },
+        }
 
     @staticmethod
     def _build_notes(verdict: str, cve_results: list[CVEValidation]) -> str:

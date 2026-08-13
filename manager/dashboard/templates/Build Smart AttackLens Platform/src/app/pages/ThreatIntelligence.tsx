@@ -524,7 +524,7 @@ function IOCDetailPanel({ ioc, status, onClose, onStatus }: {
       <div className="flex-1 bg-black/30 backdrop-blur-sm" onClick={onClose} />
 
       {/* Panel */}
-      <div className="w-[540px] bg-white shadow-2xl flex flex-col overflow-hidden border-l border-gray-200">
+      <div className="w-full sm:w-[min(540px,100vw)] h-dvh bg-white shadow-2xl flex flex-col overflow-hidden border-l border-gray-200">
         {/* Header */}
         <div className={cn("px-5 py-4 border-b border-gray-100", cat.bg)}>
           <div className="flex items-start gap-3">

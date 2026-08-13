@@ -33,6 +33,7 @@ def _make_app(idb: IntelDB) -> FastAPI:
 
 
 async def _seed_finding(idb: IntelDB, *, agent_id: str, item_key: str, **overrides) -> dict:
+    precision_score = float(overrides.get("precision_score", 0.95))
     await idb.upsert_finding({
         "agent_id": agent_id,
         "category": "package",
@@ -42,7 +43,14 @@ async def _seed_finding(idb: IntelDB, *, agent_id: str, item_key: str, **overrid
         "title": item_key,
         "source": "nvd",
         "rule_id": "nvd",
-        "precision_score": 0.95,
+        "precision_score": precision_score,
+        "model_precision_score": precision_score,
+        "terrain_score": precision_score,
+        "validation_score": precision_score,
+        "validation_state": "validated" if precision_score >= 0.90 else "rejected",
+        "validation_policy_version": "test-policy-v1",
+        "effective_validation_threshold": 0.90,
+        "validated_at": time.time() if precision_score >= 0.90 else 0.0,
         "cvss_score": 9.8,
         "epss_score": 0.72,
         "kev": True,
@@ -203,7 +211,7 @@ async def test_validated_findings_stats_are_scoped_to_agent_filter(pg_intel_dsn)
         assert r.status_code == 200, r.text
         body = r.json()
 
-        assert [f["agent_id"] for f in body["findings"]] == ["agent-a"]
+        assert [f["agent_id"] for f in body["findings"]] == ["agent-a"], body
         assert body["stats"]["active_total"] == 2
         assert body["stats"]["validated_count"] == 1
         assert body["stats"]["below_threshold"] == 1

@@ -281,6 +281,11 @@ def test_developer_security_stream_runs_dedicated_detection_logic():
         "AL-DEV-006", "AL-DEV-007", "AL-DEV-008", "AL-DEV-009",
     }
     assert all(finding["affected_asset"] == "mac-1" for finding in findings)
+    by_rule = {finding["rule_id"]: finding for finding in findings}
+    assert by_rule["AL-DEV-001"]["evidence"]["unknown_publisher"] is True
+    assert by_rule["AL-DEV-001"]["evidence"]["side_loaded"] is True
+    assert by_rule["AL-DEV-004"]["evidence"]["native_messaging"] is True
+    assert by_rule["AL-DEV-009"]["evidence"]["high_risk"] is True
 
 
 class _NVDMirrorDB:

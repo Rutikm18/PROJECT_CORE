@@ -19,6 +19,7 @@ from manager.manager.api.raw import (
 
 _DEVSEC = {
     "schema_version": 1,
+    "collector_version": "macos-developer-security/2",
     "platform": "macos",
     "capabilities": {
         "editor_extensions": {"items": [{"id": "a"}, {"id": "b"}], "count": 2},
@@ -29,7 +30,7 @@ _DEVSEC = {
         "native_messaging": {"items": []},
         "docker": {"error": "FileNotFoundError"},
     },
-    "collection": {"partial": True, "errors": [{"capability": "docker", "error": "x"}],
+    "collection": {"state": "partial", "partial": True, "errors": [{"capability": "docker", "error": "x"}],
                    "duration_ms": 1234},
 }
 
@@ -53,6 +54,8 @@ def test_devsec_summary_structure():
     assert s["counts"]["listening_ports"] == 0
     assert s["counts"]["docker"] == 0        # errored capability → 0 records
     assert s["partial"] is True
+    assert s["state"] == "partial"
+    assert s["collector_version"] == "macos-developer-security/2"
     assert s["error_count"] == 1
     # docker errored → not counted among present capabilities
     assert s["capabilities_present"] == 6

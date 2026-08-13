@@ -355,6 +355,8 @@ def _devsec_summary(data: dict) -> Optional[dict]:
         "counts":     _devsec_counts(caps),
         "capabilities_present": sum(1 for c in caps.values() if isinstance(c, dict) and "error" not in c),
         "partial":    bool(collection.get("partial")),
+        "state":      collection.get("state") or ("partial" if collection.get("partial") else "complete"),
+        "collector_version": data.get("collector_version"),
         "error_count": len(collection.get("errors", []) or []),
         "duration_ms": collection.get("duration_ms"),
     }

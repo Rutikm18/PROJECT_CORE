@@ -8,6 +8,20 @@ export const WINDOW_SECONDS: Record<WindowKey, number> = {
 export const WINDOW_KEYS = Object.keys(WINDOW_SECONDS) as WindowKey[];
 export const DEFAULT_WINDOW: WindowKey = "1h";
 
+export function parseServerWindowPresets(value: unknown): WindowKey[] {
+  if (!Array.isArray(value)) return WINDOW_KEYS;
+  const keys: WindowKey[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const { key, seconds } = item as { key?: unknown; seconds?: unknown };
+    if (typeof key !== "string" || !(key in WINDOW_SECONDS)) continue;
+    if (!Number.isFinite(seconds) || Number(seconds) <= 0) continue;
+    WINDOW_SECONDS[key as WindowKey] = Number(seconds);
+    if (!keys.includes(key as WindowKey)) keys.push(key as WindowKey);
+  }
+  return keys.length ? keys : WINDOW_KEYS;
+}
+
 export type TimeRange =
   | { kind: "relative"; key: WindowKey }
   | { kind: "absolute"; start: number; end: number };

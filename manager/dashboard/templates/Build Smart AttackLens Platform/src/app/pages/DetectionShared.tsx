@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, useContext } from "react";
 import { useTimeRange } from "../context/TimeRangeContext";
 import { rangeToParams } from "../lib/timeRange";
+import { useRefresh } from "../context/RefreshContext";
 import { createPortal } from "react-dom";
 import {
   RefreshCw, X, Search, Filter, AlertTriangle, Shield,
@@ -23,6 +24,10 @@ import {
 import { cn } from "../../lib/utils";
 import { useRBAC } from "../context/RBACContext";
 import { useAuth } from "../context/AuthContext";
+import {
+  addCaseNote, createCase, getCaseForFinding, getCaseTimeline, updateCase,
+  type CasePriority, type CaseRecord, type CaseStatus,
+} from "../lib/caseClient";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -519,27 +524,84 @@ export function FindingActions({
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
+export function parseDetectionPayload(body: unknown): {
+  findings: DetectionFinding[];
+  total: number;
+  stats: { total: number; critical: number; high: number; kev: number };
+} {
+  const payload = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const findings = Array.isArray(payload.findings)
+    ? payload.findings as DetectionFinding[]
+    : Array.isArray(body) ? body as DetectionFinding[] : [];
+  const totalValue = Number(payload.total);
+  const total = Number.isFinite(totalValue) ? totalValue : findings.length;
+  const rawStats = payload.stats && typeof payload.stats === "object"
+    ? payload.stats as Record<string, unknown> : {};
+  return {
+    findings,
+    total,
+    stats: {
+      total: Number.isFinite(Number(rawStats.total)) ? Number(rawStats.total) : total,
+      critical: Number(rawStats.critical) || 0,
+      high: Number(rawStats.high) || 0,
+      kev: Number(rawStats.kev) || 0,
+    },
+  };
+}
+
 export function useDetectionData(url: string, refreshMs = 30_000) {
   const { range } = useTimeRange();
+  const { refreshRevision, registerRefreshRequest } = useRefresh();
   const qs = rangeToParams(range).toString();
   const [findings, setFindings] = useState<DetectionFinding[]>([]);
+  const [total, setTotal] = useState(0);
+  const [stats, setStats] = useState({ total: 0, critical: 0, high: 0, kev: 0 });
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [rev,      setRev]      = useState(0);
+  const abortRef = useRef<AbortController | null>(null);
   const load = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const settleRefresh = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
+    setLoading(true);
     try {
       const sep = url.includes("?") ? "&" : "?";
-      const r = await fetch(`${url}${sep}${qs}`);
+      const r = await fetch(`${url}${sep}${qs}`, { signal: controller.signal });
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       const body = await r.json();
-      setFindings(body.findings ?? body ?? []);
+      if (controller.signal.aborted) return;
+      const parsed = parseDetectionPayload(body);
+      setFindings(parsed.findings);
+      setTotal(parsed.total);
+      setStats(parsed.stats);
       setError(null);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  }, [url, rev, qs]);
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => { const t = setInterval(() => setRev(v => v + 1), refreshMs); return () => clearInterval(t); }, [refreshMs]);
-  return { findings, loading, error, refetch: () => setRev(v => v + 1) };
+      setLastUpdated(Date.now());
+    } catch (caught) {
+      if (controller.signal.aborted) return;
+      requestError = caught;
+      setError(String(caught));
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+      settleRefresh(requestError);
+    }
+  }, [url, rev, qs, refreshRevision, registerRefreshRequest]);
+  useEffect(() => {
+    void load();
+    return () => abortRef.current?.abort();
+  }, [load]);
+  useEffect(() => {
+    if (range.kind === "absolute" || refreshMs <= 0) return;
+    const timer = window.setInterval(() => setRev(value => value + 1), refreshMs);
+    return () => window.clearInterval(timer);
+  }, [refreshMs, range.kind]);
+  return {
+    findings, total, stats, loading, error, lastUpdated,
+    refetch: () => setRev(value => value + 1),
+  };
 }
 
 interface AgentOption {
@@ -792,7 +854,7 @@ function ExploitabilityDetail({ findingId, onClose }: { findingId: number; onClo
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div className="w-[480px] max-h-[85vh] bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex flex-col"
+      <div className="w-[min(480px,calc(100vw-1rem))] max-h-[calc(100dvh-1rem)] bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex flex-col"
         onClick={e => e.stopPropagation()}>
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-gray-50/60">
@@ -1562,17 +1624,7 @@ export function OSRemediationPanel({
 
 // ── Case panel (Case tab inside FindingDetail) ────────────────────────────────
 
-interface FindingCase {
-  finding_id: number;
-  status:     string;
-  assignee:   string;
-  priority:   number;
-  due_date:   string;
-  notes:      string;
-  sla_due_at: string;
-  created_at: number;
-  updated_at: number;
-}
+type FindingCase = CaseRecord;
 
 interface TimelineEntry {
   id:          number;
@@ -1589,10 +1641,9 @@ interface TimelineEntry {
   metadata?:       Record<string, unknown>;
 }
 
-const CASE_FLOW   = ["new", "triaging", "investigating", "in_remediation", "closed"] as const;
+const CASE_FLOW: CaseStatus[] = ["open", "in_progress", "resolved", "closed"];
 const CASE_LABELS: Record<string, string> = {
-  new: "New", triaging: "Triaging", investigating: "Investigating",
-  in_remediation: "In Remediation", closed: "Closed",
+  open: "Open", in_progress: "In Progress", resolved: "Resolved", closed: "Closed",
 };
 
 function CasePanel({ finding }: { finding: DetectionFinding }) {
@@ -1605,84 +1656,99 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
   const [err,             setErr]             = useState<string | null>(null);
   const [saved,           setSaved]           = useState(false);
 
-  const [status,   setStatus]   = useState("triaging");
+  const [status,   setStatus]   = useState<CaseStatus>("open");
   const [assignee, setAssignee] = useState("");
-  const [priority, setPriority] = useState(3);
+  const [priority, setPriority] = useState<CasePriority>("medium");
   const [dueDate,  setDueDate]  = useState("");
   const [notes,    setNotes]    = useState("");
   const [noteText, setNoteText] = useState("");
 
-  const fetchTimeline = useCallback(async () => {
+  const fetchTimeline = useCallback(async (caseId: number) => {
     setLoadingTimeline(true);
     try {
-      const r = await fetch(`/api/v1/cases/${finding.id}/timeline`);
-      if (!r.ok) return;
-      const d = await r.json();
-      setTimeline(d.timeline ?? []);
+      const events = await getCaseTimeline(caseId);
+      setTimeline(events.map(event => ({
+        id: event.id,
+        actor: event.actor,
+        action: event.action,
+        created_at: event.created_at,
+        elapsed: event.elapsed,
+        changed_fields: event.new_value,
+      })));
     } finally { setLoadingTimeline(false); }
-  }, [finding.id]);
+  }, []);
 
   const fetchCase = useCallback(async () => {
     setLoadingCase(true);
     try {
-      const r = await fetch(`/api/v1/cases/${finding.id}`);
-      if (r.status === 404) { setCaseData(null); return; }
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d: FindingCase = await r.json();
-      if (!d?.finding_id) {
+      const d = await getCaseForFinding(finding.id);
+      if (!d) {
         setCaseData(null);
+        setTimeline([]);
+        setLoadingTimeline(false);
         return;
       }
       setCaseData(d);
-      setStatus(d.status ?? "triaging");
-      setAssignee(d.assignee ?? "");
-      setPriority(d.priority ?? 3);
-      setDueDate(d.due_date ?? "");
-      setNotes(d.notes ?? "");
+      setStatus(d.status);
+      setAssignee(d.owner_user_id);
+      setPriority(d.priority);
+      setDueDate(d.due_at ? new Date(d.due_at * 1000).toISOString().slice(0, 10) : "");
+      setNotes(d.description);
+      await fetchTimeline(d.id);
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : "Unable to load case");
     } finally { setLoadingCase(false); }
-  }, [finding.id]);
+  }, [finding.id, fetchTimeline]);
 
-  useEffect(() => { fetchCase(); fetchTimeline(); }, [fetchCase, fetchTimeline]);
+  useEffect(() => { void fetchCase(); }, [fetchCase]);
 
-  const saveCase = async (override?: { status: string }) => {
+  const saveCase = async (override?: { status: CaseStatus }) => {
     setSaving(true); setErr(null);
     try {
-      const r = await fetch(`/api/v1/cases/${finding.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          status: override?.status ?? status,
-          assignee, priority, due_date: dueDate, notes, actor: "analyst",
-        }),
-      });
-      if (!r.ok) { setErr(`Save failed (${r.status})`); return; }
-      const d: FindingCase = await r.json();
+      const nextStatus = override?.status ?? status;
+      const dueAt = dueDate ? new Date(`${dueDate}T23:59:59`).getTime() / 1000 : 0;
+      const d = caseData
+        ? await updateCase(caseData.id, caseData.version, {
+            status: nextStatus, owner_user_id: assignee, priority,
+            due_at: dueAt, description: notes,
+          })
+        : await createCase({
+            title: finding.title || `Finding ${finding.id}`,
+            description: notes,
+            status: nextStatus,
+            priority,
+            owner_user_id: assignee,
+            due_at: dueAt,
+            finding_ids: [finding.id],
+            tags: [finding.terrain_id || finding.category].filter(Boolean),
+          });
       setCaseData(d);
       if (override?.status) setStatus(override.status);
       setSaved(true); setTimeout(() => setSaved(false), 2000);
-      fetchTimeline();
-    } catch { setErr("Network error"); }
+      await fetchTimeline(d.id);
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : "Network error");
+    }
     finally { setSaving(false); }
   };
 
   const postNote = async () => {
     if (!noteText.trim()) return;
+    if (!caseData) return;
     setPosting(true); setErr(null);
     try {
-      const r = await fetch(`/api/v1/cases/${finding.id}/notes`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ actor: "analyst", note: noteText.trim() }),
-      });
-      if (!r.ok) { setErr(`Failed (${r.status})`); return; }
-      setNoteText(""); fetchTimeline();
-    } catch { setErr("Network error"); }
+      await addCaseNote(caseData.id, noteText.trim());
+      setNoteText("");
+      await fetchTimeline(caseData.id);
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : "Network error");
+    }
     finally { setPosting(false); }
   };
 
   const slaColor = (() => {
-    if (!caseData?.sla_due_at) return "none";
-    const diff = new Date(caseData.sla_due_at).getTime() - Date.now();
+    if (!caseData?.due_at) return "none";
+    const diff = caseData.due_at * 1000 - Date.now();
     if (isNaN(diff)) return "none";
     return diff < 0 ? "red" : diff < 172_800_000 ? "amber" : "green";
   })();
@@ -1703,7 +1769,7 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
         </div>
         <p className="text-[12px] font-bold text-gray-700">No case opened yet</p>
         <p className="text-[10px] text-gray-400 max-w-xs leading-relaxed">Open a case to track triage workflow, assign an owner, set SLA deadlines, and log investigation notes.</p>
-        <button onClick={() => saveCase({ status: "triaging" })} disabled={saving}
+        <button onClick={() => saveCase({ status: "open" })} disabled={saving}
           className="flex items-center gap-2 px-5 py-2.5 bg-orange-500 hover:bg-orange-600 text-white text-[11px] font-bold rounded-xl transition-all shadow-sm hover:shadow-md disabled:opacity-60">
           <Briefcase className="w-3.5 h-3.5" />Open Case
         </button>
@@ -1711,7 +1777,7 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
     );
   }
 
-  const flowIdx = CASE_FLOW.indexOf(status as typeof CASE_FLOW[number]);
+  const flowIdx = CASE_FLOW.indexOf(status);
 
   return (
     <div className="bg-gray-50/30">
@@ -1756,11 +1822,10 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
           </div>
           <div className="flex flex-wrap gap-2">
             {([
-              { label: "Investigating",  icon: <Search className="w-3.5 h-3.5" />,   s: "investigating",  cls: "bg-blue-50 text-blue-700 border-blue-300" },
-              { label: "False Positive", icon: <XCircle className="w-3.5 h-3.5" />,  s: "false_positive", cls: "bg-gray-100 text-gray-500 border-gray-300", note: "→ close" },
-              { label: "Accepted Risk",  icon: <Shield className="w-3.5 h-3.5" />,   s: "accepted_risk",  cls: "bg-amber-50 text-amber-600 border-amber-300", note: "→ close" },
-              { label: "Duplicate",      icon: <Layers className="w-3.5 h-3.5" />,   s: "duplicate",      cls: "bg-gray-100 text-gray-400 border-gray-200", note: "→ close" },
-            ] as { label: string; icon: React.ReactNode; s: string; cls: string; note?: string }[]).map(a => (
+              { label: "In Progress", icon: <Search className="w-3.5 h-3.5" />, s: "in_progress", cls: "bg-blue-50 text-blue-700 border-blue-300" },
+              { label: "Resolved", icon: <CheckCircle2 className="w-3.5 h-3.5" />, s: "resolved", cls: "bg-green-50 text-green-700 border-green-300" },
+              { label: "Closed", icon: <XCircle className="w-3.5 h-3.5" />, s: "closed", cls: "bg-gray-100 text-gray-500 border-gray-300" },
+            ] as { label: string; icon: React.ReactNode; s: CaseStatus; cls: string; note?: string }[]).map(a => (
               <button key={a.s}
                 onClick={() => saveCase({ status: a.s })}
                 disabled={saving || status === a.s}
@@ -1786,13 +1851,12 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
             </div>
             <div>
               <label className="text-[10px] text-gray-500 font-semibold block mb-1.5">Priority</label>
-              <select value={priority} onChange={e => setPriority(Number(e.target.value))}
+              <select value={priority} onChange={e => setPriority(e.target.value as CasePriority)}
                 className="w-full px-3 py-2 text-[12px] border border-gray-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-orange-200 cursor-pointer">
-                <option value={1}>P1 · Critical</option>
-                <option value={2}>P2 · High</option>
-                <option value={3}>P3 · Medium</option>
-                <option value={4}>P4 · Low</option>
-                <option value={5}>P5 · Info</option>
+                <option value="critical">P1 · Critical</option>
+                <option value="high">P2 · High</option>
+                <option value="medium">P3 · Medium</option>
+                <option value="low">P4 · Low</option>
               </select>
             </div>
           </div>
@@ -1820,7 +1884,7 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
         </div>
 
         {/* ── SLA Status ───────────────────────────────────────────────── */}
-        {caseData.sla_due_at && slaColor !== "none" && (
+        {caseData.due_at > 0 && slaColor !== "none" && (
           <div className="bg-white px-5 py-4">
             <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
               <Clock className="w-3.5 h-3.5" />SLA Status
@@ -1834,7 +1898,7 @@ function CasePanel({ finding }: { finding: DetectionFinding }) {
               <Clock className={cn("w-4 h-4 flex-shrink-0", slaColor === "red" && "al-heartbeat")} />
               {slaColor === "red" ? "SLA BREACHED" : slaColor === "amber" ? "SLA AT RISK" : "SLA On Track"}
               <span className="ml-auto text-[10px] opacity-70">
-                Due {new Date(caseData.sla_due_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                Due {new Date(caseData.due_at * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
               </span>
             </div>
           </div>
@@ -3569,6 +3633,54 @@ export const DEFAULT_TERRAIN_FILTERS: TerrainFilterState = {
   sortBy: "risk", sortDir: "desc",
 };
 
+const TERRAIN_SORT_PARAMS: Record<SortKey, string> = {
+  risk: "composite_score",
+  exploitability: "exploitability_score",
+  cvss: "cvss_score",
+  epss: "epss_score",
+  first_seen: "first_detected_at",
+  last_seen: "last_detected_at",
+};
+
+export function buildTerrainDataUrl(
+  apiUrl: string,
+  filters: TerrainFilterState,
+  advanced: FilterCondition[] = [],
+  page: { limit: number; offset: number } = { limit: 500, offset: 0 },
+): string {
+  const url = new URL(apiUrl, "http://attacklens.local");
+  const params = url.searchParams;
+  params.set("limit", String(page.limit));
+  params.set("offset", String(page.offset));
+  if (filters.agentId) params.set("agent_id", filters.agentId);
+  if (filters.severity) params.set("severity", filters.severity);
+  if (filters.terrainFilter) params.set("terrain_id", filters.terrainFilter);
+  if (filters.statusFilter) params.set("status", filters.statusFilter);
+  if (filters.categoryFilter) params.set("category", filters.categoryFilter);
+  if (filters.mitreFilter) params.set("mitre", filters.mitreFilter);
+  if (filters.kevOnly) params.set("kev_only", "true");
+  if (filters.exploitOnly) params.set("exploit_only", "true");
+  if (filters.search.trim()) {
+    const query = filters.search.trim();
+    if (/^AL-F-/i.test(query) || /^\d+$/.test(query)) {
+      params.set("id_search", query);
+      params.delete("search");
+    } else {
+      params.set("search", query);
+      params.delete("id_search");
+    }
+  }
+  params.set("sort_by", TERRAIN_SORT_PARAMS[filters.sortBy]);
+  params.set("sort_dir", filters.sortDir);
+  const activeAdvanced = advanced.filter(condActive).map(({ field, op, value }) => ({
+    field, op, value,
+  }));
+  if (activeAdvanced.length > 0) {
+    params.set("advanced", JSON.stringify(activeAdvanced));
+  }
+  return `${url.pathname}?${params.toString()}`;
+}
+
 const STATUS_LIST = [
   "new","triaging","investigating","in_remediation","remediated",
   "verified","closed","false_positive","accepted_risk",
@@ -3788,7 +3900,7 @@ export function TerrainDetectionPage({
   const toggleOne = (id: number) =>
     setBulkSel(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
-  // Selects / deselects ALL filtered findings (across all pages)
+  // Selects / deselects the findings on the current server page.
   const toggleAll = () =>
     setBulkSel(prev => prev.size === filtered.length ? new Set() : new Set(filtered.map(f => f.id)));
 
@@ -3811,16 +3923,12 @@ export function TerrainDetectionPage({
   };
 
   const dataUrl = useMemo(() => {
-    const url = new URL(apiUrl, window.location.origin);
-    const params = url.searchParams;
-    params.set("limit", "500");
-    if (filters.agentId) params.set("agent_id", filters.agentId);
-    if (filters.severity) params.set("severity", filters.severity);
-    if (filters.terrainFilter) params.set("terrain_id", filters.terrainFilter);
-    if (filters.statusFilter) params.set("status", filters.statusFilter);
-    return `${url.pathname}?${params.toString()}`;
-  }, [apiUrl, filters.agentId, filters.severity, filters.terrainFilter, filters.statusFilter]);
-  const { findings: raw, loading, error, refetch } = useDetectionData(dataUrl);
+    return buildTerrainDataUrl(apiUrl, filters, adv, {
+      limit: PAGE_SIZE,
+      offset: (page - 1) * PAGE_SIZE,
+    });
+  }, [apiUrl, filters, adv, page]);
+  const { findings: raw, total, stats, loading, error, refetch } = useDetectionData(dataUrl);
 
   // Dynamic dropdown options built from live data
   const mitreTactics = useMemo(() =>
@@ -3831,66 +3939,9 @@ export function TerrainDetectionPage({
     [...new Set(raw.map(f => f.category).filter((c): c is string => !!c))].sort(),
   [raw]);
 
-  // Client-side filter + sort
-  const filtered = useMemo(() => {
-    let r = raw;
-    if (filters.severity)       r = r.filter(f => f.severity === filters.severity);
-    if (filters.kevOnly)        r = r.filter(f => f.kev);
-    if (filters.exploitOnly)    r = r.filter(f => f.exploit_available);
-    if (filters.mitreFilter)    r = r.filter(f => f.mitre_tactic === filters.mitreFilter || f.mitre_technique?.includes(filters.mitreFilter));
-    if (filters.categoryFilter) r = r.filter(f => f.category === filters.categoryFilter);
-    if (filters.statusFilter)   r = r.filter(f => f.status === filters.statusFilter);
-    if (filters.terrainFilter)  r = r.filter(f => (f as any).terrain === filters.terrainFilter);
-    if (filters.agentId)        r = r.filter(f => f.agent_id === filters.agentId);
-    if (filters.search) {
-      const q = filters.search.toLowerCase().trim();
-      // ID Search: when the analyst types an ID pattern (AL-F-00000515 or 00000515),
-      // match against external_id / display_id first for instant indexed lookup feel.
-      const isId = /^al-f-|^\d+$/.test(q);
-      const cveArr = (f: DetectionFinding) => Array.isArray(f.cve_ids) ? f.cve_ids : [];
-      r = r.filter(f => {
-        // ID search: prefix-match external_id for fast narrowing as the user types
-        if (isId) {
-          const ext = (f.external_id || "").toLowerCase();
-          if (ext.startsWith(q) || ext.includes(q)) return true;
-        }
-        return (
-          f.title?.toLowerCase().includes(q) ||
-          f.description?.toLowerCase().includes(q) ||
-          f.category?.toLowerCase().includes(q) ||
-          f.source?.toLowerCase().includes(q) ||
-          (f.external_id || "").toLowerCase().includes(q) ||
-          cveArr(f).some(c => c.toLowerCase().includes(q))
-        );
-      });
-      // ID search: sort exact matches first
-      if (isId) {
-        r = [...r].sort((a, b) => {
-          const ae = (a.external_id || "").toLowerCase();
-          const be = (b.external_id || "").toLowerCase();
-          if (ae === q && be !== q) return -1;
-          if (be === q && ae !== q) return 1;
-          return ae.length - be.length;
-        });
-      }
-    }
-
-    // Advanced field+operator conditions (ANDed on top of quick filters)
-    r = applyAdvancedConditions(r, adv);
-
-    return [...r].sort((a, b) => {
-      let av = 0, bv = 0;
-      switch (filters.sortBy) {
-        case "risk":       av = a.composite_score ?? a.score; bv = b.composite_score ?? b.score; break;
-        case "exploitability": av = a.exploitability_score ?? 0; bv = b.exploitability_score ?? 0; break;
-        case "cvss":       av = a.cvss_score  ?? 0;           bv = b.cvss_score  ?? 0;           break;
-        case "epss":       av = a.epss_score  ?? 0;           bv = b.epss_score  ?? 0;           break;
-        case "first_seen": av = a.first_detected_at;          bv = b.first_detected_at;          break;
-        case "last_seen":  av = a.last_detected_at;           bv = b.last_detected_at;           break;
-      }
-      return filters.sortDir === "desc" ? bv - av : av - bv;
-    });
-  }, [raw, filters, adv]);
+  // Standard and advanced conditions are evaluated by the database before
+  // pagination; this page contains only matching rows.
+  const filtered = raw;
 
   // Reset page + bulk selection when filters change
   useEffect(() => { setPage(1); setBulkSel(new Set()); }, [
@@ -3899,14 +3950,13 @@ export function TerrainDetectionPage({
     filters.statusFilter, filters.terrainFilter, filters.agentId, adv,
   ]);
 
-  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
-  const paginated  = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+  const paginated  = filtered;
 
-  // KPIs always from full raw set
-  const kpiTotal    = raw.length;
-  const kpiCritical = raw.filter(f => f.severity === "critical").length;
-  const kpiHigh     = raw.filter(f => f.severity === "high").length;
-  const kpiKev      = raw.filter(f => f.kev).length;
+  const kpiTotal    = stats.total;
+  const kpiCritical = stats.critical;
+  const kpiHigh     = stats.high;
+  const kpiKev      = stats.kev;
   return (
     <div className="space-y-4 pb-6">
       {error && (
@@ -3922,7 +3972,7 @@ export function TerrainDetectionPage({
             filters={filters} setFilters={setFilters}
             adv={adv} setAdv={setAdv}
             mitreTactics={mitreTactics} categories={categories}
-            count={kpiTotal} filtered={filtered.length}
+            count={kpiTotal} filtered={total}
             loading={loading} refetch={refetch}
           />
 
@@ -4076,7 +4126,7 @@ export function TerrainDetectionPage({
           {(filtered.length > 0 || raw.length > 0) && (
             <div className="px-5 py-2.5 border-t border-gray-100 bg-gray-50/60 flex items-center justify-between gap-4 flex-wrap">
               <div className="flex items-center gap-3 text-[10px]">
-                <span className="font-bold text-gray-700">{filtered.length} results</span>
+                <span className="font-bold text-gray-700">{total} results</span>
                 {kpiCritical > 0 && <span className="text-red-600 font-bold flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse inline-block" />{kpiCritical} critical</span>}
                 {kpiHigh > 0     && <span className="text-amber-600 font-semibold">{kpiHigh} high</span>}
                 {kpiKev  > 0     && <span className="text-red-700 font-black bg-red-50 px-2 py-0.5 rounded-full border border-red-200">{kpiKev} KEV</span>}

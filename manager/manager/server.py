@@ -243,7 +243,9 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=_cors_origins,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        allow_headers=[
+            "Authorization", "Content-Type", "X-Request-ID", "Idempotency-Key",
+        ],
         allow_credentials=True,
         max_age=600,
     )
@@ -547,7 +549,7 @@ def create_app() -> FastAPI:
     settings_router   = make_settings_router(intel_db, store, db)
     allowlist_router          = make_allowlist_router(intel_db)
     custom_correlations_router = make_custom_correlations_router(intel_db)
-    cases_router               = make_cases_router(intel_db)
+    cases_router               = make_cases_router(intel_db, auth_required=True)
     investigations_router      = make_investigations_router(investigation_service)
 
     app.include_router(ingest_router,       prefix="/api/v1")
@@ -612,7 +614,14 @@ def create_app() -> FastAPI:
     # ── Build / version metadata (public — surfaced on the dashboard) ─────────
     @app.get("/api/v1/meta")
     async def meta():
-        return _version_info
+        from shared.wire import UI_WINDOW_KEYS, WINDOW_SECONDS
+        return {
+            **_version_info,
+            "time_range_presets": [
+                {"key": key, "seconds": WINDOW_SECONDS[key]}
+                for key in UI_WINDOW_KEYS
+            ],
+        }
 
     # ── Enrichment ────────────────────────────────────────────────────────────
     @app.post("/api/v1/enrich/{finding_id}")

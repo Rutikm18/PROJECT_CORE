@@ -97,6 +97,32 @@ def test_mcp_inventory_never_transmits_environment_values(tmp_path):
     assert "arg-secret" not in serialized
 
 
+def test_path_and_user_identifiers_can_be_minimized(monkeypatch, tmp_path):
+    import agent.os.macos.collectors.developer_security as module
+
+    home = tmp_path / "alice"
+    config = home / ".cursor/mcp.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({
+        "mcpServers": {"server": {"command": "npx", "args": ["tool@latest"]}}
+    }))
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "ATTACKLENS_DEVSEC_PATH_MODE": "hash",
+        "ATTACKLENS_DEVSEC_IDENTITY_MODE": "hash",
+    }
+    monkeypatch.setattr(module, "_get_env", lambda: env)
+
+    first = DeveloperSecurityCollector()._mcp([("alice", home)])
+    second = DeveloperSecurityCollector()._mcp([("alice", home)])
+
+    serialized = json.dumps(first)
+    assert str(home) not in serialized
+    assert first["servers"][0]["config_path"].startswith("path:sha256:")
+    assert first["servers"][0]["config_path"] == second["servers"][0]["config_path"]
+    assert module._privacy_identity("alice").startswith("identity:sha256:")
+
+
 def test_mcp_inventory_parses_toml_and_yaml_variants(tmp_path):
     home = tmp_path / "alice"
     codex = home / ".codex/config.toml"
@@ -144,6 +170,9 @@ def test_snapshot_declares_all_requested_capabilities(monkeypatch):
     snapshot = collector.collect()
 
     assert snapshot["schema_version"] == 1
+    assert snapshot["collector_version"] == "macos-developer-security/2"
+    assert snapshot["collection"]["state"] == "complete"
+    assert set(snapshot["collection"]["capability_states"].values()) == {"complete"}
     assert snapshot["privacy"]["secret_contents_collected"] is False
     assert set(snapshot["capabilities"]) == {
         "editor_extensions", "mcp_servers", "node_packages", "python_packages",
@@ -246,6 +275,7 @@ def test_snapshot_size_is_hard_bounded_and_visible(monkeypatch):
     snapshot = collector.collect()
     encoded = json.dumps(snapshot, separators=(",", ":")).encode()
     assert len(encoded) <= 8_000
+    assert snapshot["collection"]["state"] == "partial"
     assert snapshot["collection"]["partial"] is True
     assert snapshot["collection"]["payload_truncated"] is True
     assert snapshot["collection"]["payload_truncations"]
@@ -270,5 +300,28 @@ def test_timeout_status_marks_snapshot_partial(monkeypatch):
     )
 
     snapshot = collector.collect()
+    assert snapshot["collection"]["state"] == "partial"
     assert snapshot["collection"]["partial"] is True
     assert any(i["error"] == "timeout" for i in snapshot["collection"]["issues"])
+
+
+def test_total_collector_failure_has_explicit_error_state(monkeypatch):
+    monkeypatch.setattr(
+        "agent.os.macos.collectors.developer_security._user_homes", lambda: []
+    )
+    collector = DeveloperSecurityCollector()
+    for name in (
+        "_extensions", "_mcp", "_node", "_python", "_homebrew", "_applications",
+        "_cli_tools", "_shell_startup", "_launchd", "_cron", "_processes",
+        "_listeners", "_browser_extensions", "_native_messaging", "_git",
+        "_credentials", "_docker",
+    ):
+        monkeypatch.setattr(
+            collector, name,
+            lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError()),
+        )
+
+    snapshot = collector.collect()
+
+    assert snapshot["collection"]["state"] == "error"
+    assert set(snapshot["collection"]["capability_states"].values()) == {"error"}

@@ -96,6 +96,10 @@ class AIResponse:
     input_tokens:  int = 0
     output_tokens: int = 0
     latency_ms:    float = 0.0
+    generation_id: str = ""
+    upstream_provider: str = ""
+    finish_reason: str = ""
+    cost_usd: float = 0.0
 
     @property
     def total_tokens(self) -> int:
@@ -147,6 +151,21 @@ class AIProvider(ABC):
     ) -> AIResponse:
         """Send a single user prompt; system prompt is injected automatically."""
         ...
+
+    async def chat_structured(
+        self,
+        user_prompt: str,
+        *,
+        schema: dict,
+        max_tokens: int = 1500,
+    ) -> AIResponse:
+        """Request structured output; local validation remains mandatory.
+
+        Providers with native schema support override this method. The default
+        keeps the provider-neutral interface usable for providers that only
+        support JSON prompting.
+        """
+        return await self.chat(user_prompt, max_tokens=max_tokens)
 
     @abstractmethod
     async def health_check(self) -> tuple[bool, str]:

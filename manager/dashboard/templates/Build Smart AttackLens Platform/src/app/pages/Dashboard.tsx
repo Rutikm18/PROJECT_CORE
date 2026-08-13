@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
+import { useRefresh } from "../context/RefreshContext";
 
 // ── API endpoints ─────────────────────────────────────────────────────────────
 
@@ -278,6 +279,7 @@ function RadialRing({ pct, color, label, size = 68 }: {
 
 export default function SecurityDashboard() {
   const { range } = useTimeRange();
+  const { refreshRevision, registerRefreshRequest } = useRefresh();
   const qs = rangeToParams(range).toString();
 
   const [soc,      setSoc]      = useState<SocDash | null>(null);
@@ -298,14 +300,21 @@ export default function SecurityDashboard() {
   }, []);
 
   const load = useCallback(async () => {
+    const settleRefresh = registerRefreshRequest(refreshRevision);
+    let refreshError: unknown;
+    const json = async (url: string) => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`${url} failed (${response.status})`);
+      return response.json();
+    };
     const [socR, metrR, posR, pkgR, netR] = await Promise.allSettled([
       // Time-series endpoints get the global window filter.
-      fetch(`${SOC}/dashboard?${qs}`).then(r => r.ok ? r.json() : null),
-      fetch(`${SOC}/metrics?${qs}`).then(r => r.ok ? r.json() : null),
+      json(`${SOC}/dashboard?${qs}`),
+      json(`${SOC}/metrics?${qs}`),
       // Current-state endpoint — always shows latest, no window filter.
-      fetch(`${POSTURE}/agents`).then(r => r.ok ? r.json() : []),
-      fetch(`${DETECT}/packages?limit=8&sort_by=composite_score&${qs}`).then(r => r.ok ? r.json() : null),
-      fetch(`${DETECT}/network?limit=8&${qs}`).then(r => r.ok ? r.json() : null),
+      json(`${POSTURE}/agents`),
+      json(`${DETECT}/packages?limit=8&sort_by=composite_score&${qs}`),
+      json(`${DETECT}/network?limit=8&${qs}`),
     ]);
     if (socR.status === "fulfilled" && socR.value)     setSoc(socR.value);
     if (metrR.status === "fulfilled" && metrR.value)   setMetrics(metrR.value);
@@ -314,9 +323,18 @@ export default function SecurityDashboard() {
     if (netR.status === "fulfilled"  && netR.value)    setNetThreats(netR.value.findings ?? netR.value ?? []);
     setLoading(false);
     setLastSync(Math.floor(Date.now() / 1000));
-  }, [qs]);
+    const failures = [socR, metrR, posR, pkgR, netR]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length) refreshError = new Error(`${failures.length} dashboard request${failures.length === 1 ? "" : "s"} failed`);
+    settleRefresh(refreshError);
+  }, [qs, refreshRevision, registerRefreshRequest]);
 
-  useEffect(() => { load(); const t = setInterval(load, 60_000); return () => clearInterval(t); }, [load]);
+  useEffect(() => {
+    void load();
+    if (range.kind === "absolute") return;
+    const timer = window.setInterval(() => void load(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [load, range.kind]);
 
   // ── Derived metrics ────────────────────────────────────────────────────────
 

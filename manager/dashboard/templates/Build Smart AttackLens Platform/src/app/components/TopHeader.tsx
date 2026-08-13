@@ -16,7 +16,7 @@ import {
   Bell, ChevronDown, Clock, LogOut,
   Search, Users, X, LayoutDashboard,
   AlertTriangle, Zap, CheckCircle2,
-  Settings, ChevronRight, RefreshCw,
+  Settings, ChevronRight, RefreshCw, Menu, Sun, RotateCcw,
 } from "lucide-react";
 import { useRBAC, type Role } from "../context/RBACContext";
 import { useAuth } from "../context/AuthContext";
@@ -24,6 +24,11 @@ import { cn } from "../../lib/utils";
 import { useTimezone, tzAbbr, fmtTime, fmtDate, initTimezone } from "../context/timezoneStore";
 import { TimeRangePicker, isTimeAwareRoute } from "./TimeRangePicker";
 import { useRefresh } from "../context/RefreshContext";
+import {
+  DEFAULT_BRIGHTNESS,
+  MAX_BRIGHTNESS,
+  MIN_BRIGHTNESS,
+} from "../lib/brightness";
 
 // ── Breadcrumb ────────────────────────────────────────────────────────────────
 
@@ -115,10 +120,21 @@ function SevPill({ n, sev, loading }: { n: number; sev: "critical" | "high" | "m
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function TopHeader() {
+export function TopHeader({
+  brightness,
+  onBrightnessChange,
+  onOpenNavigation,
+}: {
+  brightness: number;
+  onBrightnessChange: (value: number) => void;
+  onOpenNavigation?: () => void;
+}) {
   const { user, setRole } = useRBAC();
   const { logout, user: authUser } = useAuth();
-  const { triggerRefresh, isRefreshing, refreshNonce } = useRefresh();
+  const {
+    triggerRefresh, isRefreshing, refreshRevision, registerRefreshRequest,
+    pendingRequests, lastSuccessfulAt, lastError,
+  } = useRefresh();
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -149,13 +165,18 @@ export function TopHeader() {
   const [threatsLoading, setThreatsLoading] = useState(true);
 
   const fetchThreats = useCallback(async () => {
+    const settleRefresh = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     try {
       const r = await fetch("/api/v1/attacklens/header-stats");
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`Header stats failed (${r.status})`);
       const d = await r.json();
       setThreats(d);
-    } catch { /* best-effort */ } finally { setThreatsLoading(false); }
-  }, [refreshNonce]); // eslint-disable-line react-hooks/exhaustive-deps
+    } catch (error) { requestError = error; } finally {
+      setThreatsLoading(false);
+      settleRefresh(requestError);
+    }
+  }, [refreshRevision, registerRefreshRequest]);
 
   useEffect(() => { fetchThreats(); const t = setInterval(fetchThreats, 120_000); return () => clearInterval(t); }, [fetchThreats]);
 
@@ -163,28 +184,40 @@ export function TopHeader() {
   const [agents, setAgents] = useState({ online: 0, total: 0, loading: true });
 
   const fetchAgents = useCallback(async () => {
+    const settleRefresh = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     try {
       const r = await fetch("/api/v1/agents");
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`Agent status failed (${r.status})`);
       const list: { last_seen?: number; status?: string }[] = await r.json();
       const now = Date.now() / 1000;
       const online = list.filter(a => a.status === "online" || (a.last_seen && now - a.last_seen < 300)).length;
       setAgents({ online, total: list.length, loading: false });
-    } catch { setAgents(p => ({ ...p, loading: false })); }
-  }, [refreshNonce]); // eslint-disable-line react-hooks/exhaustive-deps
+    } catch (error) {
+      requestError = error;
+      setAgents(p => ({ ...p, loading: false }));
+    } finally {
+      settleRefresh(requestError);
+    }
+  }, [refreshRevision, registerRefreshRequest]);
 
   useEffect(() => { fetchAgents(); const t = setInterval(fetchAgents, 30_000); return () => clearInterval(t); }, [fetchAgents]);
 
   // ── UI panels ─────────────────────────────────────────────────────────────
   const [userMenuOpen, setUserMenuOpen]   = useState(false);
   const [notifOpen,    setNotifOpen]      = useState(false);
+  const [brightnessOpen, setBrightnessOpen] = useState(false);
   const [cmdOpen,      setCmdOpen]        = useState(false);
   const [cmdQuery,     setCmdQuery]       = useState("");
   const [cmdIdx,       setCmdIdx]         = useState(0);
   const cmdInputRef = useRef<HTMLInputElement>(null);
 
   // close all panels
-  const closeAll = useCallback(() => { setUserMenuOpen(false); setNotifOpen(false); }, []);
+  const closeAll = useCallback(() => {
+    setUserMenuOpen(false);
+    setNotifOpen(false);
+    setBrightnessOpen(false);
+  }, []);
 
   // ⌘K keyboard shortcut
   useEffect(() => {
@@ -247,6 +280,14 @@ export function TopHeader() {
 
         {/* ── LEFT: brand + breadcrumb ─────────────────────────────────── */}
         <div className="flex items-center gap-2 min-w-0 flex-1" onClick={e => e.stopPropagation()}>
+          <button
+            type="button"
+            onClick={onOpenNavigation}
+            className="md:hidden w-7 h-7 flex items-center justify-center rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50"
+            aria-label="Open navigation"
+          >
+            <Menu className="w-4 h-4" />
+          </button>
           {/* Logo mark */}
           <div className="flex items-center flex-shrink-0">
             <span className="text-[12px] font-bold tracking-tight text-gray-900 select-none">
@@ -273,7 +314,7 @@ export function TopHeader() {
         </div>
 
         {/* ── CENTRE: live threat intelligence ─────────────────────────── */}
-        <div className="flex items-center gap-1.5 px-3" onClick={e => e.stopPropagation()}>
+        <div className="hidden xl:flex items-center gap-1.5 px-3" onClick={e => e.stopPropagation()}>
           <SevPill n={threats.critical} sev="critical" loading={threatsLoading} />
           <SevPill n={threats.high}     sev="high"     loading={threatsLoading} />
           <SevPill n={threats.medium}   sev="medium"   loading={threatsLoading} />
@@ -311,7 +352,7 @@ export function TopHeader() {
 
           {/* Time range picker (hidden on non-time-aware pages) */}
           {isTimeAwareRoute(location.pathname) && (
-            <div className="mr-1">
+            <div className="mr-1 hidden sm:block">
               <TimeRangePicker />
             </div>
           )}
@@ -320,14 +361,28 @@ export function TopHeader() {
           <button
             onClick={triggerRefresh}
             disabled={isRefreshing}
-            className="flex items-center gap-1 px-2 py-1.5 rounded-lg border border-gray-200 hover:border-orange-300 hover:bg-orange-50 text-gray-400 hover:text-orange-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Refresh all data"
+            className={cn(
+              "flex items-center gap-1 px-2 py-1.5 rounded-lg border hover:border-orange-300 hover:bg-orange-50 transition-all disabled:opacity-50 disabled:cursor-not-allowed",
+              lastError && !isRefreshing
+                ? "border-red-200 bg-red-50 text-red-600"
+                : "border-gray-200 text-gray-400 hover:text-orange-500",
+            )}
+            title={
+              isRefreshing
+                ? `Refreshing ${pendingRequests} request${pendingRequests === 1 ? "" : "s"}`
+                : lastError
+                  ? `Last refresh had errors: ${lastError}`
+                  : lastSuccessfulAt
+                    ? `Last refreshed ${new Date(lastSuccessfulAt).toLocaleTimeString()}`
+                    : "Refresh all visible data"
+            }
           >
             <RefreshCw className={cn("w-3.5 h-3.5", isRefreshing && "animate-spin")} />
+            {lastError && !isRefreshing && <span className="sr-only">Refresh failed</span>}
           </button>
 
           {/* Live indicator */}
-          <div className="flex items-center gap-1 px-2 py-1 rounded-lg mr-1"
+          <div className="hidden sm:flex items-center gap-1 px-2 py-1 rounded-lg mr-1"
             style={{ background: "rgba(16,185,129,0.08)", border: "1px solid rgba(16,185,129,0.18)" }}>
             <span className="w-1.5 h-1.5 rounded-full al-dot-breathe" style={{ background: "#10b981" }} />
             <span className="text-[9px] font-bold hidden sm:block" style={{ color: "#059669" }}>LIVE</span>
@@ -344,7 +399,7 @@ export function TopHeader() {
           {/* ⌘K search */}
           <button
             onClick={() => { setCmdOpen(true); setCmdQuery(""); setCmdIdx(0); }}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-gray-200 bg-gray-50 hover:bg-white hover:border-orange-300 text-[10px] text-gray-500 hover:text-gray-700 transition-all group ml-1"
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-gray-200 bg-gray-50 hover:bg-white hover:border-orange-300 text-[10px] text-gray-500 hover:text-gray-700 transition-all group ml-1"
             title="Global search (⌘K)"
           >
             <Search className="w-3 h-3 group-hover:text-orange-500 transition-colors" />
@@ -355,13 +410,34 @@ export function TopHeader() {
           {/* Notification bell */}
           <button
             onClick={e => { e.stopPropagation(); setNotifOpen(o => !o); setUserMenuOpen(false); }}
-            className="relative p-2 rounded-lg hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600"
+            className="relative p-2 rounded-lg hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600 hidden sm:block"
             title="Notifications"
           >
             <Bell className="w-4 h-4" />
             {threats.critical > 0 && (
               <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-red-500 ring-2 ring-white animate-pulse" />
             )}
+          </button>
+
+          {/* Application brightness */}
+          <button
+            type="button"
+            onClick={e => {
+              e.stopPropagation();
+              setBrightnessOpen(open => !open);
+              setNotifOpen(false);
+              setUserMenuOpen(false);
+            }}
+            className={cn(
+              "relative p-2 rounded-lg transition-colors text-gray-400 hover:text-amber-600",
+              brightnessOpen ? "bg-amber-50 text-amber-600" : "hover:bg-gray-100",
+            )}
+            title={`Interface brightness: ${brightness}%`}
+            aria-label={`Adjust interface brightness, currently ${brightness}%`}
+            aria-haspopup="dialog"
+            aria-expanded={brightnessOpen}
+          >
+            <Sun className="w-4 h-4" />
           </button>
 
           {/* User menu button */}
@@ -394,6 +470,64 @@ export function TopHeader() {
           </button>
         </div>
       </div>
+
+      {/* ── Application brightness panel ───────────────────────────────── */}
+      {brightnessOpen && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setBrightnessOpen(false)} />
+          <div
+            role="dialog"
+            aria-label="Interface brightness"
+            className="fixed right-3 top-12 z-50 w-[min(20rem,calc(100vw-1.5rem))] rounded-2xl border border-gray-200 bg-white p-4 shadow-xl"
+            style={{ boxShadow: "0 8px 32px rgba(0,0,0,0.12)" }}
+          >
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
+                  <Sun className="h-4 w-4" />
+                </div>
+                <div>
+                  <div className="text-[11px] font-bold text-gray-800">Interface brightness</div>
+                  <div className="text-[9px] text-gray-400">Saved on this device</div>
+                </div>
+              </div>
+              <span className="min-w-11 text-right text-[12px] font-bold tabular-nums text-gray-700">
+                {brightness}%
+              </span>
+            </div>
+
+            <label htmlFor="interface-brightness" className="sr-only">
+              Interface brightness percentage
+            </label>
+            <input
+              id="interface-brightness"
+              type="range"
+              min={MIN_BRIGHTNESS}
+              max={MAX_BRIGHTNESS}
+              step={5}
+              value={brightness}
+              onChange={event => onBrightnessChange(Number(event.target.value))}
+              className="w-full cursor-pointer accent-amber-500"
+              aria-valuetext={`${brightness} percent`}
+            />
+
+            <div className="mt-1 flex justify-between text-[9px] font-semibold text-gray-400">
+              <span>Dim</span>
+              <span>Default</span>
+              <span>Bright</span>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => onBrightnessChange(DEFAULT_BRIGHTNESS)}
+              disabled={brightness === DEFAULT_BRIGHTNESS}
+              className="mt-3 flex min-h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-gray-200 text-[10px] font-semibold text-gray-600 transition-colors hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <RotateCcw className="h-3 w-3" /> Reset to 100%
+            </button>
+          </div>
+        </>
+      )}
 
       {/* ── User menu dropdown ────────────────────────────────────────────── */}
       {userMenuOpen && (

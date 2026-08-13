@@ -25,16 +25,57 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import replace
 from typing import Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query
 
 from manager.manager.timewindow import resolve_window, WindowError
+from manager.manager.indexer import FindingQuery
 
 if TYPE_CHECKING:
     from ..indexer import IntelDB
 
 log = logging.getLogger("manager.api.detection")
+
+_ADVANCED_FILTER_FIELDS = {
+    "title", "description", "severity", "category", "status", "agent_id",
+    "source", "mitre_technique", "mitre_tactic", "cve_ids",
+    "composite_score", "cvss_score", "epss_score", "confidence_pct",
+    "kev", "exploit_available", "terrain", "package_manager",
+}
+_ADVANCED_FILTER_OPERATORS = {
+    "is", "is_not", "contains", "not_contains", "exists", "not_exists",
+}
+
+
+def _parse_advanced_filters(raw: str | None) -> list[dict[str, str]]:
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("advanced must be a JSON array") from exc
+    if not isinstance(decoded, list):
+        raise ValueError("advanced must be a JSON array")
+    if len(decoded) > 20:
+        raise ValueError("advanced supports at most 20 conditions")
+
+    parsed: list[dict[str, str]] = []
+    for index, condition in enumerate(decoded):
+        if not isinstance(condition, dict):
+            raise ValueError(f"advanced[{index}] must be an object")
+        field = str(condition.get("field") or "")
+        operator = str(condition.get("op") or "")
+        value = str(condition.get("value") or "")[:500]
+        if field not in _ADVANCED_FILTER_FIELDS:
+            raise ValueError(f"advanced[{index}].field is not supported")
+        if operator not in _ADVANCED_FILTER_OPERATORS:
+            raise ValueError(f"advanced[{index}].op is not supported")
+        if operator not in {"exists", "not_exists"} and not value.strip():
+            continue
+        parsed.append({"field": field, "op": operator, "value": value})
+    return parsed
 
 # Source string → confidence level (0–1)
 _SOURCE_CONFIDENCE: dict[str, float] = {
@@ -469,16 +510,25 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         category:  Optional[str] = Query(None),
         severity:  Optional[str] = Query(None),
         status:    Optional[str] = Query(None),
+        assignee:  Optional[str] = Query(None),
+        view:      str           = Query("active", pattern="^(active|closed|all)$"),
         sla_only:  bool          = Query(False),
+        sla_breached: bool       = Query(False),
+        kev_only:  bool          = Query(False),
+        exploit_only: bool       = Query(False),
+        mitre:     Optional[str] = Query(None, description="MITRE tactic or technique fragment"),
         search:    Optional[str] = Query(None),
+        advanced:  Optional[str] = Query(None, max_length=12000),
         id_search: Optional[str] = Query(
             None, description="Direct ID lookup — prefix match on external_id "
                               "(AL-F-NNNNNNNN). Uses UNIQUE index, O(log n). "
                               "Overrides `search` when both are present."
         ),
         sort_by:   str           = Query("composite_score"),
+        sort_dir:  str           = Query("desc", pattern="^(asc|desc)$"),
         limit:     int           = Query(200, ge=1, le=1000),
         offset:    int           = Query(0, ge=0),
+        cursor:    Optional[str] = Query(None, max_length=1000),
         validated_only: bool     = Query(
             False,
             description="Opt-in: apply the configured Settings → Validation "
@@ -494,34 +544,120 @@ def make_detection_router(intel_db: "IntelDB", db=None) -> APIRouter:
         end:      Optional[int] = Query(None),
     ):
         try:
+            advanced_filters = _parse_advanced_filters(advanced)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        try:
             ws, we = resolve_window(window, start, end)
         except WindowError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        # ── ID Search fast-path: direct indexed lookup ─────────────────────────
+        id_prefix: str | None = None
         if id_search:
-            term = id_search.strip().upper()
-            if not term.startswith("AL-F-"):
-                term = "AL-F-" + term
-            rows = await intel_db.search_by_external_id(
-                term,
-                active_only=True,
-                agent_id=agent_id,
-                terrain_id=terrain_id,
-                limit=limit,
-            )
-            return {"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": 0, "id_search": id_search}
+            id_prefix = id_search.strip().upper()
+            if not id_prefix.startswith("AL-F-"):
+                id_prefix = "AL-F-" + id_prefix
 
-        rows = await intel_db.get_soc_findings(
+        active_only = view == "active"
+        if view == "closed" and not status:
+            status = "__closed__"
+
+        query = FindingQuery(
             agent_id=agent_id, terrain_id=terrain_id, category=category,
-            severity=severity, status=status, sla_breached=sla_only, search=search,
-            active_only=True, sort_by=sort_by, limit=limit, offset=offset,
-            min_precision=await _validated_prefilter(intel_db, validated_only),
-            live_agent_ids=await _live_agent_ids(),
-            window_start=ws,
-            window_end=we,
+            severity=severity, status=status, assignee=assignee,
+            sla_breached=sla_only or sla_breached,
+            kev_only=kev_only, exploit_only=exploit_only, mitre=mitre,
+            advanced_filters=tuple(advanced_filters),
+            search=None if id_prefix else search, external_id_prefix=id_prefix,
+            active_only=active_only, sort_by=sort_by, sort_dir=sort_dir,
+            limit=limit, offset=offset, cursor=cursor,
+            validation_state="validated" if validated_only else None,
+            live_agent_ids=(
+                None if (live_ids := await _live_agent_ids()) is None else tuple(live_ids)
+            ),
+            window_start=ws, window_end=we,
         )
+        validation_stats: dict | None = None
+        effective_thresholds: dict | None = None
+        global_threshold: float | None = None
+        try:
+            all_page = None
+            if validated_only:
+                all_page = await intel_db.query_soc_findings(replace(
+                    query,
+                    validation_state=None,
+                    limit=1,
+                    offset=0,
+                    cursor=None,
+                ))
+            page = await intel_db.query_soc_findings(query)
+            if validated_only and all_page is not None:
+                from ..attacklens.ai_validator import _load_validation_settings
+
+                settings = await _load_validation_settings(intel_db)
+                global_threshold = float(settings.get("global", 0.90))
+                effective_thresholds = {
+                    "global": global_threshold,
+                    "terrain": dict(settings.get("terrain") or {}),
+                    "agent": dict(settings.get("agent") or {}),
+                }
+                terrain_ids = set(all_page.facets["terrain"]) | set(page.facets["terrain"])
+                validation_stats = {
+                    "active_total": all_page.total,
+                    "validated_count": page.total,
+                    "below_threshold": max(0, all_page.total - page.total),
+                    "by_terrain": {
+                        terrain: {
+                            "validated": page.facets["terrain"].get(terrain, 0),
+                            "below": max(
+                                0,
+                                all_page.facets["terrain"].get(terrain, 0)
+                                - page.facets["terrain"].get(terrain, 0),
+                            ),
+                        }
+                        for terrain in terrain_ids if terrain
+                    },
+                }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rows = page.findings
+        total = page.total
+        stats = {
+            "total": total,
+            "critical": page.facets["severity"].get("critical", 0),
+            "high": page.facets["severity"].get("high", 0),
+            "kev": page.facets["kev"].get("true", 0),
+        }
         rows, thr, below = await _apply_validated_filter(intel_db, rows, validated_only)
-        return _validated_body({"findings": [_enrich(r) for r in rows], "count": len(rows), "offset": offset}, validated_only, thr, below)
+        for row in rows:
+            for field in (
+                "filtered_total", "filtered_critical", "filtered_high", "filtered_kev",
+                "cursor_sort_value",
+            ):
+                row.pop(field, None)
+        body = {
+            "findings": [_enrich(r) for r in rows],
+            "count": len(rows),
+            "total": total,
+            "stats": stats,
+            "facets": page.facets,
+            "offset": offset,
+            "next_cursor": page.next_cursor,
+        }
+        if validated_only:
+            body["effective_thresholds"] = effective_thresholds or {
+                "global": 0.90, "terrain": {}, "agent": {},
+            }
+            body["validation_filter_stats"] = validation_stats or {
+                "active_total": total,
+                "validated_count": total,
+                "below_threshold": 0,
+                "by_terrain": {},
+            }
+        if id_search:
+            body["id_search"] = id_search
+        return _validated_body(
+            body, validated_only, global_threshold if validated_only else thr, below,
+        )
 
     return router
 
@@ -572,6 +708,19 @@ async def _apply_validated_filter(intel_db, rows: list[dict], validated_only: bo
 
     kept: list[dict] = []
     for r in rows:
+        state = str(r.get("validation_state") or "legacy_unassessed")
+        if state == "validated":
+            r["effective_threshold"] = round(
+                float(r.get("effective_validation_threshold") or global_threshold or 0.90),
+                3,
+            )
+            r["is_validated"] = True
+            kept.append(r)
+            continue
+        if "validation_state" in r:
+            r["is_validated"] = False
+            below += 1
+            continue
         try:
             thr = await resolve_threshold(intel_db, r.get("agent_id", ""), r.get("category", ""))
         except Exception:

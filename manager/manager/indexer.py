@@ -19,6 +19,7 @@ Dedup rule (user requirement):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -36,6 +37,192 @@ log = logging.getLogger("manager.indexer")
 
 FindingNotificationHandler = Callable[[dict, str], Awaitable[None]]
 
+
+@dataclass(frozen=True, slots=True)
+class FindingQuery:
+    """Canonical repository query for every finding collection view."""
+
+    agent_id: str | None = None
+    terrain_id: str | None = None
+    severity: str | None = None
+    status: str | None = None
+    category: str | None = None
+    assignee: str | None = None
+    sla_breached: bool = False
+    kev_only: bool = False
+    exploit_only: bool = False
+    mitre: str | None = None
+    advanced_filters: tuple[dict[str, str], ...] = ()
+    active_only: bool = True
+    search: str | None = None
+    external_id_prefix: str | None = None
+    limit: int = 200
+    offset: int = 0
+    cursor: str | None = None
+    sort_by: str = "score"
+    sort_dir: str = "desc"
+    min_precision: float | None = None
+    validation_state: str | None = None
+    live_agent_ids: tuple[str, ...] | None = None
+    window_start: int | None = None
+    window_end: int | None = None
+
+
+@dataclass(slots=True)
+class FindingPage:
+    findings: list[dict]
+    total: int
+    facets: dict[str, dict[str, int]]
+    next_cursor: str | None
+
+
+_TERMINAL_FINDING_STATUSES = {
+    "closed", "false_positive", "accepted_risk", "duplicate", "verified", "remediated",
+}
+_FINDING_SORTS = {
+    "score": "COALESCE(f.score,0)",
+    "composite_score": "COALESCE(f.composite_score,0)",
+    "exploitability_score": "COALESCE(f.exploitability_score,0)",
+    "cvss_score": "COALESCE(f.cvss_score,0)",
+    "epss_score": "COALESCE(f.epss_score,0)",
+    "first_detected_at": "COALESCE(f.first_detected_at,0)",
+    "last_detected_at": "COALESCE(f.last_detected_at,0)",
+    "priority": "COALESCE(f.priority,0)",
+    "kev": "COALESCE(f.kev,0)",
+    "exploit_available": "COALESCE(f.exploit_available,0)",
+    "severity": (
+        "CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
+        "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
+    ),
+    "sla_due": "COALESCE(f.sla_due,0)",
+}
+_ADVANCED_FINDING_FIELDS = {
+    "title": "f.title",
+    "description": "f.description",
+    "severity": "f.severity",
+    "category": "f.category",
+    "status": "f.status",
+    "agent_id": "f.agent_id",
+    "source": "f.source",
+    "mitre_technique": "f.mitre_technique",
+    "mitre_tactic": "f.mitre_tactic",
+    "cve_ids": "f.cve_ids",
+    "composite_score": "f.composite_score",
+    "cvss_score": "f.cvss_score",
+    "epss_score": "f.epss_score",
+    "confidence_pct": "(COALESCE(f.confidence, 0) * 100)",
+    "kev": "CASE WHEN f.kev=1 THEN 'true' ELSE 'false' END",
+    "exploit_available": "CASE WHEN f.exploit_available=1 THEN 'true' ELSE 'false' END",
+    "terrain": "f.terrain_id",
+    "package_manager": "COALESCE((f.evidence::jsonb)->>'package_manager', '')",
+}
+
+
+def _encode_finding_cursor(sort_by: str, sort_dir: str, value: Any, finding_id: int) -> str:
+    payload = json.dumps(
+        {"v": 1, "sort": sort_by, "dir": sort_dir, "value": value, "id": finding_id},
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_finding_cursor(token: str, sort_by: str, sort_dir: str) -> tuple[Any, int]:
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if (
+            payload.get("v") != 1
+            or payload.get("sort") != sort_by
+            or payload.get("dir") != sort_dir
+        ):
+            raise ValueError
+        finding_id = int(payload["id"])
+        value = payload["value"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError
+        return value, finding_id
+    except Exception as exc:
+        raise ValueError("cursor is invalid or belongs to a different sort") from exc
+
+
+def _compile_finding_filter(query: FindingQuery) -> tuple[str, list[Any]]:
+    """Compile the sole allowlisted finding predicate used by pages and facets."""
+    parts: list[str] = []
+    args: list[Any] = []
+    if query.agent_id:
+        parts.append("f.agent_id=?"); args.append(query.agent_id)
+    elif query.live_agent_ids is not None and query.active_only:
+        if not query.live_agent_ids:
+            parts.append("1=0")
+        else:
+            marks = ",".join("?" * len(query.live_agent_ids))
+            parts.append(f"f.agent_id IN ({marks})")
+            args.extend(query.live_agent_ids)
+    if query.severity:
+        parts.append("f.severity=?"); args.append(query.severity)
+    if query.min_precision is not None:
+        parts.append("COALESCE(f.precision_score,0)>=?"); args.append(query.min_precision)
+    if query.validation_state:
+        parts.append("f.validation_state=?"); args.append(query.validation_state)
+    if query.status == "__closed__":
+        marks = ",".join("?" * len(_TERMINAL_FINDING_STATUSES))
+        parts.append(f"f.status IN ({marks})")
+        args.extend(sorted(_TERMINAL_FINDING_STATUSES))
+    elif query.status:
+        parts.append("f.status=?"); args.append(query.status)
+    if query.category:
+        parts.append("f.category=?"); args.append(query.category)
+    if query.terrain_id:
+        parts.append("f.terrain_id=?"); args.append(query.terrain_id)
+    if query.external_id_prefix:
+        parts.append("f.external_id LIKE ?")
+        args.append(query.external_id_prefix.replace("*", "%") + "%")
+    if query.assignee:
+        parts.append("f.assignee=?"); args.append(query.assignee)
+    if query.sla_breached:
+        parts.append("f.sla_due>0 AND f.sla_due<?"); args.append(time.time())
+    if query.kev_only:
+        parts.append("f.kev=1")
+    if query.exploit_only:
+        parts.append("f.exploit_available=1")
+    if query.mitre:
+        parts.append(
+            "(LOWER(COALESCE(f.mitre_tactic,''))=LOWER(?) "
+            "OR LOWER(COALESCE(f.mitre_technique,'')) LIKE LOWER(?))"
+        )
+        args.extend([query.mitre, f"%{query.mitre}%"])
+    for condition in query.advanced_filters:
+        expression = _ADVANCED_FINDING_FIELDS.get(condition.get("field", ""))
+        operator = condition.get("op")
+        if expression is None or operator not in {
+            "is", "is_not", "contains", "not_contains", "exists", "not_exists",
+        }:
+            continue
+        text_expression = f"LOWER(COALESCE(CAST({expression} AS TEXT),''))"
+        if operator == "exists":
+            parts.append(f"{text_expression} NOT IN ('','[]','{{}}')")
+        elif operator == "not_exists":
+            parts.append(f"{text_expression} IN ('','[]','{{}}')")
+        elif operator == "is":
+            parts.append(f"{text_expression}=LOWER(?)"); args.append(condition.get("value", ""))
+        elif operator == "is_not":
+            parts.append(f"{text_expression}<>LOWER(?)"); args.append(condition.get("value", ""))
+        elif operator == "contains":
+            parts.append(f"{text_expression} LIKE LOWER(?)"); args.append(f"%{condition.get('value', '')}%")
+        elif operator == "not_contains":
+            parts.append(f"{text_expression} NOT LIKE LOWER(?)"); args.append(f"%{condition.get('value', '')}%")
+    if query.active_only and query.status not in _TERMINAL_FINDING_STATUSES:
+        parts.append("f.is_active=1")
+    elif query.active_only and query.status in _TERMINAL_FINDING_STATUSES:
+        parts.append("f.is_active=0")
+    if query.window_start is not None and query.window_end is not None:
+        parts.append("f.first_detected_at<=? AND f.last_detected_at>=?")
+        args.extend([float(query.window_end), float(query.window_start)])
+    if query.search:
+        parts.append("f.search_vector @@ websearch_to_tsquery('english',?)")
+        args.append(query.search)
+    return (("WHERE " + " AND ".join(parts)) if parts else ""), args
+
 # Reserved pseudo-agent under which fleet-wide / global-threat correlations are
 # stored (correlations table is keyed UNIQUE(agent_id, rule_id)). A real agent
 # can never collide with this — agent ids are hardware-derived (mac-/win-/host-).
@@ -43,10 +230,10 @@ FLEET_AGENT_ID = "__fleet__"
 
 _SCHEMA = """
 -- ── Attack Terrain lookup table ──────────────────────────────────────────
--- Defines the 5 canonical attack terrains. Used as a FK target for findings
--- so every finding is classified into one terrain at creation time.
+-- Defines the canonical attack terrains so every finding can be classified
+-- into one terrain at creation time.
 CREATE TABLE IF NOT EXISTS terrains (
-    id          TEXT PRIMARY KEY,               -- 'citadels' | 'vector' | 'origin' | 'identity' | 'posture'
+    id          TEXT PRIMARY KEY,
     label       TEXT NOT NULL,                  -- Human-readable title
     description TEXT NOT NULL DEFAULT '',
     color       TEXT NOT NULL DEFAULT '',       -- UI hint for dashboard chips
@@ -112,13 +299,20 @@ CREATE TABLE IF NOT EXISTS findings (
     precision_factors TEXT    NOT NULL DEFAULT '{}',
     ai_verdict        TEXT    NOT NULL DEFAULT '{}',
     ai_validation_used INTEGER NOT NULL DEFAULT 0,
+    model_precision_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    terrain_score      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    validation_score   DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    validation_state   TEXT NOT NULL DEFAULT 'legacy_unassessed',
+    validation_policy_version TEXT NOT NULL DEFAULT '',
+    effective_validation_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    validated_at       DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     -- Terrain-aware validation (per-criterion checklist)
     terrain_validation TEXT   NOT NULL DEFAULT '{}',
     -- Unique Finding ID (UUIDv4 hex) — globally unique, non-sequential,
     -- reference-safe across systems, audit logs, and external integrations.
     finding_uid       TEXT    NOT NULL DEFAULT '',
     -- Attack Terrain FK — canonical terrain classification at creation time.
-    -- References terrains(id): citadels | vector | origin | identity | posture.
+    -- References terrains(id): citadels | vector | origin | identity | posture | mesh.
     terrain_id        TEXT    NOT NULL DEFAULT '',
     -- Compact actions log (JSON array). Each entry: {action_id, action, actor,
     -- timestamp}.  A lightweight summary on the finding itself so the UI never
@@ -135,6 +329,8 @@ CREATE INDEX IF NOT EXISTS idx_find_ts      ON findings(last_detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_find_score   ON findings(score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_composite ON findings(composite_score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_exploitability ON findings(exploitability_score DESC);
+CREATE INDEX IF NOT EXISTS idx_find_validation_state
+    ON findings(validation_state, is_active, validation_score DESC);
 CREATE INDEX IF NOT EXISTS idx_find_cat     ON findings(agent_id, category);
 -- Every Attack Terrain page (processes/network/persistence/packages/ports)
 -- queries category + is_active with NO agent_id filter (fleet-wide view) —
@@ -157,6 +353,63 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_find_finding_uid ON findings(finding_uid)
     WHERE finding_uid != '';
 -- Attack Terrain index — fleet-wide filtering and dashboard grouping.
 CREATE INDEX IF NOT EXISTS idx_find_terrain_id ON findings(terrain_id);
+
+-- ── Validation decision ledger ──────────────────────────────────────────
+-- Append-only audit records. The findings row is the current projection;
+-- this table preserves the evidence/policy/model context behind each change.
+CREATE TABLE IF NOT EXISTS validation_runs (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_uid             TEXT NOT NULL UNIQUE,
+    run_key             TEXT NOT NULL,
+    finding_id          BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    finding_uid         TEXT NOT NULL DEFAULT '',
+    agent_id            TEXT NOT NULL DEFAULT '',
+    evidence_revision   TEXT NOT NULL,
+    policy_version      TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL,
+    model_score         DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    terrain_score       DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    validation_score    DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    threshold_used      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    gate_results        TEXT NOT NULL DEFAULT '{}',
+    provider            TEXT NOT NULL DEFAULT '',
+    model               TEXT NOT NULL DEFAULT '',
+    generation_id       TEXT NOT NULL DEFAULT '',
+    prompt_version      TEXT NOT NULL DEFAULT '',
+    schema_version      TEXT NOT NULL DEFAULT '',
+    tokens_used         INTEGER NOT NULL DEFAULT 0,
+    cost_usd            DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    error_class         TEXT NOT NULL DEFAULT '',
+    error_message       TEXT NOT NULL DEFAULT '',
+    started_at          DOUBLE PRECISION NOT NULL,
+    completed_at        DOUBLE PRECISION NOT NULL,
+    UNIQUE(finding_id, run_key)
+);
+CREATE INDEX IF NOT EXISTS idx_validation_runs_finding
+    ON validation_runs(finding_id, completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_validation_runs_status
+    ON validation_runs(status, completed_at DESC);
+
+-- Durable orchestration state for bounded retroactive recomputation. A job is
+-- resumed from cursor_id after restart and cancellation is checked between
+-- findings, so settings changes never require one uninterruptible table scan.
+CREATE TABLE IF NOT EXISTS validation_recompute_jobs (
+    job_uid             TEXT PRIMARY KEY,
+    state               TEXT NOT NULL DEFAULT 'queued',
+    only_unscored       INTEGER NOT NULL DEFAULT 0,
+    cursor_id           BIGINT NOT NULL DEFAULT 0,
+    target_limit        INTEGER NOT NULL DEFAULT 5000,
+    scanned             INTEGER NOT NULL DEFAULT 0,
+    updated             INTEGER NOT NULL DEFAULT 0,
+    histogram           TEXT NOT NULL DEFAULT '{}',
+    cancel_requested    INTEGER NOT NULL DEFAULT 0,
+    error               TEXT NOT NULL DEFAULT '',
+    created_at          DOUBLE PRECISION NOT NULL,
+    updated_at          DOUBLE PRECISION NOT NULL,
+    completed_at        DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_validation_recompute_state
+    ON validation_recompute_jobs(state, updated_at DESC);
 
 -- ── Full-text search ──────────────────────────────────────────────────────
 -- SQLite's FTS5 needed a separate virtual table + 3 triggers to mirror data
@@ -634,6 +887,79 @@ CREATE TABLE IF NOT EXISTS custom_correlation_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_custom_corr_enabled ON custom_correlation_rules(enabled, created_at DESC);
 
+-- ── Unified many-to-many case management ────────────────────────────────
+CREATE TABLE IF NOT EXISTS cases (
+    id              BIGSERIAL PRIMARY KEY,
+    external_id     TEXT NOT NULL DEFAULT '',
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'open',
+    priority        TEXT NOT NULL DEFAULT 'medium',
+    owner_user_id   TEXT NOT NULL DEFAULT '',
+    due_at          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_by      TEXT NOT NULL,
+    created_at      DOUBLE PRECISION NOT NULL,
+    updated_at      DOUBLE PRECISION NOT NULL,
+    closed_at       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    version         INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_external_id ON cases(external_id)
+    WHERE external_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_idempotency ON cases(tenant_id,idempotency_key)
+    WHERE idempotency_key != '';
+CREATE INDEX IF NOT EXISTS idx_cases_queue
+    ON cases(tenant_id,status,updated_at DESC,id DESC);
+
+CREATE TABLE IF NOT EXISTS case_findings (
+    case_id       BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    finding_id    BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL DEFAULT 'related',
+    added_by      TEXT NOT NULL,
+    added_at      DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY(case_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_case_findings_finding ON case_findings(finding_id,case_id);
+
+CREATE TABLE IF NOT EXISTS case_notes (
+    id          BIGSERIAL PRIMARY KEY,
+    case_id     BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    body        TEXT NOT NULL,
+    created_by  TEXT NOT NULL,
+    created_at  DOUBLE PRECISION NOT NULL,
+    edited_at   DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_case_notes_case ON case_notes(case_id,created_at,id);
+
+CREATE TABLE IF NOT EXISTS case_events (
+    id             BIGSERIAL PRIMARY KEY,
+    case_id        BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    event_type     TEXT NOT NULL,
+    actor_user_id  TEXT NOT NULL,
+    old_value_json TEXT NOT NULL DEFAULT '{}',
+    new_value_json TEXT NOT NULL DEFAULT '{}',
+    request_id     TEXT NOT NULL DEFAULT '',
+    created_at     DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_case_events_case ON case_events(case_id,created_at,id);
+
+CREATE TABLE IF NOT EXISTS case_tags (
+    case_id BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    tag     TEXT NOT NULL,
+    PRIMARY KEY(case_id, tag)
+);
+
+CREATE TABLE IF NOT EXISTS case_outbox (
+    id           BIGSERIAL PRIMARY KEY,
+    case_id      BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    event_type   TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   DOUBLE PRECISION NOT NULL,
+    published_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_case_outbox_pending ON case_outbox(published_at,id);
+
 -- ── Per-finding case management ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS finding_cases (
     finding_id  INTEGER          PRIMARY KEY,
@@ -731,6 +1057,13 @@ _SOC_MIGRATIONS = [
     ("findings", "ai_verdict",              "TEXT    DEFAULT '{}'"),
     ("findings", "ai_validation_used",      "INTEGER DEFAULT 0"),
     ("findings", "terrain_validation",      "TEXT    DEFAULT '{}'"),
+    ("findings", "model_precision_score",   "DOUBLE PRECISION DEFAULT 0.0"),
+    ("findings", "terrain_score",            "DOUBLE PRECISION DEFAULT 0.0"),
+    ("findings", "validation_score",         "DOUBLE PRECISION DEFAULT 0.0"),
+    ("findings", "validation_state",         "TEXT DEFAULT 'legacy_unassessed'"),
+    ("findings", "validation_policy_version", "TEXT DEFAULT ''"),
+    ("findings", "effective_validation_threshold", "DOUBLE PRECISION DEFAULT 0.0"),
+    ("findings", "validated_at",             "DOUBLE PRECISION DEFAULT 0.0"),
     ("nvd_cve_local", "vuln_status",         "TEXT    DEFAULT ''"),
     ("nvd_cve_local", "cpe_matches",         "TEXT    DEFAULT '[]'"),
     # Unique Finding ID + Attack Terrain FK + Actions Log
@@ -1031,13 +1364,18 @@ class IntelDB:
 
         # 4. Seed terrain lookup data (idempotent — ON CONFLICT DO NOTHING).
         try:
+            from .attacklens.terrain_catalog import all_terrains
+
             now = time.time()
             terrain_seed = [
-                ('citadels','Citadels','Execution, persistence, and malware signals','#ef4444',now),
-                ('vector','Vector','Network connections, ports, ARP, lateral movement','#f97316',now),
-                ('origin','Origin','Vulnerabilities, packages, SBOM, config drift','#eab308',now),
-                ('identity','Identity','User accounts, credentials, identity anomalies','#3b82f6',now),
-                ('posture','Posture','Security posture, SIP, Gatekeeper, FileVault, firewall','#8b5cf6',now),
+                (
+                    definition.id,
+                    definition.label,
+                    definition.description,
+                    definition.color,
+                    now,
+                )
+                for definition in all_terrains()
             ]
             for row in terrain_seed:
                 await self._conn.execute(
@@ -1127,6 +1465,42 @@ class IntelDB:
 
     # ── Findings ──────────────────────────────────────────────────────────────
 
+    async def _insert_validation_run(
+        self,
+        finding_id: int,
+        finding: dict,
+        evidence_revision: str,
+        completed_at: float,
+    ) -> None:
+        """Append one validation audit record inside the caller's transaction."""
+        record = build_validation_run_record(
+            finding_id, finding, evidence_revision, completed_at,
+        )
+        await self._conn.execute(
+            """INSERT INTO validation_runs
+               (run_uid,run_key,finding_id,finding_uid,agent_id,
+                evidence_revision,policy_version,status,model_score,
+                terrain_score,validation_score,threshold_used,gate_results,
+                provider,model,generation_id,prompt_version,schema_version,
+                tokens_used,cost_usd,error_class,error_message,started_at,completed_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (finding_id,run_key) DO NOTHING""",
+            (
+                record["run_uid"], record["run_key"], record["finding_id"],
+                record["finding_uid"], record["agent_id"],
+                record["evidence_revision"], record["policy_version"],
+                record["status"], record["model_score"],
+                record["terrain_score"], record["validation_score"],
+                record["threshold_used"],
+                json.dumps(record["gate_results"], default=str),
+                record["provider"], record["model"], record["generation_id"],
+                record["prompt_version"], record["schema_version"],
+                record["tokens_used"], record["cost_usd"],
+                record["error_class"], record["error_message"],
+                record["started_at"], record["completed_at"],
+            ),
+        )
+
     async def upsert_finding(self, f: dict, ts: float) -> str:
         """
         Upsert a finding.  Returns 'new' | 'updated' | 'unchanged'.
@@ -1174,15 +1548,15 @@ class IntelDB:
         # ── Attack Terrain classification ────────────────────────────────────
         # Resolve the canonical terrain from the finding's category.  Callers
         # (e.g. the detection engine) may pre-set terrain_id; if absent we
-        # derive it here via terrain_validators, which is the single source of
-        # truth for category→terrain mapping.
+        # derive it through terrain_validators, which consumes the canonical
+        # terrain catalog.
         terrain_id = f.get("terrain_id") or ""
         if not terrain_id:
             try:
                 from .attacklens.terrain_validators import terrain_for
                 terrain_id = terrain_for(f)
             except Exception:
-                terrain_id = "origin"  # safest fallback
+                terrain_id = "unclassified"
         f["terrain_id"] = terrain_id
 
         # ── Terrain source provenance ────────────────────────────────────────
@@ -1224,6 +1598,20 @@ class IntelDB:
 
         # Terrain validation (per-criterion checklist) — see terrain_validators.py
         terrain_validation_j = json.dumps(f.get("terrain_validation") or {}, default=str)
+        model_precision_score = float(f.get("model_precision_score") or 0.0)
+        terrain_score = float(f.get("terrain_score") or 0.0)
+        validation_score = float(f.get("validation_score") or 0.0)
+        validation_state = str(f.get("validation_state") or "legacy_unassessed")
+        if validation_state not in {
+            "legacy_unassessed", "queued", "running", "inconclusive",
+            "needs_review", "validated", "rejected", "error",
+        }:
+            validation_state = "error"
+        validation_policy_version = str(f.get("validation_policy_version") or "")[:100]
+        effective_validation_threshold = float(
+            f.get("effective_validation_threshold") or 0.0
+        )
+        validated_at = float(f.get("validated_at") or 0.0)
 
         async with self._lock:
             # ── Cache-first dedup ────────────────────────────────────────────
@@ -1272,8 +1660,9 @@ class IntelDB:
                       precision_score, precision_factors_j, ai_verdict_j,
                       ai_validation_used, terrain_validation_j,
                       finding_uid, terrain_id, actions_log_j, ts))
-                await self._conn.commit()
-                # Log creation in SOC activity
+                # Keep the insert and its generated external/validation fields
+                # in one transaction. Readers must never observe a newly
+                # inserted finding in the default legacy validation state.
                 cur2 = await self._conn.execute(
                     "SELECT id FROM findings WHERE agent_id=? AND category=? AND item_key=?",
                     (agent_id, category, item_key),
@@ -1282,9 +1671,24 @@ class IntelDB:
                 if new_row:
                     external_id = _external_id(new_row["id"])
                     await self._conn.execute(
-                        "UPDATE findings SET external_id=? WHERE id=?",
-                        (external_id, new_row["id"]),
+                        """UPDATE findings SET
+                           external_id=?, model_precision_score=?, terrain_score=?,
+                           validation_score=?, validation_state=?,
+                           validation_policy_version=?,
+                           effective_validation_threshold=?, validated_at=?
+                           WHERE id=?""",
+                        (
+                            external_id, model_precision_score, terrain_score,
+                            validation_score, validation_state,
+                            validation_policy_version,
+                            effective_validation_threshold, validated_at,
+                            new_row["id"],
+                        ),
                     )
+                    if validation_policy_version:
+                        await self._insert_validation_run(
+                            new_row["id"], f, fp, ts,
+                        )
                     await self._ensure_default_actions(
                         new_row["id"], agent_id, f.get("action_plan") or [], ts,
                     )
@@ -1329,7 +1733,10 @@ class IntelDB:
                         is_active=1, tags=?,
                         precision_score=?, precision_factors=?,
                         ai_verdict=?, ai_validation_used=?,
-                        terrain_validation=?, terrain_id=?,
+                        terrain_validation=?, model_precision_score=?,
+                        terrain_score=?, validation_score=?, validation_state=?,
+                        validation_policy_version=?,
+                        effective_validation_threshold=?, validated_at=?, terrain_id=?,
                         actions_log=?,
                         content_changed_at=?, consecutive_unchanged=0
                     WHERE agent_id=? AND category=? AND item_key=?
@@ -1344,8 +1751,13 @@ class IntelDB:
                       ts, tags_j,
                       precision_score, precision_factors_j, ai_verdict_j,
                       ai_validation_used, terrain_validation_j,
+                      model_precision_score, terrain_score, validation_score,
+                      validation_state, validation_policy_version,
+                      effective_validation_threshold, validated_at,
                       terrain_id, actions_log_j, ts,
                       agent_id, category, item_key))
+                if validation_policy_version:
+                    await self._insert_validation_run(row["id"], f, fp, ts)
                 await self._conn.commit()
                 await self._append_timeline(agent_id, category, "modified",
                                             item_key, f.get("title",""),
@@ -1957,12 +2369,20 @@ class IntelDB:
         category: str | None = None,
         assignee: str | None = None,
         sla_breached: bool = False,
+        kev_only: bool = False,
+        exploit_only: bool = False,
+        mitre: str | None = None,
+        advanced_filters: list[dict[str, str]] | None = None,
         active_only: bool = True,
         search: str | None = None,
+        external_id_prefix: str | None = None,
         limit: int = 200,
         offset: int = 0,
+        cursor: str | None = None,
         sort_by: str = "score",
+        sort_dir: str = "desc",
         min_precision: float | None = None,
+        validation_state: str | None = None,
         live_agent_ids: list[str] | None = None,
         window_start: int | None = None,
         window_end: int | None = None,
@@ -1986,110 +2406,104 @@ class IntelDB:
         agent's OS as `agent_os` — the UI uses this to lock the remediation
         panel to the right command set per finding.
         """
-        parts: list[str] = []
-        args: list = []
-        if agent_id:
-            parts.append("f.agent_id=?"); args.append(agent_id)
-        elif live_agent_ids is not None and active_only:
-            if not live_agent_ids:
-                return []   # no live agents at all — nothing to show
-            placeholders = ",".join("?" * len(live_agent_ids))
-            parts.append(f"f.agent_id IN ({placeholders})")
-            args.extend(live_agent_ids)
-        if severity:
-            parts.append("f.severity=?"); args.append(severity)
-        if min_precision is not None:
-            parts.append("COALESCE(f.precision_score, 0) >= ?"); args.append(float(min_precision))
-        _TERMINAL_SET = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
-        if status == "__closed__":
-            # Show all terminal-state findings (used by view=closed)
-            placeholders = ",".join("?" * len(_TERMINAL_SET))
-            parts.append(f"f.status IN ({placeholders})")
-            args.extend(sorted(_TERMINAL_SET))
-        elif status:
-            parts.append("f.status=?"); args.append(status)
-        if category:
-            parts.append("f.category=?"); args.append(category)
-        if terrain_id:
-            parts.append("f.terrain_id=?"); args.append(terrain_id)
-        if assignee:
-            parts.append("f.assignee=?"); args.append(assignee)
-        if sla_breached:
-            parts.append("f.sla_due > 0 AND f.sla_due < ?")
-            args.append(time.time())
-        # Terminal states always have is_active=0; applying is_active=1 would
-        # return zero rows, so skip the filter when a terminal status is requested.
-        _TERMINAL = {"closed","false_positive","accepted_risk","duplicate","verified","remediated"}
-        if active_only and status not in _TERMINAL:
-            parts.append("f.is_active=1")
-        elif active_only and status in _TERMINAL:
-            parts.append("f.is_active=0")   # terminal states are always inactive
+        query = FindingQuery(
+            agent_id=agent_id, terrain_id=terrain_id, severity=severity,
+            status=status, category=category, assignee=assignee,
+            sla_breached=sla_breached, kev_only=kev_only,
+            exploit_only=exploit_only, mitre=mitre,
+            advanced_filters=tuple(advanced_filters or ()), active_only=active_only,
+            search=search, external_id_prefix=external_id_prefix,
+            limit=limit, offset=offset, cursor=cursor, sort_by=sort_by,
+            sort_dir=sort_dir, min_precision=min_precision,
+            validation_state=validation_state,
+            live_agent_ids=None if live_agent_ids is None else tuple(live_agent_ids),
+            window_start=window_start, window_end=window_end,
+        )
+        return (await self.query_soc_findings(query, include_facets=False)).findings
 
-        # Event-time window filter — INTERVAL OVERLAP, not first-seen containment.
-        # A finding "belongs" to [start,end] if it was active at any point during
-        # it: it began on/before the window end AND was last seen on/after the
-        # window start. Filtering first_detected_at alone hid still-active findings
-        # (first seen hours ago, re-detected seconds ago) from every short window —
-        # picking "5m"/"1h" wrongly emptied the dashboard. first_detected_at is
-        # covered by idx_find_first_detected; last_detected_at by idx_find_ts.
-        if window_start is not None and window_end is not None:
-            parts.append("f.first_detected_at <= ? AND f.last_detected_at >= ?")
-            args.extend([float(window_end), float(window_start)])
+    async def query_soc_findings(
+        self, query: FindingQuery, *, include_facets: bool = True,
+    ) -> FindingPage:
+        """Return one deterministic finding page plus complete filtered facets."""
+        where, args = _compile_finding_filter(query)
+        sort_by = query.sort_by if query.sort_by in _FINDING_SORTS else "score"
+        sort_dir = "asc" if query.sort_dir.lower() == "asc" else "desc"
+        sort_expr = _FINDING_SORTS[sort_by]
+        direction = sort_dir.upper()
 
-        where = ("WHERE " + " AND ".join(parts)) if parts else ""
-        valid_sorts = {"score": "f.score DESC", "last_detected_at": "f.last_detected_at DESC",
-                       "composite_score": "f.composite_score DESC",
-                       "priority": "f.priority DESC, f.composite_score DESC",
-                       "kev": "f.kev DESC, f.composite_score DESC",
-                       "exploit_available": "f.exploit_available DESC, f.composite_score DESC",
-                       "severity": "CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",
-                       "sla_due": "f.sla_due ASC"}
-        order = valid_sorts.get(sort_by, "f.score DESC")
-
-        if search:
-            # Full-text search path, via Postgres tsvector/tsquery (was SQLite
-            # FTS5 MATCH against a separate virtual table + JOIN; now a direct
-            # predicate against findings.search_vector — see _SCHEMA). Also:
-            # previously also LEFT JOINed a subquery selecting `name FROM
-            # agents` — agents lives in manager.db, a SEPARATE database from
-            # this one (intel.db); there is no `agents` table here. That made
-            # every search query throw "no such table: agents" — confirmed by
-            # reproducing it directly against the live database. The resulting
-            # agent_name column was never read anywhere (not in _enrich, not in
-            # the frontend), so the fix is to drop it, matching the non-search
-            # branch below.
-            rows = await self._fetchall(
-                f"SELECT f.*, "
-                f"       ar.os         AS agent_os, "
-                f"       ar.hostname   AS agent_hostname, "
-                f"       ar.os_version AS agent_os_version "
-                f"FROM findings f "
-                f"LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
-                f"{where} {'AND' if where else 'WHERE'} "
-                f"f.search_vector @@ websearch_to_tsquery('english', ?) "
-                f"ORDER BY ts_rank(f.search_vector, websearch_to_tsquery('english', ?)) DESC "
-                f"LIMIT ? OFFSET ?",
-                (*args, search, search, limit, offset),
+        page_parts = [] if not where else [where.removeprefix("WHERE ")]
+        page_args = list(args)
+        if query.cursor:
+            cursor_value, cursor_id = _decode_finding_cursor(
+                query.cursor, sort_by, sort_dir,
             )
-        else:
-            rows = await self._fetchall(
-                f"SELECT f.*, "
-                f"       ar.os         AS agent_os, "
-                f"       ar.hostname   AS agent_hostname, "
-                f"       ar.os_version AS agent_os_version "
-                f"FROM findings f "
-                f"LEFT JOIN asset_registry ar ON ar.agent_id = f.agent_id "
-                f"{where} "
-                f"ORDER BY {order} LIMIT ? OFFSET ?",
-                (*args, limit, offset),
+            comparison = ">" if sort_dir == "asc" else "<"
+            page_parts.append(
+                f"({sort_expr}{comparison}? OR ({sort_expr}=? AND f.id<?))"
             )
+            page_args.extend([cursor_value, cursor_value, cursor_id])
+        page_where = "WHERE " + " AND ".join(page_parts) if page_parts else ""
 
-        result = []
-        for r in rows:
-            d = _shape_finding(dict(r))
-            d["sla_status"] = _sla_status(d.get("sla_due", 0), d.get("status", "new"))
-            result.append(d)
-        return result
+        rows = await self._fetchall(
+            f"SELECT f.*, {sort_expr} AS cursor_sort_value, "
+            f"       COUNT(*) OVER() AS filtered_total, "
+            f"       COUNT(*) FILTER (WHERE f.severity='critical') OVER() AS filtered_critical, "
+            f"       COUNT(*) FILTER (WHERE f.severity='high') OVER() AS filtered_high, "
+            f"       COUNT(*) FILTER (WHERE f.kev=1) OVER() AS filtered_kev, "
+            f"       ar.os AS agent_os, ar.hostname AS agent_hostname, "
+            f"       ar.os_version AS agent_os_version "
+            f"FROM findings f "
+            f"LEFT JOIN asset_registry ar ON ar.agent_id=f.agent_id "
+            f"{page_where} ORDER BY {sort_expr} {direction}, f.id DESC "
+            f"LIMIT ? OFFSET ?",
+            (*page_args, query.limit, 0 if query.cursor else query.offset),
+        )
+
+        findings: list[dict] = []
+        for row in rows:
+            shaped = _shape_finding(dict(row))
+            shaped["sla_status"] = _sla_status(
+                shaped.get("sla_due", 0), shaped.get("status", "new"),
+            )
+            findings.append(shaped)
+
+        facets: dict[str, dict[str, int]] = {
+            name: {} for name in (
+                "severity", "terrain", "status", "category", "validation_state",
+                "assignee", "kev", "exploit_available",
+            )
+        }
+        total = int(findings[0].get("filtered_total") or 0) if findings else 0
+        if include_facets:
+            facet_rows = await self._fetchall(
+                "WITH filtered AS ("
+                " SELECT f.severity,f.terrain_id,f.status,f.category,f.validation_state,"
+                "        f.assignee,f.kev,f.exploit_available FROM findings f "
+                f" {where}"
+                ") "
+                "SELECT 'severity' AS facet,COALESCE(severity,'') AS facet_key,COUNT(*) AS n FROM filtered GROUP BY severity "
+                "UNION ALL SELECT 'terrain',COALESCE(terrain_id,''),COUNT(*) FROM filtered GROUP BY terrain_id "
+                "UNION ALL SELECT 'status',COALESCE(status,''),COUNT(*) FROM filtered GROUP BY status "
+                "UNION ALL SELECT 'category',COALESCE(category,''),COUNT(*) FROM filtered GROUP BY category "
+                "UNION ALL SELECT 'validation_state',COALESCE(validation_state,''),COUNT(*) FROM filtered GROUP BY validation_state "
+                "UNION ALL SELECT 'assignee',COALESCE(assignee,''),COUNT(*) FROM filtered GROUP BY assignee "
+                "UNION ALL SELECT 'kev',CASE WHEN kev=1 THEN 'true' ELSE 'false' END,COUNT(*) FROM filtered GROUP BY kev "
+                "UNION ALL SELECT 'exploit_available',CASE WHEN exploit_available=1 THEN 'true' ELSE 'false' END,COUNT(*) FROM filtered GROUP BY exploit_available",
+                tuple(args),
+            )
+            for row in facet_rows:
+                facets[str(row["facet"])][str(row["facet_key"])] = int(row["n"])
+            total = sum(facets["severity"].values())
+
+        next_cursor = None
+        if findings and len(findings) == query.limit:
+            last = findings[-1]
+            next_cursor = _encode_finding_cursor(
+                sort_by, sort_dir, last["cursor_sort_value"], int(last["id"]),
+            )
+        return FindingPage(
+            findings=findings, total=total, facets=facets, next_cursor=next_cursor,
+        )
 
     async def get_finding_by_id(self, finding_id: int) -> dict | None:
         row = await self._fetchone(
@@ -2348,6 +2762,23 @@ class IntelDB:
         )
         return [dict(r) for r in rows]
 
+    async def get_validation_runs(
+        self, finding_id: int, *, limit: int = 100,
+    ) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM validation_runs WHERE finding_id=? "
+            "ORDER BY completed_at DESC, id DESC LIMIT ?",
+            (finding_id, limit),
+        )
+        out: list[dict] = []
+        for row in rows:
+            shaped = dict(row)
+            shaped["gate_results"] = _json_value(
+                shaped.get("gate_results"), {},
+            )
+            out.append(shaped)
+        return out
+
     async def get_activity(self, finding_id: int) -> list[dict]:
         rows = await self._fetchall(
             "SELECT * FROM soc_activity WHERE finding_id=? ORDER BY created_at ASC",
@@ -2473,12 +2904,21 @@ class IntelDB:
     # ── Terrains ────────────────────────────────────────────────────────────────
 
     async def get_terrains(self) -> list[dict]:
-        """Return the canonical list of all attack terrains."""
-        rows = await self._fetchall(
-            "SELECT * FROM terrains ORDER BY id",
-            (),
-        )
-        return [dict(r) for r in rows]
+        """Return UI metadata from the same catalogue used for classification."""
+        from .attacklens.terrain_catalog import all_terrains
+
+        return [
+            {
+                "id": definition.id,
+                "label": definition.label,
+                "validation_label": definition.validation_label,
+                "description": definition.description,
+                "color": definition.color,
+                "route": definition.route,
+                "categories": list(definition.categories),
+            }
+            for definition in all_terrains()
+        ]
 
     async def get_finding_by_uid(self, finding_uid: str) -> dict | None:
         """Look up a finding by its UUIDv4 hex identifier."""
@@ -3770,6 +4210,104 @@ class IntelDB:
             log.warning("compute_confidence_metrics: %s", exc)
             return {"error": str(exc)}
 
+    async def get_validation_observability(self, *, hours: int = 24) -> dict:
+        """Aggregate privacy-safe validation and rollout telemetry."""
+        hours = max(1, min(int(hours), 24 * 90))
+        cutoff = time.time() - hours * 3600
+        state_rows, run_rows, provider_rows, error_rows, job_rows, fp_rows = await asyncio.gather(
+            self._fetchall(
+                "SELECT validation_state,COUNT(*) AS n FROM findings "
+                "WHERE is_active=1 GROUP BY validation_state", (),
+            ),
+            self._fetchall(
+                "SELECT status,COUNT(*) AS n FROM validation_runs "
+                "WHERE completed_at>=? GROUP BY status", (cutoff,),
+            ),
+            self._fetchall(
+                "SELECT provider,model,COUNT(*) AS calls,SUM(tokens_used) AS tokens,"
+                "SUM(cost_usd) AS cost_usd,AVG(completed_at-started_at) AS latency_seconds "
+                "FROM validation_runs WHERE completed_at>=? "
+                "GROUP BY provider,model ORDER BY calls DESC", (cutoff,),
+            ),
+            self._fetchall(
+                "SELECT error_class,COUNT(*) AS n FROM validation_runs "
+                "WHERE completed_at>=? AND error_class!='' GROUP BY error_class", (cutoff,),
+            ),
+            self._fetchall(
+                "SELECT state,COUNT(*) AS n,MIN(created_at) AS oldest_created_at "
+                "FROM validation_recompute_jobs WHERE state IN ('pending','running','error') "
+                "GROUP BY state", (),
+            ),
+            self._fetchall(
+                "SELECT rule_id,SUM(tp_count) AS tp,SUM(fp_count) AS fp "
+                "FROM rule_fp_stats GROUP BY rule_id ORDER BY fp DESC LIMIT 100", (),
+            ),
+        )
+        from .attacklens.terrain_catalog import all_terrains
+        terrain_ids = [definition.id for definition in all_terrains()]
+        marks = ",".join("?" for _ in terrain_ids)
+        unknown = await self._fetchone(
+            f"SELECT COUNT(*) AS n FROM findings WHERE is_active=1 AND "
+            f"(terrain_id IS NULL OR terrain_id='' OR terrain_id NOT IN ({marks}))",
+            tuple(terrain_ids),
+        )
+
+        current_states = {str(row["validation_state"]): int(row["n"]) for row in state_rows}
+        decisions = {str(row["status"]): int(row["n"]) for row in run_rows}
+        errors = {str(row["error_class"]): int(row["n"]) for row in error_rows}
+        jobs = {str(row["state"]): int(row["n"]) for row in job_rows}
+        unknown_count = int((unknown or {}).get("n") or 0)
+        alerts: list[dict] = []
+        if unknown_count:
+            alerts.append({
+                "code": "unknown_terrain", "severity": "high", "count": unknown_count,
+            })
+        error_count = sum(errors.values()) + jobs.get("error", 0)
+        if error_count:
+            alerts.append({
+                "code": "validation_errors", "severity": "high", "count": error_count,
+            })
+        backlog = jobs.get("pending", 0) + jobs.get("running", 0)
+        if backlog:
+            alerts.append({
+                "code": "validation_backlog", "severity": "medium", "count": backlog,
+            })
+
+        by_rule = []
+        for row in fp_rows:
+            tp, fp = int(row["tp"] or 0), int(row["fp"] or 0)
+            denominator = tp + fp
+            by_rule.append({
+                "rule_id": row["rule_id"], "tp": tp, "fp": fp,
+                "false_positive_rate": round(fp / denominator, 4) if denominator else None,
+            })
+        return {
+            "window_hours": hours,
+            "current_states": current_states,
+            "decisions": decisions,
+            "abstentions": sum(
+                int(row["calls"]) for row in provider_rows if not row["provider"]
+            ),
+            "errors": errors,
+            "providers": [
+                {
+                    "provider": row["provider"] or "deterministic",
+                    "model": row["model"] or "",
+                    "calls": int(row["calls"] or 0),
+                    "tokens": int(row["tokens"] or 0),
+                    "cost_usd": round(float(row["cost_usd"] or 0.0), 6),
+                    "latency_ms": round(float(row["latency_seconds"] or 0.0) * 1000, 3),
+                }
+                for row in provider_rows
+            ],
+            "false_positive_by_rule": by_rule,
+            "analyst_overrides": sum(item["fp"] for item in by_rule),
+            "recompute_jobs": jobs,
+            "unknown_terrain": unknown_count,
+            "alerts": alerts,
+            "observed_at": time.time(),
+        }
+
     async def get_finding_by_id(self, finding_id: int) -> Optional[dict]:
         """
         Single finding fetch with asset_registry JOIN so the response carries
@@ -3790,7 +4328,8 @@ class IntelDB:
         return _shape_finding(dict(row)) if row else None
 
     async def recompute_terrain_validation_all(
-        self, *, only_unscored: bool = False, limit: int = 5000,
+        self, *, only_unscored: bool = False, limit: int = 250,
+        after_id: int = 0, cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """
         Re-evaluate every active finding against the terrain validator and
@@ -3806,35 +4345,76 @@ class IntelDB:
         """
         try:
             from .attacklens.terrain_validators import evaluate_finding
-            from .attacklens.ai_validator import resolve_agent_priority
+            from .attacklens.ai_validator import resolve_agent_priority, resolve_threshold
             from .attacklens.asset_priority import (
                 apply_priority_to_enriched,
                 apply_priority_to_finding,
             )
         except ImportError:
             from manager.attacklens.terrain_validators import evaluate_finding
-            from manager.attacklens.ai_validator import resolve_agent_priority
+            from manager.attacklens.ai_validator import resolve_agent_priority, resolve_threshold
             from manager.attacklens.asset_priority import (
                 apply_priority_to_enriched,
                 apply_priority_to_finding,
             )
-        rows = await self._fetchall(
-            "SELECT id, agent_id, category, item_key, severity, score, "
+        clauses = ["is_active=1", "id>?"]
+        query_args: list[Any] = [max(0, int(after_id))]
+        if only_unscored:
+            clauses.append("validation_state='legacy_unassessed'")
+        requested = max(1, min(int(limit), 500))
+        candidates = await self._fetchall(
+            "SELECT id, agent_id, category, item_key, fingerprint, severity, score, "
             "       evidence, source, rule_id, cve_ids, cvss_score, kev, "
             "       epss_score, asset_tier, host_class, ai_verdict, "
-            "       precision_score, terrain_validation "
-            "FROM findings WHERE is_active=1 LIMIT ?",
-            (limit,),
+            "       precision_score, terrain_validation, validation_state "
+            f"FROM findings WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?",
+            (*query_args, requested + 1),
         )
+        has_more = len(candidates) > requested
+        rows = candidates[:requested]
+
+        # One bounded sibling-context query for the whole batch replaces the
+        # previous per-finding SELECT (N+1). Keep at most 101 recent findings
+        # per agent: 100 peers plus the current row, matching the old bound.
+        sibling_context: dict[str, dict[str, Any]] = {}
+        agent_ids = sorted({str(row["agent_id"]) for row in rows if row["agent_id"]})
+        if agent_ids:
+            marks = ",".join("?" for _ in agent_ids)
+            sibling_rows = await self._fetchall(
+                "SELECT agent_id,category,evidence FROM ("
+                " SELECT agent_id,category,evidence,"
+                "        ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY id DESC) AS rn"
+                f" FROM findings WHERE is_active=1 AND agent_id IN ({marks})"
+                ") ranked WHERE rn<=101",
+                tuple(agent_ids),
+            )
+            for sibling in sibling_rows:
+                aid = str(sibling["agent_id"])
+                context = sibling_context.setdefault(
+                    aid, {"counts": {}, "process_evidence": []},
+                )
+                category = str(sibling["category"] or "")
+                context["counts"][category] = context["counts"].get(category, 0) + 1
+                if category == "process":
+                    value = sibling["evidence"]
+                    if isinstance(value, str):
+                        try:
+                            value = json.loads(value or "{}")
+                        except Exception:
+                            value = {}
+                    context["process_evidence"].append(
+                        value if isinstance(value, dict) else {},
+                    )
         updated = 0
         scanned = 0
         score_hist = {"00-49": 0, "50-69": 0, "70-84": 0, "85-89": 0, "90-100": 0}
         async with self._lock:
             for r in rows:
+                if cancel_check and cancel_check():
+                    has_more = True
+                    break
                 scanned += 1
                 f = dict(r)
-                if only_unscored and float(f.get("precision_score") or 0) > 0:
-                    continue
 
                 # Parse JSON columns so the evaluator sees structured input
                 for k, default in [("evidence", {}), ("cve_ids", []),
@@ -3852,33 +4432,27 @@ class IntelDB:
                            or (isinstance(ev.get("cve"), dict) and ev["cve"].get("kev")))
                 agent_id = f.get("agent_id", "")
 
-                # Cross-finding peek for package_running / port_open / paired-persistence
-                sibs = await self._fetchall(
-                    "SELECT category, evidence FROM findings "
-                    "WHERE agent_id=? AND is_active=1 AND id != ? LIMIT 100",
-                    (agent_id, f["id"]),
+                # Cross-finding context was prefetched once for this batch.
+                context = sibling_context.get(
+                    agent_id, {"counts": {}, "process_evidence": []},
                 )
+                counts = context["counts"]
+                category = str(f.get("category") or "")
                 package_running = False
-                port_open       = False
-                paired_persist  = False
-                controls_off    = 0
+                port_open = counts.get("port", 0) - (1 if category == "port" else 0) > 0
+                paired_persist = sum(counts.get(name, 0) for name in ("service", "task")) \
+                    - (1 if category in {"service", "task"} else 0) > 0
+                controls_off = max(
+                    0, counts.get("security", 0) - (1 if category == "security" else 0),
+                )
                 pkg_name = str(ev.get("name") or "").lower() if isinstance(ev, dict) else ""
-                for s in sibs:
-                    cat = s["category"]
-                    if cat == "port":
-                        port_open = True
-                    if cat in ("service", "task"):
-                        paired_persist = True
-                    if cat == "security":
-                        controls_off += 1
-                    if cat == "process" and pkg_name:
-                        try:
-                            sev_ev = json.loads(s["evidence"] or "{}")
-                        except Exception:
-                            sev_ev = {}
-                        if pkg_name in str(sev_ev.get("process") or "").lower() \
-                           or pkg_name in str(sev_ev.get("path") or "").lower():
-                            package_running = True
+                for process_evidence in context["process_evidence"]:
+                    if pkg_name and (
+                        pkg_name in str(process_evidence.get("process") or "").lower()
+                        or pkg_name in str(process_evidence.get("path") or "").lower()
+                    ):
+                        package_running = True
+                        break
 
                 enriched = {
                     "kev_hit":                kev,
@@ -3907,12 +4481,12 @@ class IntelDB:
                 ai_dict = f.get("ai_verdict") if isinstance(f.get("ai_verdict"), dict) else None
 
                 tv = evaluate_finding(f, enriched, ai_dict)
+                compatibility_score = float(tv["score"])
                 if priority is not None:
                     f["precision_score"] = tv["score"]
                     f["precision_factors"] = {}
                     apply_priority_to_finding(f, priority)
-                    tv["score"] = f["precision_score"]
-                    tv["percentage"] = round(float(f["precision_score"]) * 100, 1)
+                    compatibility_score = float(f["precision_score"])
                     tv["asset_priority_level"] = priority.level
                     tv["summary"] = (
                         f"{tv.get('summary', '')} · {priority.label} calibration"
@@ -3920,13 +4494,37 @@ class IntelDB:
                         else tv.get("summary", "")
                     )
                 new_score = float(tv["score"])
+                threshold = await resolve_threshold(self, agent_id, f.get("category", ""))
+                validation_state = (
+                    "validated" if new_score >= threshold else "needs_review"
+                )
+                validated_at = time.time() if validation_state == "validated" else 0.0
 
                 await self._conn.execute(
                     "UPDATE findings SET "
                     "   precision_score=?, "
+                    "   terrain_score=?, validation_score=?, "
+                    "   validation_state=?, validation_policy_version='terrain-v1', "
+                    "   effective_validation_threshold=?, validated_at=?, "
                     "   terrain_validation=? "
                     "WHERE id=?",
-                    (new_score, json.dumps(tv, default=str), f["id"]),
+                    (
+                        compatibility_score, new_score, new_score, validation_state,
+                        threshold, validated_at, json.dumps(tv, default=str), f["id"],
+                    ),
+                )
+                f.update({
+                    "precision_score": compatibility_score,
+                    "terrain_score": new_score,
+                    "validation_score": new_score,
+                    "validation_state": validation_state,
+                    "validation_policy_version": "terrain-v1",
+                    "effective_validation_threshold": threshold,
+                    "validated_at": validated_at,
+                    "terrain_validation": tv,
+                })
+                await self._insert_validation_run(
+                    f["id"], f, str(f.get("fingerprint") or ""), time.time(),
                 )
                 updated += 1
 
@@ -3943,7 +4541,124 @@ class IntelDB:
             "scanned":   scanned,
             "updated":   updated,
             "histogram": score_hist,
+            "cursor": int(rows[scanned - 1]["id"]) if scanned else int(after_id),
+            "has_more": has_more,
         }
+
+    async def create_validation_recompute_job(
+        self, *, only_unscored: bool = False, target_limit: int = 5000,
+    ) -> dict:
+        """Create durable progress state for a resumable validation backfill."""
+        job_uid = uuid.uuid4().hex
+        now = time.time()
+        histogram = {
+            "00-49": 0, "50-69": 0, "70-84": 0, "85-89": 0, "90-100": 0,
+        }
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO validation_recompute_jobs "
+                "(job_uid,state,only_unscored,cursor_id,target_limit,scanned,updated,"
+                " histogram,cancel_requested,error,created_at,updated_at,completed_at) "
+                "VALUES(?,'queued',?,0,?,0,0,?,0,'',?,?,0)",
+                (
+                    job_uid, 1 if only_unscored else 0,
+                    max(1, min(int(target_limit), 100_000)),
+                    json.dumps(histogram), now, now,
+                ),
+            )
+            await self._conn.commit()
+        return await self.get_validation_recompute_job(job_uid) or {}
+
+    async def get_validation_recompute_job(self, job_uid: str) -> dict | None:
+        row = await self._fetchone(
+            "SELECT * FROM validation_recompute_jobs WHERE job_uid=?", (job_uid,),
+        )
+        if not row:
+            return None
+        job = dict(row)
+        job["only_unscored"] = bool(job.get("only_unscored"))
+        job["cancel_requested"] = bool(job.get("cancel_requested"))
+        job["histogram"] = _json_value(job.get("histogram"), {})
+        return job
+
+    async def cancel_validation_recompute_job(self, job_uid: str) -> dict | None:
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE validation_recompute_jobs SET cancel_requested=1,"
+                " state=CASE WHEN state IN ('queued','running') THEN 'cancelled' ELSE state END,"
+                " updated_at=?, completed_at=CASE WHEN state IN ('queued','running') THEN ? ELSE completed_at END "
+                "WHERE job_uid=?",
+                (now, now, job_uid),
+            )
+            await self._conn.commit()
+        return await self.get_validation_recompute_job(job_uid)
+
+    async def run_validation_recompute_batch(
+        self, job_uid: str, *, batch_size: int = 250,
+    ) -> dict | None:
+        """Advance one durable job by one bounded keyset batch."""
+        job = await self.get_validation_recompute_job(job_uid)
+        if not job:
+            return None
+        if job["state"] in {"completed", "cancelled", "error"}:
+            return job
+        if job["cancel_requested"]:
+            return await self.cancel_validation_recompute_job(job_uid)
+
+        remaining = int(job["target_limit"]) - int(job["scanned"])
+        if remaining <= 0:
+            now = time.time()
+            async with self._lock:
+                await self._conn.execute(
+                    "UPDATE validation_recompute_jobs SET state='completed',updated_at=?,completed_at=? WHERE job_uid=?",
+                    (now, now, job_uid),
+                )
+                await self._conn.commit()
+            return await self.get_validation_recompute_job(job_uid)
+
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE validation_recompute_jobs SET state='running',updated_at=? WHERE job_uid=?",
+                (now, job_uid),
+            )
+            await self._conn.commit()
+        try:
+            batch = await self.recompute_terrain_validation_all(
+                only_unscored=bool(job["only_unscored"]),
+                limit=min(max(1, int(batch_size)), 500, remaining),
+                after_id=int(job["cursor_id"]),
+            )
+        except Exception as exc:
+            now = time.time()
+            async with self._lock:
+                await self._conn.execute(
+                    "UPDATE validation_recompute_jobs SET state='error',error=?,updated_at=?,completed_at=? WHERE job_uid=?",
+                    (f"{type(exc).__name__}: {exc}"[:1000], now, now, job_uid),
+                )
+                await self._conn.commit()
+            raise
+
+        histogram = dict(job.get("histogram") or {})
+        for band, count in batch["histogram"].items():
+            histogram[band] = int(histogram.get(band, 0)) + int(count)
+        scanned = int(job["scanned"]) + int(batch["scanned"])
+        updated = int(job["updated"]) + int(batch["updated"])
+        completed = not batch["has_more"] or scanned >= int(job["target_limit"])
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE validation_recompute_jobs SET state=?,cursor_id=?,scanned=?,updated=?,"
+                " histogram=?,updated_at=?,completed_at=? WHERE job_uid=?",
+                (
+                    "completed" if completed else "running", int(batch["cursor"]),
+                    scanned, updated, json.dumps(histogram), now,
+                    now if completed else 0.0, job_uid,
+                ),
+            )
+            await self._conn.commit()
+        return await self.get_validation_recompute_job(job_uid)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -3993,6 +4708,89 @@ def _elapsed_label(ts: float) -> str:
     return f"{sec // 86400}d ago"
 
 
+def build_validation_run_record(
+    finding_id: int,
+    finding: dict,
+    evidence_revision: str,
+    completed_at: float,
+) -> dict[str, Any]:
+    """Build the immutable audit record for one validation decision.
+
+    ``run_key`` deliberately excludes timestamps and the generated UUID so a
+    retry of the same evidence/policy/config decision is idempotent.
+    """
+    ai = finding.get("ai_verdict") or {}
+    if isinstance(ai, str):
+        try:
+            ai = json.loads(ai)
+        except (TypeError, json.JSONDecodeError):
+            ai = {}
+    if not isinstance(ai, dict):
+        ai = {}
+
+    terrain_gates = finding.get("terrain_validation") or {}
+    if isinstance(terrain_gates, str):
+        try:
+            terrain_gates = json.loads(terrain_gates)
+        except (TypeError, json.JSONDecodeError):
+            terrain_gates = {}
+    if not isinstance(terrain_gates, dict):
+        terrain_gates = {}
+    corroboration = finding.get("validation_corroboration") or {}
+    if isinstance(corroboration, str):
+        try:
+            corroboration = json.loads(corroboration)
+        except (TypeError, json.JSONDecodeError):
+            corroboration = {}
+    if not isinstance(corroboration, dict):
+        corroboration = {}
+    gates = (
+        {"terrain": terrain_gates, "corroboration": corroboration}
+        if corroboration else terrain_gates
+    )
+
+    identity = {
+        "evidence_revision": str(evidence_revision),
+        "policy_version": str(finding.get("validation_policy_version") or ""),
+        "status": str(finding.get("validation_state") or "legacy_unassessed"),
+        "threshold": float(finding.get("effective_validation_threshold") or 0.0),
+        "provider": str(ai.get("provider") or ""),
+        "model": str(ai.get("model") or ""),
+        "generation_id": str(ai.get("generation_id") or ""),
+        "prompt_version": str(ai.get("prompt_version") or ""),
+        "schema_version": str(ai.get("schema_version") or ""),
+    }
+    run_key = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "run_uid": uuid.uuid4().hex,
+        "run_key": run_key,
+        "finding_id": int(finding_id),
+        "finding_uid": str(finding.get("finding_uid") or ""),
+        "agent_id": str(finding.get("agent_id") or ""),
+        "evidence_revision": str(evidence_revision),
+        "policy_version": identity["policy_version"],
+        "status": identity["status"],
+        "model_score": float(finding.get("model_precision_score") or 0.0),
+        "terrain_score": float(finding.get("terrain_score") or 0.0),
+        "validation_score": float(finding.get("validation_score") or 0.0),
+        "threshold_used": identity["threshold"],
+        "gate_results": gates,
+        "provider": identity["provider"],
+        "model": identity["model"],
+        "generation_id": identity["generation_id"],
+        "prompt_version": identity["prompt_version"],
+        "schema_version": identity["schema_version"],
+        "tokens_used": int(ai.get("tokens_used") or 0),
+        "cost_usd": float(ai.get("cost_usd") or 0.0),
+        "error_class": str(finding.get("validation_error_class") or ""),
+        "error_message": str(finding.get("validation_error") or "")[:1000],
+        "started_at": float(finding.get("validation_started_at") or completed_at),
+        "completed_at": float(completed_at),
+    }
+
+
 def _fingerprint(f: dict) -> str:
     """Stable SHA-256 fingerprint of a finding's mutable fields."""
     key_fields = {
@@ -4003,6 +4801,10 @@ def _fingerprint(f: dict) -> str:
         "mitre_technique": f.get("mitre_technique"),
         "source":          f.get("source"),
         "cve_ids":         sorted(f.get("cve_ids") or []),
+        # Detector-owned stable evidence identity. This lets a repeated Mesh
+        # snapshot deduplicate while a material evidence change updates the
+        # existing row rather than creating a second incident.
+        "detection_fingerprint": f.get("detection_fingerprint"),
     }
     blob = json.dumps(key_fields, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
@@ -4080,7 +4882,8 @@ def _priority_reason(f: dict) -> str:
         reasons.append(f"EPSS {float(f.get('epss_score') or 0) * 100:.0f}%")
     if f.get("asset_tier"):
         reasons.append(f"{f.get('asset_tier')} asset")
-    if f.get("source", "").startswith("feed:") or f.get("source") in ("abuseipdb",):
+    source = str(f.get("source") or "")
+    if source.startswith("feed:") or source == "abuseipdb":
         reasons.append("threat-intel IOC hit")
     if not reasons and f.get("cvss_score"):
         reasons.append(f"CVSS {f.get('cvss_score')}")

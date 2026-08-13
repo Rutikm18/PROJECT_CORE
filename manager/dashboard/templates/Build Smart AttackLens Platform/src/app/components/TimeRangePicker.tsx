@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Clock, Calendar, RefreshCw, ChevronDown, RotateCcw } from "lucide-react";
 import { useTimeRange } from "../context/TimeRangeContext";
+import { useRefresh } from "../context/RefreshContext";
 import {
-  WINDOW_KEYS, validateCustom, DEFAULT_RANGE, isDefaultRange,
-  type TimeRange, type WindowKey,
+  WINDOW_KEYS, parseServerWindowPresets, validateCustom, DEFAULT_RANGE, isDefaultRange,
+  type WindowKey,
 } from "../lib/timeRange";
 import { cn } from "../../lib/utils";
 
@@ -18,11 +19,22 @@ function fmtEpoch(ts: number) {
 
 export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }) {
   const { range, setRange } = useTimeRange();
+  const { triggerRefresh, lastSuccessfulAt } = useRefresh();
   const [open, setOpen] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
   const [startDt, setStartDt] = useState("");
   const [endDt, setEndDt] = useState("");
   const [validErr, setValidErr] = useState<string | null>(null);
+  const [presetKeys, setPresetKeys] = useState<WindowKey[]>(WINDOW_KEYS);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/v1/meta", { signal: controller.signal })
+      .then(response => response.ok ? response.json() : Promise.reject(response.status))
+      .then(data => setPresetKeys(parseServerWindowPresets(data.time_range_presets)))
+      .catch(() => { /* keep safe compile-time fallback while offline */ });
+    return () => controller.abort();
+  }, []);
 
   const activeLabel =
     range.kind === "relative"
@@ -31,6 +43,7 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
 
   const isAbsolute = range.kind === "absolute";
   const isDefault = isDefaultRange(range);
+  const effectiveLastUpdated = lastUpdated ?? lastSuccessfulAt;
 
   function applyCustom() {
     const s = Math.floor(new Date(startDt).getTime() / 1000);
@@ -69,9 +82,9 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
         {isAbsolute ? <Calendar className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
         <span className="max-w-[120px] truncate">{activeLabel}</span>
         {!isDefault && <span className="w-1.5 h-1.5 rounded-full bg-amber-500" title="Custom filter active" />}
-        {!isAbsolute && lastUpdated && (
+        {!isAbsolute && effectiveLastUpdated && (
           <span className="text-[9px] opacity-60 ml-0.5">
-            {Math.round((Date.now() - lastUpdated) / 1000)}s ago
+            {Math.round((Date.now() - effectiveLastUpdated) / 1000)}s ago
           </span>
         )}
         <ChevronDown className={cn("w-3 h-3 opacity-60 transition-transform", open && "rotate-180")} />
@@ -103,7 +116,7 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
                 </button>
               </div>
               <div className="grid grid-cols-5 gap-1">
-                {WINDOW_KEYS.map(key => (
+                {presetKeys.map(key => (
                   <button
                     key={key}
                     onClick={() => { setRange({ kind: "relative", key }); setOpen(false); }}
@@ -180,7 +193,7 @@ export function TimeRangePicker({ lastUpdated }: { lastUpdated?: number | null }
             {isAbsolute && (
               <div className="border-t border-gray-100 px-2 py-1.5">
                 <button
-                  onClick={() => { setRange({ ...range } as TimeRange); setOpen(false); }}
+                  onClick={() => { triggerRefresh(); setOpen(false); }}
                   className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-[10px] font-semibold text-gray-600 hover:bg-gray-50 transition-all"
                 >
                   <RefreshCw className="w-3 h-3" />

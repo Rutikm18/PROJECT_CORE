@@ -16,7 +16,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -33,6 +33,8 @@ from manager.manager.attacklens.ai_validator import (
     _weighted_sum,
     validate_with_ai,
 )
+from manager.manager.attacklens.validation_model import ValidationResponseError
+from manager.manager.integrations.resilience import RateLimitedError
 
 
 def _run(coro):
@@ -71,6 +73,14 @@ def _make_idb():
 
 def _make_ai_analyst(response_text: str = '{"verdict":"tp","confidence":0.85,"reasoning":"x"}'):
     """Build a mock FindingAnalyzer-like object whose provider returns response_text."""
+    try:
+        response_payload = json.loads(response_text)
+        if isinstance(response_payload, dict):
+            response_payload.setdefault("key_evidence", [])
+            response_payload.setdefault("risk_factors", [])
+            response_text = json.dumps(response_payload)
+    except json.JSONDecodeError:
+        pass
     mock_provider = MagicMock()
     mock_resp = MagicMock()
     mock_resp.text = response_text
@@ -182,33 +192,32 @@ def test_ai_evaluate_tokens_from_resp_total_tokens():
     assert verdict.tokens_used == 123
 
 
-def test_ai_evaluate_malformed_json_defaults_to_uncertain():
-    """Empty / non-JSON LLM response → label=uncertain, confidence=0.5."""
+def test_ai_evaluate_malformed_json_is_rejected():
+    """Empty / non-JSON output cannot become an inferred verdict."""
     analyst = _make_ai_analyst("this is not json at all !!!")
     cluster = _FakeCluster()
 
     from manager.manager.attacklens.ai_validator import _ai_evaluate_cluster
-    verdict = _run(_ai_evaluate_cluster(cluster, {}, analyst))
-    assert verdict.label == "uncertain"
-    assert verdict.confidence == 0.5
+    with pytest.raises(ValidationResponseError):
+        _run(_ai_evaluate_cluster(cluster, {}, analyst))
 
 
-def test_ai_evaluate_invalid_label_defaults_to_uncertain():
+def test_ai_evaluate_invalid_label_is_rejected():
     analyst = _make_ai_analyst('{"verdict":"maybe","confidence":0.9}')
     cluster = _FakeCluster()
 
     from manager.manager.attacklens.ai_validator import _ai_evaluate_cluster
-    verdict = _run(_ai_evaluate_cluster(cluster, {}, analyst))
-    assert verdict.label == "uncertain"
+    with pytest.raises(ValidationResponseError):
+        _run(_ai_evaluate_cluster(cluster, {}, analyst))
 
 
-def test_ai_evaluate_confidence_clamped():
+def test_ai_evaluate_out_of_range_confidence_is_rejected():
     analyst = _make_ai_analyst('{"verdict":"tp","confidence":99.0}')
     cluster = _FakeCluster()
 
     from manager.manager.attacklens.ai_validator import _ai_evaluate_cluster
-    verdict = _run(_ai_evaluate_cluster(cluster, {}, analyst))
-    assert verdict.confidence <= 1.0
+    with pytest.raises(ValidationResponseError):
+        _run(_ai_evaluate_cluster(cluster, {}, analyst))
 
 
 def test_ai_evaluate_empty_response_text():
@@ -216,22 +225,16 @@ def test_ai_evaluate_empty_response_text():
     cluster = _FakeCluster()
 
     from manager.manager.attacklens.ai_validator import _ai_evaluate_cluster
-    verdict = _run(_ai_evaluate_cluster(cluster, {}, analyst))
-    assert verdict.label == "uncertain"
+    with pytest.raises(ValidationResponseError):
+        _run(_ai_evaluate_cluster(cluster, {}, analyst))
 
 
 # ── Fallback chain ────────────────────────────────────────────────────────────
 
 def test_is_transient_error_429():
-    assert _is_transient_error(RuntimeError("Got 429 from OpenRouter")) is True
-
-
-def test_is_transient_error_rate_limit():
-    assert _is_transient_error(RuntimeError("Rate limit exceeded")) is True
-
-
-def test_is_transient_error_503():
-    assert _is_transient_error(RuntimeError("503 service unavailable")) is True
+    assert _is_transient_error(
+        RateLimitedError("ai:openrouter", "429 from OpenRouter")
+    ) is True
 
 
 def test_is_transient_error_auth():
@@ -240,69 +243,6 @@ def test_is_transient_error_auth():
 
 def test_is_transient_error_value_error():
     assert _is_transient_error(ValueError("bad model")) is False
-
-
-def test_chat_with_fallback_uses_primary_on_success():
-    """When primary succeeds, no fallback is attempted."""
-    from manager.manager.attacklens.ai_validator import _chat_with_fallback
-
-    mock_resp = MagicMock()
-    mock_resp.text = '{"verdict":"tp"}'
-    mock_resp.total_tokens = 5
-
-    primary = MagicMock()
-    primary._cfg = MagicMock()
-    primary._cfg.provider = "anthropic"
-    primary.chat = AsyncMock(return_value=mock_resp)
-
-    resp, provider_name = _run(_chat_with_fallback(primary, "prompt", 100, None))
-    assert resp == mock_resp
-    assert provider_name == "anthropic"
-    primary.chat.assert_called_once()
-
-
-def test_chat_with_fallback_activates_on_rate_limit():
-    """On 429, fallback OpenRouter provider should be attempted."""
-    from manager.manager.attacklens.ai_validator import _chat_with_fallback
-
-    fallback_resp = MagicMock()
-    fallback_resp.text = '{"verdict":"uncertain"}'
-    fallback_resp.total_tokens = 10
-
-    primary = MagicMock()
-    primary._cfg = MagicMock()
-    primary._cfg.provider = "openrouter"
-    primary._cfg.api_key = "sk-or-test"
-    primary.chat = AsyncMock(side_effect=RuntimeError("429 rate limit hit"))
-
-    # OpenRouterProvider is imported inside _chat_with_fallback; patch at source
-    with patch("manager.manager.ai.providers.OpenRouterProvider") as MockOR:
-        mock_fb_provider = MagicMock()
-        mock_fb_provider.chat = AsyncMock(return_value=fallback_resp)
-        MockOR.return_value = mock_fb_provider
-
-        resp, provider_name = _run(_chat_with_fallback(primary, "prompt", 100, None))
-        assert resp == fallback_resp
-        assert "openrouter" in provider_name
-
-
-def test_chat_with_fallback_raises_if_all_fallbacks_fail():
-    """If primary and all fallbacks fail, final exception is raised."""
-    from manager.manager.attacklens.ai_validator import _chat_with_fallback
-
-    primary = MagicMock()
-    primary._cfg = MagicMock()
-    primary._cfg.provider = "openrouter"
-    primary._cfg.api_key = "sk-or-test"
-    primary.chat = AsyncMock(side_effect=RuntimeError("429 rate limit"))
-
-    with patch("manager.manager.ai.providers.OpenRouterProvider") as MockOR:
-        mock_fb_provider = MagicMock()
-        mock_fb_provider.chat = AsyncMock(side_effect=RuntimeError("also 429"))
-        MockOR.return_value = mock_fb_provider
-
-        with pytest.raises(Exception):
-            _run(_chat_with_fallback(primary, "prompt", 100, None))
 
 
 # ── PrecisionResult explainability ────────────────────────────────────────────
@@ -333,13 +273,14 @@ async def test_precision_result_no_ai_produces_valid_score():
 
 
 @pytest.mark.asyncio
-async def test_precision_result_ai_veto_populates_top_bottom_factor():
+async def test_precision_result_ai_fp_requires_review_without_suppressing():
     cluster = _FakeCluster(layers_covered={"surface"}, confidence=0.9)
     idb = _make_idb()
     analyst = _make_ai_analyst('{"verdict":"fp","confidence":0.92,"reasoning":"known scanner"}')
     result = await validate_with_ai(cluster, {}, idb, None, analyst)
-    assert result.promoted is False
-    assert "ai_veto" in (result.rejection_reason or "")
+    assert result.promoted is True
+    assert result.review_required is True
+    assert "ai_review" in (result.rejection_reason or "")
     assert result.top_factor is not None
     assert result.bottom_factor is not None
 

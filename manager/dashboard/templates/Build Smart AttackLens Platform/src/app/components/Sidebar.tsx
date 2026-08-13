@@ -7,15 +7,21 @@
  * Live badge counts come from the findings API (status=new, polled every 30 s).
  */
 import { useState, useEffect, useCallback } from "react";
-import { NavLink, useNavigate } from "react-router";
+import { NavLink } from "react-router";
 import {
   AlertTriangle, Terminal, Globe, PackageOpen,
   Crosshair, BarChart3, Monitor, Database,
   ClipboardList, LayoutDashboard, Activity,
   Settings, Server, Building2, MapPin, Layers,
-  ShieldCheck, GitMerge, Radio,
+  ShieldCheck, GitMerge, Radio, PanelLeftClose, PanelLeftOpen,
 } from "lucide-react";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
+import { useRefresh } from "../context/RefreshContext";
+import { useTerrainCatalog } from "../lib/terrainCatalog";
+import { cn } from "../../lib/utils";
+
+export const VALIDATED_NEW_FINDINGS_URL =
+  "/api/v1/detection/all?status=new&limit=1&view=active&validated_only=true";
 
 // ── Route definitions ─────────────────────────────────────────────────────────
 
@@ -34,40 +40,6 @@ interface NavGroup {
   label: string;
   items: NavItem[];
   comingSoon?: boolean;
-}
-
-// Map category keywords → the URL path that owns those findings
-const CAT_MAP: Record<string, string> = {
-  execution: "/terrain/citadels", malware: "/terrain/citadels",
-  process: "/terrain/citadels",   script: "/terrain/citadels",
-  lateral: "/terrain/citadels",   covert: "/terrain/citadels",
-  persistence: "/terrain/persistence", service: "/terrain/persistence",
-  task: "/terrain/persistence",   launchd: "/terrain/persistence",
-  plist: "/terrain/persistence",  backdoor: "/terrain/persistence",
-  network: "/terrain/vector",     connection: "/terrain/vector",
-  c2: "/terrain/vector",          dns: "/terrain/vector",
-  tunnel: "/terrain/vector",      beacon: "/terrain/vector",
-  port: "/terrain/vector",        arp: "/terrain/vector",
-  package: "/terrain/origin",     vuln: "/terrain/origin",
-  cve: "/terrain/origin",         sbom: "/terrain/origin",
-  config: "/terrain/origin",      binary: "/terrain/origin",
-  sysctl: "/terrain/origin",
-  user: "/terrain/identity",      identity: "/terrain/identity",
-  account: "/terrain/identity",   credential: "/terrain/identity",
-  keychain: "/terrain/identity",
-  security: "/posture/overview",  posture: "/posture/overview",
-  sip: "/posture/overview",       firewall: "/posture/overview",
-  gatekeeper: "/posture/overview",
-  developer_security: "/terrain/mesh", mcp: "/terrain/mesh",
-  extension: "/terrain/mesh",          agent: "/terrain/mesh",
-};
-
-function catToPath(category: string): string {
-  const c = category.toLowerCase();
-  for (const [key, path] of Object.entries(CAT_MAP)) {
-    if (c.includes(key)) return path;
-  }
-  return "/findings";
 }
 
 const GROUPS: NavGroup[] = [
@@ -127,8 +99,19 @@ type AppMeta = {
   built_at?: string | null;
 };
 
-export function Sidebar() {
-  const navigate = useNavigate();
+export function Sidebar({
+  collapsed = false,
+  mobileOpen = true,
+  onToggle,
+  onNavigate,
+}: {
+  collapsed?: boolean;
+  mobileOpen?: boolean;
+  onToggle?: () => void;
+  onNavigate?: () => void;
+}) {
+  const { refreshRevision, registerRefreshRequest } = useRefresh();
+  const terrains = useTerrainCatalog();
   const [ready,        setReady]        = useState(false);
   const [agentTotal,   setAgentTotal]   = useState<number | null>(null);
   const [agentOnline,  setAgentOnline]  = useState<number | null>(null);
@@ -139,52 +122,66 @@ export function Sidebar() {
   const [appMeta,      setAppMeta]      = useState<AppMeta | null>(null);
 
   const fetchOrgSettings = useCallback(async () => {
+    const settle = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     try {
       const r = await fetch("/api/v1/settings");
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`Settings summary failed (${r.status})`);
       const d = await r.json();
       setOrgName(d.settings?.org_name ?? "");
       setOrgLocation(d.settings?.org_location ?? "");
-    } catch { /* silent */ }
-  }, []);
+    } catch (error) { requestError = error; }
+    finally { settle(requestError); }
+  }, [refreshRevision, registerRefreshRequest]);
 
   const fetchAgents = useCallback(async () => {
+    const settle = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     try {
       const r = await fetch("/api/v1/agents");
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`Sidebar agents failed (${r.status})`);
       const agents: { online: boolean }[] = await r.json();
       setAgentTotal(agents.length);
       setAgentOnline(agents.filter(a => a.online).length);
-    } catch { /* silent */ }
-  }, []);
+    } catch (error) { requestError = error; }
+    finally { settle(requestError); }
+  }, [refreshRevision, registerRefreshRequest]);
 
   const fetchNewCounts = useCallback(async () => {
+    const settle = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     try {
-      const r = await fetch("/api/v1/soc/findings?status=new&limit=1000&view=active");
-      if (!r.ok) return;
-      const data: { findings: { category: string; severity: string }[] } = await r.json();
-      const findings = data.findings ?? [];
-      const counts: NewCounts = {};
-      let critical = 0;
-      for (const f of findings) {
-        const path = catToPath(f.category);
-        counts[path] = (counts[path] ?? 0) + 1;
-        counts["/findings"] = (counts["/findings"] ?? 0) + 1;
-        if (f.severity === "critical") critical++;
+      const r = await fetch(VALIDATED_NEW_FINDINGS_URL);
+      if (!r.ok) throw new Error(`Sidebar counts failed (${r.status})`);
+      const data: {
+        total?: number;
+        stats?: { critical?: number };
+        facets?: { terrain?: Record<string, number> };
+      } = await r.json();
+      const total = Number(data.total) || 0;
+      const counts: NewCounts = { "/findings": total, "/incidents": total };
+      const routes = new Map(terrains.map((terrain) => [terrain.id, terrain.route]));
+      for (const [terrainId, count] of Object.entries(data.facets?.terrain ?? {})) {
+        const path = routes.get(terrainId) ?? `/terrain/${terrainId}`;
+        counts[path] = (counts[path] ?? 0) + count;
       }
       setNewCounts(counts);
-      setTotalCritical(critical);
-    } catch { /* silent */ }
-  }, []);
+      setTotalCritical(Number(data.stats?.critical) || 0);
+    } catch (error) { requestError = error; }
+    finally { settle(requestError); }
+  }, [refreshRevision, registerRefreshRequest, terrains]);
 
   const fetchAppMeta = useCallback(async () => {
+    const settle = registerRefreshRequest(refreshRevision);
+    let requestError: unknown;
     try {
       const r = await fetch("/api/v1/meta");
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`App metadata failed (${r.status})`);
       const d: AppMeta = await r.json();
       setAppMeta(d);
-    } catch { /* silent */ }
-  }, []);
+    } catch (error) { requestError = error; }
+    finally { settle(requestError); }
+  }, [refreshRevision, registerRefreshRequest]);
 
   useEffect(() => {
     const t = setTimeout(() => setReady(true), 60);
@@ -195,7 +192,14 @@ export function Sidebar() {
 
   return (
     <aside
-      className="w-[220px] h-screen flex flex-col flex-shrink-0 relative overflow-hidden"
+      id="primary-navigation"
+      data-collapsed={collapsed ? "true" : "false"}
+      className={[
+        "fixed inset-y-0 left-0 z-50 w-[220px] h-dvh flex flex-col flex-shrink-0 overflow-hidden",
+        "transition-[width,transform] duration-200 ease-out md:relative md:translate-x-0",
+        mobileOpen ? "translate-x-0" : "-translate-x-full",
+        collapsed ? "md:w-[64px]" : "md:w-[220px]",
+      ].join(" ")}
       style={{
         background: "linear-gradient(180deg,#080C12 0%,#0B0F16 55%,#0D1019 100%)",
         borderRight: "1px solid rgba(255,255,255,0.07)",
@@ -213,12 +217,23 @@ export function Sidebar() {
         className="relative z-10 px-3 pt-4 pb-3 flex-shrink-0"
         style={{ borderBottom: "1px solid rgba(255,255,255,0.07)" }}
       >
-        <NavLink to="/dashboard" className="flex items-center gap-2.5 mb-3.5">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="hidden md:flex absolute right-0 top-0 min-w-11 min-h-11 items-center justify-center rounded-md text-white/35 hover:text-white/80 hover:bg-white/10 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-400"
+          title={`${collapsed ? "Expand" : "Collapse"} navigation (⌘/Ctrl+B)`}
+          aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+          aria-expanded={!collapsed}
+          aria-controls="primary-navigation"
+        >
+          {collapsed ? <PanelLeftOpen className="w-3.5 h-3.5" /> : <PanelLeftClose className="w-3.5 h-3.5" />}
+        </button>
+        <NavLink to="/dashboard" onClick={onNavigate} className={cn("flex items-center gap-2.5 mb-3.5", collapsed && "md:justify-center")}>
           <div className="relative flex-shrink-0">
             <img src="/static/logo-icon.svg" alt="Attacklens" className="w-10 h-10 relative z-10 drop-shadow-md al-logo-glow"
               style={{ filter: "drop-shadow(0 0 6px rgba(139,92,246,0.5))" }} />
           </div>
-          <div className="leading-none min-w-0">
+          {!collapsed && <div className="leading-none min-w-0">
             <div className="font-extrabold text-[14px] tracking-tight leading-none"
               style={{ background: "linear-gradient(90deg,#A78BFA 0%,#8B5CF6 50%,#7C3AED 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
               Attacklens
@@ -227,11 +242,11 @@ export function Sidebar() {
               style={{ color: "rgba(255,255,255,0.72)", letterSpacing: "0.09em" }}>
               Agentic Exposure Management
             </div>
-          </div>
+          </div>}
         </NavLink>
 
         {/* Agent fleet */}
-        <div className="rounded-lg px-2.5 py-2 mb-2"
+        {!collapsed && <div className="rounded-lg px-2.5 py-2 mb-2"
           style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)" }}>
           <div className="flex items-center justify-between mb-1.5">
             <div className="flex items-center gap-1.5">
@@ -276,10 +291,10 @@ export function Sidebar() {
                 style={{ width: `${Math.round(((agentOnline ?? 0) / agentTotal) * 100)}%`, background: "linear-gradient(90deg,#4ade80,#22c55e)" }} />
             </div>
           )}
-        </div>
+        </div>}
 
         {/* Threat pulse */}
-        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg"
+        {!collapsed && <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg"
           style={{ background: "rgba(124,58,237,0.08)", border: "1px solid rgba(124,58,237,0.15)" }}>
           <Activity className="w-3 h-3 flex-shrink-0 al-heartbeat" style={{ color: "#A78BFA" }} />
           <span className="text-[9.5px]" style={{ color: "rgba(255,255,255,0.65)" }}>
@@ -296,7 +311,7 @@ export function Sidebar() {
           {(newCounts["/findings"] ?? 0) === 0 && (
             <span className="text-[8px] ml-auto" style={{ color: "rgba(255,255,255,0.25)" }}>all clear</span>
           )}
-        </div>
+        </div>}
       </div>
 
       {/* ── Nav ──────────────────────────────────────── */}
@@ -308,7 +323,7 @@ export function Sidebar() {
           let itemIdx = GROUPS.slice(0, gi).reduce((s, g) => s + g.items.length, 0);
           return (
             <div key={group.label} className={gi > 0 ? "mt-2" : ""}>
-              <div
+              {!collapsed && <div
                 className="flex items-center gap-2 px-2 mb-1.5"
                 style={gi > 0 ? { borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "10px" } : {}}
               >
@@ -321,7 +336,7 @@ export function Sidebar() {
                     Soon
                   </span>
                 )}
-              </div>
+              </div>}
 
               {group.items.map((item, ii) => {
                 const Icon = item.icon;
@@ -332,9 +347,12 @@ export function Sidebar() {
                   <NavLink
                     key={item.to}
                     to={item.to}
+                    onClick={onNavigate}
+                    title={collapsed ? item.label : undefined}
                     className={({ isActive }) =>
                       [
-                        "al-nav-btn w-full flex items-start justify-between gap-2 px-2.5 py-2 rounded-lg mb-[2px] cursor-pointer text-left relative overflow-hidden",
+                        "al-nav-btn w-full min-h-11 flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg mb-[2px] cursor-pointer text-left relative overflow-hidden focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-400",
+                        collapsed ? "md:justify-center md:px-2" : "",
                         isActive
                           ? "bg-[rgba(124,58,237,0.14)] border border-[rgba(124,58,237,0.30)] text-[#A78BFA]"
                           : "border border-transparent text-[rgba(255,255,255,0.52)]",
@@ -351,27 +369,27 @@ export function Sidebar() {
                             style={{ width: "2.5px", height: "16px", background: "#7C3AED",
                               boxShadow: "0 0 10px rgba(124,58,237,0.8), 0 0 4px rgba(139,92,246,1)" }} />
                         )}
-                        <div className="flex items-start gap-2.5 pl-1 min-w-0">
+                        <div className={cn("flex items-start gap-2.5 pl-1 min-w-0", collapsed && "md:pl-0")}>
                           <Icon className="w-3.5 h-3.5 flex-shrink-0 mt-[1px]"
                             style={{ color: isActive ? "#A78BFA" : "rgba(255,255,255,0.32)" }} />
-                          <span className="text-[11px] leading-snug break-words"
+                          {!collapsed && <span className="text-[11px] leading-snug break-words"
                             style={{ fontWeight: isActive ? 600 : 450, letterSpacing: "-0.01em" }}>
                             {item.label}
-                          </span>
+                          </span>}
                         </div>
-                        {item.comingSoon && (
+                        {!collapsed && item.comingSoon && (
                           <span className="flex-shrink-0 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide rounded-full"
                             style={{ background: "rgba(217,119,6,0.18)", color: "rgba(252,211,77,0.9)" }}>
                             Soon
                           </span>
                         )}
-                        {item.beta && (
+                        {!collapsed && item.beta && (
                           <span className="flex-shrink-0 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide rounded-full"
                             style={{ background: "rgba(124,58,237,0.18)", color: "rgba(167,139,250,0.95)" }}>
                             Beta
                           </span>
                         )}
-                        {item.badgeColor && count > 0 && (
+                        {!collapsed && item.badgeColor && count > 0 && (
                           <span
                             className="flex-shrink-0 min-w-[18px] text-center tabular-nums px-1.5 py-0.5 text-[9px] font-bold rounded-full"
                             style={item.badgeColor === "red"
@@ -397,9 +415,12 @@ export function Sidebar() {
       <div className="relative z-10 p-3 flex-shrink-0" style={{ borderTop: "1px solid rgba(255,255,255,0.07)" }}>
         <NavLink
           to="/settings/org"
+          onClick={onNavigate}
+          title={collapsed ? "Settings" : undefined}
           className={({ isActive }) =>
             [
-              "al-nav-btn w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg mb-2 cursor-pointer text-left",
+              "al-nav-btn w-full min-h-11 flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg mb-2 cursor-pointer text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-400",
+              collapsed ? "md:justify-center md:px-2" : "",
               isActive
                 ? "text-[#A78BFA] bg-[rgba(124,58,237,0.14)] border border-[rgba(124,58,237,0.30)]"
                 : "text-[rgba(255,255,255,0.38)] border border-transparent",
@@ -410,13 +431,13 @@ export function Sidebar() {
           {({ isActive }) => (
             <>
               <Settings className="w-3 h-3" style={{ color: isActive ? "#A78BFA" : "rgba(255,255,255,0.25)" }} />
-              <span className="text-[10.5px] font-medium">Settings</span>
+              {!collapsed && <span className="text-[10.5px] font-medium">Settings</span>}
             </>
           )}
         </NavLink>
 
         {/* Org card */}
-        <div className="flex items-center gap-2.5 px-2.5 py-2 rounded-xl"
+        {!collapsed && <div className="flex items-center gap-2.5 px-2.5 py-2 rounded-xl"
           style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)" }}>
           <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0"
             style={{ background: "rgba(124,58,237,0.18)", border: "1px solid rgba(124,58,237,0.25)" }}>
@@ -433,9 +454,9 @@ export function Sidebar() {
               </div>
             )}
           </div>
-        </div>
+        </div>}
 
-        <div
+        {!collapsed && <div
           className="mt-2 flex items-center justify-between gap-2 px-1 text-[9px]"
           title={[
             appMeta?.commit ? `commit ${appMeta.commit}` : "",
@@ -447,7 +468,7 @@ export function Sidebar() {
           <span className="font-mono font-bold tabular-nums truncate" style={{ color: "rgba(255,255,255,0.58)" }}>
             {appMeta?.version ? `v${appMeta.version}` : "v..."}
           </span>
-        </div>
+        </div>}
       </div>
     </aside>
   );

@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   parseRangeFromParams, rangeToParams, pollIntervalMs, validateCustom,
-  rangesEqual, isDefaultRange, DEFAULT_RANGE, DEFAULT_WINDOW,
+  rangesEqual, isDefaultRange, parseServerWindowPresets,
+  DEFAULT_RANGE, DEFAULT_WINDOW, WINDOW_SECONDS,
 } from "./timeRange";
 
 describe("timeRange", () => {
@@ -34,6 +35,16 @@ describe("timeRange", () => {
     expect(validateCustom(100, 5000, 1000)).toMatch(/future/i);    // end in future
   });
   it("default window is 1h", () => { expect(DEFAULT_WINDOW).toBe("1h"); });
+
+  it("accepts only valid server-authoritative preset values", () => {
+    const keys = parseServerWindowPresets([
+      { key: "1h", seconds: 3601 }, { key: "bad", seconds: 7 },
+      { key: "6h", seconds: -1 },
+    ]);
+    expect(keys).toEqual(["1h"]);
+    expect(WINDOW_SECONDS["1h"]).toBe(3601);
+    WINDOW_SECONDS["1h"] = 3600;
+  });
 
   it("rangesEqual compares by kind and value", () => {
     expect(rangesEqual({ kind: "relative", key: "1h" }, { kind: "relative", key: "1h" })).toBe(true);

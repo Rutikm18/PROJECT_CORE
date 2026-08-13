@@ -31,9 +31,13 @@ log = logging.getLogger("manager.integrations")
 
 class IntegrationError(Exception):
     """Base for all integration failures. Carries the integration name."""
-    def __init__(self, integration: str, message: str, *, status: Optional[int] = None):
+    def __init__(
+        self, integration: str, message: str, *, status: Optional[int] = None,
+        error_type: Optional[str] = None,
+    ):
         self.integration = integration
         self.status = status
+        self.error_type = error_type
         super().__init__(f"[{integration}] {message}")
 
 
@@ -47,8 +51,11 @@ class PermanentError(IntegrationError):
 
 class RateLimitedError(TransientError):
     """429 — carries retry_after seconds when the server provided one."""
-    def __init__(self, integration: str, message: str, *, retry_after: Optional[float] = None):
-        super().__init__(integration, message, status=429)
+    def __init__(
+        self, integration: str, message: str, *, retry_after: Optional[float] = None,
+        error_type: Optional[str] = None,
+    ):
+        super().__init__(integration, message, status=429, error_type=error_type)
         self.retry_after = retry_after
 
 

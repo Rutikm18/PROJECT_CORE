@@ -495,3 +495,25 @@
   background: linear-gradient(90deg, #E8581A 0%, #f97316 40%, #fbbf24 100%);
   border-radius: 0 0 3px 3px;
 }
+
+/* Platform-wide keyboard affordance for bespoke controls. */
+:where(button, a, input, select, textarea):focus-visible {
+  outline: 2px solid #7c3aed;
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  :where(button, [role="button"], a.al-nav-btn) {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -36,6 +36,7 @@ from ..attacklens.asset_priority import (
     normalize_agent_priorities,
     priority_options,
 )
+from ..attacklens.terrain_catalog import all_terrains, terrain_for_category
 
 log = logging.getLogger("manager.settings")
 
@@ -160,22 +161,15 @@ ALL_DEFAULTS: dict[str, str] = {**DEFAULTS, **VALIDATION_DEFAULTS}
 
 # Terrains shown in the dashboard sidebar. Order matters — UI renders them
 # in the same order.  Each maps to one or more finding categories.
-VALIDATION_TERRAINS: list[str] = ["citadels", "vector", "origin", "identity", "posture", "mesh"]
+_TERRAIN_DEFINITIONS = all_terrains()
+VALIDATION_TERRAINS: list[str] = [definition.id for definition in _TERRAIN_DEFINITIONS]
 VALIDATION_TERRAIN_CATEGORIES: dict[str, list[str]] = {
-    "citadels": ["execution","process","script","container","persistence","service","task","malware"],
-    "vector":   ["network","connection","port","arp","covert","lateral","mount"],
-    "origin":   ["package","vulnerability","sbom","config","binary","sysctl","app","open_file","storage"],
-    "identity": ["user","identity","account","credential"],
-    "posture":  ["security","posture","sip","firewall","agent_health","battery","hardware"],
-    "mesh":     ["developer_security"],
+    definition.id: list(definition.categories)
+    for definition in _TERRAIN_DEFINITIONS
 }
 VALIDATION_TERRAIN_LABELS: dict[str, str] = {
-    "citadels": "Citadels (Execution & Persistence)",
-    "vector":   "Vector (Network & Reachability)",
-    "origin":   "Origin (Surface, Packages, Configs)",
-    "identity": "Identity (Accounts & Credentials)",
-    "posture":  "Posture (Security Controls)",
-    "mesh":     "Mesh (Developer & Agent Tooling)",
+    definition.id: definition.validation_label
+    for definition in _TERRAIN_DEFINITIONS
 }
 VALIDATION_THRESHOLD_BOUNDS = (0.50, 1.00)   # inclusive — 0.50 floor prevents footgun
 
@@ -187,11 +181,7 @@ def _clamp_threshold(value: float) -> float:
 
 def category_to_terrain(category: str) -> Optional[str]:
     """Map a finding category to its dashboard terrain (None if unknown)."""
-    c = (category or "").lower()
-    for terrain, cats in VALIDATION_TERRAIN_CATEGORIES.items():
-        if c in cats:
-            return terrain
-    return None
+    return terrain_for_category(category)
 
 NUMERIC_BOUNDS: dict[str, tuple[int, int]] = {
     "platform_refresh_secs": (10, 3600),
@@ -961,7 +951,10 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         if "global_threshold" in payload or "terrain_thresholds" in payload \
                 or "agent_thresholds" in payload or "agent_priorities" in payload:
             try:
-                rescore_report = await intel_db.recompute_terrain_validation_all()
+                job = await intel_db.create_validation_recompute_job(target_limit=5000)
+                rescore_report = await intel_db.run_validation_recompute_batch(
+                    job["job_uid"], batch_size=250,
+                )
             except Exception as exc:
                 log.warning("inline recompute on settings change failed: %s", exc)
 
@@ -980,6 +973,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                         "Faster but won't fix already-rescored findings whose criteria changed.",
         ),
         limit: int = Query(5000, ge=1, le=100000),
+        batch_size: int = Query(250, ge=1, le=500),
     ):
         """
         Manually trigger a full retro-rescore of every active finding against
@@ -991,13 +985,46 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         the analyst can immediately tell whether to relax the threshold.
         """
         try:
-            result = await intel_db.recompute_terrain_validation_all(
-                only_unscored=only_unscored, limit=limit,
+            job = await intel_db.create_validation_recompute_job(
+                only_unscored=only_unscored, target_limit=limit,
+            )
+            result = await intel_db.run_validation_recompute_batch(
+                job["job_uid"], batch_size=batch_size,
             )
             return {"status": "ok", **result}
         except Exception as exc:
             log.exception("recompute_validation failed")
             raise HTTPException(500, f"Recompute failed: {exc}")
+
+    @router.get("/validation/recompute/{job_uid}")
+    async def validation_recompute_job(job_uid: str):
+        job = await intel_db.get_validation_recompute_job(job_uid)
+        if not job:
+            raise HTTPException(404, "Validation recompute job not found")
+        return job
+
+    @router.post("/validation/recompute/{job_uid}/resume")
+    async def resume_validation_recompute(
+        job_uid: str,
+        batch_size: int = Query(250, ge=1, le=500),
+    ):
+        try:
+            job = await intel_db.run_validation_recompute_batch(
+                job_uid, batch_size=batch_size,
+            )
+        except Exception as exc:
+            log.exception("resume_validation_recompute failed")
+            raise HTTPException(500, f"Recompute failed: {exc}")
+        if not job:
+            raise HTTPException(404, "Validation recompute job not found")
+        return {"status": "ok", **job}
+
+    @router.post("/validation/recompute/{job_uid}/cancel")
+    async def cancel_validation_recompute(job_uid: str):
+        job = await intel_db.cancel_validation_recompute_job(job_uid)
+        if not job:
+            raise HTTPException(404, "Validation recompute job not found")
+        return {"status": "ok", **job}
 
     # ── GET /validation/status ────────────────────────────────────────────────
     @router.get("/validation/status")
@@ -1012,7 +1039,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         Reports:
           • pipeline_enabled    — ATTACKLENS_VALIDATION env / ENGINE_CONFIG
           • ai_validation_on    — ATTACKLENS_AI_VALIDATION + Settings toggle
-          • ai_analyst_ready    — Anthropic API key present + client built
+          • ai_analyst_ready    — shared task provider or legacy analyst ready
           • kev_status          — last-loaded count + freshness from CISA KEV
           • threshold_summary   — global + override counts
           • last_error          — most recent validator failure (if any)
@@ -1037,9 +1064,28 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             pass
         ai_validation_on = (ai_on_env or _CFG.get("ai_validation_enabled", False)) and ai_on_settings
 
-        # AI analyst readiness — check the app-state instance
+        # Validation model readiness — prefer the encrypted shared provider
+        # config; keep the legacy Anthropic analyst as a compatibility bridge.
         analyst = getattr(request.app.state, "ai_analyst", None)
-        ai_analyst_ready = bool(analyst and getattr(analyst, "enabled", False))
+        legacy_analyst_ready = bool(analyst and getattr(analyst, "enabled", False))
+        validation_provider: Optional[dict] = None
+        try:
+            from ..ai.registry import resolve_task_provider_config
+            task_config = resolve_task_provider_config("validation")
+            if task_config is not None:
+                shared_provider_ready = bool(
+                    task_config.provider == "ollama" or task_config.api_key
+                )
+                validation_provider = {
+                    "provider": task_config.provider,
+                    "model": task_config.model,
+                }
+            else:
+                shared_provider_ready = False
+        except Exception as exc:
+            shared_provider_ready = False
+            validation_provider = {"error": str(exc)[:160]}
+        ai_analyst_ready = shared_provider_ready or legacy_analyst_ready
 
         # KEV feed status — pulled from FeedManager + DB
         kev_status = {"loaded": 0, "last_refresh_ts": None, "freshness_hours": None, "source": "CISA KEV"}
@@ -1108,7 +1154,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             banner_msg    = "AI verdict step is OFF — findings use deterministic factors only."
         elif not ai_analyst_ready:
             banner_status = "degraded"
-            banner_msg    = "LLM verdict configured ON but ANTHROPIC_API_KEY missing — degrading to deterministic."
+            banner_msg    = "LLM verdict is ON but no usable validation provider is configured."
         elif kev_status["loaded"] == 0:
             banner_status = "warning"
             banner_msg    = "CISA KEV feed has not loaded yet — KEV multiplier and gate G4 unavailable."
@@ -1120,6 +1166,8 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             "pipeline_enabled":  pipeline_on,
             "ai_validation_on":  ai_validation_on,
             "ai_analyst_ready":  ai_analyst_ready,
+            "validation_provider": validation_provider,
+            "legacy_analyst_ready": legacy_analyst_ready,
             "ai_settings_on":    ai_on_settings,
             "kev_status":        kev_status,
             "thresholds": {

@@ -161,3 +161,6 @@ WINDOW_SECONDS: dict[str, int] = {
     "8h":  28800,
     "90d": 7776000,
 }
+UI_WINDOW_KEYS: tuple[str, ...] = (
+    "30s", "1m", "5m", "15m", "1h", "6h", "1d", "7d", "15d", "30d",
+)
