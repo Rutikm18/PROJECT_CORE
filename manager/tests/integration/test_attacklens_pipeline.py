@@ -274,6 +274,32 @@ class TestFindingsAPI:
             assert 0 <= f["score"] <= 10, f"Score out of range: {f['score']} in '{f['title']}'"
 
 
+# ══ 4b. Raw findings → summary → dashboard consistency ═════════════════════
+
+class TestPresentationConsistency:
+
+    def test_findings_summary_and_dashboard_counts_agree(self, client):
+        findings = _findings(client, active_only="true", limit=1000)
+        by_severity = {
+            severity: sum(1 for finding in findings if finding["severity"] == severity)
+            for severity in ("critical", "high", "medium", "low", "info")
+        }
+
+        summary_response = client.get(f"/api/v1/attacklens/{_AGENT_ID}/summary")
+        assert summary_response.status_code == 200
+        summary = summary_response.json()
+        assert summary["active"] == len(findings)
+        for severity, count in by_severity.items():
+            assert summary[severity] == count
+
+        dashboard_response = client.get("/api/v1/soc/dashboard")
+        assert dashboard_response.status_code == 200
+        dashboard = dashboard_response.json()
+        assert dashboard["kpi"]["total_active"] == summary["active"]
+        for severity, count in by_severity.items():
+            assert dashboard["kpi"][severity] == count
+
+
 # ══ 4. FTS Search API ════════════════════════════════════════════════════════
 
 class TestFTSSearch:

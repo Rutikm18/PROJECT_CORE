@@ -12,16 +12,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 
-import pytest
-
+from manager.manager.attacklens.detections import (
+    agent_health,
+    battery_health,
+    hardware_integrity,
+    mount_monitor,
+    sca_compliance,
+)
 from manager.manager.attacklens.engine import (
     _DETECTION_MODULE_ROUTES,
     detection_source_coverage,
 )
 from manager.manager.attacklens.rulepack import RulePackDetector
-from manager.manager.attacklens.detections import battery_health, mount_monitor, sca_compliance
 from shared.sections import VALID_SECTION_NAMES
-
 
 # Use the same canonical source registry as ingest and the agent. A hand-written
 # test set can silently omit a newly-added source and still pass.
@@ -98,6 +101,52 @@ class FakeDB:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+class TestAgentHealth:
+    def test_degraded_collector_and_spool_loss_fire(self):
+        out = _run(agent_health.analyze(
+            "mac-1",
+            "agent_health",
+            {
+                "sections": {
+                    "processes": {
+                        "state": "OPEN",
+                        "failures": 3,
+                        "last_result": "timeout",
+                    },
+                },
+                "link": {"spool_dropped_corrupt": 1, "spool_bytes": 4096},
+            },
+            FakeDB(),
+        ))
+        assert {finding["rule_id"] for finding in out} == {
+            "AGENT-HEALTH-COLLECTOR-OPEN",
+            "AGENT-HEALTH-SPOOL-LOSS",
+        }
+
+    def test_healthy_agent_stays_silent(self):
+        out = _run(agent_health.analyze(
+            "mac-1",
+            "agent_health",
+            {
+                "sections": {
+                    "processes": {
+                        "state": "CLOSED",
+                        "failures": 0,
+                        "last_result": "ok",
+                    },
+                },
+                "link": {
+                    "spool_dropped_trim": 0,
+                    "spool_dropped_corrupt": 0,
+                    "spool_dropped_auth": 0,
+                    "auth_failures": 0,
+                },
+            },
+            FakeDB(),
+        ))
+        assert out == []
 
 
 class TestBatteryHealth:
@@ -213,3 +262,46 @@ class TestMountMonitor:
                    [{"device": "/dev/disk1s1", "mountpoint": "/", "fstype": "apfs"},
                     {"device": "/dev/disk9s1", "mountpoint": "/Volumes/EXT", "fstype": "exfat"}], db))
         assert any(f["rule_id"] == "mount:new_removable_media" for f in out)
+
+
+class TestHardwareIntegrity:
+    def test_new_device_fires_after_durable_baseline(self):
+        db = FakeDB()
+        built_in = [{
+            "bus": "pci",
+            "vendor_id": "0x106b",
+            "product_id": "0x0001",
+            "name": "Built-in Controller",
+            "serial": "internal-1",
+        }]
+        assert _run(hardware_integrity.analyze(
+            "mac-1", "hardware", built_in, db,
+        )) == []
+
+        usb = {
+            "bus": "usb",
+            "vendor_id": "0x0781",
+            "product_id": "0x5581",
+            "name": "Removable Drive",
+            "serial": "external-1",
+        }
+        out = _run(hardware_integrity.analyze(
+            "mac-1", "hardware", [*built_in, usb], db,
+        ))
+        assert [finding["rule_id"] for finding in out] == ["HARDWARE-NEW-DEVICE"]
+
+    def test_unchanged_inventory_stays_silent(self):
+        db = FakeDB()
+        inventory = [{
+            "bus": "pci",
+            "vendor_id": "0x106b",
+            "product_id": "0x0001",
+            "name": "Built-in Controller",
+            "serial": "internal-1",
+        }]
+        assert _run(hardware_integrity.analyze(
+            "mac-1", "hardware", inventory, db,
+        )) == []
+        assert _run(hardware_integrity.analyze(
+            "mac-1", "hardware", inventory, db,
+        )) == []

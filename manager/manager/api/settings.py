@@ -953,7 +953,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             try:
                 job = await intel_db.create_validation_recompute_job(target_limit=5000)
                 rescore_report = await intel_db.run_validation_recompute_batch(
-                    job["job_uid"], batch_size=250,
+                    job["job_uid"], batch_size=250, manager_db=db,
                 )
             except Exception as exc:
                 log.warning("inline recompute on settings change failed: %s", exc)
@@ -989,7 +989,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 only_unscored=only_unscored, target_limit=limit,
             )
             result = await intel_db.run_validation_recompute_batch(
-                job["job_uid"], batch_size=batch_size,
+                job["job_uid"], batch_size=batch_size, manager_db=db,
             )
             return {"status": "ok", **result}
         except Exception as exc:
@@ -1010,7 +1010,7 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
     ):
         try:
             job = await intel_db.run_validation_recompute_batch(
-                job_uid, batch_size=batch_size,
+                job_uid, batch_size=batch_size, manager_db=db,
             )
         except Exception as exc:
             log.exception("resume_validation_recompute failed")

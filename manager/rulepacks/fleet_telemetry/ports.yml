@@ -40,7 +40,11 @@ rules:
       - approved vulnerability-scanner IP allowlist
     response_actions:
       - verify source against scanner allowlist, block/investigate if not approved
-    status: stable
+    status: experimental
+    status_reason: >
+      Windowed inbound port-scan detection (distinct destination ports per
+      source IP per minute) is a network-flow correlation over time, not a
+      per-listening-port snapshot check the rule pack can evaluate.
 
   - id: PORTS-003
     title: Well-known port bound by unauthorized process

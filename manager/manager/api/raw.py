@@ -14,12 +14,18 @@ Search algorithm:
 """
 from __future__ import annotations
 
+import asyncio
 import time
 import logging
 from typing import Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, Query
 from shared.sections import VALID_SECTION_NAMES
+# Single source of truth for the Deep Mesh capability → record-key map. Defined
+# in shared/schema.py so the composite validator (validate_section) and the
+# counts computed here can never drift. Imported under the original local name
+# to keep the counting helpers below unchanged.
+from shared.schema import DEVSEC_CAPABILITY_ITEMS as _DEVSEC_CAP_ITEMS
 
 if TYPE_CHECKING:
     from ..db import Database
@@ -227,19 +233,42 @@ def make_raw_router(db: "Database") -> APIRouter:
         last_times = await db.get_section_last_times(agent_id)
         now = int(time.time())
 
+        # Each present section needs a latest-row lookup to confirm it carries
+        # real data (not empty / not an {error} payload). Probe those rows
+        # concurrently instead of serially: an agent reporting all sections
+        # otherwise costs one DB round-trip per section, turning this operator
+        # checkpoint into ~N sequential hops. Bounded by a semaphore so a burst
+        # never monopolises the read pool (max_size=10) against live requests.
+        present_sections = [
+            sec for sec in _EXPECTED_SECTIONS if last_times.get(sec) is not None
+        ]
+        _probe_sema = asyncio.Semaphore(8)
+
+        async def _probe(sec: str):
+            """Latest-row real-data check for one section; never raises.
+            Returns True/False, or None when the lookup itself failed (unknown —
+            treated as non-blocking so a transient read error never flips a
+            fresh section to 'empty')."""
+            async with _probe_sema:
+                try:
+                    rows = await db.query_section(agent_id, sec, limit=1)
+                    return _has_real_data(rows[0]["data"]) if rows else False
+                except Exception:
+                    return None
+
+        probe_results = await asyncio.gather(
+            *(_probe(sec) for sec in present_sections)
+        )
+        has_data_by_section = dict(zip(present_sections, probe_results))
+
         sections, missing, stale, empty = [], [], [], []
         for sec, feeds in sorted(_EXPECTED_SECTIONS.items()):
             last    = last_times.get(sec)
             present = last is not None
             age     = (now - int(last)) if present else None
-            has_data = None
+            has_data = has_data_by_section.get(sec) if present else None
             status   = "missing"
             if present:
-                try:
-                    rows = await db.query_section(agent_id, sec, limit=1)
-                    has_data = _has_real_data(rows[0]["data"]) if rows else False
-                except Exception:
-                    has_data = None
                 fresh = age is not None and age <= stale_sec
                 if not fresh:
                     status = "stale"
@@ -293,28 +322,9 @@ def _resolve_window(
         return (start or 0), (end or now)
 
 
-# Every developer_security capability and the key it stores its records under.
-# Mirrors the agent collector schema; used to count records per capability so the
-# DeepMesh capability nav + list rows are informative without the payload.
-_DEVSEC_CAP_ITEMS: dict[str, Optional[str]] = {
-    "editor_extensions":   "items",
-    "mcp_servers":         "servers",
-    "browser_extensions":  "items",
-    "native_messaging":    "items",
-    "agent_cli_tools":     "items",
-    "ai_applications":     "items",
-    "listening_ports":     "items",
-    "processes":           "items",
-    "launchd":             "items",
-    "cron":                "users",
-    "shell_startup":       "files",
-    "node_packages":       "users",
-    "python_packages":     "users",
-    "homebrew":            None,      # special-cased: formulae + casks
-    "git":                 "users",
-    "credential_locations": "locations",
-    "docker":              "containers",
-}
+# _DEVSEC_CAP_ITEMS (capability → record-key map) is imported at the top of this
+# module from shared/schema.py — the single source of truth also used by the
+# developer_security composite validator in validate_section().
 
 # Short subset (with friendly labels) used for the compact list-row preview text.
 _DEVSEC_PREVIEW: tuple[tuple[str, str], ...] = (

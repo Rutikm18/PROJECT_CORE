@@ -20,12 +20,10 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import Any, Optional
 
 import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
 
 log = logging.getLogger("manager.api.remediation")
 
@@ -63,6 +61,10 @@ def _feeds(request: Request):
 
 def _notifier(request: Request):
     return getattr(request.app.state, "email_notifier", None)
+
+
+def _notification_dispatcher(request: Request):
+    return getattr(request.app.state, "finding_notification_dispatcher", None)
 
 
 # ── Remediation plans ─────────────────────────────────────────────────────────
@@ -220,12 +222,12 @@ async def generate_remediation_plan(
     idb=Depends(_idb),
     analyst=Depends(_analyst),
     notifier=Depends(_notifier),
+    notification_dispatcher=Depends(_notification_dispatcher),
 ):
     if not analyst or not analyst.enabled:
         raise HTTPException(503, "AI analyst not available. Set ANTHROPIC_API_KEY.")
 
     # Fetch finding
-    rows = await idb.get_soc_findings(active_only=False, limit=1)
     finding = None
     async with idb._pool.read() as conn:  # see _load_finding's comment on why not idb._conn
         async with conn.execute(
@@ -242,7 +244,15 @@ async def generate_remediation_plan(
     if not plan:
         raise HTTPException(500, "Remediation generation failed.")
 
-    if notify and notifier and notifier.enabled:
+    if notify and notification_dispatcher:
+        await notification_dispatcher.handle_remediation_ready(
+            finding,
+            os_type=os_type,
+            plan_identity=str(plan.get("generated_at") or "") if isinstance(plan, dict) else "",
+        )
+    elif notify and notifier and notifier.enabled:
+        # Compatibility for embeddings that have not installed the durable
+        # dispatcher on app.state.
         await notifier.send_remediation_ready(finding, os_type)
 
     return plan

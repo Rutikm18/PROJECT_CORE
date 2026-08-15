@@ -23,12 +23,13 @@ Configuration (via env vars):
 from __future__ import annotations
 
 import html
-import json
 import logging
 import os
+import re
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parseaddr
 from typing import Optional
 
 from ..integrations.client import ResilientHTTPClient
@@ -41,6 +42,8 @@ from ..integrations.resilience import (
 )
 
 log = logging.getLogger("manager.notifications.email")
+
+_EMAIL_ADDRESS = re.compile(r"^[^\s@<>\r\n]+@[^\s@<>\r\n]+\.[^\s@<>\r\n]+$")
 
 EMAIL_RETRY = RetryPolicy(max_attempts=3, base_delay=0.5, max_delay=8.0)
 
@@ -66,7 +69,42 @@ def _env(key: str, default: str = "") -> str:
 
 def _recipients(key: str) -> list[str]:
     raw = _env(key)
-    return [r.strip() for r in raw.split(",") if r.strip()] if raw else []
+    return _normalise_recipients(raw.split(",")) if raw else []
+
+
+def _normalise_recipients(values: list[str]) -> list[str]:
+    valid: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        address = str(value or "").strip()
+        canonical = address.lower()
+        if not _EMAIL_ADDRESS.fullmatch(address) or canonical in seen:
+            continue
+        seen.add(canonical)
+        valid.append(address)
+    return valid
+
+
+def _safe_subject(value: object) -> str:
+    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())[:240]
+
+
+def _valid_sender(value: str) -> bool:
+    if not value or "\r" in value or "\n" in value:
+        return False
+    _, address = parseaddr(value)
+    return bool(_EMAIL_ADDRESS.fullmatch(address))
+
+
+def _number(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _escaped(value: object, default: str = "") -> str:
+    return html.escape(str(value if value not in (None, "") else default))
 
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -85,12 +123,24 @@ class EmailNotifier:
     """
 
     def __init__(self) -> None:
+        self._config_errors: list[str] = []
+        self._last_error = ""
         self._smtp_host   = _env("SMTP_HOST")
-        self._smtp_port   = int(_env("SMTP_PORT", "587"))
+        try:
+            self._smtp_port = int(_env("SMTP_PORT", "587"))
+            if not 1 <= self._smtp_port <= 65535:
+                raise ValueError
+        except ValueError:
+            self._smtp_port = 587
+            self._config_errors.append("SMTP_PORT must be between 1 and 65535")
         self._smtp_user   = _env("SMTP_USER")
         self._smtp_pass   = _env("SMTP_PASS")
         self._smtp_from   = _env("SMTP_FROM") or self._smtp_user
         self._smtp_tls    = _env("SMTP_TLS", "starttls").lower()
+        if self._smtp_tls not in {"starttls", "ssl", "none"}:
+            self._config_errors.append("SMTP_TLS must be starttls, ssl, or none")
+        if self._smtp_host and not _valid_sender(self._smtp_from):
+            self._config_errors.append("SMTP_FROM or SMTP_USER must be a valid address")
 
         self._graph_client_id     = _env("OUTLOOK_CLIENT_ID")
         self._graph_client_secret = _env("OUTLOOK_CLIENT_SECRET")
@@ -100,10 +150,23 @@ class EmailNotifier:
         self._alert_recipients  = _recipients("ALERT_RECIPIENTS")
         self._digest_recipients = _recipients("DIGEST_RECIPIENTS") or self._alert_recipients
 
-        self._use_graph = bool(self._graph_client_id and
-                               self._graph_client_secret and
-                               self._graph_tenant_id and
-                               self._graph_sender)
+        graph_credentials_present = bool(
+            self._graph_client_id
+            and self._graph_client_secret
+            and self._graph_tenant_id
+            and self._graph_sender
+        )
+        self._use_graph = graph_credentials_present and bool(
+            _EMAIL_ADDRESS.fullmatch(self._graph_sender),
+        )
+        if graph_credentials_present and not self._use_graph:
+            self._config_errors.append("OUTLOOK_SENDER must be a valid email address")
+        self._smtp_ready = bool(
+            self._smtp_host
+            and _valid_sender(self._smtp_from)
+            and self._smtp_tls in {"starttls", "ssl", "none"}
+            and not any(error.startswith("SMTP_PORT") for error in self._config_errors)
+        )
         self._enabled = _env("EMAIL_ENABLED", "true").lower() not in ("false", "0", "no")
         self._smtp_client = ResilientHTTPClient(
             "email.smtp",
@@ -112,7 +175,7 @@ class EmailNotifier:
             connect_timeout_s=5.0,
             breaker_threshold=3,
             breaker_reset_s=120.0,
-        ) if self._smtp_host else None
+        ) if self._smtp_ready else None
         self._graph_client = ResilientHTTPClient(
             "email.graph",
             retry=EMAIL_RETRY,
@@ -121,14 +184,18 @@ class EmailNotifier:
             breaker_threshold=3,
             breaker_reset_s=120.0,
         ) if self._use_graph else None
+        self._graph_token: Optional[str] = None
+        self._graph_token_exp = 0.0
         if not self._enabled:
             log.info("Email notifications disabled (EMAIL_ENABLED=false)")
         elif not self._smtp_host and not self._use_graph:
             log.info("Email notifications not configured (set SMTP_HOST or OUTLOOK_* vars)")
+        elif self._config_errors and not self._use_graph:
+            log.error("Email configuration invalid: %s", "; ".join(self._config_errors))
 
     @property
     def enabled(self) -> bool:
-        return self._enabled and (bool(self._smtp_host) or self._use_graph)
+        return self._enabled and (self._smtp_ready or self._use_graph)
 
     @property
     def transport(self) -> str:
@@ -149,6 +216,17 @@ class EmailNotifier:
     def default_alert_recipients(self) -> list[str]:
         return list(self._alert_recipients)
 
+    def normalize_recipients(self, recipients: list[str]) -> list[str]:
+        """Validate and deduplicate recipients before they enter the audit queue."""
+        return _normalise_recipients(recipients)
+
+    def default_digest_recipients(self) -> list[str]:
+        return list(self._digest_recipients)
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
     def health_status(self) -> dict:
         snap = registry.snapshot()
         integration = next(
@@ -161,6 +239,8 @@ class EmailNotifier:
             status = "disabled"
         elif not configured:
             status = "not_configured"
+        elif not self.enabled:
+            status = "degraded"
         elif integration:
             status = integration.get("status", "healthy")
         else:
@@ -174,6 +254,7 @@ class EmailNotifier:
             "sender_configured": bool(self._graph_sender or self._smtp_from),
             "alert_recipients": recipients,
             "digest_recipients": len(self._digest_recipients),
+            "configuration_errors": list(self._config_errors),
             "metrics": integration,
         }
 
@@ -182,24 +263,28 @@ class EmailNotifier:
     async def send_critical_alert(self, finding: dict,
                                   recipients: Optional[list[str]] = None) -> bool:
         """Send immediate alert for a critical/high finding."""
-        to = recipients or self._alert_recipients
+        to = _normalise_recipients(recipients or self._alert_recipients)
         if not to or not self.enabled:
             return False
         sev   = finding.get("severity", "high")
         title = finding.get("title", "Security Finding")
         agent = finding.get("agent_id", "unknown")
-        subject = f"[AttackLens {_SEVERITY_EMOJI.get(sev, sev.upper())}] {title} — {agent}"
+        subject = _safe_subject(
+            f"[AttackLens {_SEVERITY_EMOJI.get(sev, str(sev).upper())}] {title} — {agent}"
+        )
         body = self._render_critical_alert(finding)
         return await self._send(to, subject, body)
 
     async def send_digest(self, findings: list[dict], period: str = "daily",
                           recipients: Optional[list[str]] = None) -> bool:
         """Send daily or weekly findings digest."""
-        to = recipients or self._digest_recipients
+        to = _normalise_recipients(recipients or self._digest_recipients)
         if not to or not self.enabled:
             return False
         label = period.capitalize()
-        subject = f"[AttackLens] {label} Security Digest — {len(findings)} Active Findings"
+        subject = _safe_subject(
+            f"[AttackLens] {label} Security Digest — {len(findings)} Active Findings"
+        )
         body = self._render_digest(findings, period)
         return await self._send(to, subject, body)
 
@@ -207,24 +292,23 @@ class EmailNotifier:
                               detail: str = "",
                               recipients: Optional[list[str]] = None) -> bool:
         """Notify when an analyst updates a finding (status change, comment, etc.)."""
-        to = recipients or self._alert_recipients
+        to = _normalise_recipients(recipients or self._alert_recipients)
         if not to or not self.enabled:
             return False
-        title = finding.get("title", "Finding")
         ext_id = finding.get("external_id", f"#{finding.get('id','?')}")
-        subject = f"[AttackLens SOC] {ext_id} — {action} by {analyst}"
+        subject = _safe_subject(f"[AttackLens SOC] {ext_id} — {action} by {analyst}")
         body = self._render_soc_action(finding, action, analyst, detail)
         return await self._send(to, subject, body)
 
     async def send_remediation_ready(self, finding: dict, os_type: str,
                                      recipients: Optional[list[str]] = None) -> bool:
         """Notify when AI remediation plan is ready for a finding."""
-        to = recipients or self._alert_recipients
+        to = _normalise_recipients(recipients or self._alert_recipients)
         if not to or not self.enabled:
             return False
         title  = finding.get("title", "Finding")
         ext_id = finding.get("external_id", f"#{finding.get('id','?')}")
-        subject = f"[AttackLens] Remediation Plan Ready — {ext_id}: {title}"
+        subject = _safe_subject(f"[AttackLens] Remediation Plan Ready — {ext_id}: {title}")
         body = self._render_remediation_ready(finding, os_type)
         return await self._send(to, subject, body)
 
@@ -238,6 +322,7 @@ class EmailNotifier:
             client = self._smtp_client
             send_fn = self._send_smtp
         else:
+            self._last_error = "email transport is not configured"
             return False
 
         async def _attempt() -> bool:
@@ -247,11 +332,16 @@ class EmailNotifier:
             return True
 
         try:
-            return bool(await client.call(_attempt))
+            sent = bool(await client.call(_attempt))
+            if sent:
+                self._last_error = ""
+            return sent
         except PermanentError as exc:
+            self._last_error = f"{type(exc).__name__}: {str(exc)[:500]}"
             log.error("Email permanent failure (%s): %s", subject[:60], exc)
             return False
         except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {str(exc)[:500]}"
             log.error("Email send failed (%s): %s", subject[:60], exc)
             return False
 
@@ -272,6 +362,7 @@ class EmailNotifier:
             "port":     self._smtp_port,
             "username": self._smtp_user,
             "password": self._smtp_pass,
+            "timeout": 20,
         }
         if self._smtp_tls == "ssl":
             kwargs["use_tls"] = True
@@ -303,7 +394,8 @@ class EmailNotifier:
         }
         url = f"https://graph.microsoft.com/v1.0/users/{self._graph_sender}/sendMail"
         import aiohttp
-        async with aiohttp.ClientSession() as s:
+        timeout = aiohttp.ClientTimeout(total=20, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.post(url, json=payload,
                               headers={"Authorization": f"Bearer {token}",
                                        "Content-Type": "application/json"}) as r:
@@ -330,9 +422,6 @@ class EmailNotifier:
                     status=r.status,
                 )
 
-    _graph_token:    Optional[str]  = None
-    _graph_token_exp: float         = 0.0
-
     async def _get_graph_token(self) -> Optional[str]:
         if self._graph_token and time.time() < self._graph_token_exp - 60:
             return self._graph_token
@@ -345,7 +434,8 @@ class EmailNotifier:
                 "client_secret": self._graph_client_secret,
                 "scope":         "https://graph.microsoft.com/.default",
             }
-            async with aiohttp.ClientSession() as s:
+            timeout = aiohttp.ClientTimeout(total=20, connect=5)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.post(url, data=data) as r:
                     if r.status == 429:
                         retry_after = _parse_retry_after(r.headers.get("Retry-After"))
@@ -426,20 +516,21 @@ class EmailNotifier:
 </html>"""
 
     def _render_critical_alert(self, f: dict) -> str:
-        sev    = f.get("severity", "high")
+        sev    = str(f.get("severity", "high")).lower()
         color  = _SEVERITY_COLOR.get(sev, "#888")
-        title  = html.escape(f.get("title", "Security Finding"))
-        ext_id = html.escape(f.get("external_id", f"#{f.get('id','?')}"))
-        agent  = html.escape(f.get("agent_id", "unknown"))
-        cat    = html.escape(f.get("category", "unknown"))
-        desc   = html.escape(f.get("description", ""))
-        score  = f.get("composite_score", 0)
+        title  = _escaped(f.get("title"), "Security Finding")
+        ext_id = _escaped(f.get("external_id"), f"#{f.get('id', '?')}")
+        agent  = _escaped(f.get("agent_id"), "unknown")
+        cat    = _escaped(f.get("category"), "unknown")
+        desc   = _escaped(f.get("description"))
+        score  = _number(f.get("composite_score", 0))
         kev    = "YES — Active Exploitation Confirmed" if f.get("kev") else "No"
-        epss   = f"{float(f.get('epss_score',0))*100:.1f}% exploit probability"
-        mitre  = html.escape(f.get("mitre_technique","") or "N/A")
-        rec    = html.escape(f.get("recommendation","") or "See dashboard for details")
-        cves   = ", ".join(f.get("cve_ids") or []) or "None"
-        ts     = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(f.get("last_detected_at", time.time())))
+        epss   = f"{_number(f.get('epss_score', 0))*100:.1f}% exploit probability"
+        mitre  = _escaped(f.get("mitre_technique"), "N/A")
+        rec    = _escaped(f.get("recommendation"), "See dashboard for details")
+        cves = html.escape(", ".join(map(str, f.get("cve_ids") or [])) or "None")
+        ts_value = _number(f.get("last_detected_at"), time.time())
+        ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts_value))
 
         content = f"""
 <p><span class="badge" style="background:{color}">{sev.upper()}</span>
@@ -473,15 +564,16 @@ class EmailNotifier:
         ts        = time.strftime("%Y-%m-%d", time.gmtime())
 
         rows = ""
-        for f in sorted(findings, key=lambda x: -float(x.get("composite_score",0)))[:20]:
-            sev   = f.get("severity","info")
+        for f in sorted(findings, key=lambda x: -_number(x.get("composite_score", 0)))[:20]:
+            sev   = str(f.get("severity", "info")).lower()
             color = _SEVERITY_COLOR.get(sev, "#888")
+            item_score = _number(f.get("composite_score", 0))
             rows += f"""<tr>
   <td><span class="badge" style="background:{color};font-size:10px">{sev[:4].upper()}</span></td>
-  <td>{html.escape(f.get('external_id',''))}</td>
-  <td>{html.escape(f.get('agent_id',''))}</td>
-  <td>{html.escape(f.get('title','')[:60])}</td>
-  <td>{f.get('composite_score',0):.1f}</td>
+  <td>{_escaped(f.get('external_id'))}</td>
+  <td>{_escaped(f.get('agent_id'))}</td>
+  <td>{_escaped(str(f.get('title') or '')[:60])}</td>
+  <td>{item_score:.1f}</td>
   <td>{'YES' if f.get('kev') else ''}</td>
 </tr>"""
 
@@ -524,16 +616,16 @@ class EmailNotifier:
         return self._base_template(f"{period.capitalize()} Security Digest", content)
 
     def _render_soc_action(self, f: dict, action: str, analyst: str, detail: str) -> str:
-        ext_id = html.escape(f.get("external_id", f"#{f.get('id','?')}"))
-        title  = html.escape(f.get("title", "Finding"))
-        sev    = f.get("severity","info")
+        ext_id = _escaped(f.get("external_id"), f"#{f.get('id', '?')}")
+        title  = _escaped(f.get("title"), "Finding")
+        sev    = str(f.get("severity", "info")).lower()
         color  = _SEVERITY_COLOR.get(sev, "#888")
-        status = html.escape(f.get("status",""))
+        status = _escaped(f.get("status"))
         ts     = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
         content = f"""
-<p>SOC analyst <strong>{html.escape(analyst)}</strong> performed action
-   <strong>{html.escape(action)}</strong> on {ts}.</p>
+<p>SOC analyst <strong>{_escaped(analyst)}</strong> performed action
+   <strong>{_escaped(action)}</strong> on {ts}.</p>
 
 <table>
   <tr><th>Field</th><th>Value</th></tr>
@@ -541,17 +633,17 @@ class EmailNotifier:
   <tr><td>Severity</td>
       <td><span class="badge" style="background:{color}">{sev.upper()}</span></td></tr>
   <tr><td>Current Status</td><td>{status}</td></tr>
-  <tr><td>Action</td><td>{html.escape(action)}</td></tr>
-  <tr><td>Detail</td><td>{html.escape(detail or '—')}</td></tr>
+  <tr><td>Action</td><td>{_escaped(action)}</td></tr>
+  <tr><td>Detail</td><td>{_escaped(detail, '—')}</td></tr>
 </table>
 
 <p><a href="#">View Finding &rarr;</a></p>"""
         return self._base_template(f"SOC Action: {ext_id}", content)
 
     def _render_remediation_ready(self, f: dict, os_type: str) -> str:
-        ext_id = html.escape(f.get("external_id", f"#{f.get('id','?')}"))
-        title  = html.escape(f.get("title", "Finding"))
-        sev    = f.get("severity","info")
+        ext_id = _escaped(f.get("external_id"), f"#{f.get('id', '?')}")
+        title  = _escaped(f.get("title"), "Finding")
+        sev    = str(f.get("severity", "info")).lower()
         color  = _SEVERITY_COLOR.get(sev, "#888")
 
         content = f"""
@@ -562,8 +654,8 @@ class EmailNotifier:
   <tr><td>Finding</td><td><strong>{ext_id}</strong> — {title}</td></tr>
   <tr><td>Severity</td>
       <td><span class="badge" style="background:{color}">{sev.upper()}</span></td></tr>
-  <tr><td>Target OS</td><td>{html.escape(os_type)}</td></tr>
-  <tr><td>Agent</td><td>{html.escape(f.get('agent_id',''))}</td></tr>
+  <tr><td>Target OS</td><td>{_escaped(os_type)}</td></tr>
+  <tr><td>Agent</td><td>{_escaped(f.get('agent_id'))}</td></tr>
 </table>
 
 <p>The plan includes step-by-step commands, verification steps, and

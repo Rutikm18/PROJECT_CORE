@@ -428,6 +428,22 @@ def create_app() -> FastAPI:
         email_notifier = EmailNotifier()
         finding_notifications = FindingNotificationDispatcher(intel_db, email_notifier)
 
+        async def _handle_investigation_lifecycle(
+            finding: dict, event: str, run: dict,
+        ) -> None:
+            detail = str(run.get("feedback") or run.get("decision") or "")
+            await finding_notifications.handle_workflow_event(
+                finding,
+                event=event,
+                actor=str(run.get("actor") or "AttackLens"),
+                detail=detail,
+                run_id=str(run.get("run_id") or ""),
+            )
+
+        investigation_service.set_lifecycle_notification_handler(
+            _handle_investigation_lifecycle,
+        )
+
         async def _handle_finding_event(finding: dict, event: str) -> None:
             handlers = [finding_notifications.handle_finding_event(finding, event)]
             if investigations_enabled:
@@ -445,6 +461,10 @@ def create_app() -> FastAPI:
         app.state.email_notifier = email_notifier
         app.state.finding_notification_dispatcher = finding_notifications
         app.state.investigation_service = investigation_service
+        if "maintenance" in roles:
+            _service_tasks.append(asyncio.create_task(
+                finding_notifications.run(), name="manager:email-delivery",
+            ))
         log.info("AI Analyst enabled=%s  Email enabled=%s",
                  ai_analyst.enabled, email_notifier.enabled)
 

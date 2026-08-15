@@ -64,7 +64,11 @@ rules:
       - known backup/AV/indexing process allowlist
     response_actions:
       - kill process and isolate host immediately, this is high-confidence ransomware behavior
-    status: stable
+    status: experimental
+    status_reason: >
+      Windowed per-process file-write/IOPS behavioral detection needs
+      filesystem-event telemetry aggregated over a 5m window; owned by the
+      behavioral detectors, not a single metrics-snapshot rule-pack evaluator.
 
   - id: METRICS-004
     title: Network throughput anomaly vs. baseline

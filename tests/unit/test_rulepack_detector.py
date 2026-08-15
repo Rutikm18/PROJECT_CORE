@@ -18,6 +18,43 @@ def test_rulepack_loads_yaml_categories() -> None:
     assert len(detector.rules_for("openfiles")) == 5
 
 
+def test_rulepack_inventory_distinguishes_executable_from_declarative_rules() -> None:
+    inventory = RulePackDetector.load().execution_inventory()
+
+    assert inventory["total_yaml_rules"] == 118
+    assert inventory["executable_rules"] == 85
+    assert inventory["declarative_only_rules"] == 33
+    # Every `stable` (production-ready) rule now has an executable evaluator; the
+    # 26 that used to be stable-but-declarative were either implemented or
+    # reclassified so the product's maturity signal stays truthful.
+    assert inventory["by_status"]["stable"] == {
+        "total": 76,
+        "executable": 76,
+        "declarative_only": 0,
+    }
+    # The remaining declarative-only rules must not be labelled `stable`.
+    assert not [
+        r for r in inventory["declarative_only_rule_ids"]
+        if r in _STABLE_RULE_IDS(inventory)
+    ]
+    assert "PROCESSES-002" not in inventory["declarative_only_rule_ids"]
+    # Rules reclassified out of stable (windowed/absence/flow) remain declarative.
+    assert "AGENT-HEALTH-001" in inventory["declarative_only_rule_ids"]
+    # A sample of the newly implemented evaluators is now executable.
+    for rid in ("AGENT-HEALTH-002", "SBOM-001", "CONFIGS-001", "PORTS-001"):
+        assert rid not in inventory["declarative_only_rule_ids"]
+
+
+def _STABLE_RULE_IDS(inventory: dict) -> set[str]:
+    det = RulePackDetector.load()
+    return {
+        r.id
+        for section_rules in det._rules.values()
+        for r in section_rules
+        if r.status == "stable"
+    }
+
+
 def test_process_obfuscation_rule_emits_finding() -> None:
     detector = RulePackDetector.load()
 

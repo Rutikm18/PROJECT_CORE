@@ -41,7 +41,11 @@ rules:
       - known backup/archival tool allowlist
     response_actions:
       - kill process immediately, isolate host, this is high-confidence ransomware
-    status: stable
+    status: experimental
+    status_reason: >
+      Windowed mass open/rename counting per process (>50 files/3m with a
+      uniform rename pattern) needs a filesystem-event stream over time, not a
+      single open-files snapshot; not expressible as a per-item rule.
 
   - id: OPEN_FILES-003
     title: Self-deleting process after file access (anti-forensics)

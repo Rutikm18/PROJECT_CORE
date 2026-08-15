@@ -80,13 +80,18 @@ def client(app):
         yield c
 
 
-def _envelope(section: str = "metrics", data: dict | None = None) -> dict:
+def _envelope(
+    section: str = "metrics",
+    data: object | None = None,
+    *,
+    collected_at: object | None = None,
+) -> dict:
     enc_key, mac_key = derive_keys(_AGENT_KEY)
     payload = {
         "section":      section,
         "agent_id":     _AGENT_ID,
         "agent_name":   "Integration Test Mac",
-        "collected_at": int(time.time()),
+        "collected_at": int(time.time()) if collected_at is None else collected_at,
         "os":           "macos",
         "os_version":   "15.0",
         "arch":         platform.machine(),
@@ -132,6 +137,42 @@ def test_developer_security_payload_is_received_and_queryable(client):
     assert rows[0]["data"]["capabilities"]["mcp_servers"]["servers"] == []
 
 
+def test_partial_developer_security_payload_is_preserved(client):
+    """A bounded collector timeout is degraded telemetry, not data loss."""
+    snapshot = {
+        "schema_version": 1,
+        "collector_version": "macos-developer-security/partial-acceptance",
+        "platform": "macos",
+        "scope": {"users": 1},
+        "privacy": {"credential_values_collected": False},
+        "capabilities": {"mcp_servers": {"servers": []}},
+        "collection": {
+            "state": "partial",
+            "partial": True,
+            "errors": [{"capability": "containers", "error": "timeout"}],
+        },
+    }
+
+    sent = client.post(
+        "/api/v1/ingest", json=_envelope("developer_security", snapshot)
+    )
+    assert sent.status_code == 200
+
+    raw = client.get(
+        "/api/v1/raw/query",
+        params={
+            "agent_id": _AGENT_ID,
+            "section": "developer_security",
+            "search": "partial-acceptance",
+        },
+    )
+    assert raw.status_code == 200
+    rows = raw.json()["rows"]
+    assert len(rows) == 1
+    assert rows[0]["data"]["collection"]["partial"] is True
+    assert rows[0]["data"]["collection"]["errors"][0]["capability"] == "containers"
+
+
 def test_invalid_json_returns_400(client):
     r = client.post("/api/v1/ingest",
                     content=b"not-json",
@@ -149,6 +190,36 @@ def test_malformed_timestamp_returns_400_not_500(client):
     env["timestamp"] = {"unexpected": "object"}
     r = client.post("/api/v1/ingest", json=env)
     assert r.status_code == 400
+
+
+def test_malformed_collected_at_returns_422_not_retryable_503(client):
+    r = client.post(
+        "/api/v1/ingest",
+        json=_envelope(collected_at="not-an-event-time"),
+    )
+    assert r.status_code == 422
+    assert "collected_at" in r.json().get("detail", "")
+
+
+def test_non_finite_collected_at_returns_422(client):
+    r = client.post(
+        "/api/v1/ingest",
+        json=_envelope(collected_at=float("nan")),
+    )
+    assert r.status_code == 422
+    assert "collected_at" in r.json().get("detail", "")
+
+
+def test_wrong_section_data_shape_is_rejected_in_strict_mode(client, monkeypatch):
+    from manager.manager.api import ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "_STRICT_PAYLOAD", True)
+    r = client.post(
+        "/api/v1/ingest",
+        json=_envelope("processes", {"pid": 42, "name": "not-a-list"}),
+    )
+    assert r.status_code == 422
+    assert "processes: data must be a list" in r.json().get("detail", "")
 
 
 def test_oversized_ingest_is_rejected_before_crypto(client, monkeypatch):
@@ -196,12 +267,52 @@ def test_authenticated_agent_cannot_attribute_payload_to_another_agent(client):
 
 
 def test_replay_returns_duplicate_200(client):
-    """Same nonce a second time is acknowledged idempotently."""
-    env = _envelope()
-    client.post("/api/v1/ingest", json=env)     # first: OK
+    """Same nonce is acknowledged twice but stored exactly once."""
+    marker = "duplicate-" + secrets.token_hex(8)
+    env = _envelope(data={"cpu_pct": 8.0, "mem_pct": 42.0, "marker": marker})
+    before = client.get(
+        "/api/v1/raw/count", params={"agent_id": _AGENT_ID, "search": marker}
+    ).json()["count"]
+
+    first = client.post("/api/v1/ingest", json=env)
+    assert first.status_code == 200
     r = client.post("/api/v1/ingest", json=env) # second: replay
     assert r.status_code == 200
     assert r.json()["status"] == "duplicate"
+
+    after = client.get(
+        "/api/v1/raw/count", params={"agent_id": _AGENT_ID, "search": marker}
+    ).json()["count"]
+    assert after == before + 1
+
+
+def test_delayed_collection_uses_event_time_and_remains_queryable(client):
+    """A fresh transmission may legitimately carry telemetry collected earlier."""
+    marker = "delayed-" + secrets.token_hex(8)
+    collected_at = int(time.time()) - 3600
+    r = client.post(
+        "/api/v1/ingest",
+        json=_envelope(
+            data={"cpu_pct": 8.0, "mem_pct": 42.0, "marker": marker},
+            collected_at=collected_at,
+        ),
+    )
+    assert r.status_code == 200
+
+    raw = client.get(
+        "/api/v1/raw/query",
+        params={
+            "agent_id": _AGENT_ID,
+            "section": "metrics",
+            "start": collected_at - 1,
+            "end": collected_at + 1,
+            "search": marker,
+        },
+    )
+    assert raw.status_code == 200
+    rows = raw.json()["rows"]
+    assert len(rows) == 1
+    assert rows[0]["collected_at"] == collected_at
 
 
 def test_unenrolled_agent_rejected(client):

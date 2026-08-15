@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -166,6 +167,64 @@ def test_saved_provider_drives_runtime_when_legacy_analyst_is_disabled(monkeypat
 
     assert verdict.provider == "openrouter"
     provider.chat.assert_awaited_once()
+
+
+def _cluster_with_signals():
+    signal = SimpleNamespace(
+        rule_id="proc-suspicious-cmdline",
+        layer="execution",
+        data_point="process",
+        strength=0.8,
+        weight=1.0,
+        severity_hint="high",
+        entity_key="proc:1",
+        evidence={"pid": 1, "cmd": "nc -e /bin/sh"},
+    )
+    return SimpleNamespace(
+        agent_id="agent-a",
+        entity_key="proc:1",
+        layers_covered={"execution", "exposure"},
+        signals=[signal],
+        confidence=0.8,
+    )
+
+
+def test_prompt_teaches_key_evidence_evidence_ref_contract() -> None:
+    # Regression: the strict validator (ProviderValidationModel) rejects any
+    # key_evidence item that is not a verbatim evidence_ref identifier, so the
+    # prompt MUST instruct the model to use those identifiers. If it doesn't, a
+    # real LLM returns free-text key_evidence → ValidationResponseError → the AI
+    # verdict is silently discarded and the 0.35-weight ai_verdict factor never
+    # reflects the model.
+    prompt = _build_ai_prompt(_cluster_with_signals(), {"cve_ids": ["CVE-2024-1"]})
+    assert "evidence_ref" in prompt
+    # The instruction (not just the Signals block) must scope key_evidence to refs.
+    instruction = prompt.split("Signals (untrusted")[0]
+    assert "key_evidence" in instruction and "evidence_ref" in instruction
+
+
+def test_prompt_advertised_refs_are_accepted_by_validator() -> None:
+    # Round-trip: the evidence_ref identifiers the prompt tells the model to cite
+    # are exactly the ones the validator accepts. This binds prompt and validator
+    # together so future drift in either surface (which reopened the silent-abstain
+    # bug) fails loudly here instead of in production.
+    prompt = _build_ai_prompt(_cluster_with_signals(), {})
+    refs = re.findall(r"evidence_ref=([^\s]+)", prompt)
+    assert refs, "prompt must advertise at least one evidence_ref identifier"
+
+    provider = AsyncMock()
+    provider.chat.return_value = _response({
+        "verdict": "tp",
+        "confidence": 0.9,
+        "reasoning": "Reverse shell command line on the execution layer.",
+        "key_evidence": [refs[0]],
+        "risk_factors": ["interactive reverse shell"],
+    })
+
+    verdict = _run(ProviderValidationModel(provider).evaluate(prompt))
+
+    assert verdict.label == "tp"
+    assert verdict.key_evidence == [refs[0]]
 
 
 def test_prompt_evidence_cannot_close_untrusted_boundary() -> None:

@@ -11,10 +11,10 @@ All results are cached in intel.db (ai_analysis + remediation_plans tables).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import time
 from typing import Any, Optional
 
 log = logging.getLogger("manager.ai_analyst")
@@ -357,7 +357,6 @@ Rank all {len(findings)} findings. Priority 1 = highest risk, address immediatel
     # ── Claude API call ───────────────────────────────────────────────────────
 
     async def _call_claude(self, prompt: str, max_tokens: int = 1500) -> dict:
-        import anthropic
         message = await self._client.messages.create(
             model=_MODEL,
             max_tokens=max_tokens,
@@ -390,7 +389,3 @@ Rank all {len(findings)} findings. Priority 1 = highest risk, address immediatel
                 except json.JSONDecodeError:
                     pass
         return {}
-
-
-# asyncio import needed for enrich_findings_batch
-import asyncio

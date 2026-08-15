@@ -33,17 +33,16 @@ import uuid
 
 import pytest
 from fastapi import FastAPI
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 
-from manager.manager.attacklens.custom_correlator import (
-    _get_field,
-    _evaluate_condition,
-    _matches_conditions,
-    CustomCorrelator,
-)
 from manager.manager.api.custom_correlations import make_custom_correlations_router
+from manager.manager.attacklens.custom_correlator import (
+    CustomCorrelator,
+    _evaluate_condition,
+    _get_field,
+    _matches_conditions,
+)
 from manager.manager.indexer import IntelDB
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Pure unit tests — condition evaluation (no DB required)
@@ -63,6 +62,22 @@ FINDING = {
     "cvss_score": 7.2,
     "epss_score": 0.04,
 }
+
+
+@pytest.mark.asyncio
+async def test_reload_rules_reports_executable_inventory():
+    app = _make_app(object())
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        response = await client.post("/api/v1/custom-correlations/reload-rules")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_yaml_rules"] == 118
+    assert body["executable_rules"] == 85
+    assert body["declarative_only_rules"] == 33
+    assert body["by_status"]["stable"]["declarative_only"] == 0
 
 
 # ── _get_field ────────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from ..integrations.resilience import registry
@@ -82,3 +82,21 @@ async def dedup_stats(request: Request) -> JSONResponse:
     """
     idb = request.app.state.intel_db
     return JSONResponse(content=idb.dedup_stats())
+
+
+@router.get("/notification-deliveries")
+async def notification_deliveries(
+    request: Request,
+    finding_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> JSONResponse:
+    """Return the durable email delivery audit trail without message secrets."""
+    idb = request.app.state.intel_db
+    deliveries = await idb.get_notification_deliveries(
+        finding_id=finding_id, limit=limit,
+    )
+    for delivery in deliveries:
+        # Payloads can contain endpoint evidence and are unnecessary for
+        # transport auditing. Keep them server-side.
+        delivery.pop("payload", None)
+    return JSONResponse(content={"deliveries": deliveries, "total": len(deliveries)})

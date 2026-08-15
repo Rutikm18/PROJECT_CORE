@@ -20,7 +20,7 @@ Usage:
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 
 # ── Canonical envelope metadata ──────────────────────────────────────────────
@@ -371,6 +371,37 @@ SCHEMAS: dict[str, dict] = {
     "sbom":        SBOM_COMPONENT_RECORD,
 }
 
+# ── developer_security composite sub-schema ──────────────────────────────────
+# `developer_security` (the Deep Mesh section) is a composite: the envelope in
+# SCHEMAS["developer_security"] above, plus a `capabilities` map of named
+# capabilities. Each capability is either an {"error": <ExcName>} stub (its
+# collector raised) or a dict carrying a record list under a capability-specific
+# key. This map is the SINGLE SOURCE OF TRUTH for which key holds each
+# capability's list — manager/api/raw.py imports it (as _DEVSEC_CAP_ITEMS) to
+# count records, so the composite validator here and the Deep Mesh counts there
+# can never drift. `None` marks a capability with a bespoke shape (homebrew:
+# separate `formulae` + `casks` lists) that the validator special-cases.
+DEVSEC_CAPABILITY_ITEMS: dict[str, Optional[str]] = {
+    "editor_extensions":    "items",
+    "mcp_servers":          "servers",
+    "browser_extensions":   "items",
+    "native_messaging":     "items",
+    "agent_cli_tools":      "items",
+    "ai_applications":      "items",
+    "listening_ports":      "items",
+    "processes":            "items",
+    "launchd":              "items",
+    "cron":                 "users",
+    "shell_startup":        "files",
+    "node_packages":        "users",
+    "python_packages":      "users",
+    "homebrew":             None,          # bespoke: formulae + casks lists
+    "git":                  "users",
+    "credential_locations": "locations",
+    "docker":               "containers",
+}
+
+
 # Sections where `data` is a list of records (vs a single dict)
 LIST_SECTIONS: frozenset[str] = frozenset({
     "connections", "processes", "ports", "mounts",
@@ -428,7 +459,54 @@ def validate_section(section: str, data: Any) -> list[str]:
         if not isinstance(data, dict):
             return [f"{section}: data must be a dict, got {type(data).__name__}"]
         errors.extend(_check_record(data, schema, prefix=section))
+        # developer_security is a composite section: the envelope is checked
+        # above, but its `capabilities` map needs structural validation too.
+        # Only runs when capabilities is actually a dict — a missing / wrong-typed
+        # capabilities is already reported by the envelope check.
+        if section == "developer_security":
+            caps = data.get("capabilities")
+            if isinstance(caps, dict):
+                errors.extend(_check_devsec_capabilities(caps, prefix=section))
 
+    return errors
+
+
+def _check_devsec_capabilities(capabilities: dict, prefix: str) -> list[str]:
+    """Structural validation of the developer_security capability map.
+
+    Each capability must be either an {"error": …} collector stub or a dict
+    whose declared record key (per DEVSEC_CAPABILITY_ITEMS) is a list when
+    present. Unknown capabilities are allowed for forward-compatibility but must
+    still be dict-shaped. Deep per-record field validation is intentionally
+    skipped: capability records are heterogeneous, capped, and redacted at the
+    agent, so the enforceable contract is the shape, not the fields.
+    """
+    errors: list[str] = []
+    for name, value in capabilities.items():
+        cap_prefix = f"{prefix}.capabilities.{name}"
+        if not isinstance(value, dict):
+            errors.append(
+                f"{cap_prefix}: expected object, got {type(value).__name__}"
+            )
+            continue
+        if "error" in value:
+            continue  # collector error-stub is an expected, valid shape
+        if name == "homebrew":
+            # Bespoke shape: two parallel record lists rather than one items key.
+            for sub in ("formulae", "casks"):
+                sub_val = value.get(sub)
+                if sub_val is not None and not isinstance(sub_val, list):
+                    errors.append(
+                        f"{cap_prefix}.{sub}: expected list, "
+                        f"got {type(sub_val).__name__}"
+                    )
+            continue
+        items_key = DEVSEC_CAPABILITY_ITEMS.get(name)
+        if items_key and items_key in value and not isinstance(value[items_key], list):
+            errors.append(
+                f"{cap_prefix}.{items_key}: expected list, "
+                f"got {type(value[items_key]).__name__}"
+            )
     return errors
 
 

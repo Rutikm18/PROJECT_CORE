@@ -41,6 +41,33 @@ class FakeProvider:
         return json.loads(text)
 
 
+class MalformedProvider(FakeProvider):
+    async def chat(self, prompt: str, *, max_tokens: int = 1500) -> AIResponse:
+        if "Generate at most" in prompt:
+            text = '{"hypotheses": "not-an-array"}'
+        else:
+            text = json.dumps({
+                "verdict": "likely",
+                "confidence": "high",
+                "summary": "wrong confidence type",
+                "evidence_ids": "E-FINDING",
+                "gaps": [],
+            })
+        return AIResponse(
+            text=text,
+            model="malformed-model",
+            provider="malformed-provider",
+            input_tokens=11,
+            output_tokens=3,
+            latency_ms=12.5,
+        )
+
+
+class FailingProvider(FakeProvider):
+    async def chat(self, prompt: str, *, max_tokens: int = 1500) -> AIResponse:
+        raise RuntimeError("provider unavailable")
+
+
 class FakePlan:
     def to_dict(self) -> dict:
         return {"summary": "Contain and validate", "steps": [{"title": "Validate"}]}
@@ -54,6 +81,12 @@ class FakeAnalyzer:
     async def remediate(self, *args, **kwargs):
         self.calls += 1
         return FakePlan()
+
+
+class FailingAnalyzer(FakeAnalyzer):
+    async def remediate(self, *args, **kwargs):
+        self.calls += 1
+        raise RuntimeError("remediation provider unavailable")
 
 
 class FakeIntelDB:
@@ -187,6 +220,16 @@ async def test_investigation_pauses_and_approval_only_drafts_remediation(service
     assert len(pending["review_payload"]["hypotheses"]) == 5
     assert pending["review_payload"]["hypotheses"][0]["supporting_ids"] == ["E-FINDING"]
     assert pending["review_payload"]["verdict"]["evidence_ids"] == ["E-FINDING"]
+    assert [call["stage"] for call in pending["review_payload"]["model_calls"]] == [
+        "hypothesis_generation",
+        "verdict_generation",
+    ]
+    assert {call["status"] for call in pending["review_payload"]["model_calls"]} == {
+        "succeeded",
+    }
+    assert {call["provider"] for call in pending["review_payload"]["model_calls"]} == {
+        "fake",
+    }
 
     duplicate = await graph.start_investigation(42)
     assert duplicate["run_id"] == pending["run_id"]
@@ -199,6 +242,8 @@ async def test_investigation_pauses_and_approval_only_drafts_remediation(service
     assert completed["result"]["remediation"]["source"] == "ai_direct_sdk"
     assert completed["result"]["remediation"]["execution_authorized"] is False
     assert completed["result"]["analyst"]["actor"] == "soc@example.com"
+    assert len(completed["result"]["model_calls"]) == 3
+    assert completed["result"]["model_calls"][-1]["stage"] == "remediation_generation"
     assert analyzer.calls == 1
     assert db.decisions[0]["decision"] == "approve"
 
@@ -215,6 +260,60 @@ async def test_rejection_completes_without_remediation(service):
     assert rejected["status"] == "rejected"
     assert rejected["result"]["remediation"] == {}
     assert analyzer.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_remediation_failure_uses_deterministic_fallback_and_records_it():
+    db = FakeIntelDB()
+    provider = FakeProvider()
+    analyzer = FailingAnalyzer(provider)
+    graph = InvestigationService(
+        db,
+        FakeFeeds(),
+        provider=provider,
+        analyzer=analyzer,
+        checkpointer=InMemorySaver(),
+    )
+    await graph.start()
+    try:
+        pending = await graph.start_investigation(42)
+        completed = await graph.resume_investigation(
+            pending["run_id"], decision="approve", actor="fallback-test",
+        )
+    finally:
+        await graph.stop()
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["remediation"]["source"] == (
+        "deterministic_knowledge_base"
+    )
+    remediation_call = completed["result"]["model_calls"][-1]
+    assert remediation_call["stage"] == "remediation_generation"
+    assert remediation_call["status"] == "provider_error"
+    assert remediation_call["fallback"] == "deterministic_knowledge_base"
+    assert completed["result"]["remediation"]["execution_authorized"] is False
+
+
+@pytest.mark.asyncio
+async def test_investigation_lifecycle_emits_review_and_completion_events(service):
+    graph, _, _ = service
+    events: list[tuple[dict, str, dict]] = []
+
+    async def capture(finding, event, run):
+        events.append((finding, event, run))
+
+    graph.set_lifecycle_notification_handler(capture)
+    pending = await graph.start_investigation(42)
+    await graph.resume_investigation(
+        pending["run_id"], decision="approve", actor="soc@example.test",
+    )
+
+    assert [event for _, event, _ in events] == [
+        "investigation_pending_review",
+        "investigation_completed",
+    ]
+    assert events[0][0]["id"] == 42
+    assert events[1][2]["actor"] == "soc@example.test"
 
 
 @pytest.mark.asyncio
@@ -251,6 +350,43 @@ async def test_auto_trigger_applies_event_and_severity_gates(service, monkeypatc
     await graph.handle_finding_event(db.finding, "created")
     assert len(db.runs) == 1
     assert next(iter(db.runs.values()))["status"] == "pending_review"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "expected_status"),
+    [
+        (MalformedProvider(), "invalid_response"),
+        (FailingProvider(), "provider_error"),
+    ],
+)
+async def test_provider_failures_fall_back_and_are_auditable(provider, expected_status):
+    db = FakeIntelDB()
+    analyzer = FakeAnalyzer(provider)
+    graph = InvestigationService(
+        db,
+        FakeFeeds(),
+        provider=provider,
+        analyzer=analyzer,
+        checkpointer=InMemorySaver(),
+    )
+    await graph.start()
+    try:
+        pending = await graph.start_investigation(42)
+    finally:
+        await graph.stop()
+
+    assert pending["status"] == "pending_review"
+    review = pending["review_payload"]
+    assert review["verdict"]["verdict"] == "inconclusive"
+    assert review["verdict"]["confidence"] == 0.0
+    assert len(review["errors"]) == 2
+    assert [call["stage"] for call in review["model_calls"]] == [
+        "hypothesis_generation",
+        "verdict_generation",
+    ]
+    assert {call["status"] for call in review["model_calls"]} == {expected_status}
+    assert all("error_type" in call for call in review["model_calls"])
 
 
 @pytest.mark.asyncio

@@ -16,15 +16,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import uuid
 from pathlib import Path
+from typing import Any, Optional
 
 import yaml
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
-from typing import Any, Optional
 
 log = logging.getLogger("manager.api.custom_correlations")
 
@@ -215,8 +214,9 @@ def make_custom_correlations_router(intel_db) -> APIRouter:
         agent_id = (body or {}).get("agent_id") if body else None
 
         try:
-            from ..attacklens.custom_correlator import _matches_conditions
             import time as _t
+
+            from ..attacklens.custom_correlator import _matches_conditions
 
             if agent_id:
                 findings_raw = await intel_db._fetchall(
@@ -371,18 +371,14 @@ def make_custom_correlations_router(intel_db) -> APIRouter:
             detector = RulePackDetector.load()
             rulepack_dir = str(default_rulepack_dir())
             yaml_files = list(Path(rulepack_dir).glob("*.yml")) + list(Path(rulepack_dir).glob("*.yaml"))
-            total_rules = sum(len(rules) for rules in detector._rules.values())
-            executable_rules = sum(
-                1 for section_rules in detector._rules.values()
-                for r in section_rules if detector.has_executable_rules(section_rules[0].id.split("-")[0].lower())
-            )
+            inventory = detector.execution_inventory()
             return {
                 "status": "ok",
                 "rulepack_dir": rulepack_dir,
                 "yaml_files_found": len(yaml_files),
                 "yaml_files": [f.name for f in yaml_files],
                 "sections_loaded": len(detector._rules),
-                "total_yaml_rules": total_rules,
+                **inventory,
                 "reloaded_at": time.time(),
             }
         except Exception as exc:

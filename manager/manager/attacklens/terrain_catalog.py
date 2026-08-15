@@ -62,7 +62,8 @@ _TERRAINS = (
         "Security posture, SIP, Gatekeeper, FileVault, and firewall",
         "#8b5cf6",
         "/posture/overview",
-        ("security", "posture", "sip", "firewall", "agent_health", "battery", "hardware"),
+        ("security", "posture", "sip", "firewall", "agent_health", "battery",
+         "hardware", "compliance"),
     ),
     TerrainDefinition(
         "mesh",

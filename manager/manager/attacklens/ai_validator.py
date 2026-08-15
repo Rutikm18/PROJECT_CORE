@@ -478,9 +478,17 @@ You MUST output JSON ONLY in the following schema — no markdown, no commentary
   "verdict":      "tp" | "fp" | "uncertain",
   "confidence":   0.0–1.0  (your confidence in the verdict),
   "reasoning":    "<= 3 sentences citing the strongest evidence",
-  "key_evidence": ["<short string>", ...],   // ≤ 6 items
+  "key_evidence": ["evidence:signal:<n>:<rule_id>", ...],   // ≤ 6 items — see rule below
   "risk_factors": ["<short string>", ...]    // ≤ 6 items (only if verdict=tp)
 }}
+
+CRITICAL — `key_evidence` MUST contain ONLY evidence_ref identifiers copied
+verbatim from the Signals block below: the exact token that appears after
+`evidence_ref=` (e.g. "evidence:signal:1:some_rule_id"). Do NOT paraphrase,
+summarise, translate, or invent — any value not present verbatim in the Signals
+block is rejected and your whole verdict is discarded. Put all narrative
+justification in `reasoning` (free text); `key_evidence` is a citation list of
+signal references only. If you cannot cite a signal, return an empty list.
 
 Decision rubric (apply in order):
   1. If KEV-listed CVE present AND any execution-layer signal → tp, confidence ≥ 0.9

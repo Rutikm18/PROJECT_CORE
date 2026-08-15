@@ -24,7 +24,11 @@ rules:
     response_actions:
       - identify both MACs' physical switch ports (via CAM table) to locate rogue device
       - isolate suspect port
-    status: stable
+    status: experimental
+    status_reason: >
+      Windowed/table-level correlation (>1 MAC for one IP within 5m) is not
+      expressible from a single per-item ARP snapshot record; needs cross-entry
+      windowed state the stateless rule-pack evaluator does not hold.
 
   - id: ARP-002
     title: Gratuitous ARP flood
@@ -43,7 +47,11 @@ rules:
       - known clustering software asset list
     response_actions:
       - correlate with ARP-001; isolate source if not an approved HA node
-    status: stable
+    status: experimental
+    status_reason: >
+      Packet-rate detection (>20 gratuitous ARP/min from one source) requires
+      counters over a time window, not a single snapshot item; belongs to a
+      windowed network detector, not the per-item rule pack.
 
   - id: ARP-003
     title: Default gateway MAC mismatch

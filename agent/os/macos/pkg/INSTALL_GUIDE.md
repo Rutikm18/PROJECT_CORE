@@ -8,7 +8,7 @@ Layout after install:
 /Library/AttackLens/bin/attacklens-agent       PyInstaller binary (SCA policies bundled)
 /Library/AttackLens/bin/attacklens-watchdog    PyInstaller binary
 /Library/AttackLens/agent.toml                 config (generated on first install)
-/Library/AttackLens/logs/                      agent + watchdog logs
+/Library/AttackLens/logs/           do            agent + watchdog logs
 /Library/LaunchDaemons/com.attacklens.agent.plist
 /Library/LaunchDaemons/com.attacklens.watchdog.plist
 /usr/local/bin/attacklens-service              management CLI (+ attacklens-ctl symlink)

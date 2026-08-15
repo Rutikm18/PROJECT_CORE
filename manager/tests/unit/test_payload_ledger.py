@@ -69,6 +69,32 @@ async def test_received_is_idempotent(pg_manager_dsn):
         await d.close()
 
 
+async def test_unprocessed_event_survives_manager_database_restart(pg_manager_dsn):
+    first = await _db(pg_manager_dsn)
+    try:
+        await first.ledger_received(
+            "agent-1",
+            "ports",
+            2500.0,
+            event_id="restart-pending",
+            data=[{"port": 4444}],
+            stored=True,
+        )
+    finally:
+        await first.close()
+
+    restarted = Database(pg_manager_dsn)
+    await restarted.init()
+    try:
+        lag = await restarted.ledger_lag()
+        assert lag["pending"] == 1
+        payload = await restarted.ledger_event_payload("restart-pending")
+        assert payload["data"] == [{"port": 4444}]
+        assert payload["stored_at"] is not None
+    finally:
+        await restarted.close()
+
+
 async def test_processed_without_received_still_terminal(pg_manager_dsn):
     """Sync path may process a payload that was never ledger_received — it must
     still record a terminal processed state, not look perpetually pending."""

@@ -63,12 +63,42 @@ CATEGORY_TO_TERRAIN: dict[str, str] = {
 }
 
 
+# Behavioral anomalies are cross-cutting — the terrain a given anomaly belongs
+# to is decided by *what* deviated, not the generic "behavioral" category. Route
+# by the metric / item_key so a connection-count spike lands in Vector, an admin
+# spike in Identity, a process/resource spike in Citadels, etc. Without this,
+# every behavioral finding fell through to UNCLASSIFIED and was invisible on the
+# six-bucket Attack Terrain map (it only showed under All Incidents).
+_BEHAVIORAL_METRIC_TERRAIN: tuple[tuple[str, str], ...] = (
+    ("conn", "vector"), ("port", "vector"), ("dns", "vector"),
+    ("beacon", "vector"), ("scan", "vector"), ("net", "vector"),
+    ("admin", "identity"), ("user", "identity"), ("login", "identity"),
+    ("pkg", "origin"), ("package", "origin"), ("app", "origin"),
+    ("proc", "citadels"), ("service", "citadels"), ("task", "citadels"),
+    ("suid", "citadels"), ("unsigned", "citadels"),
+    ("cpu", "citadels"), ("mem", "citadels"), ("load", "citadels"),
+)
+
+
+def _behavioral_terrain(finding: dict) -> str:
+    """Map a behavioral anomaly to a terrain bucket from its metric/item_key."""
+    ev = _ev(finding)
+    hint = str(ev.get("metric") or finding.get("item_key") or "").lower()
+    for token, terrain in _BEHAVIORAL_METRIC_TERRAIN:
+        if token in hint:
+            return terrain
+    # Impact/execution is the safest home for an otherwise-unclassified anomaly.
+    return "citadels"
+
+
 def terrain_for(finding: dict) -> str:
     explicit = str(finding.get("terrain_id") or "").strip().lower()
     known_ids = {definition.id for definition in all_terrains()}
     if explicit in known_ids or explicit == UNCLASSIFIED_TERRAIN_ID:
         return explicit
     cat = (finding.get("category") or "").lower()
+    if cat == "behavioral":
+        return _behavioral_terrain(finding)
     return terrain_for_category(cat) or UNCLASSIFIED_TERRAIN_ID
 
 
@@ -652,6 +682,140 @@ MESH_CRITERIA: list[dict] = [
 ]
 
 
+# ── Generic criteria ─────────────────────────────────────────────────────────
+# Behavioral anomalies, SCA/compliance failures, and any finding whose category
+# has no terrain-specific playbook are scored here.  Previously these matched an
+# empty criteria list → score 0 → never validated and invisible on the terrain
+# map.  The rubric rewards the signals these findings actually carry: severity,
+# deviation magnitude, MITRE mapping, corroboration, persistence, and asset tier.
+
+def _severity_rank(f: dict) -> float:
+    sev = str(f.get("severity") or "").strip().lower()
+    if sev == "critical": return 1.0
+    if sev == "high":     return 0.75
+    if sev == "medium":   return 0.5
+    if sev == "low":      return 0.3
+    try:
+        return max(0.0, min(1.0, float(f.get("score") or 0) / 10.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _deviation_magnitude(f: dict) -> float:
+    """z-score / velocity distance from baseline, or a failed compliance check."""
+    ev = _ev(f)
+    for k in ("zscore", "z_score", "sigma"):
+        try:
+            z = abs(float(ev.get(k)))
+        except (TypeError, ValueError):
+            continue
+        if z:
+            return 1.0 if z >= 4 else (0.7 if z >= 3 else (0.4 if z >= 2 else 0.2))
+    try:
+        val  = float(ev.get("value"))
+        base = float(ev.get("threshold") or ev.get("prev_mean") or ev.get("mean") or 0)
+        if base > 0:
+            r = val / base
+            return 1.0 if r >= 3 else (0.7 if r >= 2 else (0.4 if r >= 1.2 else 0.0))
+    except (TypeError, ValueError):
+        pass
+    if str(ev.get("result") or "").lower() == "failed":
+        return 0.6            # a failed CIS/SCA check is itself the deviation
+    return 0.0
+
+
+def _generic_corroborated(f: dict, e: dict) -> float:
+    if e.get("kev_hit") or e.get("malicious_ip_hit") or e.get("malicious_hash_hit"):
+        return 1.0
+    c = int(e.get("threat_intel_source_count", 0) or 0)
+    if c >= 2:
+        return 1.0
+    if c >= 1:
+        return 0.6
+    return 1.0 if (e.get("cross_layer_match") or e.get("paired_with_persistence")) else 0.0
+
+
+def _sustained(f: dict) -> float:
+    ev = _ev(f)
+    if ev.get("sustained") or "velocity" in str(f.get("source") or ""):
+        return 1.0
+    try:
+        if int(ev.get("count") or ev.get("occurrences") or 0) > 1:
+            return 0.6
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def _mapped_technique(f: dict) -> float:
+    ev = _ev(f)
+    return 1.0 if (f.get("mitre_technique") or ev.get("mitre_technique")
+                   or ev.get("mitre") or ev.get("mitre_attack")) else 0.0
+
+
+def _asset_critical(f: dict, e: dict) -> float:
+    tier = e.get("asset_tier") or f.get("asset_tier")
+    if tier == "crown_jewel":
+        return 1.0
+    if tier == "server":
+        return 0.5
+    return 0.0
+
+
+GENERIC_CRITERIA: list[dict] = [
+    {
+        "name":  "severity_weighted",
+        "label": "Severity",
+        "description": "Analyst-facing severity of the anomaly or control failure (critical / high / medium / low).",
+        "weight": 0.25,
+        "anchor": True,   # a critical anomaly is actionable on its own
+        "evaluate": lambda f, e: _severity_rank(f),
+    },
+    {
+        "name":  "deviation_magnitude",
+        "label": "Deviation from baseline",
+        "description": "Statistical distance from the learned baseline (z-score / velocity), or a failed compliance check.",
+        "weight": 0.20,
+        "evaluate": lambda f, e: _deviation_magnitude(f),
+    },
+    {
+        "name":  "intel_corroborated",
+        "label": "Corroborating signal",
+        "description": "An independent threat-intel hit, or a cross-layer / persistence pairing, supports the anomaly.",
+        "weight": 0.15,
+        "evaluate": lambda f, e: _generic_corroborated(f, e),
+    },
+    {
+        "name":  "mapped_technique",
+        "label": "MITRE ATT&CK mapped",
+        "description": "The finding carries a MITRE technique — a concrete adversary behaviour, not just a metric wobble.",
+        "weight": 0.15,
+        "evaluate": lambda f, e: _mapped_technique(f),
+    },
+    {
+        "name":  "sustained",
+        "label": "Sustained / repeated",
+        "description": "The deviation is sustained or velocity-driven rather than a single transient sample.",
+        "weight": 0.10,
+        "evaluate": lambda f, e: _sustained(f),
+    },
+    {
+        "name":  "asset_critical",
+        "label": "High-value asset",
+        "description": "Affected host is a crown-jewel or server tier — raising the stakes of any anomaly.",
+        "weight": 0.05,
+        "evaluate": lambda f, e: _asset_critical(f, e),
+    },
+    {
+        "name":  "ai_verdict_tp",
+        "label": "AI analyst verdict",
+        "description": "LLM senior-analyst review labelled this true positive.",
+        "weight": 0.10,
+        "evaluate": lambda f, e, ai=None: _ai_score(ai),
+    },
+]
+
+
 TERRAIN_CRITERIA: dict[str, list[dict]] = {
     "origin":   ORIGIN_CRITERIA,
     "vector":   VECTOR_CRITERIA,
@@ -660,6 +824,16 @@ TERRAIN_CRITERIA: dict[str, list[dict]] = {
     "posture":  POSTURE_CRITERIA,
     "mesh":     MESH_CRITERIA,
 }
+
+
+def _criteria_for(finding: dict, terrain: str) -> list[dict]:
+    """Pick the scoring rubric: category-specific anomalies (behavioral,
+    compliance) and any unmapped terrain fall back to the generic rubric so no
+    finding is ever scored against an empty criteria list."""
+    cat = (finding.get("category") or "").lower()
+    if cat in ("behavioral", "compliance"):
+        return GENERIC_CRITERIA
+    return TERRAIN_CRITERIA.get(terrain) or GENERIC_CRITERIA
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -687,7 +861,7 @@ def evaluate_finding(
     """
     enriched = enriched or {}
     terrain  = terrain_for(finding)
-    criteria = TERRAIN_CRITERIA.get(terrain, [])
+    criteria = _criteria_for(finding, terrain)
 
     items: list[dict] = []
     total_score    = 0.0

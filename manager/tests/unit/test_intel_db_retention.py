@@ -147,6 +147,11 @@ async def test_prune_inactive_noop_on_empty_db(pg_intel_dsn):
     idb = IntelDB(pg_intel_dsn); await idb.init()
     try:
         deleted = await idb.prune_inactive(time.time() - 30 * 86400)
-        assert deleted == {"findings": 0, "correlations": 0, "change_timeline": 0}
+        assert deleted == {
+            "findings": 0,
+            "correlations": 0,
+            "change_timeline": 0,
+            "notification_deliveries": 0,
+        }
     finally:
         await idb.close()

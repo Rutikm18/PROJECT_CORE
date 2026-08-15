@@ -277,6 +277,21 @@ _DEFAULT_SECURITY_PACKAGES = {
 _DEFAULT_PRIV_GROUPS = {"admin", "administrator", "administrators", "sudo", "wheel", "domain_admin"}
 _DEFAULT_SENSITIVE_MOUNTS = {"/", "/etc", "/root", "/var", "/usr", "/opt", "/Library"}
 _DEFAULT_RESTRICTED_LICENSES = {"agpl", "agpl-3.0", "gpl-3.0", "sspl", "commons-clause"}
+_DEFAULT_SECURITY_CONTROLS = {
+    "firewall", "firewall_enabled", "realtime_protection", "real_time_protection",
+    "av_realtime", "system_integrity_protection", "sip", "gatekeeper",
+    "audit_logging", "auditd", "audit", "defender_realtime", "xprotect", "filevault",
+}
+_DEFAULT_MONITORED_CONFIG_PATHS = {
+    "/etc/ssh/sshd_config", "/etc/sudoers", "/etc/pam.d", "/etc/pf.conf",
+    "/etc/audit/auditd.conf", "/etc/security", "/etc/login.defs",
+    "/library/preferences/com.apple.alf.plist",
+}
+_DEFAULT_HARDENING_SYSCTLS = {
+    "kernel.randomize_va_space", "kernel.kptr_restrict", "kernel.dmesg_restrict",
+    "kernel.yama.ptrace_scope", "kernel.unprivileged_bpf_disabled",
+    "kernel.perf_event_paranoid", "net.ipv4.conf.all.rp_filter",
+}
 
 
 def default_rulepack_dir() -> Path:
@@ -424,6 +439,17 @@ def _list_contains_path_prefix(value: str, prefixes: set[str]) -> bool:
     return any(low.startswith(p.lower()) for p in prefixes)
 
 
+def _version_tuple(v: Any) -> tuple[int, ...]:
+    """Numeric release components, e.g. 'openssl-3.0.11' -> (3, 0, 11)."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
+
+
+def _version_lt(a: Any, b: Any) -> bool:
+    """True when a is a strictly lower version than b (both parseable)."""
+    ta, tb = _version_tuple(a), _version_tuple(b)
+    return bool(ta and tb and ta < tb)
+
+
 def _trusted_integrations() -> set[str]:
     return _split_env("ATTACKLENS_TRUSTED_INTEGRATIONS", _DEFAULT_TRUSTED_INTEGRATIONS)
 
@@ -507,6 +533,19 @@ class RulePackDetector:
         self._restricted_licenses = _split_env(
             "ATTACKLENS_RESTRICTED_LICENSES", _DEFAULT_RESTRICTED_LICENSES,
         )
+        self._approved_apps = _split_env("ATTACKLENS_APPROVED_APPS")
+        self._trusted_gateway_macs = _split_env("ATTACKLENS_TRUSTED_GATEWAY_MACS")
+        self._approved_usb_vendors = _split_env("ATTACKLENS_APPROVED_USB_VENDORS")
+        self._baseline_listening_ports = _split_env("ATTACKLENS_BASELINE_LISTENING_PORTS")
+        self._monitored_security_controls = _split_env(
+            "ATTACKLENS_MONITORED_SECURITY_CONTROLS", _DEFAULT_SECURITY_CONTROLS,
+        )
+        self._monitored_config_paths = _split_env(
+            "ATTACKLENS_MONITORED_CONFIG_PATHS", _DEFAULT_MONITORED_CONFIG_PATHS,
+        )
+        self._hardening_sysctls = _split_env(
+            "ATTACKLENS_HARDENING_SYSCTLS", _DEFAULT_HARDENING_SYSCTLS,
+        )
 
     @classmethod
     def load(cls, directory: Path | None = None) -> RulePackDetector:
@@ -558,6 +597,37 @@ class RulePackDetector:
     def has_executable_rules(self, section: str) -> bool:
         """Return true only when loaded YAML has an implemented evaluator."""
         return any(rule.id in _RULE_EVALUATORS for rule in self.rules_for(section))
+
+    def execution_inventory(self) -> dict[str, Any]:
+        """Describe which declared rules can actually execute.
+
+        YAML metadata is useful for the product roadmap, but a declared rule is
+        not a detection until it has an evaluator. Keep that distinction
+        explicit anywhere inventory is shown to operators or release gates.
+        """
+        rules = [rule for section_rules in self._rules.values() for rule in section_rules]
+        status_counts: dict[str, dict[str, int]] = {}
+        declarative_only_ids: list[str] = []
+        executable = 0
+        for rule in rules:
+            counts = status_counts.setdefault(
+                rule.status,
+                {"total": 0, "executable": 0, "declarative_only": 0},
+            )
+            counts["total"] += 1
+            if rule.id in _RULE_EVALUATORS:
+                executable += 1
+                counts["executable"] += 1
+            else:
+                declarative_only_ids.append(rule.id)
+                counts["declarative_only"] += 1
+        return {
+            "total_yaml_rules": len(rules),
+            "executable_rules": executable,
+            "declarative_only_rules": len(rules) - executable,
+            "by_status": dict(sorted(status_counts.items())),
+            "declarative_only_rule_ids": sorted(declarative_only_ids),
+        }
 
     async def analyze(
         self,
@@ -1470,11 +1540,255 @@ def _users_006(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | Non
     return None
 
 
+# ── Evaluators closing the stable declarative-only gap ────────────────────────
+# Each reads only fields the agent/ingest layer already carries on a single item
+# (inline old/new transitions, baselines, TI flags, or configured allowlists),
+# mirroring the conventions of the evaluators above. Every one degrades to a
+# silent None when its decisive telemetry is absent — never a blind positive.
+
+def _agent_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    cur = _get_any(item, ("agent_version", "version"))
+    prev = _get_any(item, ("previous_version", "prior_agent_version", "max_prior_version"))
+    if cur and prev and _version_lt(cur, prev) and not _bool_true(item, "approved_rollback"):
+        return _matched("current agent_version < max previously seen version for host",
+                        "change not attributable to an approved rollback",
+                        confidence=0.90, weight=0.86)
+    return None
+
+
+def _agent_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    cur = _lower(_get(item, "config_hash"))
+    base = _lower(_get_any(item, ("baseline_config_hash", "policy_config_hash")))
+    if cur and base and cur != base and not _bool_true(item, "approved_change"):
+        return _matched("config_hash != baseline_config_hash_for_policy_group",
+                        "no matching change ticket in change window")
+    return None
+
+
+def _apps_001(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if not det._approved_apps:
+        return None
+    ident = _lower(_get_any(item, ("app_id", "bundle_id", "package_identifier", "name")))
+    if ident and ident not in det._approved_apps:
+        return _matched("app identifier not in approved_app_catalog")
+    return None
+
+
+def _apps_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if item.get("malware_hash_hit") or item.get("threat_hash_match") or _bool_true(item, "malicious_hash"):
+        return _matched("sha256(app_binary) in malicious_hash_feed", confidence=0.96, weight=0.92)
+    return None
+
+
+def _arp_003(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if not _bool_true(item, "is_default_gateway"):
+        return None
+    mac = _lower(_get_any(item, ("mac", "resolved_mac", "mac_address")))
+    if not mac:
+        return None
+    baseline = _lower(_get_any(item, ("baseline_gateway_mac", "trusted_gateway_mac")))
+    if baseline:
+        if mac != baseline:
+            return _matched("resolved_mac(gateway_ip) != trusted_gateway_mac_baseline",
+                            confidence=0.95, weight=0.90)
+    elif det._trusted_gateway_macs and mac not in det._trusted_gateway_macs:
+        return _matched("resolved_mac(gateway_ip) not in trusted_gateway_mac_baseline",
+                        confidence=0.95, weight=0.90)
+    return None
+
+
+def _arp_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if not det._approved_ouis:
+        return None
+    if _lower(_get_any(item, ("segment_class", "host_policy_class", "segment"))) not in {
+        "restricted", "restricted_segment",
+    }:
+        return None
+    mac = _lower(_get_any(item, ("mac", "mac_address")))
+    oui = _lower(_get(item, "oui")) or (":".join(mac.split(":")[:3]) if mac else "")
+    if oui and oui not in det._approved_ouis:
+        return _matched("oui(mac) not in approved_oui_list_for_segment")
+    return None
+
+
+def _battery_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    serial = _lower(_get_any(item, ("battery_serial", "serial")))
+    prev = _lower(_get_any(item, ("previous_serial", "previous_battery_serial")))
+    if serial and prev and serial != prev and not _bool_true(item, "approved_service"):
+        return _matched("battery_serial != previous_recorded_serial",
+                        "no matching depot/repair ticket for asset")
+    cur_cycles = _as_int(_get(item, "cycle_count"))
+    prev_cycles = _as_int(_get_any(item, ("previous_cycle_count", "prior_cycle_count")))
+    if cur_cycles is not None and prev_cycles is not None and cur_cycles < prev_cycles:
+        return _matched("cycle_count decreased (impossible under normal operation)")
+    return None
+
+
+def _configs_001(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    key = _lower(_get_any(item, ("config_key", "control_name", "setting")))
+    if key not in det._monitored_security_controls:
+        return None
+    old = _as_bool(_get_any(item, ("old_value", "previous_value")))
+    new = _as_bool(_get_any(item, ("new_value", "current_value")))
+    if old is True and new is False and not _bool_true(item, "approved_change"):
+        return _matched("monitored security control transitioned enabled -> disabled",
+                        confidence=0.92, weight=0.88)
+    return None
+
+
+def _configs_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    path = _lower(_get_any(item, ("config_file", "path", "file_path")))
+    if not path or not _list_contains_path_prefix(path, det._monitored_config_paths):
+        return None
+    if _bool_true(item, "hash_changed") and not _bool_true(item, "approved_change") \
+            and not _bool_true(item, "in_change_window"):
+        return _matched("monitored config file hash changed outside approved change window")
+    return None
+
+
+def _connections_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if _bool_true(item, "tor_exit_node") or _bool_true(item, "tor_exit") or _bool_true(item, "anonymizer_hit"):
+        return _matched("dest_ip in tor_exit_node_feed or known_anonymizer_feed",
+                        confidence=0.85, weight=0.80)
+    feeds = (ctx or {}).get("feeds")
+    ip = _extract_ip(_get_any(item, ("dest_ip", "remote_addr")))
+    if ip and feeds is not None:
+        for meth in ("is_tor_exit", "is_anonymizer"):
+            fn = getattr(feeds, meth, None)
+            if callable(fn):
+                try:
+                    if fn(ip):
+                        return _matched(f"dest_ip flagged by feeds.{meth}", confidence=0.85, weight=0.80)
+                except Exception:
+                    return None
+    return None
+
+
+def _hardware_003(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if _bool_true(item, "approved_service") or _bool_true(item, "service_ticket"):
+        return None
+    cur = _lower(_get_any(item, ("component_serial", "current_component_serial")))
+    prev = _lower(_get_any(item, ("previous_component_serial", "last_recorded_serial")))
+    if cur and prev and cur != prev:
+        return _matched("component serial != last_recorded_serial with no service ticket",
+                        confidence=0.85, weight=0.80)
+    return None
+
+
+def _hardware_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if not det._approved_usb_vendors:
+        return None
+    if _lower(_get_any(item, ("host_policy_class", "device_class_policy"))) != "restricted":
+        return None
+    vendor = _lower(_get_any(item, ("vendor_id", "usb_vendor_id")))
+    if vendor and vendor not in det._approved_usb_vendors:
+        return _matched("vendor_id not in approved_vendor_list for restricted host")
+    return None
+
+
+def _packages_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    cur = _get_any(item, ("version", "installed_version", "new_version"))
+    prev = _get_any(item, ("previous_version", "prior_version"))
+    if cur and prev and _version_lt(cur, prev) and _item_has_vulnerability_assertion(item) \
+            and not _bool_true(item, "approved_change"):
+        return _matched("package version downgraded to a version with known CVEs",
+                        confidence=0.85, weight=0.82)
+    return None
+
+
+def _packages_004(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    kev = bool(item.get("kev") or item.get("cisa_kev") or _bool_true(item, "kev_hit"))
+    has_cve = bool(_get_any(item, ("cve_ids", "cve_id", "cves"))) or _bool_true(item, "vulnerable")
+    if kev or has_cve:
+        return _matched("installed package version matches a published CVE (KEV/EPSS weighted)",
+                        confidence=0.92 if kev else 0.80, weight=0.85)
+    return None
+
+
+def _ports_001(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if not det._baseline_listening_ports:
+        return None
+    port = _as_int(_get_any(item, ("listening_port", "port", "local_port")))
+    if port is None or str(port) in det._baseline_listening_ports:
+        return None
+    if 32768 <= port <= 60999:          # ephemeral/dynamic range — expected churn
+        return None
+    return _matched("listening_port not in baseline_listening_ports_for_host")
+
+
+def _sbom_001(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    kev = bool(item.get("kev") or item.get("cisa_kev") or _bool_true(item, "kev_hit"))
+    if kev:
+        return _matched("SBOM component CVE present in CISA KEV", confidence=0.94, weight=0.90)
+    epss = _as_float(item.get("epss_score"))
+    if epss is not None and epss > 0.5 and bool(_get_any(item, ("cve_id", "cve_ids"))):
+        return _matched("SBOM component CVE with EPSS > 0.5", confidence=0.82, weight=0.82)
+    return None
+
+
+def _sbom_005(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if _bool_true(item, "is_eol") or _bool_true(item, "end_of_life") or _bool_true(item, "eol"):
+        return _matched("component version has reached vendor end-of-life")
+    return None
+
+
+def _services_003(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if _bool_true(item, "approved_update") or _bool_true(item, "software_update"):
+        return None
+    cur = _lower(_get_any(item, ("binary_path", "current_binary_path", "path")))
+    prev = _lower(_get_any(item, ("previous_binary_path", "old_binary_path")))
+    if cur and prev and cur != prev:
+        return _matched("service binary_path changed with no approved software-update event",
+                        confidence=0.90, weight=0.86)
+    return None
+
+
+def _storage_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    if _bool_true(item, "authorized") or _bool_true(item, "approved") or _bool_true(item, "provisioned"):
+        return None
+    if _bool_true(item, "new_volume") or _bool_true(item, "is_new") or _bool_false(item, "in_baseline"):
+        if _get_any(item, ("volume_id", "volume", "device")):
+            return _matched("new volume/partition not in provisioned baseline")
+    return None
+
+
+def _sysctl_002(det: RulePackDetector, agent_id: str, item: dict, ctx: dict | None) -> dict | None:
+    key = _lower(_get(item, "sysctl_key"))
+    if key not in det._hardening_sysctls:
+        return None
+    cur = _as_int(_get_any(item, ("current_value", "value")))
+    base = _as_int(_get_any(item, ("baseline_value", "expected_value")))
+    if cur is not None and base is not None and cur < base:
+        return _matched("hardening sysctl weakened below baseline",
+                        f"{key}: current {cur} < baseline {base}")
+    return None
+
+
 _RULE_EVALUATORS: dict[str, RuleFn] = {
+    "AGENT-HEALTH-002": _agent_002,
     "AGENT-HEALTH-003": _agent_003,
     "AGENT-HEALTH-004": _agent_004,
+    "AGENT-HEALTH-005": _agent_005,
+    "APPS-001": _apps_001,
     "APPS-002": _apps_002,
     "APPS-003": _apps_003,
+    "APPS-005": _apps_005,
+    "ARP-003": _arp_003,
+    "ARP-005": _arp_005,
+    "BATTERY-002": _battery_002,
+    "CONFIGS-001": _configs_001,
+    "CONFIGS-002": _configs_002,
+    "CONNECTIONS-005": _connections_005,
+    "HARDWARE-003": _hardware_003,
+    "HARDWARE-005": _hardware_005,
+    "PACKAGES-002": _packages_002,
+    "PACKAGES-004": _packages_004,
+    "PORTS-001": _ports_001,
+    "SBOM-001": _sbom_001,
+    "SBOM-005": _sbom_005,
+    "SERVICES-003": _services_003,
+    "STORAGE-002": _storage_002,
+    "SYSCTL-002": _sysctl_002,
     "BINARIES-001": _binaries_001,
     "BINARIES-002": _binaries_002,
     "BINARIES-003": _binaries_003,

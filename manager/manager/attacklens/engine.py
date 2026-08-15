@@ -68,6 +68,7 @@ from .detections  import (
 )
 from .clustering  import cluster_signals
 from .confidence  import score_confidence
+from .reachability import load_reachability
 from .validation  import validate_cluster
 from .config      import ENGINE_CONFIG
 from .rulepack    import RulePackDetector
@@ -1176,6 +1177,26 @@ class AttackLensEngine:
         except Exception as exc:
             log.debug("legacy cross-finding enrichment error: %s", exc)
 
+        # Authoritative reachability from the raw inventory (processes/ports).
+        # A benign running process or ordinary listening port is never itself a
+        # finding, so the sibling-findings scan above misses nearly all real
+        # reachability; the payload inventory is the source of truth. Only used
+        # to *add* a positive signal — never to clear one already established.
+        if not (package_running and port_open):
+            pkg_names = {str(ev.get("name") or ""), str(ev.get("package") or ""),
+                         str(ev.get("Formula") or "")}
+            pkg_names.discard("")
+            if pkg_names:
+                try:
+                    reach = await load_reachability(getattr(self, "_db", None), agent_id)
+                    if reach.loaded:
+                        if not package_running:
+                            package_running = any(reach.package_running(n) for n in pkg_names)
+                        if not port_open:
+                            port_open = any(reach.package_port_open(n) for n in pkg_names)
+                except Exception as exc:
+                    log.debug("legacy reachability enrichment error: %s", exc)
+
         enriched = {
             "kev_hit":              kev,
             "malicious_ip_hit":     bool(str(f.get("source", "")).startswith("feed:") or f.get("source") == "abuseipdb"),
@@ -1392,6 +1413,50 @@ class AttackLensEngine:
         host_class = await self._idb.get_host_class(cluster.agent_id) or asset_tier
         controls   = await self._idb.get_compensating_controls(cluster.agent_id)
 
+        # ── Reachability + cross-finding flags consumed by terrain_validators ──
+        # These are the criteria (Origin package_running/service_reachable,
+        # Citadels persistence_paired, Posture multi_controls_off) that the raw
+        # per-cluster enrichment above cannot see. package_running/port_open come
+        # from the authoritative payload *inventory* (processes/ports), NOT the
+        # findings table — a benign running process is never a finding, so the
+        # findings-only lookup used to resolve these to 0 almost every time.
+        package_names = {
+            str((s.evidence or {}).get("name")
+                or (s.evidence or {}).get("package")
+                or (s.evidence or {}).get("Formula") or "")
+            for s in cluster.signals
+        }
+        package_names.discard("")
+        package_running = False
+        port_open       = False
+        if package_names:
+            try:
+                reach = await load_reachability(getattr(self, "_db", None), cluster.agent_id)
+                if reach.loaded:
+                    package_running = any(reach.package_running(n) for n in package_names)
+                    port_open       = any(reach.package_port_open(n) for n in package_names)
+            except Exception as exc:
+                log.debug("reachability enrichment error agent=%s: %s", cluster.agent_id, exc)
+
+        paired_persist = False
+        controls_off   = 0
+        try:
+            sibs = await self._idb._fetchall(
+                "SELECT category FROM findings WHERE agent_id=? AND is_active=1 LIMIT 200",
+                (cluster.agent_id,),
+            )
+            for row in sibs:
+                cat = row["category"]
+                if cat in ("service", "task"):
+                    paired_persist = True
+                elif cat == "security":
+                    controls_off += 1
+        except Exception as exc:
+            log.debug("cross-finding enrichment error agent=%s: %s", cluster.agent_id, exc)
+        # A cluster spanning ≥2 telemetry layers is itself cross-layer evidence —
+        # more authoritative than the persistence-sibling proxy alone.
+        cross_layer = paired_persist or len(getattr(cluster, "layers_covered", set()) or set()) >= 2
+
         enriched = {
             "kev_hit":                   kev_hit,
             "epss_scores":               epss_scores,
@@ -1405,6 +1470,12 @@ class AttackLensEngine:
             "cve_ids":                   sorted(cve_ids),
             "malicious_ips":             sorted(ips) if mal_ip else [],
             "malicious_hashes":          sorted(hashes) if mal_hash else [],
+            # Cross-finding / reachability flags consumed by terrain_validators.py
+            "package_running":           package_running,
+            "port_open":                 port_open,
+            "paired_with_persistence":   paired_persist,
+            "cross_layer_match":         cross_layer,
+            "controls_disabled_count":   controls_off,
         }
         source_hits = {
             "kev": kev_hit,

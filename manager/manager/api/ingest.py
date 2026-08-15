@@ -37,24 +37,26 @@ import math
 import os
 import time
 from collections import Counter
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..models import IngestResponse
+from shared.schema import validate_section
+from shared.sections import VALID_SECTION_NAMES, canonical_section
 from shared.wire import (
     REQUIRED_ENVELOPE_FIELDS,
     REPLAY_WINDOW_SECONDS,
     validate_payload,
 )
-from shared.sections import VALID_SECTION_NAMES, canonical_section
+
+from ..models import IngestResponse
 
 if TYPE_CHECKING:
-    from ..db             import Database
-    from ..store          import TelemetryStore
-    from ..ws_hub         import WebSocketHub
+    from ..db import Database
+    from ..pool import AgentRateLimiter
     from ..queue.producer import QueueProducer
-    from ..pool           import AgentRateLimiter
+    from ..store import TelemetryStore
+    from ..ws_hub import WebSocketHub
 
 log = logging.getLogger("manager.api.ingest")
 
@@ -134,6 +136,31 @@ def _record_schema_gaps(agent_id: str, section: str, report: dict) -> None:
     )
 
 
+def _record_section_schema_gaps(
+    agent_id: str, section: str, errors: list[str],
+) -> None:
+    """Record bounded per-section shape failures without leaking payload data."""
+    _SCHEMA_GAPS["section_schema_error"] += 1
+    _SCHEMA_GAPS[f"section_schema_error:{section}"] += 1
+    log.warning(
+        "section schema gap agent=%s section=%s errors=%s",
+        agent_id, section, errors[:5],
+    )
+
+
+def _validated_collected_at(value: object) -> float:
+    """Return a usable event timestamp or raise for a permanent client error."""
+    if isinstance(value, bool):
+        raise ValueError("boolean is not an event timestamp")
+    try:
+        collected_at = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("must be numeric") from exc
+    if not math.isfinite(collected_at) or collected_at <= 0:
+        raise ValueError("must be a positive finite timestamp")
+    return collected_at
+
+
 def make_ingest_router(
     db:           "Database",
     store:        "TelemetryStore",
@@ -148,9 +175,9 @@ def make_ingest_router(
     producer=QueueProducer → publish-and-return (queue mode).
     rate_limiter=None   → no rate limiting (dev/test only).
     """
-    from ..crypto        import decrypt, derive_keys
+    from ..chunker import CHUNK_SIZE, split as chunk_split
+    from ..crypto import decrypt, derive_keys
     from ..queue.schemas import build_telemetry_msg
-    from ..chunker       import CHUNK_SIZE, split as chunk_split
 
     router = APIRouter()
 
@@ -337,12 +364,35 @@ def make_ingest_router(
             if section not in VALID_SECTION_NAMES:
                 _note_error("unsupported_section", section)
                 raise HTTPException(422, f"Unsupported telemetry section: {section!r}")
-            collected  = payload.get("collected_at", int(float(envelope["timestamp"])))
+            try:
+                collected = _validated_collected_at(payload.get("collected_at"))
+            except ValueError as exc:
+                _note_error("payload_schema", f"collected_at {exc}")
+                raise HTTPException(
+                    422, f"Payload collected_at {exc}",
+                ) from exc
             agent_name = payload.get("agent_name",   "")
             os_name    = payload.get("os",           "macos")
             hostname   = payload.get("hostname",     "")
             data       = payload.get("data",         {})
             client_ip  = request.client.host if request.client else ""
+
+            # Section-aware validation catches payloads that are structurally
+            # complete but unusable by their detector (for example, a dict sent
+            # for the list-shaped `processes` section). In compatibility mode
+            # the payload remains durable and the gap is observable. Explicit
+            # strict mode turns this permanent producer defect into HTTP 422 so
+            # agents do not retry it as an infrastructure outage.
+            section_errors = validate_section(section, data)
+            if section_errors:
+                _record_section_schema_gaps(agent_id, section, section_errors)
+                if _STRICT_PAYLOAD:
+                    _note_error("payload_schema", section_errors[0])
+                    raise HTTPException(
+                        422,
+                        "Payload section schema invalid — "
+                        + "; ".join(section_errors[:5]),
+                    )
 
             # ── 10. Agent registry ────────────────────────────────────────────
             await db.upsert_agent(agent_id, agent_name, client_ip)

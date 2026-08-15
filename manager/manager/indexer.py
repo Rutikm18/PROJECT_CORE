@@ -27,11 +27,11 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
-from .pg_pool import PgPool
 from . import finding_lifecycle as _lc
+from .pg_pool import PgPool
 
 log = logging.getLogger("manager.indexer")
 
@@ -1007,6 +1007,29 @@ CREATE INDEX IF NOT EXISTS idx_investigation_finding
     ON investigation_runs(finding_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_investigation_status
     ON investigation_runs(status, updated_at DESC);
+
+-- ── Durable notification delivery queue and audit trail ───────────────────
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    delivery_id       TEXT PRIMARY KEY,
+    dedupe_key        TEXT NOT NULL UNIQUE,
+    finding_id        INTEGER NOT NULL DEFAULT 0,
+    notification_type TEXT NOT NULL,
+    event             TEXT NOT NULL DEFAULT '',
+    recipients        TEXT NOT NULL DEFAULT '[]',
+    transport         TEXT NOT NULL DEFAULT '',
+    payload           TEXT NOT NULL DEFAULT '{}',
+    status            TEXT NOT NULL DEFAULT 'queued',
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT NOT NULL DEFAULT '',
+    next_attempt_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    delivered_at      DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_notification_delivery_pending
+    ON notification_deliveries(status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_notification_delivery_finding
+    ON notification_deliveries(finding_id, created_at DESC);
 """
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -1987,7 +2010,12 @@ class IntelDB:
         audit history with no active/inactive concept, so it prunes
         unconditionally by age.
         """
-        deleted = {"findings": 0, "correlations": 0, "change_timeline": 0}
+        deleted = {
+            "findings": 0,
+            "correlations": 0,
+            "change_timeline": 0,
+            "notification_deliveries": 0,
+        }
         async with self._lock:
             cur = await self._conn.execute(
                 "DELETE FROM findings WHERE is_active=0 AND last_detected_at < ?",
@@ -2004,6 +2032,12 @@ class IntelDB:
                 (cutoff_ts,),
             )
             deleted["change_timeline"] = cur.rowcount or 0
+            cur = await self._conn.execute(
+                "DELETE FROM notification_deliveries "
+                "WHERE status IN ('sent','exhausted') AND updated_at < ?",
+                (cutoff_ts,),
+            )
+            deleted["notification_deliveries"] = cur.rowcount or 0
             await self._conn.commit()
         return deleted
 
@@ -3724,6 +3758,155 @@ class IntelDB:
         )
         await self._conn.commit()
 
+    # ── Durable email notification deliveries ─────────────────────────────
+
+    @staticmethod
+    def _shape_notification_delivery(row) -> dict | None:
+        if row is None:
+            return None
+        data = dict(row)
+        for field, default in (("recipients", []), ("payload", {})):
+            value = data.get(field)
+            if isinstance(value, str):
+                try:
+                    data[field] = json.loads(value) if value else default
+                except (TypeError, ValueError):
+                    data[field] = default
+        return data
+
+    async def get_or_create_notification_delivery(
+        self,
+        *,
+        dedupe_key: str,
+        finding_id: int,
+        notification_type: str,
+        event: str,
+        recipients: list[str],
+        transport: str,
+        payload: dict,
+    ) -> dict:
+        now = time.time()
+        delivery_id = uuid.uuid4().hex
+        async with self._lock:
+            await self._conn.execute(
+                """INSERT INTO notification_deliveries
+                   (delivery_id,dedupe_key,finding_id,notification_type,event,
+                    recipients,transport,payload,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?, 'queued',?,?)
+                   ON CONFLICT(dedupe_key) DO NOTHING""",
+                (
+                    delivery_id,
+                    dedupe_key[:250],
+                    int(finding_id or 0),
+                    notification_type[:80],
+                    event[:80],
+                    json.dumps(recipients, default=str),
+                    transport[:40],
+                    json.dumps(payload, default=str),
+                    now,
+                    now,
+                ),
+            )
+            await self._conn.commit()
+        row = await self._fetchone(
+            "SELECT * FROM notification_deliveries WHERE dedupe_key=?",
+            (dedupe_key[:250],),
+        )
+        return self._shape_notification_delivery(row) or {}
+
+    async def claim_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        max_attempts: int = 5,
+        stale_after_seconds: float = 300.0,
+    ) -> dict | None:
+        now = time.time()
+        async with self._lock:
+            cur = await self._conn.execute(
+                """UPDATE notification_deliveries
+                   SET status='sending', attempts=attempts+1, updated_at=?
+                   WHERE delivery_id=? AND attempts<? AND (
+                     status IN ('queued','failed')
+                     OR (status='sending' AND updated_at<?)
+                   )
+                   RETURNING *""",
+                (now, delivery_id, max_attempts, now - stale_after_seconds),
+            )
+            row = await cur.fetchone()
+            await self._conn.commit()
+        return self._shape_notification_delivery(row)
+
+    async def finish_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        sent: bool,
+        error: str = "",
+        next_attempt_at: float = 0.0,
+        exhausted: bool = False,
+    ) -> dict | None:
+        now = time.time()
+        status = "sent" if sent else ("exhausted" if exhausted else "failed")
+        async with self._lock:
+            await self._conn.execute(
+                """UPDATE notification_deliveries SET
+                   status=?, last_error=?, next_attempt_at=?, updated_at=?,
+                   delivered_at=CASE WHEN ?=1 THEN ? ELSE delivered_at END
+                   WHERE delivery_id=?""",
+                (
+                    status,
+                    str(error or "")[:1000],
+                    float(next_attempt_at or 0.0),
+                    now,
+                    1 if sent else 0,
+                    now,
+                    delivery_id,
+                ),
+            )
+            await self._conn.commit()
+        row = await self._fetchone(
+            "SELECT * FROM notification_deliveries WHERE delivery_id=?",
+            (delivery_id,),
+        )
+        return self._shape_notification_delivery(row)
+
+    async def get_pending_notification_deliveries(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 5,
+        stale_after_seconds: float = 300.0,
+    ) -> list[dict]:
+        now = time.time()
+        rows = await self._fetchall(
+            """SELECT * FROM notification_deliveries
+               WHERE attempts<? AND next_attempt_at<=? AND (
+                 status IN ('queued','failed')
+                 OR (status='sending' AND updated_at<?)
+               )
+               ORDER BY created_at ASC LIMIT ?""",
+            (max_attempts, now, now - stale_after_seconds, max(1, min(limit, 500))),
+        )
+        return [self._shape_notification_delivery(row) or {} for row in rows]
+
+    async def get_notification_deliveries(
+        self, *, finding_id: int | None = None, limit: int = 100,
+    ) -> list[dict]:
+        if finding_id is None:
+            rows = await self._fetchall(
+                "SELECT * FROM notification_deliveries "
+                "ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM notification_deliveries WHERE finding_id=? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(finding_id), max(1, min(limit, 500))),
+            )
+        return [self._shape_notification_delivery(row) or {} for row in rows]
+
     # ── AI analysis ───────────────────────────────────────────────────────────
 
     async def upsert_ai_analysis(self, finding_id: int, data: dict) -> None:
@@ -4330,6 +4513,7 @@ class IntelDB:
     async def recompute_terrain_validation_all(
         self, *, only_unscored: bool = False, limit: int = 250,
         after_id: int = 0, cancel_check: Optional[Callable[[], bool]] = None,
+        manager_db=None,
     ) -> dict:
         """
         Re-evaluate every active finding against the terrain validator and
@@ -4350,6 +4534,7 @@ class IntelDB:
                 apply_priority_to_enriched,
                 apply_priority_to_finding,
             )
+            from .attacklens.reachability import load_reachability
         except ImportError:
             from manager.attacklens.terrain_validators import evaluate_finding
             from manager.attacklens.ai_validator import resolve_agent_priority, resolve_threshold
@@ -4357,6 +4542,7 @@ class IntelDB:
                 apply_priority_to_enriched,
                 apply_priority_to_finding,
             )
+            from manager.attacklens.reachability import load_reachability
         clauses = ["is_active=1", "id>?"]
         query_args: list[Any] = [max(0, int(after_id))]
         if only_unscored:
@@ -4405,6 +4591,21 @@ class IntelDB:
                     context["process_evidence"].append(
                         value if isinstance(value, dict) else {},
                     )
+
+        # Payload-backed reachability (processes/ports inventory). The intel DB
+        # that owns `findings` cannot see the `payloads` table, so the manager
+        # DB handle is the authoritative source for package_running/port_open.
+        # Prefetched once per agent for the batch; each is a cheap latest-payload
+        # pair, memoised behind reachability's own TTL cache. Absent handle →
+        # empty map → identical behaviour to before (no regression).
+        reachability_map: dict[str, Any] = {}
+        if manager_db is not None:
+            for aid in agent_ids:
+                try:
+                    reachability_map[aid] = await load_reachability(manager_db, aid)
+                except Exception:
+                    pass
+
         updated = 0
         scanned = 0
         score_hist = {"00-49": 0, "50-69": 0, "70-84": 0, "85-89": 0, "90-100": 0}
@@ -4453,6 +4654,17 @@ class IntelDB:
                     ):
                         package_running = True
                         break
+
+                # Authoritative reachability from the raw payload inventory —
+                # only *adds* a positive signal, never clears a findings-derived
+                # one. This is what fixes package_running/service_reachable
+                # resolving to 0 for genuine, network-exposed CVEs.
+                reach = reachability_map.get(agent_id)
+                if reach is not None and getattr(reach, "loaded", False) and pkg_name:
+                    if not package_running:
+                        package_running = reach.package_running(pkg_name)
+                    if not port_open:
+                        port_open = reach.package_port_open(pkg_name)
 
                 enriched = {
                     "kev_hit":                kev,
@@ -4595,7 +4807,7 @@ class IntelDB:
         return await self.get_validation_recompute_job(job_uid)
 
     async def run_validation_recompute_batch(
-        self, job_uid: str, *, batch_size: int = 250,
+        self, job_uid: str, *, batch_size: int = 250, manager_db=None,
     ) -> dict | None:
         """Advance one durable job by one bounded keyset batch."""
         job = await self.get_validation_recompute_job(job_uid)
@@ -4629,6 +4841,7 @@ class IntelDB:
                 only_unscored=bool(job["only_unscored"]),
                 limit=min(max(1, int(batch_size)), 500, remaining),
                 after_id=int(job["cursor_id"]),
+                manager_db=manager_db,
             )
         except Exception as exc:
             now = time.time()

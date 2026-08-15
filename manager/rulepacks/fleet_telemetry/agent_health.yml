@@ -30,7 +30,12 @@ rules:
     response_actions:
       - attempt out-of-band reachability check (ping/SSH/MDM)
       - flag host for physical/remote verification if unreachable > 24h
-    status: stable
+    status: experimental
+    status_reason: >
+      Absence-of-telemetry detection cannot run as a per-payload rule-pack
+      evaluator (a rule fires only when a payload arrives). Host liveness is
+      owned by the manager-side agent_health rich detector / stale-agent
+      monitor, not the rule pack.
 
   - id: AGENT-HEALTH-002
     title: Agent version downgrade

@@ -20,11 +20,11 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from ..attacklens.remediation_kb import recipe_for_finding
 from .base import AIProvider
 from .finding_analyzer import FindingAnalyzer
 from .key_store import load_config
 from .providers import build_provider
-from ..attacklens.remediation_kb import recipe_for_finding
 
 log = logging.getLogger("manager.ai.investigation")
 
@@ -34,6 +34,58 @@ MAX_REVIEW_ROUNDS = 2
 MAX_TEXT = 2_000
 ALLOWED_VERDICTS = {"confirmed", "likely", "inconclusive", "unlikely", "false_positive"}
 ALLOWED_DECISIONS = {"approve", "reject", "request_more"}
+
+HYPOTHESES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "hypotheses": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_HYPOTHESES,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "statement": {"type": "string"},
+                    "supporting_ids": {"type": "array", "items": {"type": "string"}},
+                    "contradicting_ids": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "status": {
+                        "type": "string",
+                        "enum": ["supported", "contradicted", "unresolved"],
+                    },
+                },
+                "required": [
+                    "statement",
+                    "supporting_ids",
+                    "contradicting_ids",
+                    "confidence",
+                    "status",
+                ],
+            },
+        },
+    },
+    "required": ["hypotheses"],
+}
+
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": sorted(ALLOWED_VERDICTS)},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "summary": {"type": "string"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "gaps": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "confidence", "summary", "evidence_ids", "gaps"],
+}
+
+
+class StructuredResponseError(ValueError):
+    """A provider replied, but its response failed the local output contract."""
+
+    def __init__(self, message: str, audit: dict) -> None:
+        super().__init__(message)
+        self.audit = audit
 
 
 class InvestigationState(TypedDict, total=False):
@@ -56,6 +108,7 @@ class InvestigationState(TypedDict, total=False):
     result: dict
     status: str
     errors: list[str]
+    model_calls: list[dict]
     started_at: float
     completed_at: float
 
@@ -144,6 +197,7 @@ class InvestigationService:
         self._graph = None
         self._start_lock = asyncio.Lock()
         self._max_review_rounds = max(1, min(int(max_review_rounds), 5))
+        self._lifecycle_notification_handler = None
 
     @property
     def ready(self) -> bool:
@@ -152,6 +206,10 @@ class InvestigationService:
     @property
     def provider_configured(self) -> bool:
         return self._provider is not None or getattr(self._analyzer, "_provider", None) is not None or load_config() is not None
+
+    def set_lifecycle_notification_handler(self, handler) -> None:
+        """Attach a best-effort durable workflow-notification callback."""
+        self._lifecycle_notification_handler = handler
 
     async def start(self) -> None:
         if self._graph is not None:
@@ -237,6 +295,7 @@ class InvestigationService:
             "finding": _json_safe(finding),
             "review_round": 0,
             "errors": [],
+            "model_calls": [],
             "status": "running",
             "started_at": time.time(),
         }
@@ -245,9 +304,11 @@ class InvestigationService:
             return await self._sync_run(run_id, thread_id)
         except Exception as exc:
             log.exception("Investigation failed for finding=%s run=%s", finding_id, run_id)
-            await self._db.update_investigation_run(
+            previous = await self._db.get_investigation_run(run_id)
+            updated = await self._db.update_investigation_run(
                 run_id, status="failed", current_node="error", error=_text(exc, 1000), completed=True,
-            )
+            ) or {}
+            await self._notify_lifecycle(previous, updated, state)
             raise
 
     async def get_run(self, run_id: str) -> dict | None:
@@ -295,9 +356,20 @@ class InvestigationService:
             return await self._sync_run(run_id, run["thread_id"])
         except Exception as exc:
             log.exception("Investigation resume failed for run=%s", run_id)
-            await self._db.update_investigation_run(
+            previous = await self._db.get_investigation_run(run_id)
+            updated = await self._db.update_investigation_run(
                 run_id, status="failed", current_node="error", error=_text(exc, 1000), completed=True,
-            )
+            ) or {}
+            finding = await self._db.get_finding_by_id(int(run["finding_id"])) or {}
+            failure_state: InvestigationState = {
+                "finding": _json_safe(finding),
+                "run_id": run_id,
+                "finding_id": int(run["finding_id"]),
+                "analyst_actor": actor,
+                "analyst_decision": decision,
+                "analyst_feedback": feedback,
+            }
+            await self._notify_lifecycle(previous, updated, failure_state)
             raise
 
     async def handle_finding_event(self, finding: dict, event: str) -> None:
@@ -433,13 +505,133 @@ class InvestigationService:
             raise RuntimeError("AI provider is not configured")
         return build_provider(config)
 
-    async def _ask_json(self, prompt: str, *, max_tokens: int) -> dict:
+    @staticmethod
+    def _response_audit(stage: str, response) -> dict:
+        return {
+            "stage": stage,
+            "contract_version": "investigation.v1",
+            "status": "succeeded",
+            "provider": _text(getattr(response, "provider", "unknown"), 100),
+            "model": _text(getattr(response, "model", "unknown"), 200),
+            "upstream_provider": _text(
+                getattr(response, "upstream_provider", ""), 100,
+            ),
+            "generation_id": _text(getattr(response, "generation_id", ""), 200),
+            "finish_reason": _text(getattr(response, "finish_reason", ""), 100),
+            "input_tokens": int(getattr(response, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(response, "output_tokens", 0) or 0),
+            "latency_ms": round(float(getattr(response, "latency_ms", 0.0) or 0.0), 1),
+            "cost_usd": round(float(getattr(response, "cost_usd", 0.0) or 0.0), 8),
+            "recorded_at": time.time(),
+        }
+
+    def _failure_audit(self, stage: str, exc: Exception) -> dict:
+        if isinstance(exc, StructuredResponseError):
+            return dict(exc.audit)
+        provider_name = "unconfigured"
+        model = ""
+        try:
+            provider = self._get_provider()
+            config = getattr(provider, "_cfg", None)
+            provider_name = _text(
+                getattr(config, "provider", "") or provider.__class__.__name__, 100,
+            )
+            model = _text(getattr(config, "model", ""), 200)
+        except Exception:
+            pass
+        return {
+            "stage": stage,
+            "contract_version": "investigation.v1",
+            "status": "provider_error",
+            "provider": provider_name,
+            "model": model,
+            "error_type": type(exc).__name__,
+            "recorded_at": time.time(),
+        }
+
+    @staticmethod
+    def _validate_structured_response(stage: str, parsed: dict) -> None:
+        if stage == "hypothesis_generation":
+            hypotheses = parsed.get("hypotheses")
+            if not isinstance(hypotheses, list) or not hypotheses:
+                raise ValueError("hypotheses must be a non-empty array")
+            for hypothesis in hypotheses[:MAX_HYPOTHESES]:
+                if not isinstance(hypothesis, dict):
+                    raise ValueError("each hypothesis must be an object")
+                if not isinstance(hypothesis.get("statement"), str):
+                    raise ValueError("hypothesis.statement must be a string")
+                for field in ("supporting_ids", "contradicting_ids"):
+                    citations = hypothesis.get(field)
+                    if not isinstance(citations, list) or not all(
+                        isinstance(item, str) for item in citations
+                    ):
+                        raise ValueError(f"hypothesis.{field} must be a string array")
+                confidence = hypothesis.get("confidence")
+                if (
+                    isinstance(confidence, bool)
+                    or not isinstance(confidence, (int, float))
+                    or not 0 <= confidence <= 1
+                ):
+                    raise ValueError("hypothesis.confidence must be between 0 and 1")
+                if hypothesis.get("status") not in {
+                    "supported", "contradicted", "unresolved",
+                }:
+                    raise ValueError("hypothesis.status is invalid")
+            return
+
+        if stage == "verdict_generation":
+            if parsed.get("verdict") not in ALLOWED_VERDICTS:
+                raise ValueError("verdict is invalid")
+            confidence = parsed.get("confidence")
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= confidence <= 1
+            ):
+                raise ValueError("verdict.confidence must be between 0 and 1")
+            if not isinstance(parsed.get("summary"), str):
+                raise ValueError("verdict.summary must be a string")
+            for field in ("evidence_ids", "gaps"):
+                values = parsed.get(field)
+                if not isinstance(values, list) or not all(
+                    isinstance(item, str) for item in values
+                ):
+                    raise ValueError(f"verdict.{field} must be a string array")
+
+    async def _ask_json(
+        self,
+        prompt: str,
+        *,
+        stage: str,
+        schema: dict,
+        required_fields: tuple[str, ...],
+        max_tokens: int,
+    ) -> tuple[dict, dict]:
         provider = self._get_provider()
-        response = await provider.chat(prompt, max_tokens=max_tokens)
-        parsed = provider.parse_json(response.text)
-        if not isinstance(parsed, dict):
-            raise ValueError("AI provider returned a non-object response")
-        return parsed
+        structured_chat = getattr(provider, "chat_structured", None)
+        if callable(structured_chat):
+            response = await structured_chat(
+                prompt, schema=schema, max_tokens=max_tokens,
+            )
+        else:
+            response = await provider.chat(prompt, max_tokens=max_tokens)
+        audit = self._response_audit(stage, response)
+        try:
+            parsed = provider.parse_json(response.text)
+            if not isinstance(parsed, dict):
+                raise ValueError("AI provider returned a non-object response")
+            missing = [field for field in required_fields if field not in parsed]
+            if missing:
+                raise ValueError(
+                    "AI provider response is missing required fields: "
+                    + ", ".join(missing)
+                )
+            self._validate_structured_response(stage, parsed)
+        except Exception as exc:
+            audit["status"] = "invalid_response"
+            audit["error_type"] = type(exc).__name__
+            raise StructuredResponseError(str(exc), audit) from exc
+        return parsed, audit
 
     def _context_payload(self, state: InvestigationState) -> dict:
         return {
@@ -460,10 +652,16 @@ Return JSON: {{"hypotheses":[{{"id":"HP-1","statement":"...","supporting_ids":["
 Analyst feedback from a prior review, if any: <untrusted>{feedback}</untrusted>
 Context: <untrusted>{context}</untrusted>"""
         try:
-            parsed = await self._ask_json(prompt, max_tokens=1400)
+            parsed, call_audit = await self._ask_json(
+                prompt,
+                stage="hypothesis_generation",
+                schema=HYPOTHESES_SCHEMA,
+                required_fields=("hypotheses",),
+                max_tokens=1400,
+            )
         except Exception as exc:
             errors = list(state.get("errors") or [])
-            errors.append(f"hypothesis_generation: {_text(exc, 300)}")
+            errors.append(f"hypothesis_generation: {type(exc).__name__}")
             return {
                 "hypotheses": [{
                     "id": "HP-1", "statement": "The available evidence requires analyst validation.",
@@ -471,6 +669,10 @@ Context: <untrusted>{context}</untrusted>"""
                     "confidence": 0.0, "status": "unresolved",
                 }],
                 "errors": errors,
+                "model_calls": [
+                    *list(state.get("model_calls") or []),
+                    self._failure_audit("hypothesis_generation", exc),
+                ],
             }
 
         allowed = {
@@ -502,7 +704,10 @@ Context: <untrusted>{context}</untrusted>"""
                 "id": "HP-1", "statement": "The available evidence is insufficient for a bounded hypothesis.",
                 "supporting_ids": [], "contradicting_ids": [], "confidence": 0.0, "status": "unresolved",
             })
-        return {"hypotheses": hypotheses}
+        return {
+            "hypotheses": hypotheses,
+            "model_calls": [*list(state.get("model_calls") or []), call_audit],
+        }
 
     async def _verify_hypotheses(self, state: InvestigationState) -> dict:
         record_map = {
@@ -537,13 +742,23 @@ Return JSON: {{"verdict":"confirmed|likely|inconclusive|unlikely|false_positive"
 Use only supplied record IDs. A lack of evidence must produce inconclusive, not confirmed.
 Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verification": state.get("verification", [])}, default=str)[:30_000]}</untrusted>"""
         try:
-            parsed = await self._ask_json(prompt, max_tokens=900)
+            parsed, call_audit = await self._ask_json(
+                prompt,
+                stage="verdict_generation",
+                schema=VERDICT_SCHEMA,
+                required_fields=("verdict", "confidence", "summary", "evidence_ids", "gaps"),
+                max_tokens=900,
+            )
         except Exception as exc:
             errors = list(state.get("errors") or [])
-            errors.append(f"verdict_generation: {_text(exc, 300)}")
+            errors.append(f"verdict_generation: {type(exc).__name__}")
             return {
                 "verdict": {"verdict": "inconclusive", "confidence": 0.0, "summary": "AI verdict unavailable; analyst review is required.", "evidence_ids": [], "gaps": ["AI provider response unavailable"]},
                 "errors": errors,
+                "model_calls": [
+                    *list(state.get("model_calls") or []),
+                    self._failure_audit("verdict_generation", exc),
+                ],
             }
         verdict = str(parsed.get("verdict") or "inconclusive").lower()
         if verdict not in ALLOWED_VERDICTS:
@@ -555,13 +770,16 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
         evidence_ids = _citations(parsed.get("evidence_ids"), allowed)
         if not evidence_ids and verdict in {"confirmed", "likely", "unlikely", "false_positive"}:
             verdict, confidence = "inconclusive", 0.0
-        return {"verdict": {
-            "verdict": verdict,
-            "confidence": confidence,
-            "summary": _text(parsed.get("summary"), 1500),
-            "evidence_ids": evidence_ids,
-            "gaps": [_text(item, 500) for item in parsed.get("gaps", [])[:10]],
-        }}
+        return {
+            "verdict": {
+                "verdict": verdict,
+                "confidence": confidence,
+                "summary": _text(parsed.get("summary"), 1500),
+                "evidence_ids": evidence_ids,
+                "gaps": [_text(item, 500) for item in parsed.get("gaps", [])[:10]],
+            },
+            "model_calls": [*list(state.get("model_calls") or []), call_audit],
+        }
 
     def _analyst_review(self, state: InvestigationState) -> dict:
         review_round = int(state.get("review_round") or 0)
@@ -577,6 +795,7 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
             "hypotheses": state.get("hypotheses") or [],
             "verification": state.get("verification") or [],
             "errors": state.get("errors") or [],
+            "model_calls": state.get("model_calls") or [],
             "allowed_decisions": allowed,
         })
         if not isinstance(decision, dict):
@@ -631,13 +850,31 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
             )
             remediation = plan.to_dict() if hasattr(plan, "to_dict") else _json_safe(plan)
             remediation["source"] = "ai_direct_sdk"
+            call_audit = {
+                "stage": "remediation_generation",
+                "contract_version": "investigation.v1",
+                "status": "succeeded",
+                "provider": _text(remediation.get("provider") or "unknown", 100),
+                "model": _text(remediation.get("model") or "unknown", 200),
+                "input_tokens": 0,
+                "output_tokens": int(remediation.get("tokens_used") or 0),
+                "latency_ms": round(float(remediation.get("latency_ms") or 0.0), 1),
+                "cost_usd": 0.0,
+                "recorded_at": time.time(),
+            }
         except Exception as exc:
-            errors.append(f"remediation_generation: {_text(exc, 300)}")
+            errors.append(f"remediation_generation: {type(exc).__name__}")
             remediation = _json_safe(recipe_for_finding(finding))
             remediation["source"] = "deterministic_knowledge_base"
+            call_audit = self._failure_audit("remediation_generation", exc)
+            call_audit["fallback"] = "deterministic_knowledge_base"
         remediation["execution_authorized"] = False
         remediation["approval_scope"] = "draft_only"
-        return {"remediation": remediation, "errors": errors}
+        return {
+            "remediation": remediation,
+            "errors": errors,
+            "model_calls": [*list(state.get("model_calls") or []), call_audit],
+        }
 
     def _finalize_approved(self, state: InvestigationState) -> dict:
         completed = time.time()
@@ -665,22 +902,26 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
                 "review_round": state.get("review_round") or 0,
             },
             "errors": state.get("errors") or [],
+            "model_calls": state.get("model_calls") or [],
             "completed_at": completed,
         }
 
     async def _sync_run(self, run_id: str, thread_id: str) -> dict:
+        previous = await self._db.get_investigation_run(run_id)
         snapshot = await self._graph.aget_state(self._config(thread_id))
         state = dict(snapshot.values or {})
         interrupts = [item for task in snapshot.tasks for item in getattr(task, "interrupts", ())]
         if interrupts:
             payload = _json_safe(interrupts[0].value)
-            return await self._db.update_investigation_run(
+            updated = await self._db.update_investigation_run(
                 run_id, status="pending_review", current_node="analyst_review", review_payload=payload,
                 error="; ".join(state.get("errors") or [])[:1000],
             ) or {}
+            await self._notify_lifecycle(previous, updated, state)
+            return updated
         status = state.get("status") or "running"
         completed = status in {"completed", "rejected", "failed"}
-        return await self._db.update_investigation_run(
+        updated = await self._db.update_investigation_run(
             run_id,
             status=status,
             current_node="complete" if completed else "running",
@@ -691,6 +932,35 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
             error="; ".join(state.get("errors") or [])[:1000],
             completed=completed,
         ) or {}
+        await self._notify_lifecycle(previous, updated, state)
+        return updated
+
+    async def _notify_lifecycle(
+        self, previous: dict | None, updated: dict, state: InvestigationState,
+    ) -> None:
+        handler = self._lifecycle_notification_handler
+        status = str(updated.get("status") or "")
+        if (
+            handler is None
+            or status not in {"pending_review", "completed", "rejected", "failed"}
+            or status == str((previous or {}).get("status") or "")
+        ):
+            return
+        event = f"investigation_{status}"
+        try:
+            await handler(
+                dict(state.get("finding") or {}),
+                event,
+                {
+                    "run_id": updated.get("run_id") or state.get("run_id"),
+                    "status": status,
+                    "actor": state.get("analyst_actor") or "AttackLens",
+                    "decision": state.get("analyst_decision") or "",
+                    "feedback": state.get("analyst_feedback") or "",
+                },
+            )
+        except Exception:
+            log.exception("investigation lifecycle notification failed run=%s", updated.get("run_id"))
 
     @staticmethod
     def _config(thread_id: str) -> dict:

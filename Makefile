@@ -7,6 +7,10 @@
 #    make test            run full test suite
 #    make test-unit       unit tests only
 #    make test-integration integration tests only
+#    make test-pipeline-validation Phase 1 telemetry-to-dashboard acceptance suite
+#    make test-detection-validation Phase 2 detection-logic acceptance suite
+#    make test-ai-validation Phase 3 AI/LangGraph acceptance suite
+#    make test-email-validation Phase 4 email integration acceptance suite
 #    make test-coverage   test with HTML coverage report
 #    make lint            ruff + mypy
 #    make lint-fix        auto-fix ruff issues
@@ -78,6 +82,68 @@ test-unit: ## Run all unit tests (agent + manager)
 .PHONY: test-integration
 test-integration: ## Run integration tests only
 	PYTHONPATH=. $(PYTHON) -m pytest manager/tests/integration/ -v --tb=short
+
+.PHONY: test-pipeline-validation
+test-pipeline-validation: ## Run Phase 1 telemetry-to-dashboard acceptance suite
+	PYTHONPATH=. $(PYTHON) -m pytest \
+	  agent/tests/integration/test_enrollment_flow.py \
+	  agent/tests/integration/test_offline_online_replay.py \
+	  manager/tests/integration/test_ingest.py \
+	  manager/tests/integration/test_attacklens_pipeline.py \
+	  manager/tests/unit/test_payload_schema.py \
+	  manager/tests/unit/test_payload_storage.py \
+	  manager/tests/unit/test_payload_ledger.py \
+	  manager/tests/unit/test_telemetry_worker_durability.py \
+	  manager/tests/unit/test_reconciler.py \
+	  manager/tests/unit/test_raw_coverage.py \
+	  -v --tb=short
+
+.PHONY: test-detection-validation
+test-detection-validation: ## Run Phase 2 detection-logic acceptance suite
+	PYTHONPATH=. $(PYTHON) -m pytest \
+	  tests/unit/test_detection_rules_verification.py \
+	  tests/unit/test_rulepack_detector.py \
+	  manager/tests/accuracy/test_detection_accuracy.py \
+	  manager/tests/unit/test_developer_security_rules.py \
+	  manager/tests/unit/test_detection_coverage.py \
+	  manager/tests/unit/test_source_contract_detectors.py \
+	  manager/tests/unit/test_engine_module_routing.py \
+	  manager/tests/unit/test_openfiles_detection.py \
+	  manager/tests/unit/test_custom_correlations.py::test_reload_rules_reports_executable_inventory \
+	  -v --tb=short
+	@set -e; \
+	  modules="app_vulnerability arp_spoofing binary_integrity container_security \
+	  covert_channel defense_evasion exfiltration lateral_movement \
+	  package_vulnerability persistence port_listener privilege_escalation \
+	  sbom_posture scheduled_task service_monitor sysctl_monitor user_account"; \
+	  for module in $$modules; do \
+	    PYTHONPATH=. $(PYTHON) -m manager.manager.attacklens.detections.$$module; \
+	  done
+
+.PHONY: test-ai-validation
+test-ai-validation: ## Run Phase 3 AI validation and LangGraph acceptance suite
+	PYTHONPATH=. $(PYTHON) -m pytest \
+	  manager/tests/unit/test_investigation_graph.py \
+	  manager/tests/unit/test_integration_retry_after.py \
+	  manager/tests/unit/test_validation_error_policy.py \
+	  manager/tests/unit/test_validation_observability.py \
+	  manager/tests/unit/test_validation_persistence.py \
+	  manager/tests/unit/test_validation_quality_floor.py \
+	  manager/tests/unit/test_validation_recompute_jobs.py \
+	  manager/tests/unit/test_validation_run_persistence.py \
+	  tests/unit/test_ai_validator.py \
+	  tests/unit/test_openrouter_provider.py \
+	  tests/unit/test_validation_accuracy.py \
+	  tests/unit/test_validation_model.py \
+	  -v --tb=short
+
+.PHONY: test-email-validation
+test-email-validation: ## Run Phase 4 durable email integration acceptance suite
+	PYTHONPATH=. $(PYTHON) -m pytest \
+	  manager/tests/unit/test_notifications_integrations.py \
+	  manager/tests/unit/test_investigation_graph.py \
+	  manager/tests/unit/test_intel_db_retention.py \
+	  -v --tb=short
 
 .PHONY: test-coverage
 test-coverage: ## Run tests with HTML + terminal coverage report

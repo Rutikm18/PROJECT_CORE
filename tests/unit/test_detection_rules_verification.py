@@ -13,14 +13,11 @@ Coverage report is printed by the session-finish hook at the bottom.
 from __future__ import annotations
 
 import asyncio
-import os
 import json
-from typing import Any
 
 import pytest
 
-from manager.manager.attacklens.rulepack import RulePackDetector, _RULE_EVALUATORS
-
+from manager.manager.attacklens.rulepack import _RULE_EVALUATORS, RulePackDetector
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -419,6 +416,301 @@ TRIGGER_FIXTURES: dict[str, tuple[str, list[dict] | dict, dict[str, str]]] = {
         [{"account_name": "svc_deploy", "account_type": "service_account", "logon_type": "interactive"}],
         {},
     ),
+
+    # ── Newly implemented evaluators (stable declarative-only gap) ─────────────
+    "AGENT-HEALTH-002": (
+        "agent_health",
+        [{"agent_version": "1.2.0", "previous_version": "1.5.3"}],
+        {},
+    ),
+    "AGENT-HEALTH-005": (
+        "agent_health",
+        [{"config_hash": "newhash", "baseline_config_hash": "basehash"}],
+        {},
+    ),
+    "APPS-001": (
+        "apps",
+        [{"name": "CryptoMiner", "app_id": "com.evil.miner"}],
+        {"ATTACKLENS_APPROVED_APPS": "safari"},  # Safari (benign) is approved; miner is not
+    ),
+    "APPS-005": (
+        "apps",
+        [{"name": "Trojan", "malware_hash_hit": True}],
+        {},
+    ),
+    "ARP-003": (
+        "arp",
+        [{"ip": "10.0.0.1", "is_default_gateway": True, "mac": "de:ad:be:ef:00:99",
+          "baseline_gateway_mac": "11:22:33:44:55:66"}],
+        {},
+    ),
+    "ARP-005": (
+        "arp",
+        [{"mac": "de:ad:be:00:11:22", "oui": "de:ad:be", "segment_class": "restricted"}],
+        {"ATTACKLENS_APPROVED_OUIS": "11:22:33"},
+    ),
+    "BATTERY-002": (
+        "battery",
+        [{"battery_serial": "NEWCELL", "previous_serial": "OLDCELL", "cycle_count": 10}],
+        {},
+    ),
+    "CONFIGS-001": (
+        "configs",
+        [{"config_key": "firewall", "old_value": "enabled", "new_value": "disabled"}],
+        {},
+    ),
+    "CONFIGS-002": (
+        "configs",
+        [{"config_file": "/etc/ssh/sshd_config", "hash_changed": True}],
+        {},
+    ),
+    "CONNECTIONS-005": (
+        "connections",
+        [{"remote_addr": "185.220.101.1:443", "tor_exit_node": True}],
+        {},
+    ),
+    "HARDWARE-003": (
+        "hardware",
+        [{"component": "nic", "component_serial": "NEWSERIAL", "previous_component_serial": "OLDSERIAL"}],
+        {},
+    ),
+    "HARDWARE-005": (
+        "hardware",
+        [{"vendor_id": "0x9999", "host_policy_class": "restricted"}],
+        {"ATTACKLENS_APPROVED_USB_VENDORS": "0x1234"},
+    ),
+    "PACKAGES-002": (
+        "packages",
+        [{"package_name": "openssl", "version": "1.0.2", "previous_version": "3.0.7",
+          "cve_ids": ["CVE-2016-2107"]}],
+        {},
+    ),
+    "PACKAGES-004": (
+        "packages",
+        [{"package_name": "log4j", "version": "2.14.1", "cve_ids": ["CVE-2021-44228"], "kev_hit": True}],
+        {},
+    ),
+    "PORTS-001": (
+        "ports",
+        [{"listening_port": 31337}],
+        {"ATTACKLENS_BASELINE_LISTENING_PORTS": "443,22,80"},
+    ),
+    "SBOM-001": (
+        "sbom",
+        [{"component_name": "openssl", "cve_id": "CVE-2022-3602", "kev_hit": True}],
+        {},
+    ),
+    "SBOM-005": (
+        "sbom",
+        [{"component_name": "python2", "is_eol": True}],
+        {},
+    ),
+    "SERVICES-003": (
+        "services",
+        [{"service_name": "cups", "binary_path": "/tmp/evilcups", "previous_binary_path": "/usr/sbin/cups"}],
+        {},
+    ),
+    "STORAGE-002": (
+        "storage",
+        [{"volume_id": "disk99", "new_volume": True}],
+        {},
+    ),
+    "SYSCTL-002": (
+        "sysctl",
+        [{"sysctl_key": "kernel.randomize_va_space", "current_value": 0, "baseline_value": 2}],
+        {},
+    ),
+}
+
+
+# One representative normal record for every section with executable rule-pack
+# logic. Each record deliberately sits on the benign side of all thresholds and
+# allowlists used by that section. The negative test below runs it once per rule
+# so every evaluator has explicit positive AND negative evidence.
+BENIGN_SECTION_FIXTURES: dict[str, list[dict] | dict] = {
+    "agent_health": [{
+        "restart_count": 0,
+        "sha256": "aabbcc",
+        "clock_skew_seconds": 0,
+    }],
+    "apps": [{
+        "name": "Safari",
+        "install_path": "/Applications/Safari.app",
+        "code_signature_valid": True,
+    }],
+    "binaries": [{
+        "name": "ls",
+        "path": "/usr/bin/ls",
+        "signature_valid": True,
+        "malware_hash_hit": False,
+        "shannon_entropy": 4.0,
+        "command_line": "ls -la",
+    }],
+    "configs": [{
+        "path": "/etc/example.conf",
+        "content": "feature_enabled=true",
+        "permission_mode": "0644",
+        "world_writable": False,
+    }],
+    "connections": [{
+        "remote_addr": "10.0.0.10:443",
+        "fingerprinted_protocol": "tls",
+        "dest_port": 443,
+        "malicious_ip": False,
+    }],
+    "containers": [{
+        "id": "approved-container",
+        "image": "registry.company.com/app:1.0.0",
+        "registry_hostname": "registry.company.com",
+        "privileged": False,
+        "mounts": [],
+        "host_pid_namespace": False,
+        "process_uid": 1000,
+    }],
+    "hardware": [{
+        "bus": "usb",
+        "name": "Standard Keyboard",
+        "vendor_id": "0x1234",
+        "product_id": "0xabcd",
+        "serial": "OTHER",
+        "secure_boot_enabled": True,
+        "previous_state": True,
+    }],
+    "mounts": [{
+        "device_type": "fixed",
+        "host_policy_class": "standard",
+        "mount_type": "apfs",
+        "mount_point": "/Users",
+        "mount_options": "rw,nosuid",
+        "world_writable": False,
+    }],
+    "network": [{
+        "ssid": "CorpWifi",
+        "bssid": "11:22:33:44:55:66",
+        "promiscuous_mode": False,
+        "host_role": "workstation",
+        "current_gateway": "10.0.0.1",
+        "domain": "example.com",
+        "domain_registration_age_days": 365,
+        "domain_name_entropy": 2.0,
+    }],
+    "openfiles": [{
+        "pid": 100,
+        "process": "tail",
+        "file_path": "/var/log/system.log",
+    }],
+    "packages": [{
+        "package_name": "requests",
+        "source_repo": "pypi.org",
+        "installed_hash": "aabbcc",
+        "registry_hash": "aabbcc",
+        "removal_event": False,
+    }],
+    "ports": [{
+        "listening_port": 443,
+        "owning_process_path": "/usr/sbin/nginx",
+    }],
+    "processes": [{
+        "name": "Safari",
+        "parent_process_name": "launchd",
+        "child_process_name": "Safari",
+        "command_line": "/Applications/Safari.app/Contents/MacOS/Safari",
+        "path": "/Applications/Safari.app/Contents/MacOS/Safari",
+        "remote_memory_allocation": False,
+        "remote_thread_created": False,
+    }],
+    "sbom": [{
+        "component_name": "approved-lib",
+        "component_license": "mit",
+        "build_target": "development",
+        "provenance_attestation_present": True,
+    }],
+    "security": [{
+        "security_agent_service_state": "running",
+        "event_type": "policy_checked",
+        "log_channel": "security",
+        "rule_action": "deny",
+        "rule_direction": "inbound",
+        "source_cidr": "10.0.0.0/24",
+        "vulnerability_severity": "medium",
+        "days_since_disclosure": 1,
+        "sla_days": 30,
+        "patch_available": True,
+        "account_privilege_level": "user",
+        "mfa_enforced_old": True,
+        "mfa_enforced": True,
+    }],
+    "services": [{
+        "service_name": "approved-service",
+        "service_create_event": False,
+        "signature_valid": True,
+        "path": "/usr/sbin/approved-service",
+        "new_state": "running",
+        "run_as_account": "service-user",
+        "target_first_seen_days": 100,
+        "start_type_new": "manual",
+        "start_type_old": "manual",
+    }],
+    "storage": [{
+        "volume": "disk1",
+        "encryption_status_new": "encrypted",
+        "encryption_status_old": "encrypted",
+        "key_identifier_changed": False,
+        "quota_usage_pct": 20,
+        "top_writing_process": {"first_seen": 100},
+        "filesystem_type": "apfs",
+        "partition_size_gb": 500,
+        "gpt_hidden_attribute": False,
+    }],
+    "sysctl": [{
+        "sysctl_key": "kernel.yama.ptrace_scope",
+        "current_value": 2,
+        "current_ptrace_scope": 2,
+        "baseline_ptrace_scope": 2,
+        "host_role": "workstation",
+        "core_pattern": "/cores/core.%P",
+    }],
+    "tasks": [{
+        "task_name": "approved-task",
+        "task_create_event": False,
+        "target_signature_valid": True,
+        "path": "/usr/bin/approved-task",
+        "run_as_account": "service-user",
+        "target_first_seen_days": 100,
+        "task_state_new": "enabled",
+        "task_state_old": "enabled",
+        "trigger_type": "daily",
+        "cron_entry_modified": False,
+        "new_command": "/usr/bin/approved-task",
+    }],
+    "users": [{
+        "account_name": "alice",
+        "account_create_event": False,
+        "account_type": "local",
+        "group_name": "staff",
+        "membership_add_event": False,
+        "days_since_last_login": 1,
+        "login_success": True,
+        "password_never_expires_old": False,
+        "password_never_expires": False,
+        "complexity_required_old": True,
+        "complexity_required": True,
+        "logon_type": "console",
+    }],
+    "arp": [{
+        "ip": "10.0.0.1",
+        "mac": "11:22:33:44:55:66",
+        "is_default_gateway": True,
+        "baseline_gateway_mac": "11:22:33:44:55:66",
+        "oui": "11:22:33",
+        "segment_class": "restricted",
+    }],
+    "battery": [{
+        "battery_serial": "BAT123",
+        "previous_serial": "BAT123",
+        "cycle_count": 150,
+        "previous_cycle_count": 150,
+    }],
 }
 
 # ── Rule inventory ────────────────────────────────────────────────────────────
@@ -440,6 +732,7 @@ def all_yaml_rule_ids(detector) -> set[str]:
 # ── Coverage report collected during session ──────────────────────────────────
 
 _report: dict[str, str] = {}  # rule_id -> "fired" | "no_fire" | "error" | "prose"
+_negative_report: dict[str, str] = {}  # rule_id -> "silent" | "false_positive" | "error"
 
 
 # ── Parametrised tests for every registered evaluator ────────────────────────
@@ -479,6 +772,29 @@ def test_evaluator_fires_with_trigger_fixture(rule_id, monkeypatch):
     assert "evidence" in finding, f"{rule_id}: finding missing evidence"
 
 
+@pytest.mark.parametrize("rule_id", sorted(TRIGGER_FIXTURES))
+def test_evaluator_stays_silent_with_benign_fixture(rule_id, monkeypatch):
+    """Every executable rule must stay silent for representative normal data."""
+    section, _, env_overrides = TRIGGER_FIXTURES[rule_id]
+    for key, value in env_overrides.items():
+        monkeypatch.setenv(key, value)
+
+    det = RulePackDetector.load()
+    feeds = _MockFeeds() if rule_id == "CONNECTIONS-002" else None
+    payload = BENIGN_SECTION_FIXTURES[section]
+    try:
+        findings = _run(det.analyze("agent-test", section, payload, feeds))
+    except Exception as exc:
+        _negative_report[rule_id] = f"error: {exc}"
+        pytest.fail(f"{rule_id}: benign fixture raised {type(exc).__name__}: {exc}")
+
+    matched = [f for f in findings if f.get("rule_id") == f"rulepack:{rule_id}"]
+    if matched:
+        _negative_report[rule_id] = "false_positive"
+        pytest.fail(f"{rule_id}: fired for benign {section} fixture: {matched}")
+    _negative_report[rule_id] = "silent"
+
+
 def test_prose_rules_enumerated(all_yaml_rule_ids):
     """All YAML rules without evaluators are identified and counted."""
     prose = sorted(all_yaml_rule_ids - set(_RULE_EVALUATORS))
@@ -494,9 +810,17 @@ def test_evaluators_have_fixtures():
     """Every registered evaluator should have a trigger fixture in this file."""
     missing = sorted(set(_RULE_EVALUATORS) - set(TRIGGER_FIXTURES))
     assert not missing, (
-        f"The following evaluators have no trigger fixture:\n"
+        "The following evaluators have no trigger fixture:\n"
         + "\n".join(f"  {r}" for r in missing)
     )
+
+
+def test_evaluator_sections_have_benign_fixtures():
+    missing = sorted(
+        {section for section, _, _ in TRIGGER_FIXTURES.values()}
+        - set(BENIGN_SECTION_FIXTURES)
+    )
+    assert not missing, "Sections without benign fixtures: " + ", ".join(missing)
 
 
 # ── Coverage report (printed after all tests) ─────────────────────────────────
@@ -506,12 +830,22 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     prose  = [r for r, s in _report.items() if s == "prose"]
     errors = {r: s for r, s in _report.items() if s.startswith("error")}
     no_fire = [r for r, s in _report.items() if s == "no_fire"]
+    silent = [r for r, s in _negative_report.items() if s == "silent"]
+    false_positives = [
+        r for r, s in _negative_report.items() if s == "false_positive"
+    ]
+    negative_errors = {
+        r: s for r, s in _negative_report.items() if s.startswith("error")
+    }
 
     terminalreporter.write_sep("=", "Detection Rule Coverage Report")
     terminalreporter.write_line(f"  Fired (evaluator verified):  {len(fired)}")
     terminalreporter.write_line(f"  Prose-only (no evaluator):   {len(prose)}")
     terminalreporter.write_line(f"  Did not fire (bad fixture?): {len(no_fire)}")
     terminalreporter.write_line(f"  Errors:                      {len(errors)}")
+    terminalreporter.write_line(f"  Benign fixture silent:       {len(silent)}")
+    terminalreporter.write_line(f"  Benign false positives:      {len(false_positives)}")
+    terminalreporter.write_line(f"  Benign fixture errors:       {len(negative_errors)}")
     if errors:
         for r, s in errors.items():
             terminalreporter.write_line(f"    {r}: {s}")
