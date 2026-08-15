@@ -1398,6 +1398,7 @@ function RetentionSettingsPanel() {
   const [saved,       setSaved]       = useState(false);
   const [error,       setError]       = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadStats = useCallback(async (quiet = false) => {
@@ -1520,7 +1521,7 @@ function RetentionSettingsPanel() {
           <button
             type="button"
             disabled={saving}
-            onClick={() => save(config.period_months, "delete")}
+            onClick={() => setConfirmDelete(true)}
             className={cn(
               "w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all",
               config.action === "delete"
@@ -1570,6 +1571,48 @@ function RetentionSettingsPanel() {
           </button>
         </div>
       </div>
+
+      {confirmDelete && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+          role="presentation"
+          onClick={() => setConfirmDelete(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl bg-white border border-[--gray-200] shadow-2xl p-5"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="retention-delete-title"
+            onClick={e => e.stopPropagation()}
+          >
+            <h2 id="retention-delete-title" className="text-sm font-bold text-[--gray-900]">
+              Are you sure?
+            </h2>
+            <p className="mt-2 text-[11px] leading-relaxed text-[--gray-500]">
+              Aged-out telemetry will be permanently deleted instead of compressed and stored.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDelete(false)}
+                className="px-3 py-2 rounded-lg border border-[--gray-200] text-[11px] font-bold text-[--gray-600] hover:bg-[--gray-50] transition-colors"
+              >
+                No
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDelete(false);
+                  void save(config.period_months, "delete");
+                }}
+                className="px-3 py-2 rounded-lg bg-red-600 text-white text-[11px] font-bold hover:bg-red-700 transition-colors"
+              >
+                Yes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Auto-Resolve stale findings ──────────────────────────────────── */}
       <div className="col-span-2 bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
