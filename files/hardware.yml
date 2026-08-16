@@ -1,0 +1,108 @@
+category: Hardware
+description: >
+  Detects unauthorized peripheral devices, hardware component changes, and
+  firmware/boot-integrity tampering.
+rules:
+  - id: HARDWARE-001
+    title: Unauthorized USB storage device connected
+    description: A USB mass-storage device not present in the approved-device list is connected to a managed endpoint.
+    mitre_attack: [T1200, T1052.001]
+    severity: medium
+    data_source: USB device connect events (vendor_id, product_id, serial)
+    detection:
+      logic: connected USB mass-storage device's (vendor_id, product_id, serial) not in approved_usb_allowlist
+      conditions:
+        - device_class == 'mass_storage'
+        - (vendor_id, product_id, serial) not in approved_usb_allowlist
+      threshold: any occurrence on policy-restricted hosts
+    false_positives:
+      - newly issued approved device not yet added to the allowlist
+    enrichment_sources:
+      - USB device allowlist / asset management
+    response_actions:
+      - block via DLP/USB control policy, verify device with user
+    status: stable
+
+  - id: HARDWARE-002
+    title: USB HID device impersonation (BadUSB pattern)
+    description: >
+      A device enumerates as a keyboard/HID immediately after connecting as
+      storage, or produces abnormally fast keystroke injection — signature
+      of a malicious USB implant.
+    mitre_attack: [T1200, T1091]
+    severity: critical
+    data_source: USB enumeration events, keystroke timing telemetry
+    detection:
+      logic: single physical USB connection enumerates multiple device classes including HID, followed by very high-speed keystroke input
+      conditions:
+        - device enumerates as both mass_storage and HID within same connect event
+        - subsequent keystroke inter-key interval < 10ms sustained for > 20 keys
+      threshold: any occurrence
+    false_positives:
+      - legitimate multi-function USB devices (some docking stations) — validate against known-good device signatures
+    enrichment_sources:
+      - known-good multi-function device signature list
+    response_actions:
+      - isolate host, physically remove device, forensic capture
+    status: experimental
+
+  - id: HARDWARE-003
+    title: Unexpected hardware component change on existing asset
+    description: A tracked hardware component (disk serial, NIC MAC, motherboard serial) changes for an asset ID without a logged service event.
+    mitre_attack: [T1200]
+    severity: high
+    data_source: hardware component serials per asset_id, service ticket correlation
+    detection:
+      logic: component serial for asset_id differs from last recorded value with no matching depot/repair ticket
+      conditions:
+        - current_component_serial != last_recorded_serial[asset_id]
+        - no matching service ticket for asset_id in relevant window
+      threshold: any occurrence
+    false_positives:
+      - legitimate depot repair/upgrade not yet logged in CMDB
+    enrichment_sources:
+      - CMDB, depot/repair ticketing system
+    response_actions:
+      - verify with asset management, physically inspect if unexplained
+    status: stable
+
+  - id: HARDWARE-004
+    title: Secure Boot or TPM disabled/tampered
+    description: A device's Secure Boot state or TPM attestation status changes to disabled/untrusted.
+    mitre_attack: [T1542.003, T1553.006]
+    severity: critical
+    data_source: Secure Boot state, TPM attestation status
+    detection:
+      logic: secure_boot_enabled transitions from true to false, or TPM attestation fails where it previously passed
+      conditions:
+        - secure_boot_enabled == false and previous_state == true
+        - OR tpm_attestation_status == 'failed' and previous_status == 'passed'
+        - no approved firmware-maintenance ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate BIOS/firmware update or IT-driven configuration change with a ticket
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - isolate host, re-verify boot chain integrity before returning to service
+    status: stable
+
+  - id: HARDWARE-005
+    title: Unknown vendor USB ID on restricted asset class
+    description: USB vendor ID does not match any entry in the organization's approved hardware vendor list, on a device class where this is restricted (e.g. kiosk, POS, secure workstation).
+    mitre_attack: [T1200]
+    severity: medium
+    data_source: USB vendor_id, restricted asset policy
+    detection:
+      logic: vendor_id not in approved_vendor_list for a restricted-policy host
+      conditions:
+        - host_policy_class == 'restricted'
+        - vendor_id not in approved_vendor_list
+      threshold: any occurrence
+    false_positives:
+      - newly procured peripheral pending allowlist update
+    enrichment_sources:
+      - USB vendor ID database, internal approved-vendor list
+    response_actions:
+      - block device, verify with procurement/asset management
+    status: stable

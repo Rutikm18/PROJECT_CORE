@@ -1,0 +1,130 @@
+category: Users
+description: >
+  Detects identity-based attack patterns: unauthorized account creation,
+  privilege-group abuse, dormant-account reactivation, and anomalous logon
+  behavior.
+rules:
+  - id: USERS-001
+    title: New local user account created outside provisioning workflow
+    description: A new local account is created on a host without a corresponding record in the IAM/HR-driven provisioning system.
+    mitre_attack: [T1136.001]
+    severity: high
+    data_source: local account creation events, IAM provisioning records
+    detection:
+      logic: new local account created with no matching IAM provisioning ticket/record
+      conditions:
+        - account_create_event == true
+        - account_type == 'local'
+        - no matching IAM provisioning record within a reasonable time window
+      threshold: any occurrence
+    false_positives:
+      - legitimate emergency/break-glass local account creation (should still be logged/ticketed after the fact)
+    enrichment_sources:
+      - IAM/HR system, change-management ticketing system
+    response_actions:
+      - verify with IT, disable account if unauthorized
+    status: stable
+
+  - id: USERS-002
+    title: User added to privileged/administrative group
+    description: An account is added to a local or domain administrative group without a corresponding approved access-request record.
+    mitre_attack: [T1098]
+    severity: critical
+    data_source: group-membership change events, access-request system records
+    detection:
+      logic: account added to a monitored privileged group with no matching approved access request
+      conditions:
+        - group_name in monitored_privileged_groups
+        - membership_add_event == true
+        - no matching approved access-request ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate access grant not yet reflected in the ticketing system (process gap, should be logged retroactively)
+    enrichment_sources:
+      - IAM access-request/approval system
+    response_actions:
+      - remove from group pending verification, investigate who performed the change
+    status: stable
+
+  - id: USERS-003
+    title: Dormant account reactivated
+    description: An account with no login activity for an extended period suddenly authenticates successfully.
+    mitre_attack: [T1078]
+    severity: high
+    data_source: account last-login timestamp history
+    detection:
+      logic: successful login for an account whose prior last-login exceeds a long-dormancy threshold
+      conditions:
+        - days_since_last_login > 90
+        - login_success == true
+        - account not flagged as a legitimately seasonal/scheduled-use account
+      threshold: '>90 days dormant then reactivated'
+    false_positives:
+      - legitimate returning employee (leave of absence), seasonal contractor, service account with infrequent legitimate use
+    enrichment_sources:
+      - HR system (leave-of-absence status)
+    response_actions:
+      - verify with account owner/manager before allowing continued access
+    status: stable
+
+  - id: USERS-004
+    title: Impossible-travel / geographically inconsistent login
+    description: Successive successful logins for the same account occur from geolocations that are not physically reachable within the elapsed time.
+    mitre_attack: [T1078]
+    severity: high
+    data_source: login events with source-IP geolocation, timestamps
+    detection:
+      logic: distance between two consecutive login geolocations for the same account exceeds physically-plausible travel speed for the elapsed time
+      conditions:
+        - required_travel_speed_kmh(login_a, login_b) > 900
+        - both logins successful
+        - source IPs not both corporate VPN egress points
+      threshold: implied speed > 900 km/h (commercial flight ceiling)
+    false_positives:
+      - corporate VPN with rotating/global exit nodes not fully allowlisted
+      - shared account usage across regions (a policy issue, but not necessarily compromise)
+    enrichment_sources:
+      - GeoIP database, corporate VPN egress IP allowlist
+    response_actions:
+      - force re-authentication/MFA challenge, notify user, investigate if unconfirmed
+    status: tuning
+
+  - id: USERS-005
+    title: Password policy weakened for an account
+    description: An account's password policy is modified to remove expiration or complexity requirements, outside standard service-account exception processes.
+    mitre_attack: [T1098]
+    severity: medium
+    data_source: account password-policy attribute changes
+    detection:
+      logic: password_never_expires or complexity_exempt flag set to true without a matching approved service-account exception record
+      conditions:
+        - (password_never_expires transitions false -> true) OR (complexity_required transitions true -> false)
+        - account not in approved_service_account_exception_list
+      threshold: any occurrence
+    false_positives:
+      - legitimate newly onboarded service account pending addition to the exception list
+    enrichment_sources:
+      - IAM service-account exception registry
+    response_actions:
+      - revert policy change, verify legitimacy with account owner
+    status: stable
+
+  - id: USERS-006
+    title: Service account used for interactive logon
+    description: An account designated as a non-interactive service account performs an interactive (console/RDP/SSH terminal) logon.
+    mitre_attack: [T1078.002]
+    severity: high
+    data_source: account type designation, logon type
+    detection:
+      logic: account tagged as service_account performs a logon_type classified as interactive
+      conditions:
+        - account_type == 'service_account'
+        - logon_type in ['interactive','remote_interactive','ssh']
+      threshold: any occurrence
+    false_positives:
+      - legitimate admin troubleshooting under a service account context (should use a personal admin account instead per best practice)
+    enrichment_sources:
+      - IAM service-account registry
+    response_actions:
+      - investigate source of the interactive session, rotate credentials if unauthorized
+    status: stable

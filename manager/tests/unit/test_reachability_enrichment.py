@@ -84,6 +84,26 @@ async def test_short_token_does_not_overmatch():
     assert ctx.package_running("go") is False
 
 
+@pytest.mark.asyncio
+async def test_lib_prefix_strip_does_not_mangle_non_lib_names():
+    """Regression: token normalisation must strip a real 'lib' PREFIX only, not
+    arbitrary leading l/i/b characters. `str.lstrip('lib')` did the latter, so
+    `ipython`→`python` (false-positive match against a python process),
+    `lodash`→`odash`, `log4j-core`→`og4jcore`, and `irb`→'' (unmatchable)."""
+    db = _FakeManagerDB(processes=[{"name": "python3"}, {"name": "node"}])
+    ctx = await rb.load_reachability(db, "agent-a")
+    # ipython is NOT installed as a process here — must not inherit python3.
+    assert ctx.package_running("ipython") is False
+    # A real 'lib' prefix is still normalised so libX matches an X process.
+    assert rb._pkg_token("libssl") == "ssl"
+    assert rb._pkg_token("libwebp") == "webp"
+    # Non-lib names keep their leading characters intact.
+    assert rb._pkg_token("ipython") == "ipython"
+    assert rb._pkg_token("lodash") == "lodash"
+    assert rb._pkg_token("log4j-core") == "log4jcore"
+    assert rb._pkg_token("irb") == "irb"
+
+
 def test_external_bind_detection():
     assert rb._external_bind("0.0.0.0") is True
     assert rb._external_bind("::") is True
@@ -193,4 +213,8 @@ async def test_legacy_precision_no_manager_db_is_safe(monkeypatch):
     }
     await engine._attach_legacy_precision(finding)
     crit = {c["name"]: c for c in finding["terrain_validation"]["criteria"]}
-    assert crit["package_running"]["status"] == "not_met"
+    # With no manager DB, reachability cannot be confirmed → n/a (skipped),
+    # NOT "not_met": absence of a positive match means "can't tell", and a
+    # library CVE must not be dragged toward 0 for telemetry it can't have.
+    assert crit["package_running"]["status"] == "skipped"
+    assert crit["package_running"]["skipped"] is True

@@ -1,0 +1,105 @@
+category: SBOM
+description: >
+  Software Bill of Materials analysis rules — detects supply-chain risk
+  introduced through software components/dependencies, independent of
+  runtime behavior.
+rules:
+  - id: SBOM-001
+    title: Component with known-exploited or high-EPSS vulnerability
+    description: A component listed in a host/application's SBOM has a CVE present in CISA's Known Exploited Vulnerabilities catalog or a high EPSS exploitation-probability score.
+    mitre_attack: [T1190]
+    severity: critical
+    data_source: SBOM component list (name, version), CVE/KEV/EPSS feeds
+    detection:
+      logic: (component_name, version) maps to a CVE present in CISA KEV, or EPSS score above threshold
+      conditions:
+        - (component_name, version) in cve_affected_versions
+        - cve_id in CISA_KEV OR epss_score(cve_id) > 0.5
+      threshold: any KEV match; EPSS > 0.5 for non-KEV
+    false_positives:
+      - vendor-applied backport patch not reflected in version string metadata
+    enrichment_sources:
+      - NVD, CISA KEV, EPSS, vendor security advisories
+    response_actions:
+      - prioritize patch per vulnerability-management SLA (KEV = emergency)
+    status: stable
+
+  - id: SBOM-002
+    title: Unsigned or untrusted-source component in build
+    description: A dependency/component in the SBOM originates from a source that is not signed or not from an approved package origin.
+    mitre_attack: [T1195.001, T1195.002]
+    severity: medium
+    data_source: SBOM component origin/signature metadata
+    detection:
+      logic: component origin not in approved_source_list, or component lacks verifiable signature/provenance (e.g., no SLSA/sigstore attestation)
+      conditions:
+        - component_origin not in approved_source_list
+        - OR provenance_attestation_present == false
+      threshold: any occurrence
+    false_positives:
+      - internal first-party components not expected to carry third-party signatures
+    enrichment_sources:
+      - Sigstore/SLSA provenance verification services
+      - approved package-source allowlist
+    response_actions:
+      - flag for security review before release, require attestation
+    status: tuning
+
+  - id: SBOM-003
+    title: New dependency introduced not present in approved baseline SBOM
+    description: Current SBOM contains a component absent from the previous approved-baseline SBOM for the same application/release line — supply-chain drift.
+    mitre_attack: [T1195.001]
+    severity: medium
+    data_source: current SBOM vs. baseline SBOM diff
+    detection:
+      logic: component present in current SBOM but absent from baseline SBOM, with no corresponding change record
+      conditions:
+        - component_id not in baseline_sbom_components
+        - no matching dependency-change record (e.g., PR/commit referencing dependency addition)
+      threshold: any occurrence
+    false_positives:
+      - legitimate new dependency added as part of normal development, simply not yet reconciled into baseline
+    enrichment_sources:
+      - source-control/CI change history
+    response_actions:
+      - review new component's origin, license, and vulnerability status before approving baseline update
+    status: tuning
+
+  - id: SBOM-004
+    title: Restricted-license component in production build
+    description: A component with a license type flagged as restricted/incompatible (e.g., certain copyleft licenses) is present in a production SBOM.
+    mitre_attack: []
+    severity: low
+    data_source: SBOM component license metadata, license policy
+    detection:
+      logic: component license in restricted_license_list and build target is production
+      conditions:
+        - component_license in restricted_license_list
+        - build_target == 'production'
+      threshold: any occurrence
+    false_positives:
+      - component used only in build tooling/dev, not shipped (verify actual distribution scope)
+    enrichment_sources:
+      - internal license-policy reference
+    response_actions:
+      - route to legal/compliance review, replace or obtain exception
+    status: stable
+
+  - id: SBOM-005
+    title: Component pinned to deprecated/EOL version with no available patch
+    description: A component version present in the SBOM has reached end-of-life with the vendor and will not receive further security patches.
+    mitre_attack: [T1190]
+    severity: medium
+    data_source: SBOM component version, vendor EOL/support lifecycle data
+    detection:
+      logic: component_version's support end-date has passed
+      conditions:
+        - vendor_eol_date(component_name, version) < today
+      threshold: any occurrence
+    false_positives:
+      - component slated for imminent removal/replacement already tracked on an engineering roadmap
+    enrichment_sources:
+      - vendor lifecycle/EOL databases (e.g., endoflife.date-style feeds)
+    response_actions:
+      - schedule upgrade/replacement, treat as elevated risk until patched
+    status: stable

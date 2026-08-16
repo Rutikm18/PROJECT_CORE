@@ -1,0 +1,569 @@
+# =============================================================================
+# PACK 20 — Execution, Persistence, Privilege and Integrity
+# Domains: processes, launchdaemons, cron, tasks, services, shell_startup,
+#          binaries, apps, users, open_files
+# =============================================================================
+
+# --------------------------------- PROCESSES ---------------------------------
+
+- id: PROC-0001
+  title: Execution from a user-writable or transient directory
+  domain: processes
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1204.002, T1059]
+  logic: |
+    exec.path MATCHES ('/tmp/*','/var/tmp/*','/dev/shm/*','~/Downloads/*','~/Library/Caches/*',
+                       '/private/var/folders/*','~/Public/*','/Users/Shared/*')
+    AND signature.valid != true
+  fp: installers and updaters unpack to /var/folders — suppress when parent is a signed installer AND lifetime < 120s
+  response: hash and submit to VT (hash only), preserve the binary before it self-deletes
+
+- id: PROC-0002
+  title: Process running from a deleted or replaced on-disk image
+  domain: processes
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1620, T1070.004]
+  logic: on_disk = false OR running_hash != disk_hash
+  notes: classic anti-forensic pattern — drop, execute, unlink. Almost never benign outside upgrades.
+  fp: in-place package upgrades of long-running daemons — correlate with a package manager event ±5m
+  response: dump process memory, capture /proc/<pid>/exe or the macOS equivalent immediately
+
+- id: PROC-0003
+  title: Unsigned or ad-hoc signed binary executed
+  domain: processes
+  layer: L1
+  severity: medium
+  confidence: medium
+  attack: [T1553, T1036]
+  logic: |
+    signature.signed = false OR signature.authority IN ('adhoc','-') OR signature.valid = false
+    AND fleet_prevalence < 0.05
+  fp: locally compiled dev binaries are extremely common on engineering hosts — scope by path (exclude project build dirs) and weight rarity
+  response: triage by parent process and network behaviour, not by signature alone
+
+- id: PROC-0004
+  title: Suspicious parent-child execution chain
+  domain: processes
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1059, T1203]
+  logic: |
+    (parent.name IN ('Microsoft Word','Microsoft Excel','Microsoft Outlook','Preview','Safari','Google Chrome','Slack','zoom.us')
+     AND child.name IN ('sh','bash','zsh','python*','osascript','curl','wget','node','powershell'))
+    OR (parent.name IN ('sshd','httpd','nginx','node','java','php-fpm') AND child.name IN ('sh','bash') AND child.tty IS NULL)
+  notes: office/browser → interpreter is the highest-signal generic exec rule in any fleet
+  fp: browsers spawn helper shells for updaters — pin exceptions to exact paths
+  response: full ancestry + network + file-write timeline for the child
+
+- id: PROC-0005
+  title: Living-off-the-land defense evasion command
+  domain: processes
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1562.001, T1553.001, T1222]
+  logic: |
+    cmdline MATCHES ANY (
+      'spctl\s+--(master-disable|global-disable)',
+      'csrutil\s+disable',
+      'xattr\s+.*-d\s+com\.apple\.quarantine',
+      'defaults\s+write\s+.*(LSQuarantine|GKAutoRearm).*(false|-bool NO)',
+      'launchctl\s+(unload|bootout).*(com\.apple\.(security|MRT|XProtect)|falcon|crowdstrike|sentinel|osquery)',
+      'systemctl\s+(stop|disable|mask)\s+(auditd|falcon|sysmon|osquery)',
+      'chflags\s+(hidden|uchg)',
+      'history\s+-c|unset\s+HISTFILE|HISTFILE=/dev/null',
+      'rm\s+-rf?\s+.*(\.zsh_history|\.bash_history|/var/log)',
+      'ifconfig\s+\w+\s+promisc'
+    )
+  fp: IT scripts — allowlist by signed management binary ancestry only
+  response: treat as active intrusion; check `agent_health` and `security` domains for coverage gaps
+
+- id: PROC-0006
+  title: Remote payload piped directly to an interpreter
+  domain: processes
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1059.004, T1105]
+  logic: |
+    cmdline MATCHES ANY (
+      '(curl|wget)[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|python[23]?|perl|node)',
+      'bash\s+-c\s+.*<\(\s*(curl|wget)',
+      'python[23]?\s+-c\s+.*urllib|requests\.get',
+      'osascript\s+-e\s+.*do shell script',
+      'echo\s+[A-Za-z0-9+/=]{80,}\s*\|\s*base64\s+-d\s*\|\s*(sh|bash)'
+    )
+  fp: some legitimate installers (rustup, homebrew, nvm) use this pattern — allowlist by exact vendor URL, alert on all others
+  response: resolve the URL, retrieve the payload from a sandbox, hunt fleet-wide for the same host
+
+- id: PROC-0007
+  title: Reverse shell or interactive redirection pattern
+  domain: processes
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1059.004, T1571]
+  logic: |
+    cmdline MATCHES ANY (
+      '/dev/(tcp|udp)/[0-9]',
+      'nc\s+(-[a-z]*e|.*-c\s)',
+      'socat.*exec:',
+      'python.*socket.*(SOCK_STREAM).*(dup2|subprocess)',
+      'bash\s+-i\s+>&',
+      'mkfifo.*\|.*(sh|bash).*\|'
+    )
+  fp: none in practice outside pentest activity — coordinate with red team calendar
+  response: isolate host immediately
+
+- id: PROC-0008
+  title: Library injection environment variable set on execution
+  domain: processes
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1574.006, T1055]
+  logic: environ MATCHES ('DYLD_INSERT_LIBRARIES=','LD_PRELOAD=','LD_AUDIT=','DYLD_LIBRARY_PATH=/(tmp|Users)')
+  fp: some profilers and debuggers — allowlist exact library paths
+  response: hash the injected dylib/so, check its own signature and prevalence
+
+- id: PROC-0009
+  title: Process masquerading as a system binary
+  domain: processes
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1036.005]
+  logic: |
+    name IN system_binary_names        -- e.g. kernel_task, launchd, sshd, systemd, WindowServer, cron
+    AND path NOT IN expected_paths[name]
+  variants: trailing-space names, unicode look-alikes, `.` prefix, extension mismatch (`update.pdf.app`)
+  fp: minimal
+  response: immediate triage
+
+- id: PROC-0010
+  title: Long-lived unsigned process with sustained CPU and no TTY
+  domain: processes
+  layer: L5
+  severity: medium
+  confidence: medium
+  attack: [T1496]
+  logic: |
+    uptime_hours > 2 AND avg_cpu_pct > 70 AND tty IS NULL AND signature.valid != true
+    AND (connections.dest_port IN (3333,4444,5555,7777,14444,45700) OR dns_query MATCHES '(pool|xmr|mine|stratum)')
+  fp: local builds, ML training — correlate against `metrics` thermal + known project dirs
+  response: cross-check `connections` for stratum protocol, `metrics` for GPU load
+
+# ------------------------ LAUNCHDAEMONS / SERVICES / TASKS -------------------
+
+- id: PERS-0001
+  title: New persistence item created
+  domain: launchdaemons
+  layer: L2
+  severity: medium
+  confidence: high
+  attack: [T1543.001, T1543.004, T1547]
+  logic: |
+    drift(persistence_inventory) = 'added'
+    AND fleet_prevalence < 0.02
+  scan_paths:
+    - /Library/LaunchDaemons/, /Library/LaunchAgents/, ~/Library/LaunchAgents/
+    - /System/Library/LaunchDaemons/ (drift only — additions here are critical)
+    - /etc/systemd/system/, ~/.config/systemd/user/, /etc/init.d/
+    - HKLM\SYSTEM\CurrentControlSet\Services (Windows)
+  notes: baseline first; every host has 100+ legitimate items, so rarity is what makes this usable
+  fp: sanctioned software installs — auto-suppress when preceded by a signed installer within 10 minutes
+  response: read the plist/unit, hash the target, check prevalence
+
+- id: PERS-0002
+  title: Persistence item executing an interpreter, script or network fetch
+  domain: launchdaemons
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1543.001, T1059]
+  logic: |
+    program_arguments MATCHES ANY (
+      '^/bin/(sh|bash|zsh)$','python[23]?$','osascript','ruby','perl','node$',
+      'curl','wget','base64','/dev/tcp','nc\s','-e\s.*http'
+    )
+    OR program_path MATCHES ('~/*','/tmp/*','/Users/Shared/*','/var/tmp/*','*/Library/Application Support/.*')
+  fp: legitimate vendor agents use absolute signed binaries — script-based daemons are the exception
+  response: treat as confirmed persistence; capture the script body
+
+- id: PERS-0003
+  title: Persistence label impersonates a vendor but target is unsigned
+  domain: launchdaemons
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1036.005, T1543.001]
+  logic: |
+    label MATCHES '(?i)^(com\.apple\.|com\.microsoft\.|com\.google\.|com\.adobe\.)'
+    AND (signature.team_id != expected_team_id[vendor] OR signature.valid = false)
+  fp: none
+  response: isolate
+
+- id: PERS-0004
+  title: High-frequency persistence interval (beacon scheduling)
+  domain: launchdaemons
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1543.001, T1071]
+  logic: |
+    (StartInterval < 300 OR StartCalendarInterval.Minute IS ARRAY)
+    AND KeepAlive = true AND RunAtLoad = true
+    AND fleet_prevalence < 0.02
+  fp: monitoring agents — allowlist by signed vendor
+  response: correlate with `connections` for periodicity
+
+- id: PERS-0005
+  title: Service or unit binary path is user-writable
+  domain: services
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1574.010, T1543]
+  logic: |
+    (file_mode(exec_path) & 0o022 != 0 OR dir_writable_by_non_root(dirname(exec_path)))
+    AND run_as_user IN ('root','_root','SYSTEM')
+  windows_variant: unquoted service path containing spaces (T1574.009)
+  fp: none — this is a privilege-escalation primitive regardless of intent
+  response: fix permissions; check whether the binary was replaced (`binaries` hash drift)
+
+- id: PERS-0006
+  title: Existing service binary replaced
+  domain: services
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1543, T1554]
+  logic: drift(hash(exec_path)) = true AND package_manager_event(±10m) IS NULL
+  fp: out-of-band updates — require the correlating package/installer event
+  response: compare against vendor-published hash
+
+- id: CRON-0001
+  title: Scheduled job with network fetch, encoding or reverse-shell content
+  domain: cron
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1053.003, T1059]
+  logic: |
+    command MATCHES ANY ('curl','wget','base64\s+-d','/dev/tcp','nc\s+-','python.*-c','eval','http://','\|\s*sh')
+  scan_paths: [/etc/crontab, /etc/cron.d/*, /var/at/tabs/*, ~/crontab, /etc/periodic/*, systemd timers, `at` queue]
+  fp: legitimate backup/sync jobs use curl — allowlist exact command strings per host role
+  response: capture crontab, identify the writing process via file-write events
+
+- id: CRON-0002
+  title: New or modified scheduled job
+  domain: cron
+  layer: L2
+  severity: medium
+  confidence: high
+  attack: [T1053.003, T1053.006]
+  logic: drift(cron_inventory) = true AND author NOT IN ('root via mdm','configuration_management')
+  fp: developer convenience jobs — surface as low-severity inventory review, escalate on CRON-0001 match
+  response: confirm with the host owner
+
+- id: TASK-0001
+  title: Scheduled task registered with hidden or elevated execution
+  domain: tasks
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1053.005]
+  logic: |
+    (run_level = 'HighestAvailable' OR principal.user_id IN ('SYSTEM','root'))
+    AND (hidden = true OR action.path MATCHES ('%TEMP%','%APPDATA%','C:\\Users\\Public','/tmp/'))
+  fp: some vendor updaters — allowlist by signed publisher
+  response: export task XML, hash the action target
+
+# ------------------------------ SHELL STARTUP --------------------------------
+
+- id: SHELL-0001
+  title: Shell startup file modified
+  domain: shell_startup
+  layer: L2
+  severity: medium
+  confidence: high
+  attack: [T1546.004]
+  logic: |
+    drift(hash(file)) = true
+    AND file IN ('~/.zshrc','~/.zshenv','~/.zprofile','~/.bashrc','~/.bash_profile','~/.profile',
+                 '/etc/zshenv','/etc/profile','/etc/bashrc','~/.config/fish/config.fish',
+                 '~/.oh-my-zsh/custom/*','/etc/profile.d/*')
+  notes: baseline noisy on dev hosts; value comes from pairing with the content rules below
+  fp: high alone — always evaluate diff content, not the file event
+  response: diff the added lines
+
+- id: SHELL-0002
+  title: Malicious content pattern in shell startup
+  domain: shell_startup
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1546.004, T1027, T1070.003]
+  logic: |
+    added_lines MATCHES ANY (
+      'eval\s+"?\$\((curl|wget)',
+      'base64\s+-d.*\|\s*(sh|bash|zsh)',
+      'curl\s+[^|]*\|\s*(sh|bash)',
+      '(^|\s)function\s+(sudo|ssh|git|kubectl|docker|aws)\s*\(',   -- command hijack for credential capture
+      '(^|\s)alias\s+(sudo|ssh|curl|scp)=',
+      'export\s+PATH=[^:]*(/tmp|/Users/[^/]+/(Downloads|Public)|\.)[^:]*:',
+      'HISTFILE=(/dev/null)?$|unset\s+HISTFILE|HISTSIZE=0',
+      '\bnohup\b.*&\s*$',
+      '/dev/tcp/'
+    )
+  extra_check: |
+    line_offset > total_lines - 5 AND preceded_by_blank_lines >= 20   -- payload hidden below the fold
+  fp: power users do wrap `sudo` occasionally — verify the function body, not the name
+  response: capture full file, rotate any credential typed into a hijacked command since the mtime
+
+- id: SHELL-0003
+  title: PATH prepended with a writable directory shadowing system binaries
+  domain: shell_startup
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1574.007]
+  logic: |
+    path_entry precedes '/usr/bin' AND writable_by_current_user(path_entry)
+    AND EXISTS file IN path_entry WITH name IN ('sudo','ssh','git','kubectl','python','node','docker')
+  fp: `~/.local/bin` and `/opt/homebrew/bin` are normal — alert only when a shadowing binary actually exists
+  response: list shadowing binaries, hash them
+
+# --------------------------------- BINARIES ----------------------------------
+
+- id: BIN-0001
+  title: New setuid/setgid binary
+  domain: binaries
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1548.001]
+  logic: drift(setuid_inventory) = 'added' AND owner IN ('root','wheel')
+  fp: rare after baseline; package installs occasionally add one — correlate with the package event
+  response: verify against the vendor package manifest
+
+- id: BIN-0002
+  title: System binary hash changed without a package transaction
+  domain: binaries
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1554, T1036]
+  logic: |
+    path MATCHES ('/usr/bin/*','/usr/sbin/*','/bin/*','/sbin/*','/usr/local/bin/*','/opt/homebrew/bin/*')
+    AND drift(sha256) = true
+    AND NOT EXISTS package_event(path, ±15m)
+  fp: Homebrew relinking — allowlist when brew was active in the window
+  response: compare against vendor hash / SIP-protected copy
+
+- id: BIN-0003
+  title: Quarantine attribute stripped from a downloaded executable
+  domain: binaries
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1553.001]
+  logic: |
+    prior_state.xattr CONTAINS 'com.apple.quarantine'
+    AND current_state.xattr NOT CONTAINS 'com.apple.quarantine'
+    AND downloaded_from IS NOT NULL
+  notes: the standard macOS infostealer install step, usually paired with "right-click → Open" social engineering
+  fp: dev-signed internal tooling — allowlist by internal signing identity
+  response: hash lookup, check for `osascript` password-prompt activity in `processes`
+
+- id: BIN-0004
+  title: Binary with library-validation or hardened-runtime protections disabled
+  domain: binaries
+  layer: L1
+  severity: medium
+  confidence: high
+  attack: [T1574, T1055]
+  logic: |
+    entitlements CONTAINS ANY (
+      'com.apple.security.cs.disable-library-validation',
+      'com.apple.security.cs.allow-dyld-environment-variables',
+      'com.apple.security.get-task-allow',
+      'com.apple.security.cs.allow-unsigned-executable-memory'
+    )
+    AND fleet_prevalence < 0.05
+  notes: these entitlements make an app a viable injection host; `get-task-allow` on a shipping app is a red flag
+  fp: Electron apps and debuggers legitimately need some of these — allowlist by bundle ID
+  response: assess whether the app is a plausible injection target for a co-resident payload
+
+- id: BIN-0005
+  title: Binary hash matches threat intelligence
+  domain: binaries
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1204]
+  logic: intel.hash_verdict(sha256) IN ('malicious','malware_family_match') OR vt.malicious_count >= 5
+  enrichment: [malwarebazaar, virustotal_hash_only, internal_denylist]
+  fp: VT single-vendor detections are unreliable — require ≥5 or a curated feed hit
+  response: isolate, hunt the same hash fleet-wide, identify delivery path
+
+# ----------------------------------- APPS ------------------------------------
+
+- id: APP-0001
+  title: Application installed outside managed channels
+  domain: apps
+  layer: L1
+  severity: medium
+  confidence: medium
+  attack: [T1204.002]
+  logic: |
+    install_path NOT IN ('/Applications','/System/Applications','~/Applications')
+    OR installer_source IN ('dmg_from_downloads','unknown')
+    OR (signature.notarized = false AND signature.developer_id IS NULL)
+  fp: portable dev tools — pair with rarity and signature status
+  response: verify the download origin URL and developer ID
+
+- id: APP-0002
+  title: Application requesting or granted sensitive TCC permissions
+  domain: apps
+  layer: L2
+  severity: high
+  confidence: medium
+  attack: [T1123, T1113, T1552]
+  logic: |
+    drift(tcc_grants) = 'added'
+    AND service IN ('kTCCServiceSystemPolicyAllFiles','kTCCServiceScreenCapture','kTCCServiceAccessibility',
+                    'kTCCServiceMicrophone','kTCCServiceCamera','kTCCServiceListenEvent')
+    AND app.signature.valid != true
+  notes: Accessibility + ListenEvent = keylogging capability; FullDiskAccess = credential store access
+  fp: legit meeting and automation tools — allowlist by bundle ID + team ID
+  response: review the grant, revoke if unexplained
+
+- id: APP-0003
+  title: Application bundle modified after installation
+  domain: apps
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1554, T1574]
+  logic: |
+    drift(hash(bundle_executable)) = true OR drift(bundle_framework_hashes) = true
+    AND signature.valid = false      -- signature broken by the edit
+  fp: self-updating apps — require the signature to be *invalid*, which upgrades never leave behind
+  response: reinstall from vendor, hunt the modifying process
+
+# ----------------------------------- USERS -----------------------------------
+
+- id: USER-0001
+  title: New local account created
+  domain: users
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1136.001]
+  logic: drift(local_users) = 'added' AND creator NOT IN ('mdm','configuration_management')
+  fp: IT provisioning — auto-suppress on MDM correlation
+  response: confirm with IT; check shell, UID and group membership
+
+- id: USER-0002
+  title: Privilege group membership change
+  domain: users
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1098, T1078.003]
+  logic: |
+    drift(group_membership) = 'added'
+    AND group IN ('admin','wheel','sudo','root','docker','staff-admin','Domain Admins','_developer')
+  notes: `docker` group membership is root-equivalent — treat it as an admin grant
+  fp: sanctioned elevation — require a ticket reference to suppress
+  response: verify approval, check for a paired sudoers drop-in
+
+- id: USER-0003
+  title: Hidden, system-shadowed or UID-0 secondary account
+  domain: users
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1564.002, T1136.001]
+  logic: |
+    (uid = 0 AND username != 'root')
+    OR (is_hidden = true AND shell NOT IN ('/usr/bin/false','/sbin/nologin'))
+    OR (uid < 500 AND created_at > baseline_date)
+    OR username MATCHES '^[._]'
+  fp: none after baseline
+  response: isolate and investigate
+
+- id: USER-0004
+  title: Passwordless sudo or sudoers modification
+  domain: users
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1548.003, T1098]
+  logic: |
+    drift(file) = true AND file IN ('/etc/sudoers','/etc/sudoers.d/*','/etc/pam.d/sudo')
+    AND (content MATCHES 'NOPASSWD' OR content MATCHES 'pam_tid|pam_permit')
+  fp: config-management pushes — suppress by author process
+  response: revert, identify writer
+
+- id: USER-0005
+  title: SSH authorized_keys modified
+  domain: users
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1098.004, T1021.004]
+  logic: |
+    drift(file) = true AND file MATCHES ('~/.ssh/authorized_keys*','/root/.ssh/authorized_keys','/etc/ssh/authorized_keys.d/*')
+  fp: legitimate key rotation — require change ticket; alert on every unmatched change
+  response: extract the key comment/fingerprint, verify ownership, remove if unknown
+
+# --------------------------------- OPEN FILES --------------------------------
+
+- id: OF-0001
+  title: Non-allowlisted process holding credential files open
+  domain: open_files
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1552.001, T1555.003]
+  logic: |
+    file.path MATCHES credential_paths
+    AND process.name NOT IN allowlist.credential_consumers[path]
+  credential_paths: |
+    ~/.ssh/id_*, ~/.aws/credentials, ~/.config/gcloud/*, ~/.kube/config, ~/.docker/config.json,
+    ~/.npmrc, ~/.pypirc, ~/.netrc, ~/.git-credentials, **/.env, ~/Library/Keychains/*,
+    **/Chrome/*/Login Data, **/Chrome/*/Cookies, **/Chrome/Local State, **/Firefox/*/logins.json,
+    **/*.kdbx, **/terraform.tfstate, ~/.config/op/*
+  fp: backup and sync agents (Time Machine, Dropbox) — allowlist explicitly by signed binary
+  response: kill process, rotate every credential in the touched paths
+
+- id: OF-0002
+  title: Credential staging — many sensitive files opened in a short window
+  domain: open_files
+  layer: L4
+  severity: critical
+  confidence: high
+  attack: [T1552, T1074.001]
+  logic: |
+    count(distinct credential_paths opened by same pid) >= 4 WITHIN 120s
+  notes: the signature move of every macOS infostealer (AMOS/Poseidon family behaviour)
+  fp: near zero
+  response: isolate; check `mounts`/`storage` for a new archive and `connections` for upload
+
+- id: OF-0003
+  title: Process holding a deleted file open
+  domain: open_files
+  layer: L1
+  severity: medium
+  confidence: medium
+  attack: [T1070.004]
+  logic: file.deleted = true AND process.signature.valid != true AND file.size > 1MB
+  fp: log rotation and temp files — exclude known temp patterns and signed daemons
+  response: recover file content from the fd before the process exits

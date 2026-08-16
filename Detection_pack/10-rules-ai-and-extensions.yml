@@ -1,0 +1,453 @@
+# =============================================================================
+# PACK 10 — AI, Agent and Extension Surface
+# Domains: editor_extensions, mcp_servers, browser_extensions, native_messaging,
+#          ai_cli_tools, ai_applications
+# This is the newest and least-covered attack surface in most fleets. Treat every
+# object here as remote-code-execution-adjacent: extensions, MCP servers and
+# native messaging hosts all run with the user's full privileges, unsandboxed.
+# =============================================================================
+
+# ----------------------------- EDITOR EXTENSIONS -----------------------------
+
+- id: EXT-0001
+  title: Editor extension sideloaded outside the marketplace
+  domain: editor_extensions
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1176.002, T1195.002]
+  logic: |
+    install_source NOT IN ('marketplace.visualstudio.com','open-vsx.org','plugins.jetbrains.com')
+    OR install_method = 'vsix_local'
+    OR extension_dir_mtime > package_json_ctime + 300s   -- files modified post-install
+  signals: [install_source, vsix_path, publisher_id]
+  fp: internal first-party extensions — allowlist by publisher + signing key, with expiry
+  response: capture extension dir, hash all JS bundles, compare against marketplace tarball
+  validation: install any .vsix with `code --install-extension ./x.vsix`
+
+- id: EXT-0002
+  title: Newly published or newly installed extension with rare fleet prevalence
+  domain: editor_extensions
+  layer: L3
+  severity: medium
+  confidence: medium
+  attack: [T1195.002]
+  logic: |
+    fleet_prevalence < 0.01
+    AND (marketplace.publish_age_days < 30 OR install_age_days < 7)
+    AND marketplace.install_count < 10000
+  enrichment: [marketplace_meta, openvsx_meta]
+  fp: genuinely niche tooling — resolve by asking the owner, not by blanket allowlist
+  response: manual review of package.json main + activationEvents
+
+- id: EXT-0003
+  title: Extension name typosquats a top-500 extension under a different publisher
+  domain: editor_extensions
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1195.002, T1036.005]
+  logic: |
+    levenshtein(display_name, top500.display_name) <= 2
+    AND publisher_id != top500.publisher_id
+  notes: also match homoglyphs (rn/m, l/I, 0/O) and reversed word order ("Prettier Code" vs "Code Prettier")
+  fp: forks with credit in description — verify publisher reputation and repo URL
+  response: block, report to marketplace
+
+- id: EXT-0004
+  title: Extension bundle contains obfuscation or dynamic code execution
+  domain: editor_extensions
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1027, T1059.007]
+  logic: |
+    file_scan(extension_dir, '*.js') MATCHES ANY (
+      'Buffer.from(*,\s*[\'"]base64[\'"])\s*.toString',
+      'new Function\s*\(',
+      'child_process.exec',
+      'eval\s*\(\s*(atob|require)',
+      '\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){20,}'          -- hex-escaped blob
+    )
+    AND shannon_entropy(largest_js_chunk) > 5.2
+  fp: minified/webpacked bundles are normal — require ≥2 pattern hits, and weight `child_process` heavily
+  response: extract and beautify the bundle, look for egress hosts
+
+- id: EXT-0005
+  title: Workspace-level auto-execution enabled in repository settings
+  domain: editor_extensions
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1546, T1204.002]
+  logic: |
+    file IN ('.vscode/tasks.json','.vscode/settings.json','.idea/workspace.xml')
+    AND (
+      json.tasks[*].runOptions.runOn = 'folderOpen'
+      OR json['security.workspace.trust.enabled'] = false
+      OR json['terminal.integrated.env.*'] IS NOT NULL
+      OR json MATCHES '(git|php|python|deno|rust-analyzer)\.(path|executablePath|check.overrideCommand)'
+    )
+  notes: |
+    Cloning a hostile repo and opening it is a full RCE path. `runOn: folderOpen` and
+    binary-path overrides are the two most abused settings. Applies to any newly cloned repo.
+  fp: monorepos with legitimate folderOpen build tasks — allowlist by repo, not globally
+  response: alert before the folder is trusted; block workspace trust auto-grant via policy
+
+- id: EXT-0006
+  title: Extension writing to credential or persistence paths
+  domain: editor_extensions
+  layer: L4
+  severity: critical
+  confidence: high
+  attack: [T1552.001, T1543.001]
+  logic: |
+    process.ancestry CONTAINS ('Code Helper','Cursor Helper','idea','extensionHost')
+    AND file.write.path MATCHES ('~/.ssh/*','~/.aws/*','~/Library/LaunchAgents/*','~/.zshrc','~/.gitconfig','~/.npmrc')
+  fp: near zero — settings-sync extensions touch ~/.config only
+  response: isolate host, rotate any key in the touched path
+
+# -------------------------------- MCP SERVERS --------------------------------
+
+- id: MCP-0001
+  title: MCP server configured to execute a shell or inline interpreter
+  domain: mcp_servers
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1059.004, T1195.002]
+  logic: |
+    config.command IN ('sh','bash','zsh','cmd','powershell','pwsh')
+    OR config.args MATCHES ('-c\s', '-e\s', '-Command', 'curl\s+.*\|\s*(sh|bash)', 'iwr .*\|.*iex')
+  scan_paths:
+    - ~/.cursor/mcp.json
+    - ~/Library/Application Support/Claude/claude_desktop_config.json
+    - ~/.config/**/mcp.json
+    - <repo>/.mcp.json
+    - ~/.codex/config.toml
+  fp: rare; some wrappers legitimately use `sh -c` — require reviewed exception with owner
+  response: quarantine config file, review the command, re-approve manually
+
+- id: MCP-0002
+  title: MCP server launched from an unpinned or remote package
+  domain: mcp_servers
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1195.002, T1105]
+  logic: |
+    (config.command IN ('npx','uvx','pipx','bunx') AND config.args NOT MATCHES '@\d+\.\d+\.\d+')
+    OR config.args MATCHES '@latest'
+    OR config.command_path MATCHES ('/tmp/*','*/Downloads/*','/var/folders/*')
+  notes: |
+    `npx -y some-mcp@latest` re-resolves on every launch — a maintainer compromise
+    becomes RCE on the next editor restart with zero user action.
+  fp: dev-time experimentation — enforce pinning by policy, then this rule is clean
+  response: pin to a digest/version, verify package provenance via deps.dev
+
+- id: MCP-0003
+  title: MCP tool description changed after approval (rug pull)
+  domain: mcp_servers
+  layer: L2
+  severity: high
+  confidence: medium
+  attack: [T1195.002, T1204]
+  logic: |
+    drift(hash(tools[*].name + tools[*].description + tools[*].inputSchema)) = true
+    AND prior_state.user_approved = true
+  notes: |
+    Tool descriptions are prompt context. A server approved as benign can silently
+    swap in new instructions on a later fetch. Hash and diff on every enumeration.
+  fp: legitimate upgrades — suppress when version bumped AND publisher signature valid
+  response: revoke approval, diff old/new descriptions, require re-consent
+
+- id: MCP-0004
+  title: Tool description contains agent-directed injection language
+  domain: mcp_servers
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1204, T1027]
+  logic: |
+    tools[*].description MATCHES ANY (
+      '(?i)ignore (all |any )?previous',
+      '(?i)do not (tell|inform|mention to) the user',
+      '(?i)before (using|calling) any other tool',
+      '(?i)always call this tool first',
+      '(?i)<IMPORTANT>|<SYSTEM>|\[\[system\]\]',
+      '(?i)read .*(\.env|id_rsa|credentials|\.aws).*and (pass|include|send)'
+    )
+  notes: tool poisoning and cross-server tool shadowing both surface here
+  fp: low; some servers write emphatic docs — human review is quick
+  response: block server, report to registry
+
+- id: MCP-0005
+  title: Secrets passed to a third-party MCP server via env
+  domain: mcp_servers
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1552.001, T1041]
+  logic: |
+    config.env.* MATCHES ('(?i)(api[_-]?key|token|secret|password|AWS_|GITHUB_|OPENAI_|ANTHROPIC_)')
+    AND server_publisher NOT IN allowlist.mcp_publishers
+  fp: expected for first-party servers — allowlist by publisher, alert on the rest
+  response: rotate the credential, move to a broker/short-lived token
+
+- id: MCP-0006
+  title: Remote MCP endpoint on an unknown or newly registered domain
+  domain: mcp_servers
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1071.001, T1102]
+  logic: |
+    config.type IN ('sse','http','streamable-http')
+    AND (
+      domain(config.url) NOT IN allowlist.mcp_domains
+      OR whois_age_days(domain(config.url)) < 90
+      OR intel.match(domain(config.url)) = true
+    )
+  enrichment: [whois_age, threat_feed_domain, asn_lookup]
+  fp: new vendors — allowlist with a change-managed process
+  response: block egress to the host, review what data the server received
+
+# ---------------------------- BROWSER EXTENSIONS -----------------------------
+
+- id: BEXT-0001
+  title: Unpacked or off-store browser extension loaded
+  domain: browser_extensions
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1176.001]
+  logic: |
+    from_webstore = false
+    OR install_type IN ('development','sideload')
+    OR (update_url IS NOT NULL AND update_url NOT MATCHES 'clients2.google.com|edge.microsoft.com|addons.mozilla.org')
+  fp: extension developers on the fleet — scope allowlist to their host IDs
+  response: capture manifest + background script, remove
+
+- id: BEXT-0002
+  title: Extension holds infostealer-grade permission combination
+  domain: browser_extensions
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1539, T1185, T1176.001]
+  logic: |
+    permissions CONTAINS '<all_urls>' OR '*://*/*'
+    AND permissions INTERSECTS ('cookies','webRequest','declarativeNetRequestWithHostAccess','nativeMessaging','debugger','scripting','proxy')
+    AND count(intersection) >= 2
+  notes: |
+    `debugger` + host permissions = full session hijack including HttpOnly cookies.
+    `proxy` = silent traffic redirect. Treat both as high on their own.
+  fp: password managers, ad blockers — allowlist by extension ID + expected permission set
+  response: compare granted permissions against the store listing
+
+- id: BEXT-0003
+  title: Extension permission escalation after update
+  domain: browser_extensions
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1176.001, T1195.002]
+  logic: |
+    drift(permissions) = true
+    AND added_permissions INTERSECTS ('cookies','<all_urls>','nativeMessaging','debugger','proxy','webRequest','tabs')
+  notes: the classic extension-sale/rug-pull pattern — ownership changes, then permissions grow
+  fp: legitimate feature releases — check changelog and store publisher continuity
+  response: force-remove pending review; alert all hosts with the extension
+
+- id: BEXT-0004
+  title: Extension force-installed by policy outside management
+  domain: browser_extensions
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1176.001, T1112]
+  logic: |
+    drift(policy.ExtensionInstallForcelist) = true
+    AND managed_by_mdm = false
+  scan_paths: ["/Library/Managed Preferences/com.google.Chrome.plist", "HKLM\\SOFTWARE\\Policies\\Google\\Chrome"]
+  fp: MDM push lag — correlate against MDM inventory timestamp
+  response: revert policy, investigate what wrote it
+
+# ----------------------------- NATIVE MESSAGING ------------------------------
+
+- id: NMH-0001
+  title: Native messaging host points to a user-writable script
+  domain: native_messaging
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1176, T1059]
+  logic: |
+    manifest.path MATCHES ('~/*','/tmp/*','/var/tmp/*','*/Downloads/*','*/Public/*')
+    OR file_mode(manifest.path) & 0o022 != 0
+    OR interpreter(manifest.path) IN ('sh','bash','python','osascript','node')
+  scan_paths:
+    - ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/
+    - /Library/Google/Chrome/NativeMessagingHosts/
+    - ~/.config/google-chrome/NativeMessagingHosts/
+    - ~/.mozilla/native-messaging-hosts/
+  notes: a native messaging host is a browser→OS command bridge; this is a favourite persistence + C2 channel
+  fp: legitimate desktop-app integrations (1Password, Zoom) install into system paths and are signed
+  response: remove manifest, hash the target binary, hunt the installing process
+
+- id: NMH-0002
+  title: Native messaging manifest with wildcard or excessive allowed_origins
+  domain: native_messaging
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1176]
+  logic: |
+    manifest.allowed_origins CONTAINS '*'
+    OR count(manifest.allowed_origins) > 5
+    OR any(manifest.allowed_origins) NOT IN known_extension_ids
+  fp: rare
+  response: restrict origins, verify the paired extension exists and is legitimate
+
+- id: NMH-0003
+  title: New native messaging host registered
+  domain: native_messaging
+  layer: L2
+  severity: medium
+  confidence: high
+  attack: [T1176]
+  logic: drift(native_messaging_hosts) = 'added' AND fleet_prevalence < 0.05
+  fp: new approved software — pair with the app install event to auto-suppress
+  response: confirm an app install preceded it within 10 minutes
+
+# ---------------------------- AI / AGENT CLI TOOLS ---------------------------
+
+- id: AICLI-0001
+  title: Coding agent running with approvals or sandbox disabled
+  domain: ai_cli_tools
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1059, T1204]
+  logic: |
+    process.name IN ('claude','codex','aider','gemini','opencode','goose','cline','openhands')
+    AND cmdline MATCHES (
+      '--dangerously-skip-permissions','--yolo','--auto-approve','--full-auto',
+      '--sandbox\s+(off|none|danger)','--approval-mode\s+(never|full-auto)','--no-confirm'
+    )
+  notes: |
+    Autonomy flags convert any prompt injection in a repo, issue, or web page into
+    unattended code execution. Alert always; block on CI runners and privileged hosts.
+  fp: sanctioned sandboxed CI use — allowlist by host role + container boundary
+  response: verify the session was human-initiated; review the agent transcript and file writes
+
+- id: AICLI-0002
+  title: Agent hook or auto-run command configured
+  domain: ai_cli_tools
+  layer: L2
+  severity: high
+  confidence: medium
+  attack: [T1546, T1059]
+  logic: |
+    drift(config.hooks) = true
+    AND config.hooks[*].command MATCHES ('curl','wget','nc ','base64','/dev/tcp','ssh ','scp ','osascript','powershell')
+  scan_paths: ["~/.claude/settings.json", "~/.config/**/agent*.json", "<repo>/.claude/settings.json", "<repo>/.cursor/rules/**"]
+  notes: repo-local agent config is attacker-controlled input the moment you clone an untrusted repo
+  fp: legitimate lint/test hooks — allowlist exact command strings, not the hook mechanism
+  response: diff config against the approved baseline
+
+- id: AICLI-0003
+  title: Repo-level agent instruction file contains injection or exfil directives
+  domain: ai_cli_tools
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1204, T1552.001, T1567]
+  logic: |
+    file IN ('CLAUDE.md','AGENTS.md','.cursorrules','.github/copilot-instructions.md','.windsurfrules','.clinerules')
+    AND content MATCHES ANY (
+      '(?i)ignore (the )?(above|previous|prior) instructions',
+      '(?i)(read|cat|include).{0,40}(\.env|id_rsa|credentials|\.aws|\.npmrc|token)',
+      '(?i)(curl|fetch|post|send).{0,40}https?://',
+      '(?i)do not (mention|tell|show).{0,20}(the )?user',
+      'invisible|\u200b|\u2062'                      -- zero-width / hidden text
+    )
+  fp: security research repos containing sample payloads — allowlist by repo
+  response: block agent run in that repo, alert repo owner
+
+- id: AICLI-0004
+  title: Agent process spawned a credential or egress tool
+  domain: ai_cli_tools
+  layer: L4
+  severity: critical
+  confidence: high
+  attack: [T1552, T1041, T1059]
+  logic: |
+    parent.name IN ai_agent_binaries
+    AND child.name IN ('curl','wget','nc','ssh','scp','rsync','aws','gcloud','az','security','gh','base64','openssl')
+    AND (child.cmdline MATCHES credential_paths OR child.dest_ip NOT IN corporate_ranges)
+    WITHIN 60s
+  fp: agents legitimately call `gh` and `aws` — gate on credential-path arguments or external destination
+  response: capture the agent transcript, treat as potential injection-driven exfil
+
+- id: AICLI-0005
+  title: Agent credential file readable or world-accessible
+  domain: ai_cli_tools
+  layer: L1
+  severity: medium
+  confidence: high
+  attack: [T1552.001]
+  logic: |
+    path IN ('~/.claude/.credentials.json','~/.codex/auth.json','~/.aider.conf.yml','~/.continue/config.json')
+    AND (file_mode & 0o077 != 0 OR content MATCHES '(sk-|ghp_|gho_|xox[baprs]-)')
+  fp: none — fix the permission
+  response: chmod 600, rotate if exposed
+
+# ----------------------------- AI APPLICATIONS -------------------------------
+
+- id: AIAPP-0001
+  title: Local model server bound to all interfaces without authentication
+  domain: ai_applications
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1190, T1133]
+  logic: |
+    process.name IN ('ollama','lm-studio','llama-server','vllm','text-generation-webui','comfyui','open-webui','jupyter')
+    AND listening.address IN ('0.0.0.0','::','*')
+    AND auth_configured = false
+  notes: |
+    Exposed inference endpoints are actively scanned. Ollama on 11434 and Jupyter
+    without a token are the two most common findings on developer laptops.
+  fp: intentional lab hosts — require documented exception + network ACL
+  response: rebind to 127.0.0.1, add auth, check `connections` for prior external hits
+
+- id: AIAPP-0002
+  title: Model artifact in a pickle-based format from an untrusted source
+  domain: ai_applications
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1195.002, T1059.006]
+  logic: |
+    file.extension IN ('.pt','.pth','.bin','.ckpt','.pkl','.joblib','.h5')
+    AND download_source NOT IN allowlist.model_registries
+    AND (pickle_opcode_scan MATCHES ('GLOBAL\s+(os|posix|subprocess|builtins)','REDUCE') OR scan_unavailable)
+  notes: prefer safetensors; pickle deserialization is arbitrary code execution at model load
+  fp: internal training artifacts — allowlist by internal storage path
+  response: quarantine, scan with a pickle opcode scanner, re-source from a trusted registry
+
+- id: AIAPP-0003
+  title: Custom node / plugin installed into an AI application from a git URL
+  domain: ai_applications
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1195.002, T1105]
+  logic: |
+    path MATCHES ('*/ComfyUI/custom_nodes/*','*/stable-diffusion-webui/extensions/*','*/open-webui/*/pipelines/*')
+    AND git.remote NOT IN allowlist.repos
+    AND (has_install_script = true OR file_scan MATCHES ('requests\.(post|get)\(','subprocess','os\.system','base64\.b64decode'))
+  notes: ComfyUI custom nodes have a documented history of credential-stealing payloads
+  fp: popular community nodes — maintain a reviewed allowlist by repo + commit
+  response: remove, hunt for browser cookie / wallet file access from the app process

@@ -279,6 +279,9 @@ def test_developer_security_stream_runs_dedicated_detection_logic():
     assert {finding["rule_id"] for finding in findings} == {
         "AL-DEV-001", "AL-DEV-002", "AL-DEV-003", "AL-DEV-004", "AL-DEV-005",
         "AL-DEV-006", "AL-DEV-007", "AL-DEV-008", "AL-DEV-009",
+        # AL-DEV-012 (AIAPP-0001): the ollama listener on *:11434 is a known
+        # inference server on a wildcard bind — new, correct coverage.
+        "AL-DEV-012",
     }
     assert all(finding["affected_asset"] == "mac-1" for finding in findings)
     by_rule = {finding["rule_id"]: finding for finding in findings}

@@ -1,0 +1,126 @@
+category: Binaries
+description: >
+  Detects execution or presence of suspicious, unsigned, masqueraded, or
+  known-malicious binaries on the endpoint.
+rules:
+  - id: BINARIES-001
+    title: Execution of unsigned binary outside allowlist
+    description: A binary without a valid digital signature executes and is not covered by an explicit exception.
+    mitre_attack: [T1553.002]
+    severity: high
+    data_source: binary code-signing status, execution events
+    detection:
+      logic: signature_valid == false at execution time and binary not in signed-exception allowlist
+      conditions:
+        - signature_valid == false
+        - sha256(binary) not in unsigned_exception_allowlist
+      threshold: any occurrence
+    false_positives:
+      - internal build tools, dev scripts compiled locally
+    enrichment_sources:
+      - VirusTotal / hash reputation
+    response_actions:
+      - hash lookup, sandbox detonation if unknown
+    status: stable
+
+  - id: BINARIES-002
+    title: Known-malicious binary hash execution
+    description: Executing binary's hash matches a known-malicious indicator from threat intelligence.
+    mitre_attack: [T1204.002]
+    severity: critical
+    data_source: binary sha256, TI malicious hash feed
+    detection:
+      logic: sha256(binary) present in malicious_hash_feed
+      conditions:
+        - sha256(binary) in malicious_hash_feed
+      threshold: any match
+    false_positives:
+      - stale TI feed entries; validate feed freshness
+    enrichment_sources:
+      - VirusTotal, MalwareBazaar, MISP
+    response_actions:
+      - isolate host, begin IR process
+    status: stable
+
+  - id: BINARIES-003
+    title: Binary executed from world-writable or temp directory
+    description: Execution path is a location any local user/process can write to, common for dropped/staged payloads.
+    mitre_attack: [T1036.005, T1204.002]
+    severity: medium
+    data_source: process execution path, filesystem permissions
+    detection:
+      logic: exec_path matches temp/world-writable pattern and binary is not a known installer/updater
+      conditions:
+        - exec_path matches '(?i)(/tmp/|/var/tmp/|\\Temp\\|\\Windows\\Temp\\|/dev/shm/)'
+        - process_name not in known_installer_allowlist
+      threshold: any occurrence
+    false_positives:
+      - legitimate self-extracting installers staging in temp before execution
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - inspect parent process chain and network activity post-execution
+    status: stable
+
+  - id: BINARIES-004
+    title: Living-off-the-land binary (LOLBin) invoked with suspicious arguments
+    description: >
+      Dual-use system binaries (certutil, rundll32, mshta, regsvr32, bitsadmin,
+      powershell, wmic, etc.) invoked with argument patterns associated with
+      download/execute or defense-evasion behavior.
+    mitre_attack: [T1218, T1105]
+    severity: high
+    data_source: process name + full command line
+    detection:
+      logic: process_name in known_lolbin_set AND command_line matches known-abuse argument patterns
+      conditions:
+        - process_name in ['certutil','rundll32','mshta','regsvr32','bitsadmin','wmic','powershell','cmd']
+        - command_line matches '(?i)(-enc|-encodedcommand|urlcache|-urlcache|javascript:|vbscript:|downloadstring|iex|/transfer)'
+      threshold: any match
+    false_positives:
+      - legitimate admin scripting using these same flags
+    enrichment_sources:
+      - known LOLBAS reference mapping (behavioral catalog, not a download source)
+    response_actions:
+      - review full parent-child chain and any resulting network connections
+    status: stable
+
+  - id: BINARIES-005
+    title: High-entropy / packed binary execution
+    description: Executable exhibits entropy characteristics consistent with packing/obfuscation, often used to evade static AV signatures.
+    mitre_attack: [T1027.002]
+    severity: medium
+    data_source: binary file entropy score, section characteristics
+    detection:
+      logic: file entropy score exceeds packing threshold and binary is unsigned
+      conditions:
+        - shannon_entropy(binary) > 7.2
+        - signature_valid == false
+      threshold: 'entropy > 7.2 combined with unsigned'
+    false_positives:
+      - legitimately packed commercial software (e.g., some installers, DRM-protected apps)
+    enrichment_sources:
+      - hash reputation, sandbox detonation service
+    response_actions:
+      - submit to sandbox for dynamic analysis before escalation
+    status: experimental
+
+  - id: BINARIES-006
+    title: Binary masquerading as a system process
+    description: Process name matches a well-known system binary but its file path or hash does not match the legitimate system binary.
+    mitre_attack: [T1036.005]
+    severity: critical
+    data_source: process name, exec_path, sha256, known-good system binary manifest
+    detection:
+      logic: process_name matches a protected system binary name but path or hash diverges from the OS-vendor manifest
+      conditions:
+        - process_name in ['svchost.exe','lsass.exe','explorer.exe','systemd','init']
+        - exec_path not in expected_system_paths[process_name] OR sha256 not in known_good_system_hashes[process_name]
+      threshold: any mismatch
+    false_positives:
+      - none expected; extremely high-fidelity rule — verify OS version-specific hash manifest is current
+    enrichment_sources:
+      - OS vendor golden hash manifest
+    response_actions:
+      - isolate host immediately, this is high-confidence malicious
+    status: stable

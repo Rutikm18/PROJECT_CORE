@@ -1,0 +1,112 @@
+category: Security
+description: >
+  High-level security-posture rules: tampering with defensive tooling,
+  log destruction, and control weakening — often the earliest signal of
+  an active intrusion attempting to blind defenses.
+rules:
+  - id: SECURITY-001
+    title: EDR/AV agent disabled or tampered
+    description: The endpoint's primary security agent service/process is stopped, uninstalled, or its self-protection is bypassed.
+    mitre_attack: [T1562.001]
+    severity: critical
+    data_source: security-agent service state, process presence
+    detection:
+      logic: monitored security-agent service transitions to stopped/disabled, or its process is terminated outside a managed update
+      conditions:
+        - security_agent_service_state == 'stopped' or 'disabled'
+        - not part of a scheduled/managed agent update window
+      threshold: any occurrence
+    false_positives:
+      - legitimate managed agent upgrade briefly stopping the service
+    enrichment_sources:
+      - agent update/maintenance schedule
+    response_actions:
+      - treat as high-priority incident, isolate host, restore agent
+    status: stable
+
+  - id: SECURITY-002
+    title: Security/audit event log cleared
+    description: The host's security or audit event log is cleared, a common step to remove evidence of intrusion.
+    mitre_attack: [T1070.001]
+    severity: critical
+    data_source: log-clear events (e.g., Windows Event ID 1102, auditd rotation-outside-policy)
+    detection:
+      logic: log-clear action observed on the security/audit log channel
+      conditions:
+        - event_type == 'log_cleared'
+        - log_channel in ['Security','Audit']
+        - actor not the automated log-rotation/retention service account
+      threshold: any occurrence
+    false_positives:
+      - legitimate scheduled log-retention/rotation job (should run under a known service account)
+    enrichment_sources:
+      - known log-rotation service-account allowlist
+    response_actions:
+      - isolate host, begin IR immediately — this is a strong intrusion indicator
+    status: stable
+
+  - id: SECURITY-003
+    title: Firewall rule change allowing broad inbound access
+    description: A new or modified firewall rule opens inbound access broadly (any-source or wide port range) on a host or network device.
+    mitre_attack: [T1562.004]
+    severity: high
+    data_source: firewall rule change events
+    detection:
+      logic: rule change adds inbound allow with source == any/0.0.0.0/0 or a wide port range
+      conditions:
+        - rule_action == 'allow'
+        - rule_direction == 'inbound'
+        - source_cidr == '0.0.0.0/0' or port_range_size > 100
+        - no correlated approved change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate infrastructure change (e.g., new public-facing service) correlated with a change ticket
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - revert rule pending verification, investigate who/what made the change
+    status: stable
+
+  - id: SECURITY-004
+    title: Critical security patch missing beyond SLA
+    description: A host is missing a patch for a critical vulnerability beyond the organization's defined remediation SLA.
+    mitre_attack: [T1190]
+    severity: high
+    data_source: patch/vulnerability scan results, remediation SLA policy
+    detection:
+      logic: known critical vulnerability remains unpatched past its SLA deadline
+      conditions:
+        - vulnerability_severity == 'critical'
+        - days_since_disclosure > sla_days_for_severity['critical']
+        - patch_available == true
+      threshold: any occurrence past SLA
+    false_positives:
+      - documented compensating control/risk acceptance on file
+    enrichment_sources:
+      - NVD, CISA KEV, EPSS
+      - risk-acceptance/exception tracking system
+    response_actions:
+      - escalate to patch owner, apply compensating controls if patch can't be applied immediately
+    status: stable
+
+  - id: SECURITY-005
+    title: MFA disabled for privileged account
+    description: Multi-factor authentication enforcement is removed or disabled for an account holding privileged/administrative access.
+    mitre_attack: [T1556]
+    severity: critical
+    data_source: identity provider MFA enforcement status, account privilege level
+    detection:
+      logic: MFA enforcement flag transitions to disabled for an account in a privileged group
+      conditions:
+        - account_privilege_level in ['admin','domain_admin','root']
+        - mfa_enforced transitions true -> false
+        - no correlated approved change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate temporary MFA exception for break-glass account (should be tightly scoped/logged)
+    enrichment_sources:
+      - IAM/identity provider logs
+      - change-management ticketing system
+    response_actions:
+      - re-enable MFA immediately, investigate who disabled it and validate account has not been used since
+    status: stable

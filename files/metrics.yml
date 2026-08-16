@@ -1,0 +1,105 @@
+category: Metrics
+description: >
+  System resource-utilization metrics used to detect resource-abuse malware
+  (cryptomining, ransomware encryption activity, DDoS participation) and
+  anomalous workload patterns. Mostly correlation-supporting rules — best
+  combined with Processes/Connections categories rather than fired alone.
+rules:
+  - id: METRICS-001
+    title: Sustained abnormal CPU utilization
+    description: Host CPU utilization sustained well above its historical baseline for an extended period with no known legitimate cause.
+    mitre_attack: [T1496]
+    severity: medium
+    data_source: cpu_utilization_pct time series, historical per-host baseline
+    detection:
+      logic: CPU utilization sustained above baseline threshold for an extended window
+      conditions:
+        - cpu_utilization_avg(window=1h) > baseline_p95_for_host + 30
+        - no scheduled batch/build job correlated
+      threshold: sustained >=1 hour above baseline+30pp
+    false_positives:
+      - legitimate compute-heavy scheduled jobs (builds, backups, batch processing)
+    enrichment_sources:
+      - job scheduler/CI system logs for correlation
+    response_actions:
+      - identify top CPU process, correlate with PROCESSES/BINARIES rules before escalating
+    status: tuning
+
+  - id: METRICS-002
+    title: Memory usage spike correlated with unknown process
+    description: Sudden memory consumption increase attributable to a process not previously observed on the host.
+    mitre_attack: [T1055]
+    severity: medium
+    data_source: per-process memory usage, process first-seen timestamp
+    detection:
+      logic: a process first seen within the last hour consumes memory far above typical new-process baseline
+      conditions:
+        - process_first_seen within last 1h
+        - process_memory_mb > 500
+      threshold: '>500MB by a brand-new process'
+    false_positives:
+      - legitimate new application with high memory footprint (e.g., IDE, browser with many tabs)
+    enrichment_sources:
+      - hash reputation for the process binary
+    response_actions:
+      - correlate with BINARIES/PROCESSES rules for the same process
+    status: tuning
+
+  - id: METRICS-003
+    title: Disk I/O spike consistent with mass file encryption
+    description: Sustained high write I/O across many distinct files in a short window, characteristic of ransomware encrypting a filesystem.
+    mitre_attack: [T1486]
+    severity: critical
+    data_source: disk write IOPS, distinct file write count per process
+    detection:
+      logic: single process writes to an abnormally high number of distinct files in a short window with high write IOPS
+      conditions:
+        - distinct_files_written_by_process(window=5m) > 100
+        - write_iops(window=5m) > baseline * 5
+        - many written files change extension to an unfamiliar/uniform pattern
+      threshold: '>100 distinct files/5min plus 5x IOPS baseline'
+    false_positives:
+      - legitimate bulk backup/compression/indexing job
+    enrichment_sources:
+      - known backup/AV/indexing process allowlist
+    response_actions:
+      - kill process and isolate host immediately, this is high-confidence ransomware behavior
+    status: stable
+
+  - id: METRICS-004
+    title: Network throughput anomaly vs. baseline
+    description: Host's network throughput (in or out) deviates sharply from its historical baseline, indicating exfiltration or DDoS participation.
+    mitre_attack: [T1041, T1498]
+    severity: medium
+    data_source: bytes in/out per interval, historical baseline
+    detection:
+      logic: throughput exceeds baseline by large multiple sustained over window
+      conditions:
+        - throughput(window=15m) > baseline_p95_for_host * 4
+      threshold: '>4x baseline sustained 15 minutes'
+    false_positives:
+      - legitimate large transfer/backup job
+    enrichment_sources:
+      - correlate with CONNECTIONS category rules for destination context
+    response_actions:
+      - identify destination and process, correlate with CONNECTIONS-003
+    status: tuning
+
+  - id: METRICS-005
+    title: Abnormal process-count spike (possible fork bomb / mass spawning)
+    description: Number of concurrently running processes on a host spikes far beyond baseline in a short window.
+    mitre_attack: [T1499.004]
+    severity: medium
+    data_source: process count time series
+    detection:
+      logic: process count increases sharply within a short window
+      conditions:
+        - process_count(now) > baseline_p95_for_host * 3
+        - time_to_spike < 60 seconds
+      threshold: '3x baseline within 60 seconds'
+    false_positives:
+      - legitimate parallel build/test execution
+    enrichment_sources: []
+    response_actions:
+      - identify parent process responsible for spawning, contain if malicious
+    status: tuning

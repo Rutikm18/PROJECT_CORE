@@ -1,0 +1,444 @@
+# =============================================================================
+# PACK 30 — Network Exposure, Egress, Containers, Media and Hardware
+# Domains: ports, connections, network, arp, containers, mounts, storage, hardware
+# =============================================================================
+
+# ------------------------------ LISTENING PORTS ------------------------------
+
+- id: PORT-0001
+  title: Sensitive service bound to a non-loopback interface
+  domain: ports
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1190, T1133]
+  logic: |
+    address IN ('0.0.0.0','::','*')
+    AND port IN (22,445,3306,5432,6379,9200,27017,11211,2375,2376,5000,5984,8020,9000,
+                 11434,1234,8000,8080,8888,3000,4200,5173,9229,5005,2345)
+  notes: |
+    Two distinct risks in one rule — datastores with weak defaults (redis 6379, mongo 27017,
+    elastic 9200) and debug/inference endpoints (node --inspect 9229, JDWP 5005, delve 2345,
+    ollama 11434). Debug ports are unauthenticated RCE by design.
+  fp: containers publishing ports and intentional lab services — scope by host role, require exception records
+  response: rebind to 127.0.0.1, check `connections` for prior external sources
+
+- id: PORT-0002
+  title: New listening port for this host
+  domain: ports
+  layer: L3
+  severity: medium
+  confidence: medium
+  attack: [T1571]
+  logic: |
+    NOT seen_in_baseline(host, port, process.hash) AND baseline_days >= 14
+    AND fleet_prevalence(port, process.name) < 0.02
+  fp: dev servers on ephemeral ports — exclude 1024–65535 bound to loopback by known dev binaries
+  response: identify the binding process and its signature
+
+- id: PORT-0003
+  title: Port bound by an unsigned process or a binary in a user-writable path
+  domain: ports
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1571, T1059]
+  logic: |
+    process.signature.valid != true
+    AND process.path MATCHES ('~/*','/tmp/*','/var/tmp/*','/Users/Shared/*')
+    AND address != '127.0.0.1'
+  fp: locally built services — require non-loopback binding, which narrows it sharply
+  response: hash the binary, treat as implant candidate
+
+- id: PORT-0004
+  title: Listener on a common implant/C2 default port
+  domain: ports
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1571]
+  logic: port IN (1337,1234,4444,4445,5555,6666,7777,8443,9001,9002,31337,50050)
+  notes: 50050 is the Cobalt Strike team server default; 4444 is the Metasploit default
+  fp: some dev tools use 1234/8443 — combine with signature status
+  response: full process and connection triage
+
+- id: PORT-0005
+  title: Tunneling or exposure utility running
+  domain: ports
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1572, T1090, T1102]
+  logic: |
+    process.name IN ('ngrok','cloudflared','localtunnel','localxpose','bore','frpc','frps','chisel','tailscale')
+    AND cmdline MATCHES ('(tunnel|funnel|http|tcp|client|--remote)')
+    AND process.name NOT IN allowlist.sanctioned_tunnels
+  notes: converts a laptop behind NAT into an internet-reachable host, bypassing every perimeter control
+  fp: sanctioned Tailscale/Cloudflare deployments — allowlist the managed config, alert on ad-hoc use
+  response: identify what is being exposed; check for `ssh -R` in `processes` as well
+
+# -------------------------------- CONNECTIONS --------------------------------
+
+- id: NET-0001
+  title: Connection to a threat-intelligence-matched destination
+  domain: connections
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1071, T1105]
+  logic: intel.match(remote_ip) OR intel.match(remote_domain) OR intel.match(ja3s_hash)
+  enrichment: [threatfox, urlhaus, feodo, spamhaus_drop, emergingthreats_compromised, tor_exit, cins]
+  fp: feed quality varies — score by feed confidence; Tor-exit matches are context, not verdict
+  response: block, identify the local process, scope fleet-wide for the same indicator
+
+- id: NET-0002
+  title: Egress to a newly registered or low-reputation domain
+  domain: connections
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1071.001, T1568]
+  logic: |
+    whois_age_days(remote_domain) < 30
+    AND process.name NOT IN ('browser_binaries')
+    AND remote_domain NOT IN corporate_allowlist
+  enrichment: [whois_age, asn_lookup, cert_transparency]
+  fp: legitimate new SaaS and CDN edge names — exclude by ASN for major CDNs
+  response: sandbox-resolve the domain, review the requesting process
+
+- id: NET-0003
+  title: Beaconing pattern — periodic egress with low jitter
+  domain: connections
+  layer: L5
+  severity: high
+  confidence: medium
+  attack: [T1071, T1029]
+  logic: |
+    GROUP BY (host, process.hash, remote_ip, remote_port) OVER 24h
+    HAVING count >= 12
+      AND stddev(interval_seconds) / mean(interval_seconds) < 0.15    -- jitter ratio
+      AND mean(bytes_out) BETWEEN 100 AND 20000
+      AND distinct(bytes_out) / count < 0.4                            -- uniform payloads
+  notes: |
+    Also flag "jittered" beacons by testing intervals against a uniform distribution
+    within ±30% of a base period. Exclude by process allowlist, never by destination alone.
+  fp: update checkers, telemetry agents, NTP, MDM — allowlist by signed process + destination pair
+  response: extract the URI pattern and user-agent; pivot on JA3/JA4 across the fleet
+
+- id: NET-0004
+  title: Possible exfiltration — high upload ratio to an external destination
+  domain: connections
+  layer: L5
+  severity: critical
+  confidence: medium
+  attack: [T1041, T1567.002]
+  logic: |
+    bytes_out > 50MB
+    AND bytes_out / greatest(bytes_in,1) > 20
+    AND remote_asn NOT IN corporate_asns
+    AND (process.signature.valid != true OR remote_domain IN cloud_storage_and_paste_hosts)
+  cloud_storage_and_paste_hosts: [transfer.sh, file.io, anonfiles, gofile.io, pastebin.com, 0x0.st, webhook.site, requestbin, ngrok.io, discord webhooks, telegram bot API]
+  fp: legitimate backups and CI artifact uploads — allowlist by process and destination together
+  response: correlate with `open_files` credential access and `storage` archive creation in the prior hour
+
+- id: NET-0005
+  title: DNS control evasion — DoH/DoT or non-corporate resolver
+  domain: connections
+  layer: L1
+  severity: medium
+  confidence: high
+  attack: [T1071.004, T1562.001, T1090]
+  logic: |
+    (remote_port IN (853,5353) AND remote_ip NOT IN corporate_resolvers)
+    OR (remote_domain IN known_doh_endpoints AND process.name NOT IN browser_binaries)
+    OR (remote_port = 53 AND remote_ip NOT IN corporate_resolvers)
+  fp: browsers default to DoH — exclude browser processes, alert on everything else
+  response: enforce resolver policy; a non-browser doing DoH is deliberately hiding
+
+- id: NET-0006
+  title: Direct-to-IP TLS with no SNI or a self-signed certificate
+  domain: connections
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1573, T1071.001]
+  logic: |
+    remote_port IN (443,8443) AND (tls.sni IS NULL OR tls.cert.self_signed = true OR tls.cert.age_days < 7)
+    AND process.signature.valid != true
+  enrichment: [ja3, ja4, cert_transparency]
+  fp: internal services with private CAs — allowlist internal ranges
+  response: JA3/JA4 pivot; compare against known C2 fingerprint sets
+
+- id: NET-0007
+  title: Sensitive-data egress to an unapproved AI endpoint
+  domain: connections
+  layer: L4
+  severity: high
+  confidence: medium
+  attack: [T1567]
+  logic: |
+    remote_domain IN llm_api_domains
+    AND process.name NOT IN allowlist.approved_ai_clients
+    AND bytes_out > 1MB
+  fp: developers testing APIs — pair with `open_files` reads of source or credential paths for high confidence
+  response: data-loss review; confirm the tool is sanctioned
+
+# --------------------------------- NETWORK / ARP -----------------------------
+
+- id: ARP-0001
+  title: Gateway MAC address changed
+  domain: arp
+  layer: L2
+  severity: high
+  confidence: medium
+  attack: [T1557.002]
+  logic: |
+    drift(mac WHERE ip = default_gateway) = true
+    AND oui_vendor(new_mac) != oui_vendor(old_mac)
+  fp: roaming between APs and network maintenance — correlate with SSID/BSSID change in `network`
+  response: verify the gateway MAC against the known-good per-SSID map before trusting the link
+
+- id: ARP-0002
+  title: One MAC claiming multiple IPs (ARP poisoning)
+  domain: arp
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1557.002]
+  logic: count(distinct ip) BY mac > 3 AND mac NOT IN (routers, virtualization_hosts)
+  fp: routers, VM hosts and load balancers legitimately do this — allowlist by known infrastructure MACs
+  response: alert user off the network; capture ARP table snapshot
+
+- id: NETIF-0001
+  title: Interface in promiscuous mode or a new virtual/tunnel interface appeared
+  domain: network
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1040, T1572]
+  logic: |
+    flags CONTAINS 'PROMISC'
+    OR drift(interfaces) = 'added' AND type IN ('tun','tap','utun','wg','ppp','bridge')
+       AND creator NOT IN allowlist.vpn_clients
+  fp: corporate VPN, Docker bridges, virtualization — allowlist by managed client
+  response: identify the creating process; unmanaged tunnels are covert-channel candidates
+
+- id: NETCFG-0001
+  title: DNS, proxy or hosts-file hijack
+  domain: network
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1557, T1562.001, T1071]
+  logic: |
+    drift(resolvers) = true AND new_resolver NOT IN corporate_resolvers
+    OR drift(system_proxy) = true AND proxy_host NOT IN corporate_proxies
+    OR drift('/etc/hosts') = true AND added_lines MATCHES
+       '(?i)(sophos|crowdstrike|sentinelone|defender|clamav|apple\.com|windowsupdate|osquery|okta|duo)'
+  notes: pointing security-vendor or update domains at 127.0.0.1 is a classic disable-the-defender move
+  fp: local development host entries — alert only on security/update domains or non-loopback targets
+  response: revert, find the writer, treat as active tampering
+
+# --------------------------- CONTAINERS / DOCKER -----------------------------
+
+- id: CNT-0001
+  title: Docker socket or API exposed
+  domain: containers
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1610, T1611]
+  logic: |
+    listening_port IN (2375,2376) AND address != '127.0.0.1'
+    OR container.mounts CONTAINS '/var/run/docker.sock'
+    OR file_mode('/var/run/docker.sock') & 0o006 != 0
+  notes: socket access is root on the host, full stop — including from inside a container
+  fp: CI runners that legitimately mount the socket — isolate those on dedicated hosts with an exception record
+  response: remove the mount, restrict socket to the docker group, audit `docker ps` history
+
+- id: CNT-0002
+  title: Container running with host-breakout capability
+  domain: containers
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1611]
+  logic: |
+    privileged = true
+    OR cap_add INTERSECTS ('SYS_ADMIN','SYS_PTRACE','SYS_MODULE','DAC_READ_SEARCH','NET_ADMIN','ALL')
+    OR pid_mode = 'host' OR network_mode = 'host' OR ipc_mode = 'host'
+    OR security_opt CONTAINS ('apparmor:unconfined','seccomp:unconfined')
+    OR mounts CONTAINS ('/:/','/etc:','/proc:','/sys:','/var/lib/kubelet')
+  fp: monitoring agents and some build tooling — allowlist by exact image digest, never by image name
+  response: assess whether the workload needs it; each of these is a one-command escape
+
+- id: CNT-0003
+  title: Container image from an untrusted registry or unpinned tag
+  domain: containers
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1610, T1195.002]
+  logic: |
+    registry NOT IN allowlist.registries
+    OR image_ref MATCHES ':latest$' OR image_ref NOT MATCHES '@sha256:'
+    OR image.signature.verified = false        -- cosign/notation attestation missing
+  fp: local dev builds — scope enforcement to production and CI host roles
+  response: pin by digest, require signature verification at admission
+
+- id: CNT-0004
+  title: Running container hash or entrypoint diverges from its image
+  domain: containers
+  layer: L2
+  severity: high
+  confidence: medium
+  attack: [T1610, T1059]
+  logic: |
+    drift(container.entrypoint) = true
+    OR container.command MATCHES ('sh\s+-c.*(curl|wget|apt-get install|apk add)','base64\s+-d','/dev/tcp')
+    OR exec_events.command MATCHES ('nsenter','chroot /host','mount /dev/')
+  notes: installing packages at runtime in a production container is both drift and a common post-exploit step
+  fp: dev containers — restrict to production roles
+  response: kill and redeploy from the pinned image; treat runtime `nsenter` as a breakout attempt
+
+- id: CNT-0005
+  title: Kubernetes credential or unauthenticated cluster endpoint exposure
+  domain: containers
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1552.007, T1613]
+  logic: |
+    (file = '~/.kube/config' AND (file_mode & 0o077 != 0 OR content MATCHES 'cluster-admin|token:'))
+    OR (listening_port IN (10250,10255,8080) AND anonymous_auth = true)
+    OR container.env MATCHES '(?i)(KUBE_TOKEN|SERVICE_ACCOUNT_TOKEN|AWS_SECRET|GITHUB_TOKEN)='
+  fp: local kind/minikube clusters — scope by host role
+  response: rotate tokens, restrict kubelet auth
+
+# ----------------------------- MOUNTS / STORAGE ------------------------------
+
+- id: MNT-0001
+  title: Disk image or removable volume mounted from a download path
+  domain: mounts
+  layer: L2
+  severity: medium
+  confidence: high
+  attack: [T1204.002, T1091]
+  logic: |
+    drift(mounts) = 'added'
+    AND (source MATCHES ('*/Downloads/*','*.dmg','*.iso','*.img') OR type IN ('msdos','exfat','udf'))
+  notes: pair with BIN-0003 (quarantine strip) and PROC-0001 for the full macOS malware install chain
+  fp: routine software installs — low severity alone, high in the chain
+  response: inventory executables on the volume
+
+- id: MNT-0002
+  title: Unmanaged network share or FUSE filesystem mounted
+  domain: mounts
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1021.002, T1039]
+  logic: |
+    type IN ('smbfs','nfs','afpfs','cifs','sshfs','fuse','webdav','osxfuse','macfuse')
+    AND server NOT IN corporate_file_servers
+  fp: user-mounted personal NAS — policy question; alert and route to the owner
+  response: verify the destination; assess data movement
+
+- id: MNT-0003
+  title: Writable and executable temp filesystem, or exec from a mount that should be noexec
+  domain: mounts
+  layer: L1
+  severity: medium
+  confidence: high
+  attack: [T1222, T1059]
+  logic: path IN ('/tmp','/dev/shm','/var/tmp') AND flags NOT CONTAINS 'noexec'
+  fp: default on many systems — treat as hardening finding, escalate when PROC-0001 also fires
+  response: remount noexec where compatible
+
+- id: STOR-0001
+  title: Backup or snapshot destruction
+  domain: storage
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1490, T1485]
+  logic: |
+    cmdline MATCHES ANY (
+      'tmutil\s+(disable|delete|deletelocalsnapshots)',
+      'vssadmin.*delete shadows','wbadmin\s+delete','bcdedit.*recoveryenabled\s+no',
+      'zfs destroy.*@','btrfs subvolume delete','rm -rf .*\.snapshot'
+    )
+    OR drift(snapshot_count) < prior_count * 0.5
+  fp: capacity management scripts — allowlist explicitly by managed process
+  response: ransomware precursor — isolate and check for mass-encryption file activity
+
+- id: STOR-0002
+  title: Large archive staged in a temporary or user directory
+  domain: storage
+  layer: L4
+  severity: high
+  confidence: medium
+  attack: [T1560.001, T1074.001]
+  logic: |
+    file.extension IN ('.zip','.tar.gz','.tgz','.7z','.rar','.dmg')
+    AND file.size > 100MB AND file.path MATCHES ('/tmp/*','~/Library/Caches/*','/var/folders/*','~/.cache/*')
+    AND creator.signature.valid != true
+  notes: strongest as a chain member — OF-0002 (credential staging) → STOR-0002 → NET-0004 (exfil)
+  fp: build artifacts — exclude project build directories by path
+  response: inspect archive contents before it leaves
+
+# --------------------------------- HARDWARE ----------------------------------
+
+- id: HW-0001
+  title: New HID device followed by a burst of process execution
+  domain: hardware
+  layer: L4
+  severity: critical
+  confidence: high
+  attack: [T1200, T1059]
+  logic: |
+    device.class = 'HID' AND drift(usb_devices) = 'added'
+    AND count(process_exec WHERE user_initiated = false) >= 5 WITHIN 60s AFTER device_insert
+  notes: keystroke-injection ("BadUSB"/Rubber Ducky) detection — the timing correlation is what makes it reliable
+  fp: legitimate keyboards and dongles are added often — the exec burst is the discriminator
+  response: isolate; review the executed commands and clipboard/terminal history
+
+- id: HW-0002
+  title: New USB mass storage or DMA-capable device attached
+  domain: hardware
+  layer: L2
+  severity: medium
+  confidence: high
+  attack: [T1052.001, T1200]
+  logic: |
+    drift(devices) = 'added' AND (class = 'MassStorage' OR bus = 'Thunderbolt')
+    AND vendor_id NOT IN allowlist.approved_peripherals
+  fp: routine on many fleets — set severity by data-classification of the host
+  response: check `storage` for bulk copy volume in the following hour
+
+- id: HW-0003
+  title: Camera or microphone accessed by an unexpected process
+  domain: hardware
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1123, T1125]
+  logic: |
+    device.type IN ('camera','microphone') AND active = true
+    AND process.name NOT IN allowlist.av_applications
+  fp: browsers and conferencing apps — allowlist explicitly, and note browsers proxy for web apps
+  response: identify the process; unsigned = immediate isolation
+
+- id: HW-0004
+  title: Platform integrity feature disabled
+  domain: hardware
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1553.006, T1542]
+  logic: |
+    drift(secure_boot) = 'disabled' OR drift(tpm.enabled) = false
+    OR drift(sip_status) = 'disabled' OR drift(filevault) = 'off'
+    OR drift(kernel_extensions) = 'added' AND team_id NOT IN allowlist.kext_vendors
+  fp: engineering hosts with documented exceptions — track exceptions with expiry, review monthly
+  response: this precedes rootkit/bootkit installation; full host review

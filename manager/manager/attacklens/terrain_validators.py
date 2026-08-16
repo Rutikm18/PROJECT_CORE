@@ -238,14 +238,19 @@ ORIGIN_CRITERIA: list[dict] = [
         "label": "Package actively running",
         "description": "Detected by behavioral / process telemetry — vulnerability is loaded, not just installed.",
         "weight": 0.15,
-        "evaluate": lambda f, e: 1.0 if (e.get("package_running") or _ev(f).get("running") or _ev(f).get("process_present")) else 0.0,
+        # n/a (None) when unconfirmed: a vulnerable library is loaded *into* other
+        # processes and is never itself a process name, so absence of a positive
+        # match means "can't tell", not "not running". Scoring it 0 dragged every
+        # library CVE below threshold. Confirmed → 1.0; otherwise drop from pool.
+        "evaluate": lambda f, e: 1.0 if (e.get("package_running") or _ev(f).get("running") or _ev(f).get("process_present")) else None,
     },
     {
         "name":  "service_reachable",
         "label": "Service reachable",
         "description": "Open / listening port belonging to the vulnerable package — exploitable from network.",
         "weight": 0.10,
-        "evaluate": lambda f, e: 1.0 if (e.get("port_open") or _ev(f).get("port") or _ev(f).get("listen")) else 0.0,
+        # n/a (None) when unconfirmed — same rationale as package_running.
+        "evaluate": lambda f, e: 1.0 if (e.get("port_open") or _ev(f).get("port") or _ev(f).get("listen")) else None,
     },
     {
         "name":  "ai_verdict_tp",
@@ -875,21 +880,28 @@ def evaluate_finding(
         try:
             sig = c["evaluate"].__code__.co_argcount
             if sig >= 3:
-                met = float(c["evaluate"](finding, enriched, ai_verdict))
+                raw = c["evaluate"](finding, enriched, ai_verdict)
             else:
-                met = float(c["evaluate"](finding, enriched))
+                raw = c["evaluate"](finding, enriched)
         except Exception as exc:
             log.debug("criterion %s threw %s — counting as 0", c["name"], exc)
-            met = 0.0
-        met = max(0.0, min(1.0, met))
+            raw = 0.0
+        # A criterion may return None to mean "not applicable — the telemetry
+        # cannot answer this" (e.g. reachability for a vulnerable *library* that
+        # is never itself a running process). An n/a criterion is dropped from
+        # the weight pool exactly like an AI abstention, so a finding is never
+        # dragged toward 0 for evidence it structurally cannot have. Reachability
+        # is an input, never a negative verdict — it can only raise the score.
+        na = raw is None
+        met = 0.0 if na else max(0.0, min(1.0, float(raw)))
         weight = float(c.get("weight", 0))
 
-        # Rule 1: skip AI criterion entirely when the LLM didn't actually run.
-        # Otherwise an abstain (0.5) on a 15 % weight drags the score down 7.5
-        # points and Detection Confidence is unfairly penalised for an analyst
-        # config the finding has no control over.
+        # Rule 1: skip a criterion entirely when it didn't/can't run — the AI
+        # criterion when the LLM didn't actually run, or any criterion that
+        # returned n/a. Otherwise an abstain drags the weighted average down and
+        # the finding is penalised for a signal it has no control over.
         is_ai = c["name"] == "ai_verdict_tp"
-        skipped = is_ai and not ai_actually_ran
+        skipped = na or (is_ai and not ai_actually_ran)
         contribution = 0.0 if skipped else met * weight
 
         if not skipped:

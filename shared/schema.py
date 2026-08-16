@@ -397,6 +397,9 @@ DEVSEC_CAPABILITY_ITEMS: dict[str, Optional[str]] = {
     "python_packages":      "users",
     "homebrew":             None,          # bespoke: formulae + casks lists
     "git":                  "users",
+    "agent_instructions":   "files",
+    "workspace_config":     "files",
+    "model_artifacts":      "items",
     "credential_locations": "locations",
     "docker":               "containers",
 }

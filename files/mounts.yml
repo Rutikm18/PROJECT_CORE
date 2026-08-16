@@ -1,0 +1,104 @@
+category: Mounts
+description: >
+  Detects unauthorized filesystem mounts, insecure mount permissions, and
+  suspicious remote-mount activity.
+rules:
+  - id: MOUNTS-001
+    title: Unauthorized removable media mount
+    description: Removable storage volume mounted on a host where policy restricts removable media.
+    mitre_attack: [T1200, T1052.001]
+    severity: medium
+    data_source: mount events, device type, host policy class
+    detection:
+      logic: mount event with device_type == removable on a host with removable-media-restricted policy
+      conditions:
+        - device_type == 'removable'
+        - host_policy_class == 'removable_restricted'
+        - device not in approved exception list
+      threshold: any occurrence
+    false_positives:
+      - approved exception device not yet in allowlist
+    enrichment_sources:
+      - USB/removable device allowlist (see HARDWARE-001)
+    response_actions:
+      - unmount, alert user/manager, log for DLP review
+    status: stable
+
+  - id: MOUNTS-002
+    title: Remote/network mount to unrecognized host
+    description: Host mounts an NFS/SMB/CIFS share from a remote host not in the corporate-approved server list.
+    mitre_attack: [T1021.002]
+    severity: medium
+    data_source: network mount source host/IP
+    detection:
+      logic: remote mount source not present in approved_file_server_list
+      conditions:
+        - mount_type in ['nfs','smb','cifs']
+        - remote_host not in approved_file_server_list
+      threshold: any occurrence
+    false_positives:
+      - newly provisioned file server not yet added to the allowlist
+    enrichment_sources:
+      - internal file-server inventory
+    response_actions:
+      - verify legitimacy, unmount if unapproved
+    status: stable
+
+  - id: MOUNTS-003
+    title: Mount point permissions weakened to world-writable
+    description: A filesystem mount is configured or remounted with overly permissive access, especially on sensitive paths.
+    mitre_attack: [T1222]
+    severity: high
+    data_source: mount options/permission flags
+    detection:
+      logic: mount options include world-writable equivalent on a sensitive mount point
+      conditions:
+        - mount_point in sensitive_mount_points
+        - mount_options indicate world-write permission
+      threshold: any occurrence
+    false_positives:
+      - intentional shared scratch space, if explicitly documented/allowlisted
+    enrichment_sources: []
+    response_actions:
+      - remediate permissions, audit recent writes to that mount
+    status: stable
+
+  - id: MOUNTS-004
+    title: Hidden or unusual mount namespace created
+    description: A new mount namespace is created outside normal container/service orchestration activity, potentially used to hide filesystem activity from standard tooling.
+    mitre_attack: [T1564.001]
+    severity: high
+    data_source: mount namespace creation events, correlated process
+    detection:
+      logic: new mount namespace created by a process not part of the container runtime or approved sandboxing tool
+      conditions:
+        - mount_namespace_create_event == true
+        - initiating_process not in ['containerd','runc','dockerd','systemd-nspawn']
+      threshold: any occurrence
+    false_positives:
+      - legitimate sandboxing tools not yet in the allowlist (e.g., bwrap, firejail)
+    enrichment_sources:
+      - approved sandboxing-tool allowlist
+    response_actions:
+      - inspect initiating process and its purpose before escalating
+    status: experimental
+
+  - id: MOUNTS-005
+    title: Sensitive volume re-mounted outside business hours
+    description: A previously unmounted sensitive data volume is mounted during an atypical time window for that asset.
+    mitre_attack: [T1005]
+    severity: medium
+    data_source: mount event timestamp, sensitive-volume tag, business-hours policy
+    detection:
+      logic: mount event for a tagged sensitive volume occurs outside the asset's normal business-hours window
+      conditions:
+        - volume tagged as 'sensitive'
+        - mount_time outside business_hours_for_host
+      threshold: any occurrence
+    false_positives:
+      - legitimate off-hours maintenance/backup job
+    enrichment_sources:
+      - change-management/maintenance-window system
+    response_actions:
+      - verify with asset owner, correlate with OPEN_FILES rules for subsequent access
+    status: tuning

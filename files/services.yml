@@ -1,0 +1,106 @@
+category: Services
+description: >
+  Detects service-based persistence, hijacking, and defense-evasion through
+  the OS service-management subsystem (Windows Services, systemd, launchd).
+rules:
+  - id: SERVICES-001
+    title: New service installed for persistence
+    description: A new service is created pointing to a binary in a non-standard location or lacking a valid signature, common persistence technique.
+    mitre_attack: [T1543]
+    severity: high
+    data_source: service creation events (name, binary path, signature)
+    detection:
+      logic: newly created service's binary_path is unsigned or resides in a non-standard install directory
+      conditions:
+        - service_create_event == true
+        - (signature_valid == false OR binary_path matches suspicious-location pattern from BINARIES-003)
+      threshold: any occurrence
+    false_positives:
+      - legitimate internally-developed service not yet signed through the standard pipeline
+    enrichment_sources:
+      - hash reputation
+    response_actions:
+      - stop and disable service pending verification
+    status: stable
+
+  - id: SERVICES-002
+    title: Critical security service stopped or disabled
+    description: A monitored security-relevant service (EDR, firewall, Windows Defender, logging agent) is stopped or its start type changed to disabled.
+    mitre_attack: [T1562.001]
+    severity: critical
+    data_source: service state/start-type changes for monitored security services
+    detection:
+      logic: service_name in monitored_security_services and state transitions to stopped/disabled without a managed maintenance correlation
+      conditions:
+        - service_name in monitored_security_services
+        - new_state in ['stopped','disabled']
+        - no matching maintenance window
+      threshold: any occurrence
+    false_positives:
+      - legitimate managed maintenance/upgrade window
+    enrichment_sources:
+      - maintenance-window/change-management system
+    response_actions:
+      - restore service immediately, treat as high-priority incident
+    status: stable
+
+  - id: SERVICES-003
+    title: Service binary path modified (service hijacking)
+    description: An existing service's executable path is changed to point to a different binary — classic service-hijack persistence/privilege technique.
+    mitre_attack: [T1543, T1574]
+    severity: critical
+    data_source: service configuration binary_path field, change history
+    detection:
+      logic: binary_path for an existing service_name differs from its previously recorded value
+      conditions:
+        - current_binary_path != previous_binary_path[service_name]
+        - no correlated approved software-update event
+      threshold: any occurrence
+    false_positives:
+      - legitimate software update relocating its own service binary
+    enrichment_sources:
+      - software update/patch management logs
+    response_actions:
+      - revert binary path or validate new binary's hash/signature before allowing
+    status: stable
+
+  - id: SERVICES-004
+    title: Service configured to run as SYSTEM/root with unusual binary
+    description: A newly configured or modified service runs with the highest local privilege level while pointing to a binary that is unsigned or previously unseen.
+    mitre_attack: [T1543, T1548]
+    severity: critical
+    data_source: service run-as account, binary signature/first-seen status
+    detection:
+      logic: service run_as_account in ['SYSTEM','root','LocalSystem'] and binary is unsigned or first-seen
+      conditions:
+        - run_as_account in ['SYSTEM','root','LocalSystem']
+        - (signature_valid == false OR binary_first_seen_days < 1)
+      threshold: any occurrence
+    false_positives:
+      - legitimate new system-level agent deployment (e.g., new monitoring tool rollout)
+    enrichment_sources:
+      - hash reputation, software deployment tooling logs
+    response_actions:
+      - validate deployment source, stop service if unverified
+    status: stable
+
+  - id: SERVICES-005
+    title: Service start type changed to automatic without change record
+    description: A previously manual/disabled service is switched to automatic startup, potentially establishing persistence for a dormant implant.
+    mitre_attack: [T1543]
+    severity: medium
+    data_source: service start_type field changes
+    detection:
+      logic: start_type transitions from manual/disabled to automatic without a matching change ticket
+      conditions:
+        - start_type_new == 'automatic'
+        - start_type_old in ['manual','disabled']
+        - no matching change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate IT configuration change not logged in the tracked change system
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - verify legitimacy, revert if unauthorized
+    status: tuning

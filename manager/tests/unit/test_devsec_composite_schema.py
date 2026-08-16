@@ -156,11 +156,12 @@ def test_items_key_map_is_shared_with_raw_module():
     assert raw._DEVSEC_CAP_ITEMS is DEVSEC_CAPABILITY_ITEMS
 
 
-def test_map_covers_all_seventeen_collector_capabilities():
+def test_map_covers_all_twenty_collector_capabilities():
     expected = {
         "editor_extensions", "mcp_servers", "node_packages", "python_packages",
         "homebrew", "ai_applications", "agent_cli_tools", "shell_startup",
         "launchd", "cron", "processes", "listening_ports", "browser_extensions",
-        "native_messaging", "git", "credential_locations", "docker",
+        "native_messaging", "git", "agent_instructions", "workspace_config",
+        "model_artifacts", "credential_locations", "docker",
     }
     assert set(DEVSEC_CAPABILITY_ITEMS) == expected

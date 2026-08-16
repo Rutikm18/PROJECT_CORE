@@ -1,0 +1,103 @@
+category: Containers
+description: >
+  Detects risky container configurations and behavior consistent with
+  container escape, privilege abuse, or supply-chain compromise.
+rules:
+  - id: CONTAINERS-001
+    title: Privileged container launched
+    description: A container is started with the privileged flag, granting near-host-equivalent kernel access.
+    mitre_attack: [T1611]
+    severity: high
+    data_source: container runtime config (privileged flag)
+    detection:
+      logic: container launched with privileged == true and image not in approved-privileged allowlist
+      conditions:
+        - privileged == true
+        - image_name not in approved_privileged_image_allowlist
+      threshold: any occurrence
+    false_positives:
+      - legitimate infra tooling requiring privileged mode (e.g., certain monitoring/CNI agents)
+    enrichment_sources:
+      - internal approved-image registry/allowlist
+    response_actions:
+      - verify business need, stop container if unapproved
+    status: stable
+
+  - id: CONTAINERS-002
+    title: Sensitive host path or Docker socket mounted into container
+    description: Container mounts the host's Docker socket or other sensitive host paths, enabling straightforward container escape.
+    mitre_attack: [T1611]
+    severity: critical
+    data_source: container volume mount list
+    detection:
+      logic: mount source matches docker.sock or other sensitive host paths
+      conditions:
+        - mount_source in ['/var/run/docker.sock','/proc','/etc','/root']
+        - container not in approved orchestration/monitoring allowlist
+      threshold: any occurrence
+    false_positives:
+      - legitimate CI/CD runner or monitoring agent requiring socket access
+    enrichment_sources:
+      - approved-image/allowlist registry
+    response_actions:
+      - stop container, review what actions were taken via the mounted socket
+    status: stable
+
+  - id: CONTAINERS-003
+    title: Container image from untrusted or unscanned registry
+    description: Image pulled from a registry outside the organization's approved/scanned registry list.
+    mitre_attack: [T1195.002]
+    severity: medium
+    data_source: image registry origin
+    detection:
+      logic: image registry hostname not in approved_registry_list
+      conditions:
+        - registry_hostname not in approved_registry_list
+      threshold: any occurrence
+    false_positives:
+      - developer pulling public images for local testing (should use isolated dev environment policy)
+    enrichment_sources:
+      - approved registry allowlist
+      - image vulnerability scan results (e.g., Trivy/Grype output if available)
+    response_actions:
+      - block pull at registry proxy, request image be mirrored into approved registry after scan
+    status: stable
+
+  - id: CONTAINERS-004
+    title: Possible container escape / namespace-breakout indicators
+    description: Process inside a container performs actions typically associated with breaking container isolation (e.g., writing to host cgroup release_agent, unexpected host PID namespace visibility).
+    mitre_attack: [T1611]
+    severity: critical
+    data_source: container process syscalls/file-write events
+    detection:
+      logic: process inside container writes to known escape-relevant host-exposed paths, or a containerized process observes PIDs outside its namespace
+      conditions:
+        - write_target matches '(?i)(cgroup.*release_agent|/proc/sys/kernel/core_pattern)'
+        - OR container process enumerates host PID namespace unexpectedly
+      threshold: any occurrence
+    false_positives:
+      - none expected for a hardened container config; validate runtime security policy first
+    enrichment_sources: []
+    response_actions:
+      - isolate host immediately, this is high-confidence critical
+    status: experimental
+
+  - id: CONTAINERS-005
+    title: Container running as root without justification
+    description: Container process runs as UID 0 despite an available non-root image variant or policy requiring non-root execution.
+    mitre_attack: [T1611]
+    severity: low
+    data_source: container process UID
+    detection:
+      logic: container's main process UID == 0 and image/policy does not require root
+      conditions:
+        - process_uid == 0
+        - image not in root_required_allowlist
+      threshold: any occurrence
+    false_positives:
+      - base images that legitimately require root for init tasks before dropping privileges
+    enrichment_sources:
+      - internal image policy/allowlist
+    response_actions:
+      - flag for image hardening (non-root user directive)
+    status: stable

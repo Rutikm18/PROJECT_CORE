@@ -1,0 +1,103 @@
+category: Configs
+description: >
+  Detects unauthorized or risky changes to security-relevant configuration
+  files and settings, and drift from managed baselines.
+rules:
+  - id: CONFIGS-001
+    title: Security control disabled via configuration change
+    description: A security-relevant setting (firewall, real-time AV, SIP/System Integrity Protection, audit logging) is turned off.
+    mitre_attack: [T1562.004, T1562.001]
+    severity: critical
+    data_source: config key/value for known security controls
+    detection:
+      logic: monitored security-control config key transitions from enabled to disabled
+      conditions:
+        - config_key in monitored_security_controls
+        - new_value == 'disabled' and old_value == 'enabled'
+        - no correlated approved change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate maintenance requiring temporary control disable, if change-ticket correlated
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - re-enable control, investigate actor/process that made the change
+    status: stable
+
+  - id: CONFIGS-002
+    title: Configuration file modified outside change window
+    description: Any file in the monitored security-config set is modified without a corresponding change record.
+    mitre_attack: [T1562.001]
+    severity: high
+    data_source: config file hash/mtime, change-management correlation
+    detection:
+      logic: config file hash changes and timestamp falls outside any approved change window
+      conditions:
+        - config_file in monitored_config_paths
+        - hash_changed == true
+        - modification_time not within approved_change_window
+      threshold: any occurrence
+    false_positives:
+      - emergency fix applied without ticket logged in time
+    enrichment_sources:
+      - change-management system
+    response_actions:
+      - diff against last-known-good, restore if unauthorized
+    status: stable
+
+  - id: CONFIGS-003
+    title: Plaintext credentials/secrets detected in configuration
+    description: Configuration content contains patterns consistent with embedded credentials, API keys, or private key material.
+    mitre_attack: [T1552.001]
+    severity: high
+    data_source: config file content scan
+    detection:
+      logic: config content matches secret-pattern signatures
+      conditions:
+        - content matches '(?i)(password\s*=|api[_-]?key\s*=|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|aws_secret_access_key)'
+      threshold: any match
+    false_positives:
+      - placeholder/example values in template configs (check for common placeholder strings)
+    enrichment_sources:
+      - secrets-scanning ruleset (e.g., existing gitleaks/trufflehog pattern libraries)
+    response_actions:
+      - rotate exposed credential immediately, remediate config to use secrets manager
+    status: stable
+
+  - id: CONFIGS-004
+    title: Configuration file permissions weakened
+    description: A security-relevant config file's permissions are changed to be world-writable or otherwise overly permissive.
+    mitre_attack: [T1222]
+    severity: high
+    data_source: config file permission bits
+    detection:
+      logic: file permission mode grants write access to non-owner/group unexpectedly
+      conditions:
+        - config_file in monitored_config_paths
+        - permission_mode allows world-write (e.g., mode & 0o002)
+      threshold: any occurrence
+    false_positives:
+      - intentional shared-write config in a multi-user dev environment (should be explicitly allowlisted)
+    enrichment_sources: []
+    response_actions:
+      - correct permissions, audit for unauthorized modifications made while weakened
+    status: stable
+
+  - id: CONFIGS-005
+    title: Fleet-wide configuration drift from golden baseline
+    description: Host's configuration set diverges from the golden/managed baseline for its policy group, aggregated across multiple config keys.
+    mitre_attack: [T1562.001]
+    severity: medium
+    data_source: config hash set per host vs. policy-group baseline
+    detection:
+      logic: percentage of config keys differing from baseline exceeds threshold
+      conditions:
+        - drifted_key_count / total_monitored_keys > 0.10
+      threshold: '>10% of monitored keys drifted'
+    false_positives:
+      - policy group recently updated and baseline not yet refreshed
+    enrichment_sources:
+      - configuration-management system (baseline source of truth)
+    response_actions:
+      - reconcile baseline vs. actual, remediate or update baseline via approved process
+    status: tuning

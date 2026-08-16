@@ -1,0 +1,522 @@
+# =============================================================================
+# PACK 40 — Software Supply Chain, Vulnerability Correlation, Posture, Telemetry
+# Domains: node_packages, python_packages, homebrew, packages, sbom, sca,
+#          git, credential_locations, dev_security, configs, sysctl, security,
+#          metrics, agent_health
+# =============================================================================
+
+# ------------------------- NODE / PYTHON / HOMEBREW --------------------------
+
+- id: PKG-0001
+  title: Package with an install-time script executing network or shell commands
+  domain: node_packages
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1195.002, T1059]
+  logic: |
+    (package.json.scripts.* MATCHES ANY ('preinstall','postinstall','prepare','prepublish')
+     AND script_body MATCHES ('curl','wget','node\s+-e','base64','child_process','/dev/tcp',
+                              'https?://','eval\(','process\.env\.(AWS|GITHUB|NPM)_'))
+    OR (setup.py CONTAINS class MATCHES '(install|develop|egg_info)' AND body MATCHES ('urllib|requests\.|subprocess|os\.system|socket\.'))
+  applies_to: [node_packages, python_packages]
+  notes: |
+    Install scripts run before any code review, at `npm install` / `pip install` time,
+    with full user privileges. This is the primary npm/PyPI malware execution vector.
+  fp: native modules legitimately run node-gyp — allowlist by exact package@version, not by name
+  response: block install, extract the script, hash and report; rotate any credential on the host
+
+- id: PKG-0002
+  title: Newly published package version pulled into a build
+  domain: node_packages
+  layer: L3
+  severity: high
+  confidence: medium
+  attack: [T1195.002]
+  logic: |
+    registry.version_publish_age_hours < 72
+    AND (registry.maintainer_count = 1 OR registry.maintainer_changed_within_days < 30)
+    AND fleet_prevalence < 0.05
+  enrichment: [npm_registry, pypi_json, deps_dev, osv_batch]
+  notes: |
+    Compromised-maintainer attacks have a short exploitation window. A 24–72h cooling-off
+    policy on new versions blocks most of them; this rule detects violations of it.
+  fp: fast-moving internal packages — exclude internal scopes
+  response: hold the build, diff the version against the previous release tarball
+
+- id: PKG-0003
+  title: Typosquat or dependency-confusion candidate
+  domain: node_packages
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1195.002, T1036]
+  logic: |
+    levenshtein(name, popular_package.name) <= 2 AND name != popular_package.name
+    OR (name IN internal_package_names AND registry = 'public')      -- dependency confusion
+    OR name MATCHES '(?i)(^|-)(reqeusts|urllib3?-|lodahs|expres+|colorsss|crossenv|discord\.?js-)'
+  notes: dependency confusion is the higher-impact half — public resolution of an internal scope is a hard fail
+  fp: legitimate forks — verify repo URL and maintainer
+  response: pin the internal registry, add scope-level resolution rules
+
+- id: PKG-0004
+  title: Package flagged as malware or matching a known compromise campaign
+  domain: node_packages
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1195.002]
+  logic: |
+    osv.advisory.type = 'MALWARE'
+    OR github_advisory.classification = 'MALWARE'
+    OR package_files MATCHES ANY (
+      'webhook\.site|requestbin|pipedream\.net|oast\.(fun|pro|site)',   -- exfil sinks
+      'trufflehog|gitleaks',                                            -- credential-scanner staging
+      '\.github/workflows/.*curl.*\$\{\{\s*secrets'                     -- CI secret exfil injection
+    )
+  enrichment: [osv_batch, github_advisory_graphql]
+  notes: the second block catches self-propagating credential-stealing worm patterns before advisories land
+  fp: security tooling packages legitimately reference scanners — check the package's stated purpose
+  response: remove, rotate all developer and CI credentials on affected hosts, audit repo pushes
+
+- id: PKG-0005
+  title: Lockfile drift or integrity mismatch
+  domain: node_packages
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1195.002, T1565.001]
+  logic: |
+    drift(package-lock.json | yarn.lock | poetry.lock | Pipfile.lock) = true
+    AND drift(package.json | pyproject.toml) = false
+    OR installed_artifact.sha512 != lockfile.integrity
+  fp: `npm audit fix` and dependabot — correlate with the commit author and CI identity
+  response: integrity mismatch is never benign; re-resolve from a clean cache
+
+- id: PKG-0006
+  title: Package installed from a non-standard registry or index
+  domain: python_packages
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1195.002, T1071]
+  logic: |
+    config MATCHES ('--extra-index-url','--index-url','registry=https?://(?!registry\.npmjs\.org)','_auth=')
+    AND host NOT IN allowlist.registries
+  scan_paths: [~/.npmrc, ./.npmrc, ~/.pip/pip.conf, ~/.config/pip/pip.conf, ./pip.conf, ~/.condarc, ~/.cargo/config.toml]
+  notes: also alert when a plaintext `_authToken` / `password` is present in these files (see CRED-0001)
+  fp: internal mirrors — allowlist them explicitly
+  response: verify registry ownership; check what was installed from it
+
+- id: PKG-0007
+  title: Python code-execution persistence in site-packages
+  domain: python_packages
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1546, T1195.002]
+  logic: |
+    file MATCHES ('site-packages/*.pth','sitecustomize.py','usercustomize.py')
+    AND content MATCHES ('import\s+os|subprocess|exec\(|__import__|socket')
+  notes: `.pth` files execute lines starting with `import` on *every* interpreter start — silent, durable persistence
+  fp: a few legitimate packages use .pth for path setup — those contain paths, not `import os`
+  response: remove, identify the installing package
+
+- id: PKG-0008
+  title: Homebrew third-party tap or formula with a non-vendor source URL
+  domain: homebrew
+  layer: L1
+  severity: medium
+  confidence: medium
+  attack: [T1195.002]
+  logic: |
+    tap NOT IN ('homebrew/core','homebrew/cask','homebrew/services', allowlist.taps)
+    OR formula.url NOT MATCHES vendor_domain(formula.homepage)
+    OR install_options CONTAINS '--HEAD'
+  notes: |
+    Taps are arbitrary git repos with Ruby code executed at install time. `--HEAD` installs
+    from an unpinned branch. Also alert when brew writes a binary that shadows /usr/bin (see BIN-0002).
+  fp: common on dev fleets — use a reviewed tap allowlist rather than blanket alerting
+  response: review the formula source
+
+- id: PKG-0009
+  title: Package installed outside any package manager (unmanaged software)
+  domain: packages
+  layer: L3
+  severity: medium
+  confidence: medium
+  attack: [T1105, T1554]
+  logic: |
+    binary EXISTS IN ('/usr/local/bin','/opt/*','~/bin','~/.local/bin')
+    AND NOT owned_by_any_package_manager(binary)
+    AND fleet_prevalence < 0.05
+  fp: developer-built tools everywhere — this is an inventory-hygiene rule, not a page
+  response: attribute to an owner; unmanaged binaries never get patched
+
+# ----------------------------- SBOM / SCA / CVE ------------------------------
+
+- id: SCA-0001
+  title: Exploited-in-the-wild vulnerability present on a reachable component
+  domain: sca
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1190, T1203]
+  logic: |
+    cve IN cisa_kev
+    AND component IN (sbom.components ∪ packages ∪ containers.image_layers)
+    AND (component.reachable = true OR component.process_running = true OR component.port_listening = true)
+  enrichment: [nvd_cve_2.0, cisa_kev, epss, osv]
+  notes: |
+    Prioritization order that actually works:
+      1. KEV + running/listening        → same-day
+      2. EPSS >= 0.5 + CVSS >= 7 + running → 7 days
+      3. CVSS >= 9 not running          → 30 days
+      4. everything else                → backlog
+    Reachability (is the process running / port bound / library actually loaded) removes
+    the majority of raw scanner noise. Join SBOM components against `processes` and `open_files`.
+  fp: unreachable dev dependencies — the reachability join is the fix
+  response: patch or compensating control; verify with a re-scan, not a ticket close
+
+- id: SCA-0002
+  title: Vulnerable developer-tooling component with known RCE
+  domain: sca
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1195.002, T1203]
+  logic: |
+    component.name IN ('git','curl','openssl','node','python','docker','runc','containerd','log4j*','xz-utils')
+    AND cve.cvss >= 7.5 AND (cve IN cisa_kev OR epss >= 0.2)
+  worked_examples: |
+    git CVE-2024-32002 (submodule symlink → hook execution on clone, case-insensitive FS — macOS/Windows),
+    git CVE-2024-32004 (untrusted local repo clone RCE), git CVE-2022-24765 (safe.directory),
+    runc CVE-2024-21626 (container escape via leaked fd), xz-utils CVE-2024-3094 (sshd backdoor).
+    These are exactly the components a developer fleet keeps stale.
+  response: force-upgrade; for git CVEs also disable `protocol.file.allow` and audit `core.hooksPath`
+
+- id: SCA-0003
+  title: SBOM drift — component appeared without a build event
+  domain: sbom
+  layer: L2
+  severity: high
+  confidence: medium
+  attack: [T1195, T1554]
+  logic: |
+    drift(sbom.components) = 'added'
+    AND NOT EXISTS build_event(artifact, ±1h)
+    AND component NOT IN prior_release.sbom
+  notes: a component in the running artifact that is not in the build's SBOM means the artifact was altered post-build
+  fp: incomplete SBOM generation — fix generation first, or this rule is pure noise
+  response: rebuild from source, compare digests, verify provenance attestation (SLSA/in-toto)
+
+# ----------------------------------- GIT -------------------------------------
+
+- id: GIT-0001
+  title: Git hooks path redirected or hook script contains execution primitives
+  domain: git
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1546, T1195.002]
+  logic: |
+    git_config.core.hooksPath IS NOT NULL AND value NOT IN allowlist.hook_dirs
+    OR file MATCHES '.git/hooks/(pre-commit|post-checkout|post-merge|pre-push|post-commit)'
+       AND content MATCHES ('curl','wget','base64','/dev/tcp','python -c','nc\s','osascript','powershell')
+  notes: hooks execute on ordinary developer actions — a poisoned hook fires on the next `git pull`
+  fp: pre-commit frameworks (husky, lefthook) set hooksPath — allowlist those exact directories
+  response: inspect the hook, identify the commit or clone that introduced it
+
+- id: GIT-0002
+  title: Git config rewriting remote URLs or leaking credentials
+  domain: git
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1552.001, T1557]
+  logic: |
+    git_config MATCHES 'url\..*\.insteadOf' AND target_host NOT IN allowlist.git_hosts
+    OR git_config.credential.helper = 'store'
+    OR EXISTS('~/.git-credentials')
+    OR git_config MATCHES 'filter\..*\.(clean|smudge)\s*=.*(sh|bash|curl|python)'
+    OR git_config.http.sslVerify = false
+  notes: |
+    `insteadOf` silently redirects every clone/push to an attacker host. `.gitattributes`
+    filter drivers execute on checkout. `credential.helper=store` writes tokens in plaintext.
+  fp: internal proxy configuration uses insteadOf — allowlist internal hosts
+  response: revert config, rotate tokens found in ~/.git-credentials
+
+- id: GIT-0003
+  title: Repository remote points to an unapproved or look-alike host
+  domain: git
+  layer: L1
+  severity: high
+  confidence: medium
+  attack: [T1195.002, T1036]
+  logic: |
+    remote.url_host NOT IN allowlist.git_hosts
+    OR levenshtein(remote.url_host, 'github.com') <= 2 AND host != 'github.com'
+    OR remote.url MATCHES '^(http|git)://'          -- unauthenticated/plaintext transport
+  fp: OSS contributions to arbitrary hosts — scope enforcement to work repos and CI
+  response: verify the repo's provenance before building it
+
+- id: GIT-0004
+  title: CI workflow referencing an unpinned or untrusted third-party action
+  domain: git
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1195.002, T1078.004]
+  logic: |
+    file MATCHES '.github/workflows/*.ya?ml'
+    AND (uses MATCHES '@(main|master|v\d+)$'                       -- mutable tag, not a SHA
+         OR uses.owner NOT IN allowlist.action_owners
+         OR content MATCHES 'pull_request_target' AND content MATCHES 'actions/checkout.*head\.sha')
+  notes: |
+    `pull_request_target` + checkout of the PR head runs untrusted code with repo secrets —
+    the highest-impact CI misconfiguration there is. Mutable action tags enable retroactive compromise.
+  fp: internal actions — allowlist the org
+  response: pin to commit SHA, remove secret access from fork-triggered workflows
+
+- id: GIT-0005
+  title: Secret committed or present in a working tree
+  domain: dev_security
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1552.001]
+  logic: |
+    file_content MATCHES ANY (
+      'ghp_[A-Za-z0-9]{36}','github_pat_[A-Za-z0-9_]{60,}','gho_|ghu_|ghs_|ghr_',
+      'sk-(ant-)?[A-Za-z0-9\-_]{40,}','xox[baprs]-[A-Za-z0-9-]{10,}',
+      'AKIA[0-9A-Z]{16}','ASIA[0-9A-Z]{16}',
+      '-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----',
+      'AIza[0-9A-Za-z\-_]{35}','glpat-[A-Za-z0-9\-_]{20}'
+    )
+    AND (staged_for_commit = true OR file NOT IN .gitignore)
+  entropy_fallback: shannon_entropy(candidate) > 4.5 AND length BETWEEN 20 AND 120
+  fp: test fixtures and rotated sample keys — maintain a verified-false-positive hash list
+  response: rotate first, scrub history second — order matters
+
+# --------------------------- CREDENTIAL LOCATIONS ----------------------------
+
+- id: CRED-0001
+  title: Credential file with weak permissions or an unencrypted private key
+  domain: credential_locations
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1552.001]
+  logic: |
+    path IN credential_paths
+    AND (file_mode & 0o077 != 0
+         OR (path MATCHES 'id_(rsa|ecdsa|ed25519)$' AND content NOT MATCHES 'ENCRYPTED')
+         OR (path IN ('~/.npmrc','~/.pypirc','~/.netrc') AND content MATCHES '(_authToken|password|api_key)\s*='))
+  fp: none — every hit is a real hygiene failure
+  response: chmod 600, add a passphrase, migrate to an agent or broker
+
+- id: CRED-0002
+  title: Long-lived static cloud credentials on an endpoint
+  domain: credential_locations
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1552.001, T1078.004]
+  logic: |
+    file = '~/.aws/credentials' AND content MATCHES 'aws_access_key_id\s*=\s*AKIA'
+    AND key_age_days > 90
+  notes: AKIA prefix = long-lived IAM user key; ASIA = temporary STS, which is the target state
+  fp: legacy service accounts — track exceptions with a migration deadline
+  response: migrate to SSO/identity-center short-lived credentials, delete the key
+
+- id: CRED-0003
+  title: Keychain or browser credential store accessed by CLI tooling
+  domain: credential_locations
+  layer: L1
+  severity: critical
+  confidence: high
+  attack: [T1555.001, T1555.003, T1539]
+  logic: |
+    cmdline MATCHES ANY (
+      'security\s+(dump-keychain|find-generic-password|find-internet-password)',
+      'sqlite3\s+.*(Login Data|Cookies|logins\.json|key4\.db)',
+      'cp\s+.*(Local State|Login Data|Cookies)',
+      'osascript.*(display dialog.*password|keychain)'
+    )
+  notes: |
+    macOS infostealers pair `osascript` fake password prompts with `security` keychain dumps.
+    An osascript dialog asking for the login password from an unsigned parent is near-certain malware.
+  fp: password-manager CLIs — allowlist by exact signed binary path
+  response: isolate, rotate everything in the keychain, force re-auth on all sessions
+
+- id: CRED-0004
+  title: Credential material copied to a non-standard location
+  domain: credential_locations
+  layer: L4
+  severity: critical
+  confidence: high
+  attack: [T1074.001, T1552]
+  logic: |
+    file.write.content_hash IN hashes(credential_files)
+    AND destination.path NOT IN credential_paths
+  fp: legitimate backups — allowlist backup agents
+  response: treat as staged exfil; check `storage` and `connections`
+
+# ------------------- SECURITY POSTURE / CONFIGS / SYSCTL ---------------------
+
+- id: SEC-0001
+  title: Endpoint protection or OS integrity control disabled
+  domain: security
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1562.001]
+  logic: |
+    drift(control_state) = 'disabled' FOR control IN (
+      'sip','gatekeeper','filevault','firewall','xprotect','mrt','edr_agent',
+      'defender_realtime','auditd','selinux','apparmor','secure_boot')
+  fp: sanctioned maintenance windows — suppress by change ticket only, never blanket
+  response: re-enable, determine which process/user disabled it, treat the window as compromised
+
+- id: SEC-0002
+  title: Trust store or MDM profile modification
+  domain: configs
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1553.004, T1556]
+  logic: |
+    drift(system_trust_store) = 'added' AND ca.issuer NOT IN corporate_cas
+    OR drift(configuration_profiles) = 'added' AND profile.source != approved_mdm
+    OR drift('/etc/pam.d/*') = true
+  notes: an added root CA enables transparent TLS interception; a rogue profile can re-enroll the device
+  fp: corporate proxy CAs and MDM pushes — allowlist by fingerprint and MDM identity
+  response: remove CA, invalidate sessions established while it was trusted
+
+- id: SEC-0003
+  title: SSH daemon weakened
+  domain: configs
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1021.004, T1098.004]
+  logic: |
+    drift('/etc/ssh/sshd_config*') = true
+    AND effective_config MATCHES ANY (
+      'PermitRootLogin\s+yes','PasswordAuthentication\s+yes','PermitEmptyPasswords\s+yes',
+      'AuthorizedKeysCommand\s+', 'ForceCommand\s+', 'PermitTunnel\s+yes')
+  fp: lab hosts — scope by role
+  response: revert; check `users` for authorized_keys additions in the same window
+
+- id: SYSCTL-0001
+  title: Kernel hardening parameter weakened
+  domain: sysctl
+  layer: L2
+  severity: high
+  confidence: high
+  attack: [T1562.001, T1055, T1090]
+  logic: |
+    drift(sysctl) = true AND (
+      kernel.yama.ptrace_scope = 0            -- enables arbitrary process injection
+      OR kernel.kptr_restrict = 0 OR kernel.dmesg_restrict = 0
+      OR kernel.randomize_va_space = 0
+      OR net.ipv4.ip_forward = 1              -- host turned into a pivot/router
+      OR net.ipv4.conf.*.rp_filter = 0
+      OR net.ipv4.conf.*.accept_redirects = 1
+      OR fs.suid_dumpable = 1
+      OR kernel.unprivileged_userns_clone = 1
+    )
+  fp: container hosts legitimately set ip_forward and userns — scope by role, alert on laptops always
+  response: revert; ptrace_scope=0 and ip_forward=1 on an endpoint are strong intrusion indicators
+
+- id: DEV-0001
+  title: Debug or remote-execution port enabled on a developer runtime
+  domain: dev_security
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1190, T1059]
+  logic: |
+    cmdline MATCHES ('--inspect(-brk)?=0\.0\.0\.0','-agentlib:jdwp=.*address=\*','dlv .*--listen=0\.0\.0\.0',
+                     'PYDEVD_.*0\.0\.0\.0','--remote-debugging-port')
+  notes: an exposed Node inspector or JDWP port is unauthenticated arbitrary code execution
+  fp: intentional local debugging — the 0.0.0.0 binding is the discriminator
+  response: rebind to loopback
+
+# ------------------------ METRICS / AGENT HEALTH -----------------------------
+
+- id: AH-0001
+  title: Telemetry gap — agent stopped reporting (dead-man switch)
+  domain: agent_health
+  layer: L5
+  severity: critical
+  confidence: high
+  attack: [T1562.001]
+  logic: |
+    now - last_heartbeat > 3 * expected_interval
+    AND host.power_state != 'off' AND host.last_known_network = 'online'
+  notes: |
+    The most important rule in the pack. Every other detection assumes data arrives.
+    Alert on silence, and alert louder when silence follows any other signal within 1h.
+  fp: sleep/travel — correlate with power and network state; suppress on clean shutdown events
+  response: treat as tampering until proven otherwise; verify agent binary hash out-of-band
+
+- id: AH-0002
+  title: Agent configuration, binary or log tampering
+  domain: agent_health
+  layer: L2
+  severity: critical
+  confidence: high
+  attack: [T1562.001, T1070.002]
+  logic: |
+    drift(agent.binary_hash) = true AND NOT managed_upgrade
+    OR drift(agent.config) = true AND writer != agent_updater
+    OR log_file.size decreased OR log_file.inode changed
+    OR drift(collector_enabled_set) = 'removed'
+  fp: managed upgrades — correlate with the deployment system
+  response: reinstall from a trusted source, investigate the modifying process
+
+- id: AH-0003
+  title: System clock manipulation
+  domain: agent_health
+  layer: L1
+  severity: high
+  confidence: high
+  attack: [T1070.006, T1562]
+  logic: |
+    abs(agent_time - ntp_time) > 300s
+    OR drift(timezone_or_ntp_server) = true AND ntp_server NOT IN corporate_ntp
+    OR monotonic_clock_regression_detected = true
+  notes: timestomping and log-correlation defeat both start here
+  fp: VM resume and long sleep — correlate with power events
+  response: resync, re-baseline the affected time window as untrusted
+
+- id: MET-0001
+  title: Sustained resource consumption consistent with cryptomining
+  domain: metrics
+  layer: L5
+  severity: high
+  confidence: medium
+  attack: [T1496]
+  logic: |
+    p95(cpu_pct OR gpu_pct) > 80 SUSTAINED 30m
+    AND thermal_pressure IN ('heavy','trapping') AND battery.discharge_rate > baseline * 2
+    AND top_process.signature.valid != true
+    AND NOT correlated_with(build_event OR ml_training_job)
+  fp: builds, ML work, video encoding — the discriminators are process signature and job correlation
+  response: pair with NET-0001/PORT-0004 for stratum traffic before concluding
+
+- id: MET-0002
+  title: Abnormal collector volume — flood or starvation
+  domain: agent_health
+  layer: L5
+  severity: medium
+  confidence: medium
+  attack: [T1499, T1562]
+  logic: |
+    event_rate(domain) > 10 * p95(baseline_rate) OR event_rate(domain) < 0.1 * p95(baseline_rate)
+  notes: |
+    Floods are used to bury a real signal in noise and to blow through ingestion quotas;
+    starvation means a collector was silently disabled. Both are detections, not just ops alarms.
+  fp: legitimate bulk operations (mass install, imaging) — correlate with deployment windows
+  response: check per-collector status before treating downstream rule silence as "all clear"

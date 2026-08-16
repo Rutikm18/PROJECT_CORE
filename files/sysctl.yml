@@ -1,0 +1,106 @@
+category: Sysctl
+description: >
+  Detects tampering with kernel runtime parameters used for defense evasion,
+  privilege escalation prep, or covert network pivoting.
+rules:
+  - id: SYSCTL-001
+    title: IP forwarding unexpectedly enabled
+    description: net.ipv4.ip_forward (or ipv6 equivalent) is enabled on a host not designated as a router/gateway, potential covert network pivot setup.
+    mitre_attack: [T1090]
+    severity: high
+    data_source: sysctl net.ipv4.ip_forward / net.ipv6.conf.all.forwarding values
+    detection:
+      logic: ip_forward parameter set to 1 on a host whose designated role is not router/gateway
+      conditions:
+        - net.ipv4.ip_forward == 1 or net.ipv6.conf.all.forwarding == 1
+        - host_role not in ['router','gateway','firewall']
+        - no correlated approved change ticket
+      threshold: any occurrence
+    false_positives:
+      - legitimate host running approved VPN/container networking that requires forwarding (should be an explicit allowlisted role)
+    enrichment_sources:
+      - CMDB host-role registry
+      - change-management ticketing system
+    response_actions:
+      - revert parameter, investigate what network path was being established
+    status: stable
+
+  - id: SYSCTL-002
+    title: Kernel hardening parameter disabled
+    description: A kernel-hardening sysctl (ASLR randomization, dmesg restriction, kptr_restrict, etc.) is weakened from its baseline value.
+    mitre_attack: [T1562.001]
+    severity: high
+    data_source: monitored hardening sysctl keys vs. CIS/org baseline
+    detection:
+      logic: monitored hardening sysctl value diverges from baseline in the weaker direction
+      conditions:
+        - sysctl_key in monitored_hardening_keys
+        - current_value != baseline_value_for(sysctl_key)
+        - direction_of_change == 'weaker'
+      threshold: any occurrence
+    false_positives:
+      - legitimate debugging session temporarily weakening a control (should be ticketed and time-boxed)
+    enrichment_sources:
+      - CIS Benchmark baseline reference
+    response_actions:
+      - restore baseline value, investigate reason for change
+    status: stable
+
+  - id: SYSCTL-003
+    title: Core dump path redirected to unusual or writable location
+    description: kernel.core_pattern is modified to point to a script or an unusual/world-writable path — a known local-privilege-escalation technique.
+    mitre_attack: [T1548]
+    severity: critical
+    data_source: kernel.core_pattern value
+    detection:
+      logic: core_pattern value begins with a pipe to an executable, or points to a non-standard/writable path
+      conditions:
+        - core_pattern matches '^\|' (piped to a program)
+        - OR core_pattern target path is world-writable
+      threshold: any occurrence
+    false_positives:
+      - legitimate crash-reporting tool (e.g., systemd-coredump, apport) using a pipe pattern — verify against known-good patterns
+    enrichment_sources:
+      - known-good core_pattern reference values per distro
+    response_actions:
+      - revert to safe default, investigate what invoked the change
+    status: stable
+
+  - id: SYSCTL-004
+    title: Fleet-wide sysctl baseline drift
+    description: Aggregate divergence of a host's sysctl parameter set from its CIS/org security baseline exceeds threshold.
+    mitre_attack: [T1562.001]
+    severity: medium
+    data_source: full monitored sysctl key set vs. baseline
+    detection:
+      logic: percentage of monitored sysctl keys differing from baseline exceeds threshold
+      conditions:
+        - drifted_key_count / total_monitored_keys > 0.10
+      threshold: '>10% of monitored keys drifted'
+    false_positives:
+      - baseline not yet updated after an approved OS/kernel upgrade
+    enrichment_sources:
+      - configuration-management baseline source of truth
+    response_actions:
+      - reconcile against baseline via approved config-management run
+    status: tuning
+
+  - id: SYSCTL-005
+    title: ptrace_scope lowered (debugging restriction removed)
+    description: kernel.yama.ptrace_scope is lowered, permitting broader process-attach/injection capability — often a precursor to process-injection-based attacks.
+    mitre_attack: [T1055, T1562.001]
+    severity: high
+    data_source: kernel.yama.ptrace_scope value
+    detection:
+      logic: ptrace_scope value decreases from its hardened baseline (e.g., from 1/2/3 to 0)
+      conditions:
+        - current_ptrace_scope < baseline_ptrace_scope
+        - no correlated approved change ticket (e.g., legitimate debugging need)
+      threshold: any decrease
+    false_positives:
+      - legitimate developer/debugging workstation with an approved exception policy
+    enrichment_sources:
+      - change-management ticketing system
+    response_actions:
+      - restore hardened value, investigate for follow-on injection activity (correlate with PROCESSES-003)
+    status: stable

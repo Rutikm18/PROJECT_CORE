@@ -56,6 +56,17 @@ PRECISION_WEIGHTS: dict[str, float] = {
 }
 PRECISION_THRESHOLD = 0.90
 
+# Default threshold for the *Validated Findings page* terrain score. This is a
+# DIFFERENT scale from PRECISION_THRESHOLD (the AI-precision cluster-promotion
+# gate): the terrain score caps a single-anchor "smoking gun" finding (KEV CVE,
+# malicious-hash IOC, SIP disabled, …) at the 0.80 anchor floor in
+# terrain_validators.evaluate_finding. Defaulting the page filter to the 0.90
+# promotion threshold therefore hid EVERY definitive finding — the anchor floor
+# was dead code and the page came up nearly empty. The page default must sit at
+# or below that anchor floor; 0.75 leaves a small margin and still admits only
+# anchored or strongly-corroborated findings. Analyst-configurable in Settings.
+TERRAIN_VALIDATION_THRESHOLD = 0.75
+
 # Minimum factor contributions for a TP — caller can short-circuit when missing
 # (e.g. AI says FP with >0.85 confidence → reject regardless of other factors).
 AI_VETO_CONFIDENCE = 0.85
@@ -636,10 +647,13 @@ async def _load_validation_settings(idb) -> dict:
         agent_priorities = {}
 
     try:
+        # Default to the terrain-page threshold, NOT the 0.90 AI-precision
+        # promotion gate — the terrain score's anchor floor is 0.80, so a 0.90
+        # default filtered out every definitive (anchor) finding.
         global_thr = float(kv.get("validation_global_threshold")
-                           or ENGINE_CONFIG.get("ai_precision_threshold", PRECISION_THRESHOLD))
+                           or TERRAIN_VALIDATION_THRESHOLD)
     except (TypeError, ValueError):
-        global_thr = PRECISION_THRESHOLD
+        global_thr = TERRAIN_VALIDATION_THRESHOLD
 
     use_ai = (kv.get("validation_use_ai_verdict", "true") or "true").lower() == "true"
     try:

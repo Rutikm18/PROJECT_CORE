@@ -16,6 +16,37 @@ _SENSITIVE_ENV = re.compile(
 _TEMP_PATH = re.compile(r"^/(?:tmp|private/tmp|var/tmp)(?:/|$)", re.I)
 _SHELL_EXEC = {"child_process", "exec", "spawn", "shell", "eval"}
 
+# MCP-0001 — a server whose launcher IS an interpreter, or whose args pipe a
+# remote payload into one, is direct RCE the moment the editor restarts.
+_MCP_INTERPRETERS = {
+    "sh", "bash", "zsh", "dash", "fish", "ash", "ksh",
+    "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+}
+_MCP_SHELL_ARGS = re.compile(
+    r"(?:^|\s)-c(?:\s|$)|(?:^|\s)-e(?:\s|$)|-Command\b|"
+    r"curl\s+.*\|\s*(?:sh|bash|zsh)\b|wget\s+.*\|\s*(?:sh|bash)\b|"
+    r"iwr\s+.*\|\s*iex\b|\biex\b",
+    re.I,
+)
+# AICLI-0001 — an autonomy/sandbox-off flag turns any prompt injection in a
+# repo, issue, or web page into unattended local code execution.
+_AGENT_BINARY = re.compile(
+    r"\b(?:claude|codex|aider|gemini|opencode|goose|cline|openhands)\b", re.I,
+)
+_AGENT_AUTONOMY = re.compile(
+    r"--dangerously-skip-permissions\b|--yolo\b|--auto-approve\b|--full-auto\b|"
+    r"--sandbox\s+(?:off|none|danger\w*)\b|--approval-mode\s+(?:never|full-auto)\b|"
+    r"--no-confirm\b",
+    re.I,
+)
+# AIAPP-0001 — exposed inference endpoints are actively scanned; ollama:11434
+# and token-less jupyter are the two most common developer-laptop findings.
+_INFERENCE_SERVERS = (
+    "ollama", "lm-studio", "llama-server", "llama_server", "llama.cpp",
+    "vllm", "text-generation-webui", "comfyui", "open-webui", "openwebui",
+    "jupyter-lab", "jupyterlab", "jupyter-notebook", "jupyter",
+)
+
 RULE_SPECS: dict[str, dict[str, str]] = {
     "AL-DEV-001": {"asset": "editor extension", "condition": "auto activation AND command execution AND side-loaded/unverified publisher", "boundary": "all three anchors are required"},
     "AL-DEV-002": {"asset": "MCP server", "condition": "mutable @latest reference OR unpinned ephemeral runner with sensitive/capability access", "boundary": "an ephemeral runner alone is not sufficient"},
@@ -26,6 +57,13 @@ RULE_SPECS: dict[str, dict[str, str]] = {
     "AL-DEV-007": {"asset": "credential location", "condition": "group/other read or write permission on a credential-related file", "boundary": "owner-only 0600 and directories are silent"},
     "AL-DEV-008": {"asset": "developer listener", "condition": "interesting developer/AI process AND wildcard bind", "boundary": "loopback or unrelated wildcard listeners are silent"},
     "AL-DEV-009": {"asset": "developer container", "condition": "privileged, host network, Docker socket/root bind, or SYS_ADMIN posture", "boundary": "ordinary bridge containers are silent"},
+    "AL-DEV-010": {"asset": "MCP server", "condition": "launcher command is a shell/interpreter OR args pipe a remote payload into one (curl|sh, -c, iex)", "boundary": "a pinned npx/node/python server without inline-shell args is silent"},
+    "AL-DEV-011": {"asset": "coding agent process", "condition": "a known agent binary running with an autonomy or sandbox-disabling flag", "boundary": "an agent with no autonomy flag, or an unrelated process carrying such a flag, is silent"},
+    "AL-DEV-012": {"asset": "local inference server", "condition": "a known model/inference server listening on a wildcard (all-interface) bind", "boundary": "the same server bound to loopback, or a non-inference wildcard listener, is silent"},
+    "AL-DEV-013": {"asset": "Git configuration", "condition": "a url.<base>.insteadOf / pushInsteadOf remote-rewrite override is configured", "boundary": "hooksPath/sshCommand (AL-DEV-006) and unrelated Git settings are silent here"},
+    "AL-DEV-014": {"asset": "agent instruction file", "condition": "a repo-level agent instruction file (CLAUDE.md/AGENTS.md/.cursorrules/…) contains prompt-injection or exfiltration directives", "boundary": "instruction files with no matched injection indicator are silent"},
+    "AL-DEV-015": {"asset": "editor workspace", "condition": "a repo VS Code workspace auto-runs a task on folder-open, disables workspace trust, injects terminal env, or overrides a tool binary path", "boundary": "workspace files with no auto-exec / trust-bypass / override signal are silent"},
+    "AL-DEV-016": {"asset": "model artifact", "condition": "a pickle-format model artifact in an untrusted location has a dangerous unpickling opcode (high) or is a container format that cannot be scanned in place (medium)", "boundary": "a raw pickle that scans clean, and trusted-path artifacts, are silent"},
 }
 
 
@@ -60,6 +98,7 @@ def _hit(
     tactic: str,
     action: str,
     item_key: str,
+    fp: str | None = None,
 ) -> dict[str, Any]:
     score = {"critical": 9.5, "high": 8.0, "medium": 5.5, "low": 3.0}[severity]
     fingerprint_payload = json.dumps(
@@ -85,7 +124,7 @@ def _hit(
             "ISO 27001": ["A.8.8", "A.8.19"],
         },
         "recommended_action": action,
-        "false_positive_notes": "Confirm the component and execution path against the approved developer tooling baseline.",
+        "false_positive_notes": fp or "Confirm the component and execution path against the approved developer tooling baseline.",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "category": "developer_security",
         "item_key": item_key,
@@ -206,7 +245,8 @@ def _browser_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
     return hits
 
 
-def _git_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+def _git_settings(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten every Git setting the collector emits across user/system/local scopes."""
     git = capabilities.get("git")
     if not isinstance(git, dict):
         return []
@@ -217,6 +257,13 @@ def _git_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
     for scope in (git.get("system"), git.get("local")):
         if isinstance(scope, dict):
             settings.extend(row for row in (scope.get("settings") or []) if isinstance(row, dict))
+    return settings
+
+
+def _git_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    settings = _git_settings(capabilities)
+    if not settings:
+        return []
     risky = [row for row in settings if str(row.get("key") or "").lower() in {
         "core.hookspath", "core.sshcommand"
     }]
@@ -281,6 +328,193 @@ def _runtime_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
     return hits
 
 
+def _mcp_shell_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    hits = []
+    for row in _items(capabilities, "mcp_servers", "servers"):
+        name = str(row.get("name") or "unknown")
+        command = str(row.get("command") or "")
+        binary = command.rsplit("/", 1)[-1].strip().lower()
+        args = [str(value) for value in (row.get("args") or [])]
+        combined = " ".join([command, *args])
+        interpreter = binary in _MCP_INTERPRETERS
+        piped = bool(_MCP_SHELL_ARGS.search(combined))
+        if not (interpreter or piped):
+            continue
+        hits.append(_hit(
+            "AL-DEV-010", "critical", "MCP server launches a shell or inline interpreter",
+            "An MCP server is configured to run a shell/interpreter directly or to pipe a remote "
+            "payload into one, which executes with the developer's full privileges on every editor launch.",
+            {"name": name, "config_path": row.get("config_path"), "command": command or None,
+             "args": args[:100], "launcher_is_interpreter": interpreter, "pipes_remote_payload": piped,
+             "capability_indicators": [str(v) for v in (row.get("capability_indicators") or [])]},
+            technique="T1059.004", tactic="Execution",
+            action="Quarantine the MCP config, replace the shell launcher with a pinned binary/package, and re-approve the server manually.",
+            item_key=f"mcp_shell:{row.get('config_path')}:{name}",
+            fp="Rare; a few wrappers legitimately use `sh -c`. Require a reviewed, owner-approved exception rather than allowlisting the shell mechanism.",
+        ))
+    return hits
+
+
+def _agent_autonomy_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    hits = []
+    for row in _items(capabilities, "processes"):
+        command = str(row.get("command") or "")
+        agent = _AGENT_BINARY.search(command)
+        autonomy = _AGENT_AUTONOMY.search(command)
+        if not (agent and autonomy):
+            continue
+        agent_name = agent.group(0).lower()
+        flags = sorted({m.group(0).lower() for m in _AGENT_AUTONOMY.finditer(command)})
+        # Deliberately exclude the volatile PID from evidence so the fingerprint
+        # does not churn every snapshot (object_hash volatile-field discipline).
+        hits.append(_hit(
+            "AL-DEV-011", "high", "Coding agent running with approvals or sandbox disabled",
+            "A known AI coding agent is running with an autonomy or sandbox-disabling flag, which converts "
+            "any prompt injection in a repository, issue, or web page into unattended local code execution.",
+            {"agent": agent_name, "user": row.get("user"), "flags": flags,
+             "interesting": bool(row.get("interesting"))},
+            technique="T1204", tactic="Execution",
+            action="Verify the session was human-initiated on a non-privileged host; review the agent transcript and file writes, and block autonomy flags on CI runners.",
+            item_key=f"agent_autonomy:{agent_name}:{'|'.join(flags)}",
+            fp="Sanctioned sandboxed CI use is legitimate — allowlist by host role and container boundary, not by disabling the rule.",
+        ))
+    return hits
+
+
+def _inference_exposure_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    hits = []
+    for row in _items(capabilities, "listening_ports"):
+        process = str(row.get("process") or "").lower()
+        if not process or not row.get("wildcard"):
+            continue
+        matched = next(
+            (name for name in _INFERENCE_SERVERS
+             if process == name or (len(process) >= 6 and (process.startswith(name) or name.startswith(process)))),
+            None,
+        )
+        if not matched:
+            continue
+        endpoint = str(row.get("endpoint") or row.get("port") or "unknown")
+        hits.append(_hit(
+            "AL-DEV-012", "high", "Local inference server is exposed on all interfaces",
+            "A local model/inference server is bound to a wildcard address and is reachable from the network; "
+            "exposed inference endpoints are actively scanned and are often unauthenticated.",
+            {"process": process, "server": matched, "endpoint": endpoint, "port": row.get("port"),
+             "user": row.get("user"), "wildcard": True},
+            technique="T1190", tactic="Initial Access",
+            action="Rebind the server to 127.0.0.1, require authentication, and review `connections` for prior external hits.",
+            item_key=f"inference_exposed:{matched}:{row.get('port') or endpoint}",
+            fp="Intentional lab hosts exist — require a documented exception plus a network ACL rather than a blanket allowlist.",
+        ))
+    return hits
+
+
+def _git_url_rewrite_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    risky = [
+        row for row in _git_settings(capabilities)
+        if (key := str(row.get("key") or "").lower()).startswith("url.")
+        and (key.endswith(".insteadof") or key.endswith(".pushinsteadof"))
+    ]
+    if not risky:
+        return []
+    keys = sorted({str(row.get("key")) for row in risky})
+    return [_hit(
+        "AL-DEV-013", "medium", "Git URL-rewrite override is configured",
+        "Git is configured to transparently rewrite remote URLs (insteadOf/pushInsteadOf), which can silently "
+        "redirect clones and dependency fetches to an attacker-controlled host.",
+        {"settings": risky[:20], "keys": keys}, technique="T1195.002", tactic="Initial Access",
+        action="Confirm each rewrite is managed and expected; the redirect target is the value that matters — remove any rewrite pointing off a trusted host.",
+        item_key=f"git_url_rewrite:{','.join(keys)}",
+        fp="A local https→ssh convenience rewrite is common and benign — triage on the rewrite *target*, and allowlist known-good pairs.",
+    )]
+
+
+_INJECTION_STRONG = {"ignore_previous", "hide_from_user", "hidden_text"}
+
+
+def _workspace_config_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    hits = []
+    for row in _items(capabilities, "workspace_config", "files"):
+        indicators = sorted({str(value) for value in (row.get("indicators") or [])})
+        if not indicators:
+            continue
+        filename = str(row.get("filename") or "workspace config")
+        repo = row.get("repo")
+        hits.append(_hit(
+            "AL-DEV-015", "high", "Editor workspace auto-executes or overrides tool binaries",
+            "A repository VS Code workspace runs a task on folder-open, disables workspace trust, injects "
+            "terminal environment, or overrides a language/tool binary path — each is a remote-code-execution "
+            "path the moment a hostile repository is opened.",
+            {"filename": filename, "repo": repo, "editor": row.get("editor"), "user": row.get("user"),
+             "indicators": indicators,
+             "signals": [s for s in (row.get("signals") or []) if isinstance(s, dict)][:20]},
+            technique="T1204.002", tactic="Execution",
+            action="Do not trust the workspace; review the flagged tasks/overrides before opening it, and disable workspace-trust auto-grant by policy.",
+            item_key=f"workspace_config:{repo}:{filename}",
+            fp="Monorepos with legitimate folderOpen build tasks exist — allowlist by repo, not globally.",
+        ))
+    return hits
+
+
+def _model_artifact_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    hits = []
+    for row in _items(capabilities, "model_artifacts"):
+        scan = row.get("scan") if isinstance(row.get("scan"), dict) else {}
+        dangerous = bool(scan.get("dangerous"))
+        unavailable = bool(scan.get("scan_unavailable"))
+        if not (dangerous or unavailable):
+            continue
+        path = row.get("path")
+        if dangerous:
+            severity = "high"
+            summary = ("references a dangerous module during unpickling "
+                       f"({', '.join(scan.get('dangerous_modules') or []) or 'code-exec opcode'})")
+        else:
+            severity = "medium"
+            summary = "is a pickle-based container format that cannot be verified in place"
+        hits.append(_hit(
+            "AL-DEV-016", severity, "Untrusted pickle-format model artifact",
+            f"A model artifact in an untrusted location {summary}; loading a pickle-based model "
+            "deserializes arbitrary code, so this is code execution at model load.",
+            {"path": path, "extension": row.get("extension"), "format": row.get("format"),
+             "location": row.get("location"), "user": row.get("user"),
+             "dangerous": dangerous, "scan_unavailable": unavailable,
+             "dangerous_modules": scan.get("dangerous_modules") or [],
+             "globals": (scan.get("globals") or [])[:20]},
+            technique="T1195.002", tactic="Execution",
+            action="Quarantine the file, re-source it from a trusted registry, and prefer safetensors; treat the host as exposed if the model was already loaded.",
+            item_key=f"model_artifact:{path}",
+            fp="Internal training artifacts are legitimate — allowlist by internal storage path via ATTACKLENS_DEVSEC_MODEL_REGISTRIES.",
+        ))
+    return hits
+
+
+def _agent_instruction_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    hits = []
+    for row in _items(capabilities, "agent_instructions", "files"):
+        indicators = sorted({str(value) for value in (row.get("indicators") or [])})
+        if not indicators:
+            continue
+        filename = str(row.get("filename") or "agent instruction file")
+        repo = row.get("repo")
+        # A strong injection verb (override / hide-from-user / hidden unicode) is
+        # high; a lone read-secret or egress hint in agent context is medium.
+        severity = "high" if _INJECTION_STRONG.intersection(indicators) else "medium"
+        hits.append(_hit(
+            "AL-DEV-014", severity, "Repo agent-instruction file contains injection or exfil directives",
+            "A repository-level AI-agent instruction file carries prompt-injection or data-exfiltration "
+            "language, which is read as agent context the moment a coding agent opens the repository.",
+            {"filename": filename, "repo": repo, "user": row.get("user"),
+             "indicators": indicators, "match_count": row.get("match_count"),
+             "matches": [m for m in (row.get("matches") or []) if isinstance(m, dict)][:20]},
+            technique="T1204", tactic="Execution",
+            action="Block agent runs in this repository, review the flagged lines, and alert the repo owner; treat the host as exposed if an agent already ran there.",
+            item_key=f"agent_instruction:{repo}:{filename}",
+            fp="Security-research repos and prompt-engineering docs legitimately contain sample injection payloads — allowlist by repo, not globally.",
+        ))
+    return hits
+
+
 async def analyze(
     agent_id: str,
     section: str,
@@ -297,11 +531,18 @@ async def analyze(
     hits = [
         *_extension_hits(capabilities),
         *_mcp_hits(capabilities),
+        *_mcp_shell_hits(capabilities),
         *_path_hits(capabilities),
         *_browser_hits(capabilities),
         *_git_hits(capabilities),
+        *_git_url_rewrite_hits(capabilities),
         *_credential_hits(capabilities),
         *_runtime_hits(capabilities),
+        *_agent_autonomy_hits(capabilities),
+        *_inference_exposure_hits(capabilities),
+        *_agent_instruction_hits(capabilities),
+        *_workspace_config_hits(capabilities),
+        *_model_artifact_hits(capabilities),
     ]
     asset = hostname or agent_id
     for hit in hits:

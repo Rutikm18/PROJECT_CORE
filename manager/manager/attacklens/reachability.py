@@ -79,7 +79,12 @@ def _pkg_token(package_name: str) -> str:
     if name.startswith("@") and "/" in name:      # @scope/pkg -> pkg
         name = name.split("/", 1)[1]
     name = _VERSION_SUFFIX.sub("", name)
-    name = name.lstrip("lib")  # libssl -> ssl, libpng -> png (common C libs)
+    # Strip a real leading "lib" *prefix* only (libssl -> ssl, libpng -> png).
+    # NOTE: `str.lstrip("lib")` removes any leading run of l/i/b *characters*,
+    # not the prefix — it mangled ipython->python (false-positive vs a python
+    # process), lodash->odash, log4j-core->og4jcore, and irb->'' (unmatchable).
+    if name.startswith("lib") and len(name) > 4:
+        name = name[3:]
     name = re.sub(r"[^a-z0-9]+", "", name)
     return name if len(name) >= _MIN_TOKEN_LEN else ""
 

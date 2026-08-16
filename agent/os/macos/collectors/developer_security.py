@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pickletools
 import plistlib
 import pwd
 import re
@@ -32,7 +33,7 @@ from .base import BaseCollector, _get_env, run_budget_remaining
 
 
 _SCHEMA_VERSION = 1
-_COLLECTOR_VERSION = "macos-developer-security/2"
+_COLLECTOR_VERSION = "macos-developer-security/3"
 _MAX_ITEMS = 500
 _MAX_FILES = 400
 _MAX_TEXT = 512 * 1024
@@ -70,6 +71,73 @@ _DANGEROUS_BROWSER_PERMS = {
 }
 _SECRET_FILE = re.compile(r"^\.env($|\.)|credential|token|secret|config\.json$", re.I)
 _TEMP_PATH = re.compile(r"^/(?:tmp|private/tmp|var/tmp)(?:/|$)", re.I)
+
+# Repo-level AI-agent instruction files. These are read as agent *context* the
+# moment a coding agent opens the repository, so a hostile clone can carry a
+# prompt-injection or exfiltration directive straight into an autonomous run.
+# We ship only line numbers, line hashes, and which indicator class matched —
+# never the file contents (mirrors `_shell_startup`).
+_AGENT_INSTRUCTION_NAMES = {
+    "claude.md", "agents.md", "gemini.md", ".cursorrules",
+    ".windsurfrules", ".clinerules", ".aider.conf.yml",
+    "copilot-instructions.md",  # lives under .github/
+}
+_INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ignore_previous", re.compile(
+        r"ignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:above|previous|prior|earlier)\s+"
+        r"(?:instructions?|prompts?|rules?|context)", re.I)),
+    ("read_secret", re.compile(
+        r"(?:read|cat|include|open|load|print|show|send|exfiltrat\w*)\b.{0,40}"
+        r"(?:\.env\b|id_rsa|credentials|\.aws\b|\.npmrc\b|\.ssh\b|secret|"
+        r"api[_-]?key|token)", re.I)),
+    ("egress", re.compile(
+        r"(?:curl|wget|fetch|requests\.(?:post|get)|http\.post|send|upload|"
+        r"exfiltrat\w*)\b.{0,40}https?://", re.I)),
+    ("hide_from_user", re.compile(
+        r"do\s+not\s+(?:mention|tell|inform|show|reveal|disclose|notify)\b"
+        r".{0,20}(?:the\s+)?user", re.I)),
+    # zero-width space/non-joiner/joiner, word-joiner, invisible-times, BOM
+    ("hidden_text", re.compile("[\u200b\u200c\u200d\u2060\u2062\ufeff]")),
+)
+_INSTRUCTION_PRUNE_DIRS = {
+    ".git", "node_modules", "vendor", "dist", "build", ".venv", "venv",
+    "__pycache__", ".cache", "site-packages", ".next", "target", ".tox",
+    "Pods", "DerivedData", ".gradle",
+}
+
+# EXT-0005 — a workspace that auto-runs a task on folder-open, disables trust,
+# or overrides a tool binary path is a full RCE path the moment a hostile repo
+# is opened. VS Code (`.vscode/`) is the dominant, documented surface.
+_WORKSPACE_TRUST_KEY = "security.workspace.trust.enabled"
+_BINARY_OVERRIDE_KEY = re.compile(
+    r"^(?:git|php|python|deno|go|rust-analyzer|clangd|terraform|"
+    r"terminal\.integrated\.(?:shell|profiles|automationProfile))\."
+    r"(?:path|executablePath|interpreterPath|defaultInterpreterPath|"
+    r"serverPath|check\.overrideCommand)",
+    re.I,
+)
+
+# AIAPP-0002 — pickle deserialization is arbitrary code execution at model load.
+# Raw-pickle formats can be opcode-scanned in place (never executed); container
+# formats (torch zip / hdf5) can't be scanned here, so they are flagged as
+# scan-unavailable per the pack. Model files are looked for in untrusted
+# download/app locations, not trusted caches.
+_MODEL_PICKLE_EXT = {".pkl", ".joblib", ".ckpt"}
+_MODEL_ARCHIVE_EXT = {".pt", ".pth", ".bin", ".h5"}
+_MODEL_ROOTS_REL = ("Downloads", "Desktop")
+_MODEL_APP_ROOTS_REL = (
+    "ComfyUI/models", "comfyui/models",
+    "stable-diffusion-webui/models", "Library/Application Support/ComfyUI/models",
+)
+_PICKLE_DANGEROUS_MODULES = {
+    "os", "posix", "nt", "subprocess", "builtins", "__builtin__", "sys",
+    "socket", "shutil", "commands", "pty", "runpy", "importlib", "ctypes",
+    "operator", "webbrowser", "pip",
+}
+_PICKLE_STRING_OPS = {
+    "SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE",
+    "STRING", "SHORT_BINSTRING", "BINSTRING",
+}
 
 
 def _clip(value: Any, limit: int = _MAX_FIELD) -> str:
@@ -542,6 +610,9 @@ class DeveloperSecurityCollector(BaseCollector):
             "browser_extensions": part("browser_extensions", lambda: self._browser_extensions(homes)),
             "native_messaging": part("native_messaging", lambda: self._native_messaging(homes)),
             "git": part("git", lambda: self._git(homes)),
+            "agent_instructions": part("agent_instructions", lambda: self._agent_instructions(homes)),
+            "workspace_config": part("workspace_config", lambda: self._workspace_configs(homes)),
+            "model_artifacts": part("model_artifacts", lambda: self._model_artifacts(homes)),
             "credential_locations": part("credential_locations", lambda: self._credentials(homes)),
             "docker": part("docker", self._docker),
         }
@@ -1268,6 +1339,282 @@ class DeveloperSecurityCollector(BaseCollector):
                 "keychains": [_privacy_path(_clip(line.strip().strip('"'), 1024))
                               for line in keychains.get("stdout", "").splitlines() if line.strip()],
                 "default_keychain": _privacy_path(_clip(default.get("stdout", "").strip().strip('"'), 1024)) or None}
+
+    @staticmethod
+    def _scan_pickle_opcodes(
+        path: Path, *, max_bytes: int = 4 * 1024 * 1024, max_ops: int = 20_000,
+    ) -> dict[str, Any]:
+        """Statically scan a raw pickle's opcodes for dangerous module references.
+
+        Never unpickles. Reads a bounded prefix and walks opcodes with
+        `pickletools.genops`, tracking recent string constants so that both
+        protocol-0/1 GLOBAL and protocol-2+ STACK_GLOBAL module references are
+        caught. Returns what it saw; malformed/truncated pickles are reported,
+        not raised.
+        """
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(max_bytes)
+        except OSError:
+            return {"scanned": False, "scan_unavailable": True, "dangerous": False, "globals": []}
+        globals_found: list[str] = []
+        dangerous: set[str] = set()
+        recent: list[str] = []
+        partial = False
+
+        def _flag(module_qualname: str) -> None:
+            root = str(module_qualname or "").strip().split()[0].split(".")[0].lstrip("_")
+            if root and (root in _PICKLE_DANGEROUS_MODULES
+                         or f"__{root}__" == "__builtin__"):
+                dangerous.add(root)
+
+        try:
+            ops = 0
+            for opcode, arg, _pos in pickletools.genops(head):
+                ops += 1
+                if ops > max_ops:
+                    partial = True
+                    break
+                name = opcode.name
+                if name in _PICKLE_STRING_OPS:
+                    recent.append(str(arg))
+                    del recent[:-4]
+                elif name == "GLOBAL":
+                    module = str(arg or "").split(" ", 1)[0]
+                    globals_found.append(str(arg)[:128])
+                    _flag(module)
+                elif name == "STACK_GLOBAL":
+                    if len(recent) >= 2:
+                        globals_found.append(f"{recent[-2]} {recent[-1]}"[:128])
+                        _flag(recent[-2])
+        except Exception:
+            # A dangerous GLOBAL near the header is still valid evidence even if
+            # the tail is truncated by our byte cap or is genuinely corrupt.
+            partial = True
+        return {"scanned": True, "scan_unavailable": False,
+                "dangerous": bool(dangerous), "dangerous_modules": sorted(dangerous),
+                "globals": sorted(set(globals_found))[:20], "partial": partial}
+
+    def _model_artifacts(self, homes: list[tuple[str, Path]]) -> dict[str, Any]:
+        """Inventory pickle-format model artifacts in untrusted locations.
+
+        Only artifacts that are actually risky are emitted: a confirmed dangerous
+        opcode (any format we can read) or a container format we cannot scan here.
+        A raw pickle that scans clean is deliberately dropped. Operator-trusted
+        path prefixes (ATTACKLENS_DEVSEC_MODEL_REGISTRIES) are skipped.
+        """
+        trusted = tuple(
+            p for p in str(_get_env().get("ATTACKLENS_DEVSEC_MODEL_REGISTRIES", "")).split(":") if p
+        )
+        rows: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        exts = _MODEL_PICKLE_EXT | _MODEL_ARCHIVE_EXT
+        for user, home in homes:
+            roots = [home / rel for rel in (*_MODEL_ROOTS_REL, *_MODEL_APP_ROOTS_REL)]
+            for root in roots:
+                if scanned >= _MAX_FILES or truncated or not _is_dir(root):
+                    continue
+                found, cut = _walk([root], lambda p: p.suffix.lower() in exts,
+                                   max_depth=6, max_files=max(1, _MAX_FILES - scanned))
+                truncated = truncated or cut
+                for path in found:
+                    if scanned >= _MAX_FILES:
+                        truncated = True
+                        break
+                    if trusted and str(path).startswith(trusted):
+                        continue
+                    remaining = run_budget_remaining()
+                    if remaining is not None and remaining < 0.5:
+                        truncated = True
+                        break
+                    scanned += 1
+                    ext = path.suffix.lower()
+                    if ext in _MODEL_PICKLE_EXT:
+                        scan = self._scan_pickle_opcodes(path)
+                    else:
+                        scan = {"scanned": False, "scan_unavailable": True,
+                                "dangerous": False, "globals": []}
+                    if not (scan.get("dangerous") or scan.get("scan_unavailable")):
+                        continue  # a raw pickle that scanned clean is safe
+                    rows.append({
+                        "user": _privacy_identity(user),
+                        **(_file_meta(path) or {"path": _privacy_path(path)}),
+                        "extension": ext,
+                        "format": "pickle" if ext in _MODEL_PICKLE_EXT else "container",
+                        "location": _privacy_path(root),
+                        "scan": scan,
+                    })
+                    if len(rows) >= _MAX_ITEMS:
+                        truncated = True
+                        break
+        return {"items": rows, "count": len(rows), "scanned": scanned, "truncated": truncated}
+
+    @staticmethod
+    def _scan_workspace_file(path: Path) -> list[dict[str, Any]]:
+        """Flag the auto-execution / trust-bypass / binary-override signals in one workspace file.
+
+        Ships only the flagged key (and a redacted value for path overrides), never
+        the whole file.
+        """
+        doc = _read_json(path)
+        if not isinstance(doc, dict):
+            return []
+        signals: list[dict[str, Any]] = []
+        name = path.name.lower()
+        if name == "tasks.json":
+            tasks = doc.get("tasks")
+            for task in tasks if isinstance(tasks, list) else []:
+                if not isinstance(task, dict):
+                    continue
+                options = task.get("runOptions")
+                run_on = options.get("runOn") if isinstance(options, dict) else None
+                if str(run_on or "").lower() == "folderopen":
+                    signals.append({"indicator": "auto_run_on_open",
+                                    "detail": _redact(task.get("label") or task.get("command"))[:256]})
+        elif name == "settings.json":
+            if doc.get(_WORKSPACE_TRUST_KEY) is False:
+                signals.append({"indicator": "trust_disabled", "detail": _WORKSPACE_TRUST_KEY})
+            for key, value in doc.items():
+                text = str(key)
+                if _BINARY_OVERRIDE_KEY.search(text):
+                    signals.append({"indicator": "binary_path_override",
+                                    "detail": _redact(f"{text}={value}")[:256]})
+                elif text.startswith("terminal.integrated.env"):
+                    signals.append({"indicator": "terminal_env_injection", "detail": _clip(text, 256)})
+        return signals[:50]
+
+    def _workspace_configs(self, homes: list[tuple[str, Path]]) -> dict[str, Any]:
+        """Scan repo `.vscode/` workspace files for folder-open auto-exec and tool-path overrides.
+
+        Bounded home walk that descends `.vscode` but prunes heavy/vendored trees;
+        only files carrying at least one danger signal are emitted.
+        """
+        rows: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        for user, home in homes:
+            if scanned >= _MAX_FILES or truncated:
+                break
+            for current, dirs, files in os.walk(home, followlinks=False):
+                remaining = run_budget_remaining()
+                if remaining is not None and remaining < 0.5:
+                    truncated = True
+                    break
+                current_path = Path(current)
+                depth = len(current_path.parts) - len(home.parts)
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in _INSTRUCTION_PRUNE_DIRS
+                    and (not d.startswith(".") or d == ".vscode")
+                ]
+                if depth >= 6:
+                    dirs[:] = []
+                if current_path.name != ".vscode":
+                    continue
+                for fname in ("tasks.json", "settings.json"):
+                    if fname not in files:
+                        continue
+                    if scanned >= _MAX_FILES:
+                        truncated = True
+                        break
+                    path = current_path / fname
+                    scanned += 1
+                    signals = self._scan_workspace_file(path)
+                    if not signals:
+                        continue
+                    rows.append({
+                        "user": _privacy_identity(user),
+                        **(_file_meta(path) or {"path": _privacy_path(path)}),
+                        "editor": "vscode",
+                        "filename": fname,
+                        "repo": _privacy_path(current_path.parent),
+                        "indicators": sorted({str(s["indicator"]) for s in signals}),
+                        "signals": signals,
+                    })
+                    if len(rows) >= _MAX_ITEMS:
+                        truncated = True
+                        break
+                if scanned >= _MAX_FILES or truncated:
+                    break
+        return {"files": rows, "count": len(rows), "scanned": scanned,
+                "truncated": truncated, "contents_transmitted": False}
+
+    def _agent_instructions(self, homes: list[tuple[str, Path]]) -> dict[str, Any]:
+        """Scan repo-level AI-agent instruction files for prompt-injection / exfil directives.
+
+        Ships line numbers, line hashes and which indicator class matched only —
+        never the file contents (mirrors `_shell_startup`). Only files with at
+        least one indicator are emitted. The walk is bounded by depth, a pruned
+        directory set, a file cap, and the shared run budget.
+        """
+        rows: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        for user, home in homes:
+            if scanned >= _MAX_FILES or truncated:
+                break
+            for current, dirs, files in os.walk(home, followlinks=False):
+                remaining = run_budget_remaining()
+                if remaining is not None and remaining < 0.5:
+                    truncated = True
+                    break
+                current_path = Path(current)
+                depth = len(current_path.parts) - len(home.parts)
+                # Prune heavy/vendored trees and hidden dirs, but keep .github so
+                # copilot-instructions.md stays reachable.
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in _INSTRUCTION_PRUNE_DIRS
+                    and (not d.startswith(".") or d == ".github")
+                ]
+                if depth >= 6:
+                    dirs[:] = []
+                for name in files:
+                    lname = name.lower()
+                    if lname not in _AGENT_INSTRUCTION_NAMES:
+                        continue
+                    # copilot-instructions.md is only meaningful under .github/
+                    if lname == "copilot-instructions.md" and current_path.name != ".github":
+                        continue
+                    if scanned >= _MAX_FILES:
+                        truncated = True
+                        break
+                    path = current_path / name
+                    scanned += 1
+                    text, text_truncated = _read_text(path, 256 * 1024)
+                    if not text:
+                        continue
+                    matches: list[dict[str, Any]] = []
+                    indicators: set[str] = set()
+                    for number, line in enumerate(text.splitlines(), 1):
+                        hit = [key for key, pattern in _INJECTION_PATTERNS if pattern.search(line)]
+                        if hit:
+                            matches.append({"line": number, "sha256": _hash_line(line),
+                                            "indicators": hit})
+                            indicators.update(hit)
+                        if len(matches) >= 100:
+                            break
+                    if not matches:
+                        continue
+                    repo = current_path.parent if lname == "copilot-instructions.md" else current_path
+                    rows.append({
+                        "user": _privacy_identity(user),
+                        **(_file_meta(path) or {"path": _privacy_path(path)}),
+                        "filename": name,
+                        "repo": _privacy_path(repo),
+                        "indicators": sorted(indicators),
+                        "match_count": len(matches),
+                        "matches": matches[:100],
+                        "content_truncated": text_truncated,
+                    })
+                    if len(rows) >= _MAX_ITEMS:
+                        truncated = True
+                        break
+                if scanned >= _MAX_FILES or truncated:
+                    break
+        return {"files": rows, "count": len(rows), "scanned": scanned,
+                "truncated": truncated, "contents_transmitted": False}
 
     def _docker(self) -> dict[str, Any]:
         raw = _run_command(["docker", "ps", "-a", "--format", "{{json .}}"])
