@@ -60,8 +60,14 @@ _TERRAINS = (
         "Posture",
         "Posture (Security Controls)",
         "Security posture, SIP, Gatekeeper, FileVault, and firewall",
-        "#8b5cf6",
-        "/posture/overview",
+        # Indigo, not violet: the Mesh terrain page already renders violet, and
+        # two adjacent terrains sharing an accent made the map dots ambiguous.
+        "#6366f1",
+        # Posture is an Attack Terrain like any other, so it lives under
+        # /terrain/. The Sidebar routes its badge counts through this field, so
+        # the old /posture/overview target sent posture findings to the legacy
+        # SecurityPosture page instead of the terrain view.
+        "/terrain/posture",
         ("security", "posture", "sip", "firewall", "agent_health", "battery",
          "hardware", "compliance"),
     ),

@@ -18,10 +18,12 @@
  * /terrain/origin               terrain/origin/          VulnerabilitySurface
  * /terrain/vector               terrain/vector/          NetworkThreats
  * /terrain/citadels             terrain/citadels/        ExecutionThreats
- * /terrain/persistence          terrain/persistence/     PersistenceBackdoors
- * /terrain/identity             terrain/identity/        IdentityAccess
+ * /terrain/mesh                 terrain/mesh/            MeshThreats
+ * /terrain/identity             terrain/identity/        IdentityTerrain
+ * /terrain/posture              terrain/posture/         PostureTerrain
+ * /terrain/persistence          terrain/persistence/     PersistenceBackdoors  (disabled)
  *
- * /posture/overview             posture/overview/        SecurityPosture
+ * /posture/overview             posture/overview/        SecurityPosture       (disabled)
  * /posture/compliance           posture/compliance/      CISCompliance
  *
  * /intelligence/:tab            ThreatIntelligence.tsx   ioc|cve|kev|hunt|feeds
@@ -38,12 +40,13 @@
  * /analysis/accuracy            analysis/accuracy/       Accuracy
  * /analysis/coverage            analysis/coverage/       DetectionCoverage
  *
- * /settings/:section            Settings.tsx             org|license|roles|platform|validation|retention|ai
+ * /settings/:section            Settings.tsx             org|license|roles|platform|validation|pipeline|retention|ai
  *   /settings/org               ↳ Organisation Details
  *   /settings/license           ↳ License & Validity
  *   /settings/roles             ↳ Role Access Matrix
  *   /settings/platform          ↳ Platform Config
- *   /settings/validation        ↳ Finding Validation
+ *   /settings/validation        ↳ Finding Validation (thresholds)
+ *   /settings/pipeline          ↳ Validation Pipeline (stages, accuracy, debug)
  *   /settings/retention         ↳ Data Retention
  *   /settings/ai                ↳ AI Configuration
  * ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +68,7 @@ export const ROUTES = {
     mesh:        "/terrain/mesh",
     persistence: "/terrain/persistence",
     identity:    "/terrain/identity",
+    posture:     "/terrain/posture",
   },
 
   posture: {
@@ -100,6 +104,7 @@ export const ROUTES = {
     roles:      "/settings/roles",
     platform:   "/settings/platform",
     validation: "/settings/validation",
+    pipeline:   "/settings/pipeline",
     retention:  "/settings/retention",
     ai:         "/settings/ai",
   },

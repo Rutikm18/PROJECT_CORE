@@ -36,7 +36,7 @@ const SEG: Record<string, string> = {
   dashboard: "Security Dashboard", findings: "Validated Findings",
   incidents: "All Incidents", terrain: "Attack Terrain",
   origin: "Origin", vector: "Vector", citadels: "Citadels", mesh: "Mesh",
-  persistence: "Persistence & Backdoors", identity: "Identity & Access",
+  persistence: "Persistence & Backdoors", identity: "Identity",
   posture: "Posture", overview: "Security Posture", compliance: "CIS Compliance",
   intelligence: "Threat Intelligence", ioc: "IOC Triage", cve: "CVE Intel",
   kev: "KEV Mandates", hunt: "Hunt Queries", feeds: "Feed Status",
@@ -46,6 +46,7 @@ const SEG: Record<string, string> = {
   coverage: "Detection Coverage", "custom-rules": "Custom Rules",
   settings: "Settings", org: "Organisation", license: "License",
   roles: "Roles", platform: "Platform", validation: "Validation",
+  pipeline: "Validation Pipeline",
   retention: "Data Retention", ai: "AI Configuration",
   notifications: "Notifications", integrations: "Integrations",
 };
@@ -61,8 +62,8 @@ const CMD = [
   { label: "Vector — Network",      path: "/terrain/vector",        group: "Attack Terrain" },
   { label: "Citadels — Execution",  path: "/terrain/citadels",      group: "Attack Terrain" },
   { label: "Mesh — Developer & Agent", path: "/terrain/mesh",       group: "Attack Terrain" },
-  { label: "Identity & Access",     path: "/identity",              group: "Navigate" },
-  { label: "Security Posture",      path: "/posture/overview",      group: "Navigate" },
+  { label: "Identity — Accounts",   path: "/terrain/identity",      group: "Attack Terrain" },
+  { label: "Posture — Controls",    path: "/terrain/posture",       group: "Attack Terrain" },
   { label: "CIS Compliance",        path: "/posture/compliance",    group: "Navigate" },
   { label: "IOC Triage",           path: "/intelligence/ioc",      group: "Intelligence" },
   { label: "CVE Intel",            path: "/intelligence/cve",      group: "Intelligence" },
@@ -129,7 +130,7 @@ export function TopHeader({
   onBrightnessChange: (value: number) => void;
   onOpenNavigation?: () => void;
 }) {
-  const { user, setRole } = useRBAC();
+  const { user } = useRBAC();
   const { logout, user: authUser } = useAuth();
   const {
     triggerRefresh, isRefreshing, refreshRevision, registerRefreshRequest,
@@ -553,28 +554,24 @@ export function TopHeader({
               </div>
             </div>
 
-            {/* Role switcher */}
+            {/* Signed-in role.
+                This was a "Switch Role" menu backed by localStorage — anyone
+                could grant themselves admin from devtools. The role now comes
+                from the signed session token via /api/v1/auth/me and is shown
+                read-only; changing it means changing the account, not the
+                browser. */}
             <div className="px-3 pt-2.5 pb-1">
-              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wider px-1 mb-1.5">Switch Role</div>
-              {(["admin", "analyst", "viewer"] as Role[]).map(r => (
-                <button key={r}
-                  onClick={() => { setRole(r); setUserMenuOpen(false); }}
-                  className={cn(
-                    "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-left transition-all mb-0.5",
-                    user.role === r
-                      ? "bg-orange-50 border border-orange-200"
-                      : "hover:bg-gray-50 border border-transparent"
-                  )}>
-                  <div className={cn("w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0", ROLE_STYLE[r].dot.replace("bg-", "bg-") + " opacity-90")}>
-                    <span className="text-[8px]">{ROLE_ICON[r]}</span>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className={cn("text-[10px] font-bold capitalize", user.role === r ? "text-orange-700" : "text-gray-700")}>{r}</div>
-                    <div className="text-[9px] text-gray-400 leading-snug truncate">{ROLE_DESC[r]}</div>
-                  </div>
-                  {user.role === r && <CheckCircle2 className="w-3.5 h-3.5 text-orange-500 flex-shrink-0" />}
-                </button>
-              ))}
+              <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wider px-1 mb-1.5">Signed in as</div>
+              <div className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl bg-orange-50 border border-orange-200 mb-0.5">
+                <div className={cn("w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0", ROLE_STYLE[user.role].dot, "opacity-90")}>
+                  <span className="text-[8px]">{ROLE_ICON[user.role]}</span>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[10px] font-bold capitalize text-orange-700">{user.role}</div>
+                  <div className="text-[9px] text-gray-400 leading-snug truncate">{ROLE_DESC[user.role]}</div>
+                </div>
+                <CheckCircle2 className="w-3.5 h-3.5 text-orange-500 flex-shrink-0" />
+              </div>
             </div>
 
             {/* Actions */}

@@ -64,8 +64,28 @@ class TestVersionResolution:
 
 
 class TestMetaEndpoint:
+    """/api/v1/meta requires a dashboard session.
+
+    It used to be public, but its only callers are inside the authenticated
+    shell (Sidebar, Dashboard, TimeRangePicker) — the login screen reads
+    /api/v1/auth/policy instead — so an anonymous build/version banner was free
+    fingerprinting. See the auth boundary in server.py and
+    manager/tests/unit/test_api_auth_coverage.py.
+
+    The token is minted through auth_ui itself so signer and verifier resolve
+    the same secret.
+    """
+
     def setup_method(self):
+        from manager.manager.api import auth_ui
+
+        token, _jti, _exp = auth_ui._make_token("admin@attacklens.ai", "admin")
         self.client = TestClient(create_app())
+        self.client.cookies.set("al_session", token)
+
+    def test_meta_requires_a_session(self):
+        anonymous = TestClient(create_app())
+        assert anonymous.get("/api/v1/meta").status_code == 401
 
     def test_meta_returns_200(self):
         r = self.client.get("/api/v1/meta")

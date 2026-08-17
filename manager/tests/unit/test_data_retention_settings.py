@@ -300,8 +300,22 @@ def app(tmp_path_factory, _module_pg_manager_dsn, _module_pg_intel_dsn):
 
 @pytest.fixture(scope="module")
 def client(app):
+    """A signed-in operator.
+
+    /api/v1/settings requires a dashboard session (see the auth boundary in
+    server.py and test_api_auth_coverage.py). These tests exercise the
+    authenticated path, so the client carries a real session cookie rather than
+    the endpoints being left open to satisfy the suite.
+
+    The token is minted through auth_ui itself, so it is signed with whatever
+    secret that module resolved at import — signer and verifier cannot drift.
+    """
     from fastapi.testclient import TestClient
+    from manager.manager.api import auth_ui
+
+    token, _jti, _exp = auth_ui._make_token("admin@attacklens.ai", "admin")
     with TestClient(app) as c:
+        c.cookies.set("al_session", token)
         yield c
 
 

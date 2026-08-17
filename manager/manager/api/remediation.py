@@ -55,6 +55,24 @@ def _analyst(request: Request):
     return getattr(request.app.state, "ai_analyst", None)
 
 
+def _active_model(analyst) -> str:
+    """Best-effort name of the model the analyst will actually use.
+
+    Prefers the configured provider's model over the AI_ANALYST_MODEL env
+    default, so the response does not claim Claude when the call is being
+    served by, say, a DeepSeek model through OpenRouter.
+    """
+    try:
+        from ..ai.key_store import load_config
+        cfg = load_config()
+        if cfg is not None and not getattr(analyst, "_client", None):
+            return cfg.model
+    except Exception:
+        pass
+    import os as _os
+    return _os.environ.get("AI_ANALYST_MODEL", "claude-sonnet-4-6")
+
+
 def _feeds(request: Request):
     return getattr(request.app.state, "feeds", None)
 
@@ -225,7 +243,11 @@ async def generate_remediation_plan(
     notification_dispatcher=Depends(_notification_dispatcher),
 ):
     if not analyst or not analyst.enabled:
-        raise HTTPException(503, "AI analyst not available. Set ANTHROPIC_API_KEY.")
+        raise HTTPException(
+            503,
+            "No AI provider configured. Set one in Settings -> AI Provider "
+            "(or POST /api/v1/ai/provider).",
+        )
 
     # Fetch finding
     finding = None
@@ -276,7 +298,11 @@ async def generate_ai_analysis(
     analyst=Depends(_analyst),
 ):
     if not analyst or not analyst.enabled:
-        raise HTTPException(503, "AI analyst not available. Set ANTHROPIC_API_KEY.")
+        raise HTTPException(
+            503,
+            "No AI provider configured. Set one in Settings -> AI Provider "
+            "(or POST /api/v1/ai/provider).",
+        )
 
     async with idb._pool.read() as conn:  # see _load_finding's comment on why not idb._conn
         async with conn.execute(
@@ -303,11 +329,17 @@ async def ai_prioritize(
 ):
     """AI-assisted prioritization of active findings."""
     if not analyst or not analyst.enabled:
-        raise HTTPException(503, "AI analyst not available. Set ANTHROPIC_API_KEY.")
+        raise HTTPException(
+            503,
+            "No AI provider configured. Set one in Settings -> AI Provider "
+            "(or POST /api/v1/ai/provider).",
+        )
     findings = await idb.get_soc_findings(agent_id=agent_id, active_only=True, limit=limit)
     prioritized = await analyst.prioritize_findings(findings)
+    # Report the model actually used, not a hardcoded Anthropic name — the
+    # analyst may be running on any configured provider.
     return {"findings": prioritized, "count": len(prioritized),
-            "ai_powered": True, "model": "claude-sonnet-4-6"}
+            "ai_powered": True, "model": _active_model(analyst)}
 
 
 # ── Asset registry ────────────────────────────────────────────────────────────

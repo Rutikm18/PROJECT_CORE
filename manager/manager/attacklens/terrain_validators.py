@@ -432,28 +432,97 @@ CITADELS_CRITERIA: list[dict] = [
     },
 ]
 
+# Identity has the same two-emitter split as posture (see _disabled_control):
+# the routed detections/user_account module emits {"username": ..., "uid": ...}
+# with rule_id="uid_zero_clone", while the inline engine._users emits
+# {"name": ..., "uid": ...} with source="rule:uid0". The criteria below
+# originally read only "name", so a module-emitted UID 0 backdoor — the single
+# most definitive identity finding there is — scored 0.0.
+_IDENTITY_NAME_KEYS = ("name", "username", "user", "account")
+
+# rule_id / source values that mean "this account was just given privilege".
+_PRIV_ESCALATION_SOURCES = frozenset({
+    "behavioral_change",        # inline behavioural baseline
+    "privgroup_added",          # detections/user_account
+    "new_account",
+})
+
+_NOLOGIN_SHELLS = frozenset({
+    "/bin/false", "/usr/bin/false", "/sbin/nologin", "/usr/sbin/nologin",
+    "/bin/nologin", "/dev/null", "",
+})
+
+
+def _identity_username(f: dict) -> str:
+    ev = _ev(f)
+    for key in _IDENTITY_NAME_KEYS:
+        value = ev.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _uid_zero_non_root(f: dict) -> float:
+    """A root-equivalent account that is not `root` itself.
+
+    Checks gid as well as uid: detections/user_account flags either, because a
+    GID 0 clone is the same backdoor with one field changed.
+    """
+    ev = _ev(f)
+    ids = [ev.get("uid"), ev.get("gid")]
+    if not any(str(value) == "0" for value in ids if value is not None):
+        return 0.0
+    username = _identity_username(f)
+    if not username:
+        # No name recorded but a UID 0 account was flagged — still a real
+        # signal, just not one we can confirm is non-root. Partial, not zero:
+        # zero would silently drop the terrain's anchor.
+        return 0.5
+    return 0.0 if username.lower() == "root" else 1.0
+
+
+def _service_account_shell(f: dict) -> float:
+    ev = _ev(f)
+    try:
+        uid = int(ev.get("uid", -1) or -1)
+    except (TypeError, ValueError):
+        return 0.0
+    if not 1 <= uid < 500:
+        return 0.0
+    shell = str(ev.get("shell") or "").strip()
+    return 1.0 if shell.lower() not in _NOLOGIN_SHELLS else 0.0
+
+
+def _privilege_recently_granted(f: dict) -> float:
+    ev = _ev(f)
+    if ev.get("admin_recently_granted") or ev.get("newly_added"):
+        return 1.0
+    source = str(f.get("source") or f.get("rule_id") or "")
+    return 1.0 if any(name in source for name in _PRIV_ESCALATION_SOURCES) else 0.0
+
+
 IDENTITY_CRITERIA: list[dict] = [
     {
         "name":  "uid_zero_non_root",
         "label": "UID 0 account other than root",
-        "description": "A user with UID 0 exists with a non-`root` name — classic backdoor admin.",
+        "description": "A user with UID or GID 0 exists under a non-`root` name — classic backdoor admin.",
         "weight": 0.30,
         "anchor": True,   # non-root UID 0 is a definitive TP
-        "evaluate": lambda f, e: 1.0 if (str(_ev(f).get("uid", "")) == "0" and _ev(f).get("name", "") not in ("root", "")) else 0.0,
+        "evaluate": lambda f, e: _uid_zero_non_root(f),
     },
     {
         "name":  "new_admin_recently",
         "label": "Newly-elevated admin",
-        "description": "Account was granted admin privileges within the last 7 days (per behavioural baseline).",
+        "description": "Account was newly created or added to a privileged group — per the behavioural baseline or the account-change detector.",
         "weight": 0.20,
-        "evaluate": lambda f, e: 1.0 if _ev(f).get("admin_recently_granted") or "behavioral_change" in (f.get("source", "") or "") else 0.0,
+        "evaluate": lambda f, e: _privilege_recently_granted(f),
     },
     {
         "name":  "service_with_shell",
         "label": "System account with interactive shell",
-        "description": "Service account (UID < 500) has a non-`/sbin/nologin` shell — privilege-escalation vector.",
+        "description": "Service account (UID < 500) has a non-`nologin` shell — privilege-escalation vector.",
         "weight": 0.15,
-        "evaluate": lambda f, e: 1.0 if (int(_ev(f).get("uid", -1) or -1) in range(1, 500) and _ev(f).get("shell") not in ("/bin/false","/usr/bin/false","/sbin/nologin","")) else 0.0,
+        "evaluate": lambda f, e: _service_account_shell(f),
     },
     {
         "name":  "stale_active",
@@ -465,9 +534,12 @@ IDENTITY_CRITERIA: list[dict] = [
     {
         "name":  "lateral_signal",
         "label": "Lateral-movement signal",
-        "description": "Login from an unusual source IP, ASN, or geolocation for this account.",
+        "description": "Login from an unusual source IP, ASN, or geolocation for this account, or a hidden / relocated home directory.",
         "weight": 0.10,
-        "evaluate": lambda f, e: 1.0 if _ev(f).get("lateral_movement") else 0.0,
+        "evaluate": lambda f, e: 1.0 if (
+            _ev(f).get("lateral_movement")
+            or str(f.get("source") or "") in {"hidden_user", "home_changed"}
+        ) else 0.0,
     },
     {
         "name":  "ai_verdict_tp",
@@ -478,19 +550,109 @@ IDENTITY_CRITERIA: list[dict] = [
     },
 ]
 
-def _posture_key_off(f: dict, key_name: str) -> bool:
-    """Detect a disabled posture control.  The engine's security handler emits
-    findings with item_key='sec:<key>' and evidence={'<key>': False} — so we
-    check both the item_key and the evidence-dict for the named key."""
+# Two different emitters produce posture findings and they do not agree on
+# either the control's name or the evidence shape:
+#
+#   detections/sbom_posture.detect_posture_issues (the ROUTED path — this is
+#     what actually runs, because ENGINE_CONFIG["use_detection_modules"]
+#     defaults to True and _DETECTION_MODULE_ROUTES maps "security" to it)
+#       evidence = {"control_key": "sip_enabled", "status": "disabled"}
+#
+#   engine._security (the inline fallback)
+#       item_key = "sec:sip", evidence = {"sip": "disabled"}
+#
+# The criteria below were written against a third shape that neither emitter
+# produces ({"sip_enabled": False}), so every control criterion scored 0.0 for
+# every real posture finding. Confirmed live against a critical "Security
+# control disabled: Secure Boot" finding that scored 0.0%.
+#
+# Aliases map every spelling of a control onto one canonical group.
+_CONTROL_ALIASES: dict[str, str] = {
+    "sip": "sip", "sip_enabled": "sip", "csrutil": "sip",
+    "gatekeeper": "gatekeeper", "gatekeeper_enabled": "gatekeeper",
+    "filevault": "filevault", "filevault_enabled": "filevault",
+    "firewall": "firewall", "firewall_enabled": "firewall",
+    "ufw_enabled": "firewall", "firewalld_enabled": "firewall",
+    "windows_firewall": "firewall",
+}
+
+# Values that mean "this control is not protecting the host". Strings, because
+# the collectors report posture as text far more often than as a bool.
+_OFF_VALUES = {"disabled", "off", "false", "no", "inactive", "0", "permissive"}
+
+
+def _canonical_control(name: object) -> str:
+    key = str(name or "").strip().lower()
+    return _CONTROL_ALIASES.get(key, key)
+
+
+def _is_off(value: object) -> bool:
+    if value is False:
+        return True
+    if value is True or value is None:
+        return False
+    return str(value).strip().lower() in _OFF_VALUES
+
+
+def _disabled_control(f: dict) -> str:
+    """Return the canonical control this finding reports as disabled, else ''.
+
+    Understands every emitter shape rather than one, so a routed-module finding
+    and an inline-analyzer finding for the same control score identically.
+    """
     ev = _ev(f)
-    if ev.get(key_name) is False:
-        return True
-    # Some emitters use {key: <name>, value: <bool>} shape
-    if ev.get("key") == key_name and ev.get("value") is False:
-        return True
-    if str(f.get("item_key", "")).endswith(f":{key_name}") and ev.get(key_name) is False:
-        return True
-    return False
+
+    # Routed detection module: {"control_key": ..., "status": "disabled"}.
+    control_key = ev.get("control_key")
+    if control_key and _is_off(ev.get("status", "disabled")):
+        return _canonical_control(control_key)
+
+    # Legacy {"key": <name>, "value": <bool>} shape.
+    if ev.get("key") is not None and _is_off(ev.get("value")):
+        return _canonical_control(ev.get("key"))
+
+    # Inline analyzer: item_key="sec:<key>" with evidence {"<key>": "disabled"}.
+    item_key = str(f.get("item_key") or "")
+    if ":" in item_key:
+        tail = item_key.rsplit(":", 1)[-1]
+        if tail and _is_off(ev.get(tail, ev.get(_canonical_control(tail)))):
+            return _canonical_control(tail)
+
+    # Last resort: any evidence key that names a known control and reads off.
+    for name, value in ev.items():
+        if name in _CONTROL_ALIASES and _is_off(value):
+            return _canonical_control(name)
+    return ""
+
+
+def _posture_key_off(f: dict, key_name: str) -> bool:
+    """True when this finding reports the named security control as disabled."""
+    return _disabled_control(f) == _canonical_control(key_name)
+
+
+def _critical_control_off(f: dict) -> float:
+    """Any control the detection module classes as critical-when-disabled.
+
+    The four macOS controls have their own criteria below; this covers the rest
+    of the cross-platform catalogue (Secure Boot, Defender, SELinux, BitLocker,
+    …) so a Windows or Linux posture failure is not silently scored zero for
+    being spelled differently from a Mac one.
+    """
+    ev = _ev(f)
+    control = _disabled_control(f)
+    if not control:
+        return 0.0
+    try:
+        from .detections.sbom_posture import CRITICAL_DISABLED
+        critical = {_canonical_control(name) for name in CRITICAL_DISABLED}
+    except Exception:
+        critical = {"sip", "gatekeeper", "filevault"}
+    if control in critical:
+        return 1.0
+    # A control outside the critical set is still a real control failure — the
+    # module rates it "high", so score it as partial rather than not-met.
+    known = bool(ev.get("control_key")) or control in _CONTROL_ALIASES
+    return 0.5 if known else 0.0
 
 
 POSTURE_CRITERIA: list[dict] = [
@@ -503,45 +665,53 @@ POSTURE_CRITERIA: list[dict] = [
         "evaluate": lambda f, e: 1.0 if _posture_key_off(f, "sip_enabled") else 0.0,
     },
     {
+        "name":  "critical_control_disabled",
+        "label": "Critical security control disabled",
+        "description": "A control the detection module rates critical-when-disabled is OFF — Secure Boot, Defender real-time, SELinux, BitLocker, and the macOS controls below. Cross-platform, so a Windows or Linux baseline failure scores the same as a Mac one.",
+        "weight": 0.20,
+        "anchor": True,   # the module already judged this definitive, not suggestive
+        "evaluate": lambda f, e: _critical_control_off(f),
+    },
+    {
         "name":  "gatekeeper_off",
         "label": "Gatekeeper disabled",
         "description": "Unsigned applications can execute without prompt — code-signing enforcement bypassed.",
-        "weight": 0.15,
+        "weight": 0.10,
         "evaluate": lambda f, e: 1.0 if _posture_key_off(f, "gatekeeper") else 0.0,
     },
     {
         "name":  "filevault_off",
         "label": "FileVault disabled",
         "description": "Full-disk encryption is OFF — data extractable if device lost.",
-        "weight": 0.15,
+        "weight": 0.10,
         "evaluate": lambda f, e: 1.0 if _posture_key_off(f, "filevault") else 0.0,
     },
     {
         "name":  "firewall_off",
         "label": "Application firewall disabled",
-        "description": "macOS application firewall is OFF — inbound connections unfiltered.",
-        "weight": 0.10,
+        "description": "Host firewall is OFF — inbound connections unfiltered.",
+        "weight": 0.08,
         "evaluate": lambda f, e: 1.0 if _posture_key_off(f, "firewall") else 0.0,
     },
     {
         "name":  "multi_controls_off",
         "label": "Multiple controls disabled",
         "description": "Two or more security controls are off at the same time — coordinated tampering or severe misconfiguration.",
-        "weight": 0.15,
+        "weight": 0.12,
         "evaluate": lambda f, e: 1.0 if int(e.get("controls_disabled_count", 0) or 0) >= 2 else 0.0,
     },
     {
         "name":  "crown_jewel_asset",
         "label": "Crown-jewel asset",
         "description": "Affected host is tagged crown_jewel — posture failures here have outsized blast radius.",
-        "weight": 0.10,
+        "weight": 0.08,
         "evaluate": lambda f, e: 1.0 if (e.get("asset_tier") or f.get("asset_tier")) == "crown_jewel" else (0.5 if (e.get("asset_tier") or f.get("asset_tier")) == "server" else 0.0),
     },
     {
         "name":  "ai_verdict_tp",
         "label": "AI analyst verdict",
         "description": "LLM senior-analyst review labelled this true positive.",
-        "weight": 0.10,
+        "weight": 0.07,
         "evaluate": lambda f, e, ai=None: _ai_score(ai),
     },
 ]

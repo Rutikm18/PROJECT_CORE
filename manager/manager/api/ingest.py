@@ -39,7 +39,7 @@ import time
 from collections import Counter
 from typing import TYPE_CHECKING, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from shared.schema import validate_section
 from shared.sections import VALID_SECTION_NAMES, canonical_section
@@ -50,6 +50,7 @@ from shared.wire import (
 )
 
 from ..models import IngestResponse
+from .authz import require_session
 
 if TYPE_CHECKING:
     from ..db import Database
@@ -181,7 +182,12 @@ def make_ingest_router(
 
     router = APIRouter()
 
-    @router.get("/ingest/health")
+    # Protected per-endpoint rather than at the router, because this router is
+    # on the auth allowlist in server.py: POST /ingest is the agent telemetry
+    # path and authenticates by HMAC, not by a dashboard session. This endpoint
+    # is the router's one operator-facing route, so it carries the session
+    # dependency itself.
+    @router.get("/ingest/health", dependencies=[Depends(require_session)])
     async def ingest_health() -> dict:
         """Per-stage ingest diagnostics — pinpoint where telemetry stops.
 

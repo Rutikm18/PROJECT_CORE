@@ -21,7 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from ..attacklens.remediation_kb import recipe_for_finding
-from .base import AIProvider
+from .base import AIProvider, AIResponseError
 from .finding_analyzer import FindingAnalyzer
 from .key_store import load_config
 from .providers import build_provider
@@ -167,9 +167,61 @@ def _extract_iocs(value: Any) -> list[tuple[str, str]]:
 
 
 def _citations(value: Any, allowed: set[str]) -> list[str]:
+    kept, _fabricated = _ground_citations(value, allowed)
+    return kept
+
+
+def _ground_citations(value: Any, allowed: set[str]) -> tuple[list[str], int]:
+    """Keep only citations that name real evidence, and count the invented ones.
+
+    Dropping fabricated IDs is the grounding guard. Counting them is what makes
+    the fabrication visible: a verdict citing one real ID out of five otherwise
+    looks identical to one citing five out of five, and an analyst reviewing
+    the run has no way to tell that the model was inventing evidence.
+    """
     if not isinstance(value, list):
-        return []
-    return [str(item) for item in value if str(item) in allowed][:10]
+        return [], 0
+    kept: list[str] = []
+    fabricated = 0
+    for item in value:
+        text = str(item)
+        if text in allowed:
+            if text not in kept:
+                kept.append(text)
+        else:
+            fabricated += 1
+    return kept[:10], fabricated
+
+
+def _usage_totals(model_calls: Any) -> dict:
+    """Roll per-call spend up to the run.
+
+    The per-stage audits already carry cost, but nothing summed them, so
+    answering "what did this investigation cost" meant every consumer
+    re-implementing the loop — and a stage that reports zero (as remediation
+    once did) stays invisible unless the total is shown next to the calls.
+    """
+    calls = model_calls if isinstance(model_calls, list) else []
+    total_in = total_out = total_attempts = 0
+    total_cost = 0.0
+    billed = 0
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        billed += 1
+        total_in += int(call.get("input_tokens") or 0)
+        total_out += int(call.get("output_tokens") or 0)
+        total_attempts += int(call.get("attempts") or 1)
+        total_cost += float(call.get("cost_usd") or 0.0)
+    return {
+        "model_calls": billed,
+        # attempts > model_calls means corrective retries were billed.
+        "provider_requests": total_attempts,
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "total_tokens": total_in + total_out,
+        "cost_usd": round(total_cost, 8),
+    }
 
 
 class InvestigationService:
@@ -522,6 +574,8 @@ class InvestigationService:
             "output_tokens": int(getattr(response, "output_tokens", 0) or 0),
             "latency_ms": round(float(getattr(response, "latency_ms", 0.0) or 0.0), 1),
             "cost_usd": round(float(getattr(response, "cost_usd", 0.0) or 0.0), 8),
+            # >1 means a corrective retry was billed for this stage.
+            "attempts": int(getattr(response, "attempts", 1) or 1),
             "recorded_at": time.time(),
         }
 
@@ -608,18 +662,8 @@ class InvestigationService:
         max_tokens: int,
     ) -> tuple[dict, dict]:
         provider = self._get_provider()
-        structured_chat = getattr(provider, "chat_structured", None)
-        if callable(structured_chat):
-            response = await structured_chat(
-                prompt, schema=schema, max_tokens=max_tokens,
-            )
-        else:
-            response = await provider.chat(prompt, max_tokens=max_tokens)
-        audit = self._response_audit(stage, response)
-        try:
-            parsed = provider.parse_json(response.text)
-            if not isinstance(parsed, dict):
-                raise ValueError("AI provider returned a non-object response")
+
+        def _check(parsed: dict) -> None:
             missing = [field for field in required_fields if field not in parsed]
             if missing:
                 raise ValueError(
@@ -627,6 +671,57 @@ class InvestigationService:
                     + ", ".join(missing)
                 )
             self._validate_structured_response(stage, parsed)
+
+        # chat_json runs _check inside its retry loop, so a missing field or a
+        # bad enum earns one corrective attempt instead of aborting the whole
+        # investigation — cheap models drop out of format intermittently, and
+        # every node here is a hard dependency for the next one.
+        chat_json = getattr(provider, "chat_json", None)
+        if callable(chat_json):
+            try:
+                parsed, response = await chat_json(
+                    prompt, max_tokens=max_tokens, schema=schema, validate=_check,
+                )
+            except AIResponseError as exc:
+                # The audit trail is the point of this module, so record which
+                # model produced the bad reply rather than losing it with the
+                # exception.
+                audit = (
+                    self._response_audit(stage, exc.response)
+                    if exc.response is not None
+                    else self._failure_audit(stage, exc)
+                )
+                audit["status"] = "invalid_response"
+                audit["error_type"] = type(exc).__name__
+                raise StructuredResponseError(str(exc), audit) from exc
+            except Exception as exc:
+                raise StructuredResponseError(
+                    str(exc), self._failure_audit(stage, exc),
+                ) from exc
+            return parsed, self._response_audit(stage, response)
+
+        # Minimal injected providers (tests, alternative implementations) may
+        # implement only chat/chat_structured. They get the original
+        # single-attempt path rather than being rejected outright.
+        structured_chat = getattr(provider, "chat_structured", None)
+        try:
+            if callable(structured_chat):
+                response = await structured_chat(
+                    prompt, schema=schema, max_tokens=max_tokens,
+                )
+            else:
+                response = await provider.chat(prompt, max_tokens=max_tokens)
+        except Exception as exc:
+            raise StructuredResponseError(
+                str(exc), self._failure_audit(stage, exc),
+            ) from exc
+
+        audit = self._response_audit(stage, response)
+        try:
+            parsed = provider.parse_json(response.text)
+            if not isinstance(parsed, dict):
+                raise ValueError("AI provider returned a non-object response")
+            _check(parsed)
         except Exception as exc:
             audit["status"] = "invalid_response"
             audit["error_type"] = type(exc).__name__
@@ -691,11 +786,22 @@ Context: <untrusted>{context}</untrusted>"""
                 confidence = max(0.0, min(float(raw.get("confidence", 0.0)), 1.0))
             except (TypeError, ValueError):
                 confidence = 0.0
+            supporting, fake_support = _ground_citations(raw.get("supporting_ids"), allowed)
+            contradicting, fake_contra = _ground_citations(
+                raw.get("contradicting_ids"), allowed,
+            )
+            fabricated = fake_support + fake_contra
+            # A hypothesis whose support was entirely invented is unresolved,
+            # not supported — otherwise a fabricated citation carries it into
+            # the verdict stage as though it had evidence behind it.
+            if status == "supported" and not supporting:
+                status, confidence = "unresolved", min(confidence, 0.3)
             hypotheses.append({
                 "id": f"HP-{index}",
                 "statement": _text(raw.get("statement"), 1000),
-                "supporting_ids": _citations(raw.get("supporting_ids"), allowed),
-                "contradicting_ids": _citations(raw.get("contradicting_ids"), allowed),
+                "supporting_ids": supporting,
+                "contradicting_ids": contradicting,
+                "fabricated_citations": fabricated,
                 "confidence": confidence,
                 "status": status,
             })
@@ -767,15 +873,34 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
             confidence = max(0.0, min(float(parsed.get("confidence", 0.0)), 1.0))
         except (TypeError, ValueError):
             confidence = 0.0
-        evidence_ids = _citations(parsed.get("evidence_ids"), allowed)
+        evidence_ids, fabricated = _ground_citations(parsed.get("evidence_ids"), allowed)
         if not evidence_ids and verdict in {"confirmed", "likely", "unlikely", "false_positive"}:
             verdict, confidence = "inconclusive", 0.0
+
+        # A verdict is only as grounded as the evidence it can actually point
+        # at. When most of the citations were invented, damp confidence by the
+        # share that survived rather than presenting a partly-fabricated
+        # verdict at face value. The counts are recorded either way so the
+        # reviewing analyst — and the audit trail — can see it.
+        cited_total = len(evidence_ids) + fabricated
+        grounding_ratio = (len(evidence_ids) / cited_total) if cited_total else 0.0
+        if fabricated and grounding_ratio < 0.5:
+            confidence = round(confidence * grounding_ratio, 4)
+            log.warning(
+                "Investigation verdict cited %d fabricated evidence id(s) of %d; "
+                "confidence damped to %.4f", fabricated, cited_total, confidence,
+            )
+        if fabricated:
+            call_audit = {**call_audit, "fabricated_citations": fabricated}
+
         return {
             "verdict": {
                 "verdict": verdict,
                 "confidence": confidence,
                 "summary": _text(parsed.get("summary"), 1500),
                 "evidence_ids": evidence_ids,
+                "fabricated_citations": fabricated,
+                "grounding_ratio": round(grounding_ratio, 4),
                 "gaps": [_text(item, 500) for item in parsed.get("gaps", [])[:10]],
             },
             "model_calls": [*list(state.get("model_calls") or []), call_audit],
@@ -849,17 +974,26 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
                 os_type=str(finding.get("agent_os") or "unknown"), force=True, intel_db=self._db,
             )
             remediation = plan.to_dict() if hasattr(plan, "to_dict") else _json_safe(plan)
-            remediation["source"] = "ai_direct_sdk"
+            remediation["source"] = "ai_provider"
+            # These used to be hardcoded 0 because the plan carried only a
+            # summed tokens_used and no cost at all, so the remediation stage —
+            # the most expensive call in the run — reported as free and made
+            # every per-run cost total wrong.
             call_audit = {
                 "stage": "remediation_generation",
                 "contract_version": "investigation.v1",
                 "status": "succeeded",
                 "provider": _text(remediation.get("provider") or "unknown", 100),
                 "model": _text(remediation.get("model") or "unknown", 200),
-                "input_tokens": 0,
-                "output_tokens": int(remediation.get("tokens_used") or 0),
+                "upstream_provider": _text(
+                    remediation.get("upstream_provider") or "", 100,
+                ),
+                "generation_id": _text(remediation.get("generation_id") or "", 200),
+                "input_tokens": int(remediation.get("input_tokens") or 0),
+                "output_tokens": int(remediation.get("output_tokens") or 0),
+                "attempts": int(remediation.get("attempts") or 1),
                 "latency_ms": round(float(remediation.get("latency_ms") or 0.0), 1),
-                "cost_usd": 0.0,
+                "cost_usd": round(float(remediation.get("cost_usd") or 0.0), 8),
                 "recorded_at": time.time(),
             }
         except Exception as exc:
@@ -887,6 +1021,7 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
         return {"result": result, "status": "rejected", "completed_at": completed}
 
     def _result_payload(self, state: InvestigationState, status: str, completed: float) -> dict:
+        model_calls = state.get("model_calls") or []
         return {
             "run_id": state.get("run_id"),
             "finding_id": state.get("finding_id"),
@@ -902,7 +1037,8 @@ Data: <untrusted>{json.dumps({"hypotheses": state.get("hypotheses", []), "verifi
                 "review_round": state.get("review_round") or 0,
             },
             "errors": state.get("errors") or [],
-            "model_calls": state.get("model_calls") or [],
+            "model_calls": model_calls,
+            "usage": _usage_totals(model_calls),
             "completed_at": completed,
         }
 

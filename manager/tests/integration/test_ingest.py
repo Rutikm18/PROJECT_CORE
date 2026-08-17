@@ -62,7 +62,13 @@ def app(tmp_path_factory):
 @pytest.fixture(scope="module")
 def client(app):
     from fastapi.testclient import TestClient
+    from manager.tests.conftest import authenticate
     with TestClient(app) as c:
+        # These tests POST as an agent (allowlisted, HMAC-authenticated) and
+        # then read the result back through dashboard routes, which require a
+        # session. The cookie covers the read side; it does not affect the
+        # agent path, which authenticates per-payload.
+        authenticate(c)
         # Enroll the test agent once for all tests in this module
         c.post(
             "/api/v1/enroll",

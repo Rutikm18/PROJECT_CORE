@@ -67,6 +67,41 @@ router = APIRouter(tags=["auth"])
 # ── Credential setup ──────────────────────────────────────────────────────────
 _ADMIN_EMAIL = os.environ.get("DASHBOARD_EMAIL", "admin@attacklens.ai").strip().lower()
 
+# Roles the rest of the manager understands: authz.require_admin treats
+# admin/owner as privileged, and cases.py accepts admin/analyst/viewer.
+KNOWN_ROLES = frozenset({"owner", "admin", "analyst", "viewer"})
+FALLBACK_ROLE = "viewer"
+
+
+def _configured_role() -> str:
+    """The role this deployment's single account holds.
+
+    The role was previously the string literal "admin", written into every
+    token regardless of configuration — so the claim carried no information and
+    nothing downstream could distinguish principals by it. It is configuration
+    now. Phase 1 replaces this env account with a users table, at which point
+    the role comes from the row and this function goes away.
+
+    An unrecognised value falls back to the least privilege rather than the
+    most, so a typo in DASHBOARD_ROLE cannot mint an admin.
+    """
+    raw = os.environ.get("DASHBOARD_ROLE", "admin").strip().lower()
+    if raw in KNOWN_ROLES:
+        return raw
+    log.warning(
+        "auth: DASHBOARD_ROLE=%r is not one of %s - falling back to %r",
+        raw, ", ".join(sorted(KNOWN_ROLES)), FALLBACK_ROLE,
+    )
+    return FALLBACK_ROLE
+
+
+def _display_identity(email: str, role: str) -> dict:
+    """Name and initials for the UI, derived rather than hardcoded to "Admin"."""
+    local = (email or "").split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+    name = local.title() if local else role.title()
+    initials = "".join(part[0] for part in name.split()[:2]).upper() or "?"
+    return {"name": name, "initials": initials}
+
 # Prefer a pre-hashed password from env; fall back to plaintext (hashed once at import)
 _stored_hash: str
 
@@ -327,7 +362,8 @@ async def login(body: LoginRequest, request: Request, response: Response):
     _revoke_all_sessions(email)
     _prune_revoked()
 
-    token, jti, exp = _make_token(email, "admin")
+    role = _configured_role()
+    token, jti, exp = _make_token(email, role)
     _active_sessions[email].append(jti)
 
     _reset_counters(ip, email)
@@ -352,10 +388,9 @@ async def login(body: LoginRequest, request: Request, response: Response):
         "expires_at": int(exp),
         "idle_minutes": _IDLE_TTL_MINUTES,
         "user": {
-            "email":    email,
-            "role":     "admin",
-            "name":     "Admin",
-            "initials": "A",
+            "email": email,
+            "role":  role,
+            **_display_identity(email, role),
         },
     }
 
@@ -406,11 +441,18 @@ async def me(
     if not payload:
         return JSONResponse({"error": "Session expired or invalid."}, status_code=401, headers=AUTH_CACHE_HEADERS)
 
+    # Fail closed on the role. This defaulted to "admin", so a token that
+    # carried no role claim — an older session, or one minted by a bug — was
+    # reported to the UI as a full administrator. An absent claim now reads as
+    # the least privilege instead.
+    email = payload.get("sub") or ""
+    role = str(payload.get("role") or FALLBACK_ROLE).lower()
+    if role not in KNOWN_ROLES:
+        role = FALLBACK_ROLE
     return {
-        "email":        payload.get("sub"),
-        "role":         payload.get("role", "admin"),
-        "name":         "Admin",
-        "initials":     "A",
+        "email":        email,
+        "role":         role,
+        **_display_identity(email, role),
         "expires_at":   payload.get("exp"),
         "idle_minutes": payload.get("idle", _IDLE_TTL_MINUTES),
     }

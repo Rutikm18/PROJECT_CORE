@@ -239,7 +239,10 @@ async def test_investigation_pauses_and_approval_only_drafts_remediation(service
     )
 
     assert completed["status"] == "completed"
-    assert completed["result"]["remediation"]["source"] == "ai_direct_sdk"
+    # "ai_direct_sdk" was accurate when this path called the Anthropic SDK
+    # directly. It now resolves through the shared provider abstraction, so
+    # the audit trail must not claim a transport that is no longer used.
+    assert completed["result"]["remediation"]["source"] == "ai_provider"
     assert completed["result"]["remediation"]["execution_authorized"] is False
     assert completed["result"]["analyst"]["actor"] == "soc@example.com"
     assert len(completed["result"]["model_calls"]) == 3

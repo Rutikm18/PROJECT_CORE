@@ -27,6 +27,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _allow_free_models(monkeypatch):
+    """These tests drive a ':free' model to exercise transport mechanics.
+
+    Free tiers train on submitted prompts, so provider calls to one are refused
+    unless the operator opts in (see the privacy gate in providers.py). That
+    policy is covered by test_ai_catalog_and_safety.py; here it is orthogonal
+    noise, so opt in for the whole module.
+    """
+    monkeypatch.setenv("ATTACKLENS_AI_ALLOW_TRAINING_MODELS", "true")
+
+
 # ── OpenRouter registered ─────────────────────────────────────────────────────
 
 def test_openrouter_in_provider_models():
@@ -148,7 +160,11 @@ def test_openrouter_chat_returns_correct_provider_name():
 
 
 def test_openrouter_structured_chat_enforces_validation_privacy_and_schema():
-    provider = _make_provider()
+    # Deliberately a PAID model. data_collection=deny and zdr=true cannot be
+    # satisfied by a free tier, so combining them with allow_fallbacks=False
+    # leaves OpenRouter zero eligible providers and the call fails outright.
+    # The free-model path is covered by the companion test below.
+    provider = _make_provider("openai/gpt-4o-mini")
     captured_payload = {}
 
     async def mock_request_json(method, url, *, headers=None, json_body=None):

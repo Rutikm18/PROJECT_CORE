@@ -144,6 +144,12 @@ services:
       ADMIN_TOKEN:             "${ADMIN_TOKEN:-}"
       OPEN_ENROLLMENT:         "${OPEN_ENROLLMENT:-true}"
 
+      # Signs dashboard sessions (api/auth_ui.py) and derives the AES key that
+      # encrypts the stored AI provider key (ai/key_store.py). Unset means
+      # sessions reset on every restart and the AI key falls back to a random
+      # file beside its own ciphertext. env.sh generates this.
+      JWT_SECRET:              "${JWT_SECRET:-}"
+
       DEFAULT_KEY_EXPIRY_DAYS: "${DEFAULT_KEY_EXPIRY_DAYS:-0}"
 
       LOG_LEVEL:               "${LOG_LEVEL:-info}"
@@ -152,7 +158,10 @@ services:
       # Single-process default; deploy/docker-compose.ha.yml splits these roles.
       MANAGER_ROLES:           "${MANAGER_ROLES:-api,telemetry,detection,maintenance,intel}"
       TELEMETRY_ARCHIVE_ENABLED: "${TELEMETRY_ARCHIVE_ENABLED:-true}"
-      CORS_ORIGINS:            "${CORS_ORIGINS:-*}"
+      # Empty = same-origin only. Do NOT default this to '*': with credentials
+      # allowed the CORS layer echoes the caller's origin back when a cookie is
+      # present, so any site could call this API on a logged-in admin's session.
+      CORS_ORIGINS:            "${CORS_ORIGINS:-}"
       HTTPS_ONLY:              "${HTTPS_ONLY:-true}"
 
       # Manager always runs plain HTTP — Caddy handles TLS
@@ -185,7 +194,25 @@ services:
       ATTACKLENS_AI_VALIDATION:         "${ATTACKLENS_AI_VALIDATION:-false}"
       ATTACKLENS_AI_PRECISION_THRESHOLD: "${ATTACKLENS_AI_PRECISION_THRESHOLD:-0.90}"
 
-      # ── AI analyst (Claude API) ─────────────────────────────────────────────
+      # ── AI provider ─────────────────────────────────────────────────────────
+      # One-time bootstrap of the encrypted provider store (data/ai_provider.enc).
+      # Ignored once a provider is configured — the stored config always wins.
+      AI_PROVIDER:             "${AI_PROVIDER:-}"
+      AI_MODEL:                "${AI_MODEL:-}"
+      AI_API_KEY:              "${AI_API_KEY:-}"
+      AI_BASE_URL:             "${AI_BASE_URL:-}"
+
+      # OpenRouter transport: attribution headers plus the spend guard
+      # (kill switch, per-minute rate cap, daily USD budget) in ai/providers.py.
+      OPENROUTER_APP_URL:      "${OPENROUTER_APP_URL:-https://attacklens.ai}"
+      OPENROUTER_APP_TITLE:    "${OPENROUTER_APP_TITLE:-AttackLens}"
+      ATTACKLENS_OPENROUTER_ENABLED: "${ATTACKLENS_OPENROUTER_ENABLED:-true}"
+      ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE: "${ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE:-60}"
+      ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD: "${ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD:-25}"
+      # Free models train on prompts; sending endpoint telemetry to one is opt-in.
+      ATTACKLENS_AI_ALLOW_TRAINING_MODELS: "${ATTACKLENS_AI_ALLOW_TRAINING_MODELS:-false}"
+
+      # ── AI analyst (legacy Anthropic-only path) ─────────────────────────────
       ANTHROPIC_API_KEY:       "${ANTHROPIC_API_KEY:-}"
       AI_ANALYST_MODEL:        "${AI_ANALYST_MODEL:-claude-sonnet-4-6}"
       AI_ANALYST_ENABLED:      "${AI_ANALYST_ENABLED:-true}"

@@ -78,7 +78,11 @@ def app(tmp_path_factory):
 @pytest.fixture(scope="module")
 def client(app):
     from fastapi.testclient import TestClient
+    from manager.tests.conftest import authenticate
     with TestClient(app) as c:
+        # Ingest is allowlisted (agent HMAC); the detection/findings routes this
+        # pipeline asserts against require a dashboard session.
+        authenticate(c)
         r = c.post(
             "/api/v1/enroll",
             json={

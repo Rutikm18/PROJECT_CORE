@@ -13,9 +13,10 @@ import {
   Bell, RefreshCw, Save, AlertTriangle, CheckCircle2, Info,
   Clock, Users, Lock, Unlock, Globe, RotateCcw, ChevronRight,
   Brain, Target, Trash2, Plus, Database, Archive, FolderOpen,
-  Cpu, Eye, EyeOff, Zap, ExternalLink, TestTube2,
+  Cpu, Eye, EyeOff, Zap, ExternalLink, TestTube2, Layers,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import ValidationPipelinePanel from "./settings/ValidationPipelinePanel";
 import { setTimezone, tzAbbr, tzOffsetStr, TIMEZONE_LIST, TZ_DEFAULT, isValidTimezone, fmtTime } from "../context/timezoneStore";
 
 const API = "/api/v1/settings";
@@ -58,7 +59,7 @@ interface RoleEntry {
   color:       string;
 }
 
-type TabId = "org" | "license" | "roles" | "platform" | "validation" | "retention" | "ai";
+type TabId = "org" | "license" | "roles" | "platform" | "validation" | "pipeline" | "retention" | "ai";
 
 const EMPTY: OrgSettings = {
   org_name: "", org_description: "", org_location: "", contact_email: "",
@@ -166,7 +167,7 @@ const PERM_LABELS: Record<string, string> = {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const VALID_SECTIONS: TabId[] = ["org", "license", "roles", "platform", "validation", "retention", "ai"];
+const VALID_SECTIONS: TabId[] = ["org", "license", "roles", "platform", "validation", "pipeline", "retention", "ai"];
 
 export default function Settings() {
   const { section } = useParams<{ section?: string }>();
@@ -259,6 +260,7 @@ export default function Settings() {
     { id: "roles",      label: "Role Access",   icon: Users      },
     { id: "platform",   label: "Platform",      icon: Settings2  },
     { id: "validation", label: "Validation",    icon: Brain      },
+    { id: "pipeline",   label: "Validation Pipeline", icon: Layers },
     { id: "retention",  label: "Data Retention", icon: Database  },
     { id: "ai",         label: "AI Provider",   icon: Cpu        },
   ];
@@ -803,6 +805,15 @@ export default function Settings() {
       ══════════════════════════════════════════════════════════════════════ */}
       {tab === "validation" && (
         <ValidationSettingsPanel />
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          TAB: Validation Pipeline — every engine point, accuracy, integrations,
+          and a per-finding debug trace. Thresholds live in the Validation tab;
+          this one explains what those thresholds are applied to.
+      ══════════════════════════════════════════════════════════════════════ */}
+      {tab === "pipeline" && (
+        <ValidationPipelinePanel />
       )}
 
       {/* ══════════════════════════════════════════════════════════════════════

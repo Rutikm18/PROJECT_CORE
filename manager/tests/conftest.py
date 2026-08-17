@@ -96,3 +96,32 @@ def enc_key(derived_keys: tuple[bytes, bytes]) -> bytes:
 @pytest.fixture
 def mac_key(derived_keys: tuple[bytes, bytes]) -> bytes:
     return derived_keys[1]
+
+
+# ── Dashboard session helper ─────────────────────────────────────────────────
+# Every /api/v1/* data route now requires a dashboard session (see the auth
+# boundary in manager/manager/server.py and the coverage test in
+# manager/tests/unit/test_api_auth_coverage.py). Tests that drive those routes
+# are exercising the *authenticated* path, so they sign in rather than the
+# endpoints being reopened to keep the suite green.
+
+
+def dashboard_session_token(
+    email: str = "admin@attacklens.ai", role: str = "admin",
+) -> str:
+    """Mint a valid dashboard JWT.
+
+    Minted through auth_ui itself, so it is signed with whatever secret that
+    module resolved at import time — signer and verifier can never drift, even
+    when JWT_SECRET is unset and an ephemeral key is generated per process.
+    """
+    from manager.manager.api import auth_ui
+
+    token, _jti, _exp = auth_ui._make_token(email, role)
+    return token
+
+
+def authenticate(client, *, email: str = "admin@attacklens.ai", role: str = "admin"):
+    """Attach a dashboard session cookie to a TestClient. Returns the client."""
+    client.cookies.set("al_session", dashboard_session_token(email, role))
+    return client

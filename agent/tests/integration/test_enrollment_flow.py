@@ -41,7 +41,12 @@ def app(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def client(app):
+    from manager.tests.conftest import authenticate
     with TestClient(app) as c:
+        # Enrolment and ingest are allowlisted (agents authenticate per-payload
+        # by HMAC), but this flow also asserts the agent shows up on
+        # GET /api/v1/agents, which is a dashboard route and needs a session.
+        authenticate(c)
         yield c
 
 

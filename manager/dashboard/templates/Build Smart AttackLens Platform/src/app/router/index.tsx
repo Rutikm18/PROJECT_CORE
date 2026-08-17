@@ -54,6 +54,8 @@ const VulnerabilitySurface = lazy(() => import("../pages/VulnerabilitySurface"))
 const NetworkThreats     = lazy(() => import("../pages/NetworkThreats"));
 const ExecutionThreats   = lazy(() => import("../pages/ExecutionThreats"));
 const MeshThreats        = lazy(() => import("../pages/MeshThreats"));
+const IdentityTerrain    = lazy(() => import("../pages/IdentityTerrain"));
+const PostureTerrain     = lazy(() => import("../pages/PostureTerrain"));
 const PersistenceBackdoors = lazy(() => import("../pages/PersistenceBackdoors"));
 const IdentityAccess     = lazy(() => import("../pages/IdentityAccess"));
 const SecurityPosture    = lazy(() => import("../pages/SecurityPosture"));
@@ -139,8 +141,9 @@ export const router = createBrowserRouter([
               { path: "vector",       element: <S><NetworkThreats /></S> },
               { path: "citadels",     element: <S><ExecutionThreats /></S> },
               { path: "mesh",         element: <S><MeshThreats /></S> },
+              { path: "identity",     element: <S><IdentityTerrain /></S> },
+              { path: "posture",      element: <S><PostureTerrain /></S> },
               // { path: "persistence",  element: <S><PersistenceBackdoors /></S> },
-              // { path: "identity",     element: <S><IdentityAccess /></S> },
             ],
           },
 

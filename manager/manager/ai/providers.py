@@ -18,12 +18,24 @@ from typing import Optional
 
 import aiohttp
 
+from . import catalog
 from .base import AIProvider, AIResponse, ProviderConfig, SYSTEM_PROMPT
 from ..integrations.resilience import PermanentError, RateLimitedError, TransientError
 
 log = logging.getLogger("manager.ai.providers")
 
 _TIMEOUT = aiohttp.ClientTimeout(total=60)
+
+
+def _allow_training_models() -> bool:
+    """Whether free, train-on-input models may receive endpoint telemetry.
+
+    Read per call rather than at import so an operator can flip it without a
+    redeploy, matching the OpenRouter kill switch.
+    """
+    return os.environ.get(
+        "ATTACKLENS_AI_ALLOW_TRAINING_MODELS", "false",
+    ).lower() in {"1", "true", "yes", "on"}
 
 
 class _OpenRouterUsageGuard:
@@ -347,8 +359,25 @@ class OpenRouterProvider(OpenAIProvider):
             headers["HTTP-Referer"] = app_url
         if app_title:
             headers["X-OpenRouter-Title"] = app_title
+        model_id = self._cfg.model
+        is_free = catalog.is_free_model(model_id)
+
+        # Privacy gate. Free tiers generally train on submitted prompts, and the
+        # prompts here carry endpoint telemetry — process names, package lists,
+        # finding evidence. Sending that to a training-on-input model is a
+        # decision an operator has to make explicitly, so it is opt-in.
+        if is_free and not _allow_training_models():
+            raise PermanentError(
+                "ai:openrouter",
+                f"Model '{model_id}' is a free tier, which generally trains on "
+                "submitted prompts. AttackLens prompts contain endpoint "
+                "telemetry. Set ATTACKLENS_AI_ALLOW_TRAINING_MODELS=true to "
+                "accept this, or choose a paid model.",
+                error_type="privacy_policy",
+            )
+
         payload = {
-            "model":       self._cfg.model,
+            "model":       model_id,
             "max_tokens":  max_tokens,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -356,20 +385,39 @@ class OpenRouterProvider(OpenAIProvider):
             ],
         }
         if schema is not None:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "attacklens_validation",
-                    "strict": True,
-                    "schema": schema,
-                },
-            }
-            payload["provider"] = {
-                "require_parameters": True,
-                "data_collection": "deny",
-                "zdr": True,
-                "allow_fallbacks": False,
-            }
+            # Capability check. require_parameters=True with allow_fallbacks=False
+            # tells OpenRouter to route only to providers supporting every
+            # parameter sent — so handing a strict json_schema to a model that
+            # cannot do structured output yields zero eligible providers and the
+            # whole call fails. Most free models are in that category.
+            supports = catalog.supports_structured_output(model_id)
+            if supports is False:
+                log.info(
+                    "Model %s does not support structured outputs — falling back "
+                    "to prompt-based JSON.", model_id,
+                )
+            else:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "attacklens_validation",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
+                provider_prefs: dict = {
+                    "require_parameters": True,
+                    "allow_fallbacks": False,
+                }
+                # data_collection=deny and zdr exclude free providers by
+                # definition, so requesting them alongside a free model
+                # guarantees an empty route. The operator has already opted in
+                # to training-on-input above; asking for the opposite here would
+                # just turn that into an unexplained routing failure.
+                if not is_free:
+                    provider_prefs["data_collection"] = "deny"
+                    provider_prefs["zdr"] = True
+                payload["provider"] = provider_prefs
         body = await self._http.request_json(
             "POST", f"{self._base}/chat/completions", headers=headers, json_body=payload
         )

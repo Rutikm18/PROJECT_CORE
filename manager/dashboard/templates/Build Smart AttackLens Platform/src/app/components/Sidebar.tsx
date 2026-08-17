@@ -13,7 +13,7 @@ import {
   Crosshair, BarChart3, Monitor, Database,
   ClipboardList, LayoutDashboard, Activity,
   Settings, Server, Building2, MapPin, Layers,
-  ShieldCheck, GitMerge, Radio, PanelLeftClose, PanelLeftOpen,
+  ShieldCheck, ShieldAlert, GitMerge, Radio, PanelLeftClose, PanelLeftOpen,
 } from "lucide-react";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 import { useRefresh } from "../context/RefreshContext";
@@ -58,15 +58,15 @@ const GROUPS: NavGroup[] = [
       { label: "Vector",    to: "/terrain/vector",      icon: Globe,       badgeColor: "red"   },
       { label: "Citadels",  to: "/terrain/citadels",    icon: Terminal,    badgeColor: "red"   },
       { label: "Mesh",      to: "/terrain/mesh",        icon: Radio,       badgeColor: "red"   },
+      { label: "Identity",  to: "/terrain/identity",    icon: ShieldCheck, badgeColor: "red"   },
+      { label: "Posture",   to: "/terrain/posture",     icon: ShieldAlert, badgeColor: "amber" },
       // { label: "Persistence & Backdoors", to: "/terrain/persistence", icon: Server },
-      // { label: "Identity & Access", to: "/terrain/identity", icon: ShieldCheck },
     ],
   },
   {
-    label: "Posture",
+    label: "Compliance",
     comingSoon: !CIS_COMPLIANCE_LIVE,
     items: [
-      // { label: "Security Posture", to: "/posture/overview", icon: Database },
       { label: "CIS Compliance",   to: "/posture/compliance",  icon: ClipboardList, comingSoon: !CIS_COMPLIANCE_LIVE },
     ],
   },

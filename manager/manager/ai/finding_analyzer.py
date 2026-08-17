@@ -24,11 +24,73 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .base import AIProvider, AIResponse
+from .base import (
+    URGENCY_LEVELS,
+    AIProvider,
+    AIResponse,
+    AIResponseError,
+    coerce_confidence,
+    coerce_enum,
+    coerce_str_list,
+)
 from .providers import build_provider
 from .key_store import load_config
 
 log = logging.getLogger("manager.ai.finding_analyzer")
+
+
+def _text_field(value: object, limit: int = 4000) -> str:
+    """Normalise a free-text field that the model may return as a non-string."""
+    if isinstance(value, str):
+        return value.strip()[:limit]
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v).strip() for v in value if v)[:limit]
+    if value is None or isinstance(value, bool):
+        return ""
+    return str(value)[:limit]
+
+
+def _int_or(value: object, default: int) -> int:
+    """Coerce a model-supplied rank to int without raising on prose."""
+    try:
+        return int(float(value))          # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+EFFORT_LEVELS = {"trivial", "low", "medium", "high", "significant"}
+RISK_LEVELS   = {"none", "low", "medium", "high", "critical"}
+
+# Strict schema for the analysis call. Providers with native structured-output
+# support enforce this server-side; the rest fall back to prompt-based JSON.
+_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "analysis":       {"type": "string"},
+        "threat_context": {"type": "string"},
+        "risk_factors":   {"type": "array", "items": {"type": "string"}},
+        "urgency":        {"type": "string", "enum": sorted(URGENCY_LEVELS)},
+        "confidence":     {"type": "number"},
+        "mitre_context":  {"type": "string"},
+    },
+    "required": ["analysis", "urgency", "confidence"],
+    "additionalProperties": False,
+}
+
+
+def _reject_truncated(resp: AIResponse) -> None:
+    """Fail fast when the model hit the token ceiling mid-object.
+
+    finish_reason was already captured everywhere but acted on nowhere. A
+    truncated reply usually still parses as *something*, so without this it
+    lands in the cache as a plausible-looking partial analysis.
+    """
+    if str(getattr(resp, "finish_reason", "") or "").lower() in {"length", "max_tokens"}:
+        raise AIResponseError(
+            "model response was cut off at the token limit "
+            f"(finish_reason={resp.finish_reason!r}) — raise max_tokens or "
+            "choose a model with a larger output budget"
+        )
 
 
 # ── Result types ──────────────────────────────────────────────────────────────
@@ -46,6 +108,16 @@ class AIFindingAnalysis:
     mitre_context: str           # MITRE ATT&CK mapping insight
     tokens_used:   int
     latency_ms:    float
+    # Spend telemetry. tokens_used alone cannot answer "what did this cost" —
+    # pricing is asymmetric between input and output, and cost_usd is the only
+    # figure the provider actually bills. generation_id/upstream_provider make
+    # a call traceable back to the provider's own dashboard.
+    cost_usd:      float = 0.0
+    input_tokens:  int = 0
+    output_tokens: int = 0
+    attempts:      int = 1
+    generation_id: str = ""
+    upstream_provider: str = ""
     generated_at:  float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -61,6 +133,12 @@ class AIFindingAnalysis:
             "mitre_context": self.mitre_context,
             "tokens_used":   self.tokens_used,
             "latency_ms":    round(self.latency_ms, 1),
+            "cost_usd":      round(self.cost_usd, 8),
+            "input_tokens":  self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "attempts":      self.attempts,
+            "generation_id": self.generation_id,
+            "upstream_provider": self.upstream_provider,
             "generated_at":  self.generated_at,
         }
 
@@ -80,6 +158,12 @@ class AIRemediationPlan:
     compensating: str            # if immediate remediation not possible
     tokens_used:  int
     latency_ms:   float
+    cost_usd:      float = 0.0
+    input_tokens:  int = 0
+    output_tokens: int = 0
+    attempts:      int = 1
+    generation_id: str = ""
+    upstream_provider: str = ""
     generated_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -97,6 +181,12 @@ class AIRemediationPlan:
             "compensating": self.compensating,
             "tokens_used":  self.tokens_used,
             "latency_ms":   round(self.latency_ms, 1),
+            "cost_usd":      round(self.cost_usd, 8),
+            "input_tokens":  self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "attempts":      self.attempts,
+            "generation_id": self.generation_id,
+            "upstream_provider": self.upstream_provider,
             "generated_at": self.generated_at,
         }
 
@@ -152,22 +242,40 @@ class FindingAnalyzer:
         provider = self._get_provider()
         prompt   = _analysis_prompt(finding)
 
-        resp: AIResponse = await provider.chat(prompt, max_tokens=800)
-        parsed  = provider.parse_json(resp.text)
+        # chat_json retries once with a corrective instruction when the reply
+        # is not usable JSON, and raises rather than caching a blank analysis
+        # that reads to an analyst as "the AI found nothing".
+        parsed, resp = await provider.chat_json(
+            prompt, max_tokens=800, schema=_ANALYSIS_SCHEMA,
+        )
 
         result = AIFindingAnalysis(
             finding_id    = finding_id,
             provider      = resp.provider,
             model         = resp.model,
-            analysis      = parsed.get("analysis", ""),
-            threat_context = parsed.get("threat_context", ""),
-            risk_factors  = parsed.get("risk_factors", [])[:5],
-            urgency       = parsed.get("urgency", "scheduled"),
-            confidence    = float(parsed.get("confidence", 0.5)),
-            mitre_context = parsed.get("mitre_context", ""),
+            analysis      = _text_field(parsed.get("analysis")),
+            threat_context = _text_field(parsed.get("threat_context")),
+            risk_factors  = coerce_str_list(parsed.get("risk_factors"), limit=5),
+            urgency       = coerce_enum(
+                parsed.get("urgency"), URGENCY_LEVELS, "scheduled",
+            ),
+            confidence    = coerce_confidence(parsed.get("confidence")),
+            mitre_context = _text_field(parsed.get("mitre_context")),
             tokens_used   = resp.total_tokens,
             latency_ms    = resp.latency_ms,
+            cost_usd      = resp.cost_usd,
+            input_tokens  = resp.input_tokens,
+            output_tokens = resp.output_tokens,
+            attempts      = resp.attempts,
+            generation_id = resp.generation_id,
+            upstream_provider = resp.upstream_provider,
         )
+
+        if not result.analysis:
+            raise AIResponseError(
+                "model returned JSON without an 'analysis' field — "
+                f"keys present: {sorted(parsed)[:8]}"
+            )
 
         if intel_db:
             await _cache_analysis(intel_db, finding_id, result)
@@ -192,24 +300,36 @@ class FindingAnalyzer:
         provider = self._get_provider()
         prompt   = _remediation_prompt(finding, os_type)
 
-        resp: AIResponse = await provider.chat(prompt, max_tokens=2000)
-        parsed  = provider.parse_json(resp.text)
+        parsed, resp = await provider.chat_json(prompt, max_tokens=2000)
 
         result = AIRemediationPlan(
             finding_id  = finding_id,
             provider    = resp.provider,
             model       = resp.model,
             os_type     = os_type,
-            summary     = parsed.get("summary", ""),
-            effort      = parsed.get("effort", "medium"),
-            risk_level  = parsed.get("remediation_risk", "low"),
-            steps       = parsed.get("steps", []),
-            verification = parsed.get("verification", []),
-            long_term   = parsed.get("long_term_recommendations", []),
-            compensating = parsed.get("compensating_controls", ""),
+            summary     = _text_field(parsed.get("summary")),
+            effort      = coerce_enum(parsed.get("effort"), EFFORT_LEVELS, "medium"),
+            risk_level  = coerce_enum(parsed.get("remediation_risk"), RISK_LEVELS, "low"),
+            # steps carry structured command objects, so they keep their shape.
+            steps       = parsed.get("steps", []) if isinstance(parsed.get("steps"), list) else [],
+            verification = coerce_str_list(parsed.get("verification"), limit=10),
+            long_term   = coerce_str_list(parsed.get("long_term_recommendations"), limit=10),
+            compensating = _text_field(parsed.get("compensating_controls")),
             tokens_used = resp.total_tokens,
             latency_ms  = resp.latency_ms,
+            cost_usd    = resp.cost_usd,
+            input_tokens  = resp.input_tokens,
+            output_tokens = resp.output_tokens,
+            attempts      = resp.attempts,
+            generation_id = resp.generation_id,
+            upstream_provider = resp.upstream_provider,
         )
+
+        if not result.summary and not result.steps:
+            raise AIResponseError(
+                "model returned no summary and no steps — "
+                f"keys present: {sorted(parsed)[:8]}"
+            )
 
         if intel_db:
             await _cache_remediation(intel_db, finding_id, os_type, result)
@@ -234,18 +354,21 @@ class FindingAnalyzer:
         prompt     = _prioritize_prompt(candidates)
 
         try:
-            resp   = await provider.chat(prompt, max_tokens=1000)
-            parsed = provider.parse_json(resp.text)
+            parsed, resp = await provider.chat_json(prompt, max_tokens=1000)
         except Exception as exc:
             log.warning("AI prioritization failed: %s", exc)
             return findings
 
         pmap: dict[str, dict] = {}
-        for item in parsed.get("prioritized", []):
+        prioritized = parsed.get("prioritized")
+        for item in prioritized if isinstance(prioritized, list) else []:
+            if not isinstance(item, dict):
+                continue
             key = str(item.get("item_key", ""))
             pmap[key] = {
-                "ai_priority": int(item.get("priority_rank", 99)),
-                "ai_reason":   str(item.get("reason", "")),
+                # A non-numeric rank would raise and lose the whole batch.
+                "ai_priority": _int_or(item.get("priority_rank"), 99),
+                "ai_reason":   _text_field(item.get("reason"), 500),
             }
 
         for f in findings:
@@ -438,6 +561,12 @@ async def _load_cached_analysis(idb, finding_id: int) -> Optional[AIFindingAnaly
             mitre_context = data.get("mitre_context", ""),
             tokens_used   = int(data.get("tokens_used", 0)),
             latency_ms    = float(data.get("latency_ms", 0)),
+            cost_usd      = float(data.get("cost_usd", 0.0) or 0.0),
+            input_tokens  = int(data.get("input_tokens", 0) or 0),
+            output_tokens = int(data.get("output_tokens", 0) or 0),
+            attempts      = int(data.get("attempts", 1) or 1),
+            generation_id = data.get("generation_id", "") or "",
+            upstream_provider = data.get("upstream_provider", "") or "",
             generated_at  = float(data.get("generated_at", 0)),
         )
     except Exception as exc:
@@ -471,6 +600,12 @@ async def _load_cached_remediation(idb, finding_id: int, os_type: str) -> Option
             compensating = data.get("compensating", ""),
             tokens_used = int(data.get("tokens_used", 0)),
             latency_ms  = float(data.get("latency_ms", 0)),
+            cost_usd      = float(data.get("cost_usd", 0.0) or 0.0),
+            input_tokens  = int(data.get("input_tokens", 0) or 0),
+            output_tokens = int(data.get("output_tokens", 0) or 0),
+            attempts      = int(data.get("attempts", 1) or 1),
+            generation_id = data.get("generation_id", "") or "",
+            upstream_provider = data.get("upstream_provider", "") or "",
             generated_at = float(data.get("generated_at", 0)),
         )
     except Exception as exc:

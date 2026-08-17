@@ -27,7 +27,9 @@ import os
 import sys
 import time
 
-from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import (
+    Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect, HTTPException,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,6 +62,7 @@ from .api.finding_validation import router as finding_validation_router
 from .api.auth_ui            import router as auth_router
 from .api.ai_settings        import router as ai_settings_router
 from .api.integrations       import router as integrations_router
+from .api.authz              import require_session
 from shared.wire import REPLAY_WINDOW_SECONDS
 
 log = logging.getLogger("manager")
@@ -207,10 +210,20 @@ def create_app() -> FastAPI:
     from .version import get_version_info
 
     _version_info = get_version_info()
+    # Swagger was already disabled, but ReDoc and the raw OpenAPI schema were
+    # not — so the complete route map, parameters and models stayed public on
+    # every deployment. They are opt-in now, and off by default, matching the
+    # existing intent of docs_url=None.
+    _expose_api_docs = os.environ.get(
+        "ATTACKLENS_EXPOSE_API_DOCS", "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
     app = FastAPI(
         title="mac_intel Manager",
         version=_version_info["version"],
-        docs_url=None,
+        docs_url="/docs" if _expose_api_docs else None,
+        redoc_url="/redoc" if _expose_api_docs else None,
+        openapi_url="/openapi.json" if _expose_api_docs else None,
     )
 
     # ── Security headers middleware ────────────────────────────────────────────
@@ -231,14 +244,30 @@ def create_app() -> FastAPI:
 
     app.add_middleware(SecurityHeadersMiddleware)
 
-    # CORS: default to same-origin only in production.
-    # Set CORS_ORIGINS=https://your-dashboard.example.com in production env.
-    # Use CORS_ORIGINS=* only for local development.
+    # CORS: same-origin only unless an origin is explicitly configured.
+    #
+    # An unset CORS_ORIGINS used to fall back to ["*"], which is unsafe here
+    # because credentials are allowed: with allow_credentials=True, Starlette
+    # echoes the *requesting* origin back whenever a cookie is present rather
+    # than sending a literal "*", so any site could make credentialed calls
+    # riding a logged-in admin's al_session cookie. An empty list now means
+    # exactly what it says — no cross-origin access. The dashboard is served
+    # from this same origin through Caddy, so it needs no CORS grant at all.
     _cors_origins = [
         o.strip()
         for o in os.environ.get("CORS_ORIGINS", "").split(",")
         if o.strip()
-    ] or ["*"]
+    ]
+    # A literal "*" stays available for local development, but never together
+    # with credentials — that combination is what makes the wildcard dangerous,
+    # and the CORS spec forbids it anyway.
+    _cors_wildcard = "*" in _cors_origins
+    if _cors_wildcard:
+        log.warning(
+            "CORS_ORIGINS=* — credentialed cross-origin requests are disabled "
+            "for safety. Set an explicit origin to allow the dashboard to call "
+            "this manager from another host."
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins,
@@ -246,7 +275,7 @@ def create_app() -> FastAPI:
         allow_headers=[
             "Authorization", "Content-Type", "X-Request-ID", "Idempotency-Key",
         ],
-        allow_credentials=True,
+        allow_credentials=not _cors_wildcard,
         max_age=600,
     )
 
@@ -423,6 +452,41 @@ def create_app() -> FastAPI:
         app.state.feeds             = engine.feeds
         app.state.threat_intel_url  = threat_intel_url  # empty string in embedded mode
 
+        # Seed the encrypted AI provider store from AI_PROVIDER / AI_API_KEY on
+        # first boot, so a deployment can ship its LLM config in .env instead of
+        # requiring a dashboard visit before AI features work. No-ops once a
+        # provider is configured, and never performs network I/O.
+        try:
+            from .ai.key_store import bootstrap_from_env as _ai_bootstrap
+            _ai_bootstrap()
+        except Exception as exc:   # never block startup on optional AI config
+            log.warning("AI provider bootstrap skipped: %s", exc)
+
+        async def _ai_catalog_refresher() -> None:
+            """Keep the OpenRouter model catalog warm.
+
+            Without this the catalog is only fetched when someone opens
+            Settings, so on a fresh boot every lookup falls back to a heuristic:
+            model IDs go unvalidated, and structured-output capability reads as
+            "unknown" so a strict schema is sent to models that cannot honour
+            it. Runs in the background — a provider outage must never delay or
+            fail startup.
+            """
+            from .ai import catalog
+            from .ai.key_store import load_config
+
+            while True:
+                try:
+                    cfg = load_config()
+                    if cfg is not None and cfg.provider == "openrouter":
+                        # refresh() respects its own 6h TTL, so this is cheap.
+                        await catalog.refresh()
+                except Exception as exc:
+                    log.debug("AI model catalog refresh skipped: %s", exc)
+                await asyncio.sleep(3600)
+
+        _service_tasks.append(asyncio.create_task(_ai_catalog_refresher()))
+
         # AI analyst + email notifier — attach to app.state for route access
         ai_analyst     = AIAnalyst(intel_db, engine.feeds)
         email_notifier = EmailNotifier()
@@ -572,29 +636,56 @@ def create_app() -> FastAPI:
     cases_router               = make_cases_router(intel_db, auth_required=True)
     investigations_router      = make_investigations_router(investigation_service)
 
-    app.include_router(ingest_router,       prefix="/api/v1")
-    app.include_router(agents_router,       prefix="/api/v1/agents")
-    app.include_router(enroll_router,       prefix="/api/v1")
-    app.include_router(attacklens_router,   prefix="/api/v1/attacklens")
-    app.include_router(keys_router,      prefix="/api/v1/keys")
-    app.include_router(findings_router,  prefix="/api/v1/soc")
-    app.include_router(threat_router,    prefix="/api/v1/threat")
-    app.include_router(raw_router,       prefix="/api/v1/raw")
-    app.include_router(assets_router,    prefix="/api/v1/assets")
-    app.include_router(posture_router,    prefix="/api/v1/posture")
-    app.include_router(detection_router,  prefix="/api/v1/detection")
-    app.include_router(accuracy_router,   prefix="/api/v1/accuracy")
-    app.include_router(settings_router,   prefix="/api/v1/settings")
-    app.include_router(allowlist_router,          prefix="/api/v1/allowlist")
-    app.include_router(custom_correlations_router, prefix="/api/v1/custom-correlations")
-    app.include_router(cases_router,               prefix="/api/v1/cases")
-    app.include_router(investigations_router,      prefix="/api/v1/ai")
-    app.include_router(intel_router)              # prefix=/api/v1/intel defined inline
-    app.include_router(finding_validation_router) # prefix=/api/v1/findings (POST /{id}/validate etc.)
-    app.include_router(remediation_router)        # prefixes defined inline (actors, news, overview)
-    app.include_router(ai_settings_router)        # prefix=/api/v1/ai (provider config + analysis)
-    app.include_router(integrations_router)       # prefix=/api/v1/integrations (reliability health)
-    app.include_router(auth_router)               # dashboard login/logout/me
+    # ── Authentication boundary ───────────────────────────────────────────────
+    #
+    # Deny by default. Every router below carries `dependencies=_SESSION`, so a
+    # route is protected by being registered — not by remembering to decorate
+    # each endpoint. Per-endpoint auth is how one gets missed, and this codebase
+    # had missed all of them: before this, every /api/v1/* data route answered
+    # anonymous callers with 200 and the full fleet.
+    #
+    # THE ALLOWLIST — three routers are deliberately left open, each because it
+    # carries its own credential scheme that predates the dashboard session:
+    #
+    #   ingest_router   POST /api/v1/ingest is the agent telemetry path. Agents
+    #                   authenticate per-payload with an HMAC signature + nonce,
+    #                   not a browser cookie. Its one non-agent endpoint
+    #                   (/ingest/health) is protected individually in ingest.py.
+    #   enroll_router   Agents must reach enrolment *before* they hold any
+    #                   credential. Gated by ENROLLMENT_TOKENS / OPEN_ENROLLMENT.
+    #   auth_router     Login cannot require a session to obtain a session.
+    #                   /logout and /me verify their own token.
+    #
+    # Anything added outside that list must be session-protected. The route
+    # coverage test in manager/tests/unit/test_api_auth_coverage.py walks
+    # app.routes and fails when a new /api/v1/* route is neither protected nor
+    # explicitly listed, so this boundary cannot regress silently.
+    _SESSION = [Depends(require_session)]
+
+    app.include_router(ingest_router,       prefix="/api/v1")   # allowlisted: agent HMAC
+    app.include_router(enroll_router,       prefix="/api/v1")   # allowlisted: enrolment tokens
+    app.include_router(auth_router)                             # allowlisted: issues the session
+
+    app.include_router(agents_router,       prefix="/api/v1/agents",     dependencies=_SESSION)
+    app.include_router(attacklens_router,   prefix="/api/v1/attacklens", dependencies=_SESSION)
+    app.include_router(keys_router,         prefix="/api/v1/keys",       dependencies=_SESSION)
+    app.include_router(findings_router,     prefix="/api/v1/soc",        dependencies=_SESSION)
+    app.include_router(threat_router,       prefix="/api/v1/threat",     dependencies=_SESSION)
+    app.include_router(raw_router,          prefix="/api/v1/raw",        dependencies=_SESSION)
+    app.include_router(assets_router,       prefix="/api/v1/assets",     dependencies=_SESSION)
+    app.include_router(posture_router,      prefix="/api/v1/posture",    dependencies=_SESSION)
+    app.include_router(detection_router,    prefix="/api/v1/detection",  dependencies=_SESSION)
+    app.include_router(accuracy_router,     prefix="/api/v1/accuracy",   dependencies=_SESSION)
+    app.include_router(settings_router,     prefix="/api/v1/settings",   dependencies=_SESSION)
+    app.include_router(allowlist_router,    prefix="/api/v1/allowlist",  dependencies=_SESSION)
+    app.include_router(custom_correlations_router, prefix="/api/v1/custom-correlations", dependencies=_SESSION)
+    app.include_router(cases_router,        prefix="/api/v1/cases",      dependencies=_SESSION)
+    app.include_router(investigations_router, prefix="/api/v1/ai",       dependencies=_SESSION)
+    app.include_router(intel_router,              dependencies=_SESSION)  # /api/v1/intel, prefix inline
+    app.include_router(finding_validation_router, dependencies=_SESSION)  # /api/v1/findings
+    app.include_router(remediation_router,        dependencies=_SESSION)  # prefixes inline
+    app.include_router(ai_settings_router,        dependencies=_SESSION)  # /api/v1/ai provider config
+    app.include_router(integrations_router,       dependencies=_SESSION)  # /api/v1/integrations
 
     # ── Global exception handler ──────────────────────────────────────────────
     @app.exception_handler(Exception)
@@ -631,8 +722,11 @@ def create_app() -> FastAPI:
             "archive_enabled": store.enabled,
         }
 
-    # ── Build / version metadata (public — surfaced on the dashboard) ─────────
-    @app.get("/api/v1/meta")
+    # ── Build / version metadata ──────────────────────────────────────────────
+    # Session-gated: the login screen only calls /api/v1/auth/policy, so nothing
+    # pre-auth needs this, and an unauthenticated build/version banner is free
+    # fingerprinting for anyone deciding which CVEs to try.
+    @app.get("/api/v1/meta", dependencies=[Depends(require_session)])
     async def meta():
         from shared.wire import UI_WINDOW_KEYS, WINDOW_SECONDS
         return {
@@ -644,7 +738,7 @@ def create_app() -> FastAPI:
         }
 
     # ── Enrichment ────────────────────────────────────────────────────────────
-    @app.post("/api/v1/enrich/{finding_id}")
+    @app.post("/api/v1/enrich/{finding_id}", dependencies=[Depends(require_session)])
     async def enrich_finding(finding_id: str):
         if _enrich_worker is None:
             raise HTTPException(status_code=503, detail="Enrichment worker not running")
@@ -658,13 +752,20 @@ def create_app() -> FastAPI:
         return updated
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
-    @app.get("/api/v1/dashboard/ws-token")
+    @app.get("/api/v1/dashboard/ws-token", dependencies=[Depends(require_session)])
     async def dashboard_ws_token(x_admin_token: str = Header(default="")):
         """
-        Return a short-lived WS auth token for the browser dashboard.
-        Requires the X-Admin-Token header (same as /keys/*).
-        Never exposes the raw master key — returns it only when caller is
-        already authenticated as admin.
+        Return the WS auth token for the browser dashboard.
+
+        This hands back the master API key, so it needs a real credential. It
+        previously had an escape hatch: the X-Admin-Token check ran only `if
+        _admin` — so on any deployment that had not set ADMIN_TOKEN (the
+        default), the branch was skipped and the endpoint returned the master
+        key to an anonymous caller. The trailing "allow localhost-only access"
+        comment described a check that was never implemented.
+
+        Now a dashboard session is required to reach the endpoint at all, and
+        the admin-token comparison still applies on top when one is configured.
         """
         master = (api_key or "").strip()
         _admin = admin_token.strip()
@@ -672,8 +773,6 @@ def create_app() -> FastAPI:
             x_admin_token.strip().encode(), _admin.encode()
         ):
             raise HTTPException(status_code=401, detail="Invalid admin token")
-        # If no admin token is configured, allow localhost-only access.
-        client_host = ""  # request object not injected here; safe to skip check
         return {"token": master, "note": "Treat as a secret; valid until server restart"}
 
     @app.websocket("/ws/{agent_id}")

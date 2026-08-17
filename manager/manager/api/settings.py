@@ -1180,4 +1180,275 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
             "banner": {"status": banner_status, "message": banner_msg},
         }
 
+    # ── GET /validation/criteria ─────────────────────────────────────────────
+    @router.get("/validation/criteria")
+    async def validation_criteria():
+        """
+        The scoring rubric for every terrain — criterion names, weights, and
+        which ones are anchors.
+
+        This is what Settings → Validation Pipeline shows for "what does this
+        section actually check?". It is derived from TERRAIN_CRITERIA, so it
+        cannot drift from the code that scores findings.
+        """
+        try:
+            from ..attacklens.pipeline_inventory import terrain_rubrics
+
+            rubrics = terrain_rubrics()
+            return {
+                "rubrics": rubrics,
+                "terrain_count": len(rubrics),
+                "criteria_total": sum(r["criteria_count"] for r in rubrics),
+            }
+        except Exception as exc:
+            log.exception("validation_criteria failed")
+            raise HTTPException(500, f"Failed to load validation criteria: {exc}")
+
+    # ── GET /validation/pipeline ─────────────────────────────────────────────
+    @router.get("/validation/pipeline")
+    async def validation_pipeline(
+        hours: int = Query(24, ge=1, le=2160,
+                           description="Observability window for run/error counters."),
+    ):
+        """
+        Every validation engine point in one response: what runs, in what order,
+        how it is configured, how it fails, and how it is currently behaving.
+
+        Four blocks, matching the four questions an operator actually has:
+
+          stages       — the pipeline inventory with live config and sub-checks
+          accuracy     — is the output correct?  (states, FP rate by rule,
+                         unknown-terrain count, model decisions)
+          integrations — what does it depend on, and is that dependency healthy?
+          failures     — what is currently broken, and where?
+
+        Nothing here is fatal: each block degrades to an `error` field so one
+        unavailable subsystem cannot blank the whole page.
+        """
+        from ..attacklens.pipeline_inventory import (
+            apply_settings_values, build_inventory, settings_config_keys,
+        )
+
+        # ── Stages, with settings-backed config values filled in ─────────────
+        stages: list[dict] = []
+        stages_error = ""
+        try:
+            stages = build_inventory()
+            raw = await _load()
+            wanted = set(settings_config_keys())
+            resolved = {
+                key: raw.get(key, VALIDATION_DEFAULTS.get(key))
+                for key in wanted
+            }
+            stages = apply_settings_values(stages, resolved)
+        except Exception as exc:
+            log.warning("pipeline inventory failed: %s", exc)
+            stages_error = str(exc)[:240]
+
+        # ── Accuracy + failures, from the decision ledger ────────────────────
+        observability: dict = {}
+        try:
+            observability = await intel_db.get_validation_observability(hours=hours)
+        except Exception as exc:
+            log.warning("validation observability failed: %s", exc)
+            observability = {"error": str(exc)[:240]}
+
+        confidence: dict = {}
+        try:
+            confidence = await intel_db.compute_confidence_metrics()
+        except Exception as exc:
+            log.warning("confidence metrics failed: %s", exc)
+            confidence = {"error": str(exc)[:240]}
+
+        # ── Integration points ───────────────────────────────────────────────
+        integrations: dict = {}
+        try:
+            from ..integrations.resilience import registry
+
+            snapshot = registry.snapshot()
+            integrations = snapshot if isinstance(snapshot, dict) else {"raw": snapshot}
+        except Exception as exc:
+            log.debug("integration registry unavailable: %s", exc)
+            integrations = {"error": str(exc)[:240]}
+
+        ingest: dict = {}
+        try:
+            from .ingest import ingest_stats, schema_gap_stats
+
+            ingest = {"stages": ingest_stats(), "schema_gaps": schema_gap_stats()}
+        except Exception as exc:
+            log.debug("ingest stats unavailable: %s", exc)
+            ingest = {"error": str(exc)[:240]}
+
+        by_rule = observability.get("false_positive_by_rule") or []
+        rated = [r for r in by_rule if r.get("false_positive_rate") is not None]
+        worst = sorted(
+            rated, key=lambda r: r["false_positive_rate"], reverse=True,
+        )[:15]
+
+        return {
+            "window_hours": hours,
+            "stages": stages,
+            "stage_count": len(stages),
+            "stages_error": stages_error,
+            "accuracy": {
+                "current_states":  observability.get("current_states", {}),
+                "decisions":       observability.get("decisions", {}),
+                "abstentions":     observability.get("abstentions", 0),
+                "unknown_terrain": observability.get("unknown_terrain", 0),
+                "analyst_overrides": observability.get("analyst_overrides", 0),
+                "precision_overall": confidence.get("precision_overall"),
+                "precision_by_rule": confidence.get("precision_by_rule", []),
+                "rejected_by_gate":  confidence.get("rejected_by_gate", []),
+                "worst_rules":       worst,
+                "false_positive_by_rule": by_rule,
+                "error": confidence.get("error") or observability.get("error") or "",
+            },
+            "integrations": {
+                "providers": observability.get("providers", []),
+                "registry":  integrations,
+                "ingest":    ingest,
+            },
+            "failures": {
+                "errors":         observability.get("errors", {}),
+                "recompute_jobs": observability.get("recompute_jobs", {}),
+                "alerts":         observability.get("alerts", []),
+            },
+            "observed_at": observability.get("observed_at") or time.time(),
+        }
+
+    # ── GET /validation/debug/{finding_id} ───────────────────────────────────
+    @router.get("/validation/debug/{finding_id}")
+    async def validation_debug(finding_id: int):
+        """
+        Trace one finding through the pipeline.
+
+        Re-runs terrain scoring against the finding as it is stored right now and
+        returns the per-criterion breakdown next to the threshold that applies to
+        it and the stored decision-ledger history. That combination answers the
+        question the thresholds page cannot: not "what is the threshold" but
+        "which criterion is holding *this* finding below it".
+
+        Scoring here is a pure recomputation — it never writes, so an analyst can
+        debug freely without perturbing the ledger.
+        """
+        finding = None
+        try:
+            finding = await intel_db.get_finding_by_id(finding_id)
+        except Exception as exc:
+            log.warning("validation_debug fetch failed: %s", exc)
+        if not finding:
+            raise HTTPException(404, f"Finding {finding_id} not found")
+
+        from ..attacklens.terrain_validators import evaluate_finding, terrain_for
+
+        terrain = terrain_for(finding)
+
+        # The stored AI verdict, when one was recorded. Passing it back in keeps
+        # the recomputation faithful — omitting it would silently drop the AI
+        # criterion's weight and change the score we are trying to explain.
+        ai_verdict = None
+        raw_verdict = finding.get("ai_verdict")
+        if isinstance(raw_verdict, str) and raw_verdict.strip():
+            try:
+                ai_verdict = json.loads(raw_verdict)
+            except json.JSONDecodeError:
+                ai_verdict = None
+        elif isinstance(raw_verdict, dict):
+            ai_verdict = raw_verdict
+
+        evaluation: dict = {}
+        eval_error = ""
+        try:
+            evaluation = evaluate_finding(finding, {}, ai_verdict)
+        except Exception as exc:
+            log.exception("validation_debug evaluate failed")
+            eval_error = str(exc)[:240]
+
+        # Threshold resolution, showing every layer so the winning one is obvious.
+        threshold_chain: dict = {}
+        try:
+            settings = await _load()
+            global_thr = float(
+                settings.get("validation_global_threshold")
+                or VALIDATION_DEFAULTS["validation_global_threshold"]
+            )
+            try:
+                terrain_map = json.loads(settings.get("validation_terrain_thresholds") or "{}")
+            except json.JSONDecodeError:
+                terrain_map = {}
+            try:
+                agent_map = json.loads(settings.get("validation_agent_thresholds") or "{}")
+            except json.JSONDecodeError:
+                agent_map = {}
+            agent_id = str(finding.get("agent_id") or "")
+            agent_thr = agent_map.get(agent_id)
+            terrain_thr = terrain_map.get(terrain)
+            if agent_thr is not None:
+                effective, source = float(agent_thr), "agent"
+            elif terrain_thr is not None:
+                effective, source = float(terrain_thr), "terrain"
+            else:
+                effective, source = global_thr, "global"
+            threshold_chain = {
+                "agent":     {"agent_id": agent_id, "value": agent_thr},
+                "terrain":   {"terrain_id": terrain, "value": terrain_thr},
+                "global":    {"value": global_thr},
+                "effective": effective,
+                "source":    source,
+            }
+        except Exception as exc:
+            log.warning("validation_debug threshold resolution failed: %s", exc)
+            threshold_chain = {"error": str(exc)[:240]}
+
+        runs: list[dict] = []
+        try:
+            runs = await intel_db.get_validation_runs(finding_id, limit=20)
+        except Exception as exc:
+            log.debug("validation_debug ledger read failed: %s", exc)
+
+        score = float(evaluation.get("score") or 0.0)
+        effective = threshold_chain.get("effective")
+        passes = (effective is not None) and score >= float(effective)
+
+        # The blocking criteria: unmet, non-skipped, ordered by the weight they
+        # cost. This is the actionable half of the whole endpoint.
+        blocking = sorted(
+            [
+                c for c in evaluation.get("criteria", [])
+                if not c.get("skipped") and c.get("status") != "met"
+            ],
+            key=lambda c: float(c.get("weight") or 0.0),
+            reverse=True,
+        )
+
+        return {
+            "finding": {
+                "id":            finding.get("id"),
+                "external_id":   finding.get("external_id"),
+                "title":         finding.get("title"),
+                "agent_id":      finding.get("agent_id"),
+                "hostname":      finding.get("agent_hostname"),
+                "category":      finding.get("category"),
+                "item_key":      finding.get("item_key"),
+                "severity":      finding.get("severity"),
+                "source":        finding.get("source"),
+                "rule_id":       finding.get("rule_id"),
+                "status":        finding.get("status"),
+                "is_active":     finding.get("is_active"),
+                "stored_precision_score": finding.get("precision_score"),
+                "validation_state":       finding.get("validation_state"),
+            },
+            "terrain":     terrain,
+            "evaluation":  evaluation,
+            "eval_error":  eval_error,
+            "ai_verdict":  ai_verdict,
+            "ai_ran":      bool(evaluation.get("ai_ran")),
+            "thresholds":  threshold_chain,
+            "passes_threshold": passes,
+            "blocking_criteria": blocking,
+            "validation_runs":   runs,
+            "run_count":         len(runs),
+        }
+
     return router

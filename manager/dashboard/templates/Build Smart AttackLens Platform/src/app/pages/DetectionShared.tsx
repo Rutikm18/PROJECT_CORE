@@ -38,6 +38,10 @@ export interface DetectionFinding {
   terrain_id?:       string;      // citadels|vector|origin|identity|posture
   agent_id:          string;
   category:          string;
+  // Stable per-entity key the engine assigns (e.g. "sec:sip", "user:bob:uid0").
+  // Returned by SELECT f.* and far more reliable than title text when a view
+  // needs to discriminate between findings from the same rule.
+  item_key?:         string;
   severity:          "critical" | "high" | "medium" | "low" | "info";
   score:             number;
   composite_score?:  number;
