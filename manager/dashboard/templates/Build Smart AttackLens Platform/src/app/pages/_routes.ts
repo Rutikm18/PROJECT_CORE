@@ -47,6 +47,7 @@
  *   /settings/platform          ↳ Platform Config
  *   /settings/validation        ↳ Finding Validation (thresholds)
  *   /settings/pipeline          ↳ Validation Pipeline (stages, accuracy, debug)
+ *   /settings/customers         ↳ Customer Dashboards (portal provisioning)
  *   /settings/retention         ↳ Data Retention
  *   /settings/ai                ↳ AI Configuration
  * ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +106,7 @@ export const ROUTES = {
     platform:   "/settings/platform",
     validation: "/settings/validation",
     pipeline:   "/settings/pipeline",
+    customers:  "/settings/customers",
     retention:  "/settings/retention",
     ai:         "/settings/ai",
   },

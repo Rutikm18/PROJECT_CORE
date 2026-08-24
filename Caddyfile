@@ -7,7 +7,9 @@
     redir https://{host}:8443{uri} permanent
 }
 
-:8443 {
+# Named site: an address-only ":8443" gives Caddy's internal CA no subject
+# to issue a leaf for, so every TLS handshake fails with alert 80.
+localhost:8443 {
     tls internal
 
     header {

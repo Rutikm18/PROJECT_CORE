@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -65,7 +66,11 @@ audit = logging.getLogger("manager.audit")   # separate audit logger
 router = APIRouter(tags=["auth"])
 
 # ── Credential setup ──────────────────────────────────────────────────────────
-_ADMIN_EMAIL = os.environ.get("DASHBOARD_EMAIL", "admin@attacklens.ai").strip().lower()
+# `or` rather than a get() default: docker-compose.yml passes
+# DASHBOARD_EMAIL: "${DASHBOARD_EMAIL:-}", so the variable is always *set*, just
+# empty. A get() default never fires, leaving the expected login email as "" and
+# rejecting every credential a human could type.
+_ADMIN_EMAIL = (os.environ.get("DASHBOARD_EMAIL") or "admin@attacklens.ai").strip().lower()
 
 # Roles the rest of the manager understands: authz.require_admin treats
 # admin/owner as privileged, and cases.py accepts admin/analyst/viewer.
@@ -125,8 +130,82 @@ else:
 # screen for first-run convenience) ONLY when the operator has NOT overridden it
 # via DASHBOARD_PASSWORD_HASH or a custom DASHBOARD_PASSWORD. We never expose an
 # operator-set password (we only hold its hash) — only this known default.
-_USING_DEFAULT_CREDENTIALS = (not _env_hash) and (_env_plaintext == _DEFAULT_PASSWORD)
-if _USING_DEFAULT_CREDENTIALS:
+# GET /api/v1/auth/policy is unauthenticated by necessity (the login screen
+# needs the password rules before anyone can log in), so whatever it returns is
+# world-readable at a well-known path. Surfacing the built-in default there is
+# defensible on a laptop during first-run; it is not defensible once the
+# deployment has been pointed at a public address, where it would publish a
+# password that is byte-identical on every install.
+#
+# The gate is config-based, not network-based, on purpose: behind the bundled
+# Caddy the manager only ever sees the proxy's private container address, so a
+# client-IP check would pass for every internet visitor, and X-Forwarded-For is
+# set by the caller. DOMAIN/PUBLIC_IP are written by env.sh for internet-facing
+# installs and cannot be forged by a request.
+#
+# What the gate must ask is whether the configured address is *reachable from
+# the internet*, not merely whether the variable is set. env.sh writes
+# PUBLIC_IP on every install including a laptop, where it is `localhost` — so a
+# set/unset test classifies every local developer as an internet deployment,
+# hides the first-run credential, and leaves them at a login screen with no way
+# in. Unparseable values fall through to "public", so a typo fails closed.
+_LOCAL_HOSTNAMES = {"localhost", "localhost.localdomain", "ip6-localhost"}
+_LOCAL_SUFFIXES = (".local", ".localhost", ".internal", ".test", ".localdomain")
+# Enumerated rather than expressed as `not ip.is_global`, because a security
+# gate must fail closed and `is_global` is false for far more than the ranges
+# that actually mean "unreachable from outside this network" — it also covers
+# the RFC 5737 documentation blocks (203.0.113.0/24 and friends), which Python
+# further reports as `is_private`. An operator who writes PUBLIC_IP=203.0.113.10
+# believes they are on a public address, and an unfamiliar address class must
+# never be silently downgraded to "safe". Only these mean genuinely local:
+_PRIVATE_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "127.0.0.0/8", "::1/128",              # loopback
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",   # RFC1918
+    "fc00::/7",                            # IPv6 unique-local
+    "169.254.0.0/16", "fe80::/10",         # link-local
+    "100.64.0.0/10",                       # CGNAT
+))
+
+
+def _is_public_address(value: str) -> bool:
+    """True when a DOMAIN/PUBLIC_IP value could be reached from outside.
+
+    Unrecognised input returns True: a typo must not quietly publish the
+    built-in credential.
+    """
+    host = (value or "").strip().lower().strip("[]")
+    if not host:
+        return False
+    if host in _LOCAL_HOSTNAMES or host.endswith(_LOCAL_SUFFIXES):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # A real hostname (attacklens.example.com). Treat as internet-facing.
+        return True
+    return not any(address in network for network in _PRIVATE_NETWORKS)
+
+
+_PUBLICLY_ADDRESSED = (
+    _is_public_address(os.environ.get("DOMAIN", ""))
+    or _is_public_address(os.environ.get("PUBLIC_IP", ""))
+)
+
+_DEFAULT_PASSWORD_IN_USE = (not _env_hash) and (_env_plaintext == _DEFAULT_PASSWORD)
+# Only ever controls whether the login screen offers click-to-autofill. It does
+# NOT gate authentication — the default password keeps working when this is
+# False, it simply stops being advertised.
+_USING_DEFAULT_CREDENTIALS = _DEFAULT_PASSWORD_IN_USE and not _PUBLICLY_ADDRESSED
+
+if _DEFAULT_PASSWORD_IN_USE and _PUBLICLY_ADDRESSED:
+    log.warning(
+        "auth: built-in DEFAULT dashboard password is in use on an "
+        "internet-reachable deployment (DOMAIN/PUBLIC_IP resolves to a public "
+        "address). It is NOT being surfaced on the login screen. Set "
+        "DASHBOARD_PASSWORD_HASH now — until you do, this install shares a "
+        "password with every other AttackLens install."
+    )
+elif _DEFAULT_PASSWORD_IN_USE:
     log.warning(
         "auth: using built-in DEFAULT dashboard password — surfaced on the login "
         "screen for first-run setup. Set DASHBOARD_PASSWORD_HASH before deploying."
@@ -178,26 +257,58 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (pad % 4))
 
 
+# Token audiences. This is the claim that makes /portal/login a genuinely
+# separate principal rather than a second door onto the same session: a portal
+# token presented to an operator route is refused, and the reverse.
+#
+# A token with no `aud` is treated as MANAGER. Every token issued before this
+# claim existed was an operator session, so that default is both backward
+# compatible and safe — a portal token always carries `aud` explicitly, so the
+# permissive direction can never manufacture a customer principal.
+AUD_MANAGER = "manager"
+AUD_PORTAL = "portal"
+
+
 def _make_token(
     email: str, role: str, tenant_id: str = "default",
+    *, aud: str = AUD_MANAGER, extra: Optional[dict] = None,
 ) -> tuple[str, str, float]:
-    """Return (token, jti, exp_epoch)."""
+    """Return (token, jti, exp_epoch).
+
+    `extra` carries audience-specific claims — the portal adds org_id and
+    user_id so a request can resolve its tenant without a second lookup.
+    """
     now  = time.time()
     exp  = now + _JWT_TTL_HOURS * 3600
     jti  = secrets.token_urlsafe(20)
     hdr  = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    pay  = _b64url(json.dumps({
+    claims = {
         "sub":  email,
         "role": role,
+        "aud":  str(aud or AUD_MANAGER),
         "tenant_id": str(tenant_id or "default")[:120],
         "jti":  jti,
         "iat":  int(now),
         "exp":  int(exp),
         "idle": _IDLE_TTL_MINUTES,   # frontend reads this for idle-timeout config
-    }).encode())
+    }
+    # Reserved claims win, so a caller cannot smuggle a different audience or
+    # subject in through `extra`.
+    for key, value in (extra or {}).items():
+        if key not in claims:
+            claims[key] = value
+    pay  = _b64url(json.dumps(claims).encode())
     sig_input = f"{hdr}.{pay}".encode()
     sig = _b64url(hmac.new(_JWT_SECRET, sig_input, hashlib.sha256).digest())
     return f"{hdr}.{pay}.{sig}", jti, exp
+
+
+def token_audience(payload: Optional[dict]) -> str:
+    """The audience a verified payload belongs to, defaulting to manager."""
+    if not isinstance(payload, dict):
+        return ""
+    aud = str(payload.get("aud") or AUD_MANAGER).strip().lower()
+    return aud if aud in {AUD_MANAGER, AUD_PORTAL} else ""
 
 
 def _verify_token(token: str) -> Optional[dict]:
@@ -226,6 +337,12 @@ def _client_ip(request: Request) -> str:
     fwd = request.headers.get("X-Forwarded-For", "").split(",")
     candidate = fwd[0].strip()
     return candidate if candidate else (request.client.host if request.client else "unknown")
+
+
+# Start counting down only near the limit. Announcing "4 of 5 remaining" on a
+# first typo is noise; the warning exists so the attempt before a 15-minute
+# lockout does not look like every other failure.
+_WARN_BELOW_ATTEMPTS = 2
 
 
 def _user_agent(request: Request) -> str:
@@ -287,15 +404,30 @@ def _revoke_all_sessions(email: str) -> None:
 
 # ── Error responses — no user enumeration ─────────────────────────────────────
 
-def _auth_error(locked_minutes: int = 0) -> JSONResponse:
+def _auth_error(locked_minutes: int = 0, attempts_remaining: int | None = None) -> JSONResponse:
+    """401 for a bad credential, 429 once a lockout window is open.
+
+    `attempts_remaining` counts down the IP budget, never the account one:
+    the IP counter is a property of the caller, so surfacing it cannot tell an
+    attacker whether an email exists, while the account counter would. Without
+    it the last failure before a 30-minute lockout looks identical to the
+    first, which is how an operator ends up locked out with no warning.
+    """
     if locked_minutes:
         return JSONResponse(
             {"error": f"Too many failed attempts. Try again in {locked_minutes} minute(s)."},
             status_code=429,
             headers=AUTH_CACHE_HEADERS,
         )
+    message = "Invalid credentials."
+    if attempts_remaining is not None and attempts_remaining <= _WARN_BELOW_ATTEMPTS:
+        plural = "" if attempts_remaining == 1 else "s"
+        message = (
+            f"Invalid credentials. {attempts_remaining} attempt{plural} remaining "
+            f"before this address is locked out."
+        )
     return JSONResponse(
-        {"error": "Invalid credentials."},
+        {"error": message},
         status_code=401,
         headers=AUTH_CACHE_HEADERS,
     )
@@ -341,8 +473,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
     if not (email_matches and password_ok):
         ip_count, acct_count = _record_failure(ip, email)
-        ip_remaining   = max(0, IP_LOCKOUT_ATTEMPTS   - ip_count)
-        acct_remaining = max(0, ACCOUNT_LOCKOUT_ATTEMPTS - acct_count)
+        ip_remaining = max(0, IP_LOCKOUT_ATTEMPTS - ip_count)
         audit.warning(
             "login.failure ip=%s email=%s ip_count=%d acct_count=%d ua=%s",
             ip, email, ip_count, acct_count, ua,
@@ -350,7 +481,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         mins = _lockout_minutes(ip, email)
         if mins:
             return _auth_error(locked_minutes=mins)
-        return _auth_error()
+        return _auth_error(attempts_remaining=ip_remaining)
 
     # ── MFA hook ──────────────────────────────────────────────────────────────
     if _MFA_ENABLED:

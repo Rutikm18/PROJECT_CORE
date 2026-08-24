@@ -289,6 +289,19 @@ class AIProvider(ABC):
             breaker_reset_s=60.0,
         )
 
+    @property
+    def model_id(self) -> str:
+        """The configured model, readable without reaching into `_cfg`.
+
+        Callers that cache responses need this *before* the call, since a
+        verdict produced by one model must not be served for another.
+        """
+        return str(getattr(self._cfg, "model", "") or "")
+
+    @property
+    def provider_name(self) -> str:
+        return str(getattr(self._cfg, "provider", "") or "")
+
     @abstractmethod
     async def chat(
         self,

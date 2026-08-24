@@ -19,7 +19,7 @@ import time
 import logging
 from typing import Optional, TYPE_CHECKING
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from shared.sections import VALID_SECTION_NAMES
 # Single source of truth for the Deep Mesh capability → record-key map. Defined
 # in shared/schema.py so the composite validator (validate_section) and the
@@ -38,10 +38,31 @@ log = logging.getLogger("manager.api.raw")
 def make_raw_router(db: "Database") -> APIRouter:
     router = APIRouter()
 
+    # ── Tenant boundary ─────────────────────────────────────────────────────
+    # The list and count paths are scoped in db.py, which reads the request's
+    # tenant from the same ContextVar the finding queries use. These three
+    # endpoints address a single agent or row directly, so membership is
+    # checked here instead — and an out-of-scope target is reported as 404
+    # rather than 403, so a customer cannot probe for which agents exist.
+
+    def _scope() -> Optional[tuple[str, ...]]:
+        from ..api.tenant_scope import current_tenant
+        return current_tenant()
+
+    def _require_agent_in_scope(agent_id: Optional[str]) -> None:
+        scope = _scope()
+        if scope is None or agent_id is None:
+            return
+        if agent_id not in scope:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+
     @router.get("/agents")
     async def list_agents():
         """All enrolled agents with last-seen timestamp and online status."""
         agents = await db.get_all_agents()
+        scope = _scope()
+        if scope is not None:
+            agents = [a for a in agents if str(a.get("agent_id")) in scope]
         now = int(time.time())
         result = []
         for a in agents:
@@ -66,8 +87,15 @@ def make_raw_router(db: "Database") -> APIRouter:
     @router.get("/sections")
     async def list_sections(agent_id: Optional[str] = Query(None)):
         """Distinct telemetry sections, optionally scoped to one agent."""
-        sections = await db.get_distinct_sections(agent_id)
-        return {"sections": sections}
+        _require_agent_in_scope(agent_id)
+        scope = _scope()
+        if scope is not None and agent_id is None:
+            # Union across the caller's own agents rather than the whole fleet.
+            seen: set[str] = set()
+            for owned in scope:
+                seen.update(await db.get_distinct_sections(owned))
+            return {"sections": sorted(seen)}
+        return {"sections": await db.get_distinct_sections(agent_id)}
 
     @router.get("/count")
     async def count_payloads(
@@ -177,6 +205,10 @@ def make_raw_router(db: "Database") -> APIRouter:
         row = await db.get_payload_by_id(id)
         if row is None:
             return {"found": False, "id": id}
+        scope = _scope()
+        if scope is not None and str(row.get("agent_id")) not in scope:
+            # Indistinguishable from a row that does not exist.
+            return {"found": False, "id": id}
         data = row.get("data", {})
         return {
             "found":        True,
@@ -223,6 +255,7 @@ def make_raw_router(db: "Database") -> APIRouter:
         i.e. the agent is actually delivering the data the 14 detection modules
         need. Per-section `status` ∈ ok | stale | empty | missing pinpoints gaps.
         """
+        _require_agent_in_scope(agent_id)
         if not agent_id:
             agents = await db.get_all_agents()
             if not agents:

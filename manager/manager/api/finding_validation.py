@@ -235,11 +235,11 @@ async def get_exploitability(
     if persist:
         try:
             async with idb._lock:
-                await idb._conn.execute(
-                    "UPDATE findings SET exploitability_score=?, exploitability_band=? WHERE id=?",
-                    (result.score, result.band, finding_id),
-                )
-                await idb._conn.commit()
+                async with idb.write_txn() as conn:
+                    await conn.execute(
+                        "UPDATE findings SET exploitability_score=?, exploitability_band=? WHERE id=?",
+                        (result.score, result.band, finding_id),
+                    )
         except Exception as exc:
             log.warning("Failed to persist exploitability for finding %s: %s", finding_id, exc)
 
@@ -301,11 +301,11 @@ async def backfill_exploitability(
         result = exploitability_scorer.compute(f, cve_published_ts=published_ts or None)
         try:
             async with idb._lock:
-                await idb._conn.execute(
-                    "UPDATE findings SET exploitability_score=?, exploitability_band=? WHERE id=?",
-                    (result.score, result.band, f["id"]),
-                )
-                await idb._conn.commit()
+                async with idb.write_txn() as conn:
+                    await conn.execute(
+                        "UPDATE findings SET exploitability_score=?, exploitability_band=? WHERE id=?",
+                        (result.score, result.band, f["id"]),
+                    )
             scored += 1
         except Exception as exc:
             log.warning("backfill: finding %s failed: %s", f.get("id"), exc)

@@ -222,16 +222,41 @@ class PgConnection:
         return _Execute(_run())
 
     async def commit(self) -> None:
-        if self._tx is not None:
-            await self._tx.commit()
-            self._tx = None
+        # Clear _tx BEFORE awaiting, not after. When the await raises — a
+        # dropped backend, a statement timeout, a concurrent operation on this
+        # shared connection — a trailing `self._tx = None` never runs, so the
+        # dead Transaction stays installed. asyncpg marks it FAILED, _ensure_tx
+        # early-returns on `self._tx is not None` and so never reaches its
+        # self-healing ROLLBACK, and every later commit on this connection
+        # raises "cannot commit; the transaction is in error state" until the
+        # process restarts. Because IntelDB._conn is one long-lived connection
+        # shared by every writer, that is not one broken request — it is
+        # settings, detection, dedup and case management all failing together,
+        # for days. Clearing first means the next write self-heals instead.
+        tx, self._tx = self._tx, None
+        if tx is None:
+            return
+        try:
+            await tx.commit()
+        except BaseException:
+            # Best-effort: return the underlying connection to a usable state.
+            # _ensure_tx() also recovers via is_in_transaction(), so failure
+            # here is not fatal — the original error is what the caller needs.
+            try:
+                await tx.rollback()
+            except BaseException:
+                pass
+            raise
         # Mirrors sqlite3: a new implicit transaction starts on the next
         # write, so code that commits more than once per checkout still works.
 
     async def rollback(self) -> None:
-        if self._tx is not None:
-            await self._tx.rollback()
-            self._tx = None
+        # Same ordering rule as commit(): a rollback that itself fails must not
+        # leave the failed Transaction installed, or the connection is wedged
+        # for the life of the process.
+        tx, self._tx = self._tx, None
+        if tx is not None:
+            await tx.rollback()
 
 
 class PgPool:

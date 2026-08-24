@@ -16,7 +16,11 @@ import {
   Cpu, Eye, EyeOff, Zap, ExternalLink, TestTube2, Layers,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { isStaleResponse } from "../lib/retention";
 import ValidationPipelinePanel from "./settings/ValidationPipelinePanel";
+import CustomersPanel from "./settings/CustomersPanel";
+import { CUSTOMER_PORTAL_LIVE } from "../featureFlags";
+import { ComingSoon } from "../components/ComingSoon";
 import { setTimezone, tzAbbr, tzOffsetStr, TIMEZONE_LIST, TZ_DEFAULT, isValidTimezone, fmtTime } from "../context/timezoneStore";
 
 const API = "/api/v1/settings";
@@ -59,7 +63,7 @@ interface RoleEntry {
   color:       string;
 }
 
-type TabId = "org" | "license" | "roles" | "platform" | "validation" | "pipeline" | "retention" | "ai";
+type TabId = "org" | "license" | "roles" | "platform" | "validation" | "pipeline" | "customers" | "retention" | "ai";
 
 const EMPTY: OrgSettings = {
   org_name: "", org_description: "", org_location: "", contact_email: "",
@@ -151,6 +155,70 @@ function Toggle({ value, onChange, label }: { value: boolean; onChange: (v: bool
   );
 }
 
+// ── Save bar ──────────────────────────────────────────────────────────────────
+// Every panel on this page saves through this one component. The page used to
+// carry four different save conventions — a dirty-tracked "Save Changes", four
+// separate section buttons in Validation that all called the same endpoint,
+// a Retention panel that applied immediately with no button at all, and a
+// "Save Configuration" in AI — so what a button meant depended on where you
+// happened to be. Sharing the component makes the panels consistent by
+// construction rather than by everyone remembering the convention.
+
+function SaveBar({
+  dirty, saved, saving, error, onSave, onReload, reloading, savingLabel, children,
+}: {
+  dirty: boolean;
+  saved: boolean;
+  saving: boolean;
+  error?: string | null;
+  onSave: () => void;
+  onReload?: () => void;
+  reloading?: boolean;
+  // Only for a panel whose save genuinely does more than write — the AI panel
+  // also round-trips a live connection test, and hiding that behind a generic
+  // "Saving…" makes a slow provider look like a hung button.
+  savingLabel?: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center justify-end gap-2">
+      {children}
+      {error && <span className="text-[10px] text-red-600 mr-auto">{error}</span>}
+      {dirty && !saved && (
+        <span className="text-[10px] text-amber-600 font-semibold flex items-center gap-1">
+          <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />Unsaved changes
+        </span>
+      )}
+      {saved && (
+        <span className="text-[10px] text-green-600 font-semibold flex items-center gap-1 al-bounce-in">
+          <CheckCircle2 className="w-3.5 h-3.5" />Saved
+        </span>
+      )}
+      {onReload && (
+        <button
+          onClick={onReload}
+          className="p-2 hover:bg-[--gray-50] rounded-lg transition-colors"
+          aria-label="Reload"
+        >
+          <RefreshCw className={cn("w-3.5 h-3.5 text-[--gray-400]", reloading && "animate-spin")} />
+        </button>
+      )}
+      <button
+        onClick={onSave}
+        disabled={saving || !dirty}
+        className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-[11px] font-bold text-white transition-all disabled:opacity-50"
+        style={{
+          background: "linear-gradient(135deg,#7C3AED,#6D28D9)",
+          boxShadow: dirty ? "0 2px 8px rgba(124,58,237,0.35)" : undefined,
+        }}
+      >
+        <Save className="w-3.5 h-3.5" />
+        {saving ? (savingLabel ?? "Saving…") : "Save changes"}
+      </button>
+    </div>
+  );
+}
+
 // ── Permission chip ───────────────────────────────────────────────────────────
 
 const PERM_LABELS: Record<string, string> = {
@@ -167,7 +235,7 @@ const PERM_LABELS: Record<string, string> = {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const VALID_SECTIONS: TabId[] = ["org", "license", "roles", "platform", "validation", "pipeline", "retention", "ai"];
+const VALID_SECTIONS: TabId[] = ["org", "license", "roles", "platform", "validation", "pipeline", "customers", "retention", "ai"];
 
 export default function Settings() {
   const { section } = useParams<{ section?: string }>();
@@ -254,13 +322,14 @@ export default function Settings() {
 
   const licC = license ? licenseColor(license.status) : licenseColor("unconfigured");
 
-  const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
+  const TABS: { id: TabId; label: string; icon: React.ElementType; comingSoon?: boolean }[] = [
     { id: "org",        label: "Organisation",  icon: Building2  },
     { id: "license",    label: "License",       icon: ShieldCheck },
     { id: "roles",      label: "Role Access",   icon: Users      },
     { id: "platform",   label: "Platform",      icon: Settings2  },
     { id: "validation", label: "Validation",    icon: Brain      },
     { id: "pipeline",   label: "Validation Pipeline", icon: Layers },
+    { id: "customers",  label: "Customer Dashboards", icon: Building2, comingSoon: !CUSTOMER_PORTAL_LIVE },
     { id: "retention",  label: "Data Retention", icon: Database  },
     { id: "ai",         label: "AI Provider",   icon: Cpu        },
   ];
@@ -284,30 +353,10 @@ export default function Settings() {
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            {dirty && !saved && (
-              <span className="text-[10px] text-amber-600 font-semibold flex items-center gap-1">
-                <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />Unsaved changes
-              </span>
-            )}
-            {saved && (
-              <span className="text-[10px] text-green-600 font-semibold flex items-center gap-1 al-bounce-in">
-                <CheckCircle2 className="w-3.5 h-3.5" />Saved
-              </span>
-            )}
-            <button onClick={load} className="p-2 hover:bg-[--gray-50] rounded-lg transition-colors">
-              <RefreshCw className={cn("w-3.5 h-3.5 text-[--gray-400]", loading && "animate-spin")} />
-            </button>
-            <button
-              onClick={save}
-              disabled={saving || !dirty}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-[11px] font-bold text-white transition-all disabled:opacity-50"
-              style={{ background: "linear-gradient(135deg,#7C3AED,#6D28D9)", boxShadow: dirty ? "0 2px 8px rgba(124,58,237,0.35)" : undefined }}
-            >
-              <Save className="w-3.5 h-3.5" />
-              {saving ? "Saving…" : "Save Changes"}
-            </button>
-          </div>
+          <SaveBar
+            dirty={dirty} saved={saved} saving={saving}
+            onSave={save} onReload={load} reloading={loading}
+          />
         </div>
       </div>
 
@@ -332,6 +381,12 @@ export default function Settings() {
               style={tab === t.id ? { background: "linear-gradient(135deg,#7C3AED,#6D28D9)" } : {}}
             >
               <Icon className="w-3.5 h-3.5" />{t.label}
+              {t.comingSoon && (
+                <span className={cn(
+                  "text-[8px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded",
+                  tab === t.id ? "bg-white/20 text-white" : "bg-amber-100 text-amber-700",
+                )}>Soon</span>
+              )}
             </button>
           );
         })}
@@ -817,6 +872,23 @@ export default function Settings() {
       )}
 
       {/* ══════════════════════════════════════════════════════════════════════
+          TAB: Customer Dashboards — provision the scoped, read-only portal a
+          customer signs into at /portal. Agent assignment here is the control
+          that decides what they can see.
+      ══════════════════════════════════════════════════════════════════════ */}
+      {tab === "customers" && (
+        CUSTOMER_PORTAL_LIVE ? <CustomersPanel /> : (
+          <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card">
+            <ComingSoon
+              icon={<Building2 className="w-6 h-6 text-[--gray-400]" />}
+              title="Customer Dashboards"
+              description="Provisioning scoped, read-only dashboards for your customers — create an organisation, issue its licence, assign the endpoints it may see, and invite its users. Built and ready; enabling shortly."
+            />
+          </div>
+        )
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
           TAB: Data Retention
       ══════════════════════════════════════════════════════════════════════ */}
       {tab === "retention" && (
@@ -947,9 +1019,20 @@ function ValidationSettingsPanel() {
   const [saving,  setSaving]  = useState(false);
   const [error,   setError]   = useState<string | null>(null);
   const [saved,   setSaved]   = useState(false);
+  const [dirty,   setDirty]   = useState(false);
   const [pickerAgent, setPickerAgent] = useState("");
   const [priorityAgent, setPriorityAgent] = useState("");
   const [priorityLevel, setPriorityLevel] = useState("top");
+
+  // Every editable control in this panel routes through `edit` so the single
+  // save bar knows there is something to commit. Previously each section had
+  // its own button and sent only its own slice, which meant editing two
+  // sections and pressing one button silently discarded the other's changes.
+  const edit = (next: VSettings) => {
+    setData(next);
+    setDirty(true);
+    setSaved(false);
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1004,10 +1087,25 @@ function ValidationSettingsPanel() {
         priority_options: d.priority_options || data?.priority_options || [],
       });
       setSaved(true);
+      setDirty(false);
       setTimeout(() => setSaved(false), 1500);
       setError(null);
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setSaving(false); }
+  };
+
+  // Sends every section in one request. The four old buttons each sent a
+  // single slice, so edits made outside the section you happened to save were
+  // dropped without warning.
+  const saveAll = () => {
+    if (!data) return;
+    save({
+      global_threshold:   data.global_threshold,
+      use_ai_verdict:     data.use_ai_verdict,
+      terrain_thresholds: data.terrain_thresholds,
+      agent_thresholds:   data.agent_thresholds,
+      agent_priorities:   data.agent_priorities || {},
+    });
   };
 
   if (loading || !data) {
@@ -1029,6 +1127,15 @@ function ValidationSettingsPanel() {
   return (
     <div className="space-y-4">
 
+      {/* One save bar for the whole panel: global threshold, terrain, agent and
+          priority overrides all commit together to the same endpoint. */}
+      <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card px-5 py-3">
+        <SaveBar
+          dirty={dirty} saved={saved} saving={saving} error={error}
+          onSave={saveAll} onReload={load} reloading={loading}
+        />
+      </div>
+
       {/* ── Global threshold + LLM toggle ──────────────────────────────── */}
       <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
         <SectionLabel icon={Brain}>Global Detection Confidence Threshold</SectionLabel>
@@ -1040,7 +1147,7 @@ function ValidationSettingsPanel() {
         <ThresholdSlider
           value={data.global_threshold}
           bounds={data.bounds}
-          onChange={v => setData({ ...data, global_threshold: v })}
+          onChange={v => edit({ ...data, global_threshold: v })}
           label="Global Detection Confidence threshold"
           description="Applies to every finding that has no terrain or agent override."
         />
@@ -1054,24 +1161,11 @@ function ValidationSettingsPanel() {
           </div>
           <Toggle
             value={data.use_ai_verdict}
-            onChange={v => setData({ ...data, use_ai_verdict: v })}
+            onChange={v => edit({ ...data, use_ai_verdict: v })}
             label=""
           />
         </div>
 
-        <div className="flex items-center justify-end gap-2 pt-2">
-          {error && <span className="text-[10px] text-red-600">{error}</span>}
-          {saved && <span className="text-[10px] text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" />Saved</span>}
-          <button
-            disabled={saving}
-            onClick={() => save({
-              global_threshold: data.global_threshold,
-              use_ai_verdict:   data.use_ai_verdict,
-            })}
-            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
-            <Save className="w-3.5 h-3.5" />Save global
-          </button>
-        </div>
       </div>
 
       {/* ── Per-terrain overrides ──────────────────────────────────────── */}
@@ -1107,7 +1201,7 @@ function ValidationSettingsPanel() {
                       const next = { ...data.terrain_thresholds };
                       if (enabled) delete next[terrain.id];
                       else next[terrain.id] = data.global_threshold;
-                      setData({ ...data, terrain_thresholds: next });
+                      edit({ ...data, terrain_thresholds: next });
                     }}
                     className={cn(
                       "px-2 py-1 rounded-lg text-[10px] font-bold border transition-colors",
@@ -1124,21 +1218,13 @@ function ValidationSettingsPanel() {
                     bounds={data.bounds}
                     onChange={v => {
                       const next = { ...data.terrain_thresholds, [terrain.id]: v };
-                      setData({ ...data, terrain_thresholds: next });
+                      edit({ ...data, terrain_thresholds: next });
                     }}
                   />
                 )}
               </div>
             );
           })}
-        </div>
-        <div className="flex items-center justify-end gap-2 pt-2">
-          <button
-            disabled={saving}
-            onClick={() => save({ terrain_thresholds: data.terrain_thresholds })}
-            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
-            <Save className="w-3.5 h-3.5" />Save terrain overrides
-          </button>
         </div>
       </div>
 
@@ -1171,7 +1257,7 @@ function ValidationSettingsPanel() {
               onClick={() => {
                 if (!pickerAgent) return;
                 const next = { ...data.agent_thresholds, [pickerAgent]: data.global_threshold };
-                setData({ ...data, agent_thresholds: next });
+                edit({ ...data, agent_thresholds: next });
                 setPickerAgent("");
               }}
               className="flex items-center gap-1 px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-[--gray-300] text-white text-[10px] font-bold rounded-xl transition-colors">
@@ -1208,7 +1294,7 @@ function ValidationSettingsPanel() {
                     onClick={() => {
                       const next = { ...data.agent_thresholds };
                       delete next[aid];
-                      setData({ ...data, agent_thresholds: next });
+                      edit({ ...data, agent_thresholds: next });
                     }}
                     className="px-2 py-1 rounded-lg text-[10px] font-bold border bg-white text-red-600 border-red-200 hover:bg-red-50 transition-colors">
                     <Trash2 className="w-3 h-3 inline" />
@@ -1219,7 +1305,7 @@ function ValidationSettingsPanel() {
                   bounds={data.bounds}
                   onChange={v => {
                     const next = { ...data.agent_thresholds, [aid]: v };
-                    setData({ ...data, agent_thresholds: next });
+                    edit({ ...data, agent_thresholds: next });
                   }}
                 />
               </div>
@@ -1227,14 +1313,6 @@ function ValidationSettingsPanel() {
           })}
         </div>
 
-        <div className="flex items-center justify-end gap-2 pt-2">
-          <button
-            disabled={saving}
-            onClick={() => save({ agent_thresholds: data.agent_thresholds })}
-            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
-            <Save className="w-3.5 h-3.5" />Save agent overrides
-          </button>
-        </div>
       </div>
 
       {/* ── Per-agent asset priority confidence boost ──────────────────── */}
@@ -1267,7 +1345,7 @@ function ValidationSettingsPanel() {
             onClick={() => {
               if (!priorityAgent) return;
               const next = { ...data.agent_priorities, [priorityAgent]: priorityLevel };
-              setData({ ...data, agent_priorities: next });
+              edit({ ...data, agent_priorities: next });
               setPriorityAgent("");
               setPriorityLevel("top");
             }}
@@ -1297,7 +1375,7 @@ function ValidationSettingsPanel() {
                     onClick={() => {
                       const next = { ...data.agent_priorities };
                       delete next[aid];
-                      setData({ ...data, agent_priorities: next });
+                      edit({ ...data, agent_priorities: next });
                     }}
                     className="px-2 py-1 rounded-lg text-[10px] font-bold border bg-white text-red-600 border-red-200 hover:bg-red-50 transition-colors">
                     <Trash2 className="w-3 h-3 inline" />
@@ -1308,7 +1386,7 @@ function ValidationSettingsPanel() {
                     value={level}
                     onChange={e => {
                       const next = { ...data.agent_priorities, [aid]: e.target.value };
-                      setData({ ...data, agent_priorities: next });
+                      edit({ ...data, agent_priorities: next });
                     }}
                     className={selectCls}
                   >
@@ -1330,14 +1408,6 @@ function ValidationSettingsPanel() {
           })}
         </div>
 
-        <div className="flex items-center justify-end gap-2 pt-2">
-          <button
-            disabled={saving}
-            onClick={() => save({ agent_priorities: data.agent_priorities || {} })}
-            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white text-[11px] font-bold rounded-xl transition-colors">
-            <Save className="w-3.5 h-3.5" />Save priority overrides
-          </button>
-        </div>
       </div>
 
       {/* ── Info footer ────────────────────────────────────────────────── */}
@@ -1410,19 +1480,44 @@ function RetentionSettingsPanel() {
   const [error,       setError]       = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Edits live here until the save bar commits them. Driving the controls from
+  // a draft also removes the need for the optimistic write this panel used to
+  // do: the control now moves the instant you touch it because it reads the
+  // draft, and the 60s stats poll can no longer stomp an in-progress edit,
+  // because the poll only ever writes `config`.
+  const [draft, setDraft] = useState<{ period_months: number; action: "delete" | "archive" } | null>(null);
+  const dirty = !!(config && draft) && (
+    draft.period_months !== config.period_months || draft.action !== config.action
+  );
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Orders config writes. The 60s stats poll and every save both resolve into
+  // setConfig; without this, a poll issued just before a save can land just
+  // after it and put the previous period back on screen.
+  const reqSeq   = useRef(0);
+  const savingRef = useRef(false);
 
   const loadStats = useCallback(async (quiet = false) => {
+    const seq = ++reqSeq.current;
     if (!quiet) setRefreshing(true);
     try {
       const r = await fetch(`${RETENTION_API}/retention`);
       if (!r.ok) throw new Error(`${r.status}`);
       const d = await r.json();
+      if (isStaleResponse(seq, reqSeq.current)) return;
       setConfig(d.config);
+      // Seed once. After that the draft changes only through a user edit or a
+      // successful save, so the 60s poll can never discard pending work. If
+      // another operator changes the value meanwhile, the draft simply reads
+      // as unsaved against the new server state, which is the truth.
+      setDraft(prev => prev ?? { period_months: d.config.period_months, action: d.config.action });
       setStats(d.stats);
       setLastUpdated(new Date());
       setError(null);
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    } catch (e) {
+      if (!isStaleResponse(seq, reqSeq.current)) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    }
     finally { if (!quiet) setRefreshing(false); }
   }, []);
 
@@ -1434,11 +1529,20 @@ function RetentionSettingsPanel() {
 
   useEffect(() => {
     load();
-    timerRef.current = setInterval(() => loadStats(true), STORAGE_REFRESH_INTERVAL_MS);
+    timerRef.current = setInterval(() => {
+      // Skip the tick entirely while a save is in flight — the save refreshes
+      // on completion anyway, and a concurrent poll only adds a response to
+      // discard.
+      if (!savingRef.current) void loadStats(true);
+    }, STORAGE_REFRESH_INTERVAL_MS);
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [load, loadStats]);
 
   const save = async (periodMonths: number, action: "delete" | "archive", autoResolveDays?: number) => {
+    // No optimistic write: the controls read `draft`, so they already moved
+    // when the user touched them. A failure leaves the draft intact and shows
+    // the error, which is what "unsaved changes" is supposed to mean.
+    savingRef.current = true;
     setSaving(true); setSaved(false);
     try {
       const body: Record<string, string> = {
@@ -1463,12 +1567,34 @@ function RetentionSettingsPanel() {
           : `HTTP ${r.status}`;
         throw new Error(msg);
       }
-      await load();
+      // Quiet refresh: load() flips `loading`, which swaps the whole panel for
+      // the "Loading retention settings…" spinner on every dropdown change.
+      await loadStats(true);
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
       setError(null);
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setSaving(false); }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    finally { savingRef.current = false; setSaving(false); }
+  };
+
+  // Deleting aged-out telemetry is irreversible, so the confirmation guards the
+  // commit rather than the click that selects the mode — you can now change
+  // your mind before saving without ever seeing the dialog.
+  const commit = () => {
+    if (!draft) return;
+    setConfirmDelete(false);
+    void save(draft.period_months, draft.action);
+  };
+
+  const requestSave = () => {
+    if (!draft) return;
+    if (draft.action === "delete" && config?.action !== "delete") {
+      setConfirmDelete(true);
+      return;
+    }
+    commit();
   };
 
   if (loading || !config) {
@@ -1482,6 +1608,13 @@ function RetentionSettingsPanel() {
   return (
     <div className="grid grid-cols-2 gap-4">
 
+      <div className="col-span-2 bg-white border border-[--gray-200] rounded-2xl shadow-card px-5 py-3">
+        <SaveBar
+          dirty={dirty} saved={saved} saving={saving} error={error}
+          onSave={requestSave} onReload={() => loadStats()} reloading={refreshing}
+        />
+      </div>
+
       {/* ── Retention period ─────────────────────────────────────────────── */}
       <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
         <SectionLabel icon={Clock}>Retention Period</SectionLabel>
@@ -1493,8 +1626,8 @@ function RetentionSettingsPanel() {
 
         <Field label="Keep data for" hint="default: 1 day">
           <select
-            value={config.period_months}
-            onChange={e => save(Number(e.target.value), config.action)}
+            value={draft?.period_months ?? config.period_months}
+            onChange={e => setDraft(d => d && { ...d, period_months: Number(e.target.value) })}
             disabled={saving}
             className={selectCls}
           >
@@ -1532,20 +1665,20 @@ function RetentionSettingsPanel() {
           <button
             type="button"
             disabled={saving}
-            onClick={() => setConfirmDelete(true)}
+            onClick={() => setDraft(d => d && { ...d, action: "delete" })}
             className={cn(
               "w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all",
-              config.action === "delete"
+              draft?.action === "delete"
                 ? "border-purple-300 bg-purple-50/40"
                 : "border-[--gray-200] hover:border-[--gray-300]"
             )}
           >
-            <Trash2 className={cn("w-4 h-4 flex-shrink-0 mt-0.5", config.action === "delete" ? "text-purple-600" : "text-[--gray-400]")} />
+            <Trash2 className={cn("w-4 h-4 flex-shrink-0 mt-0.5", draft?.action === "delete" ? "text-purple-600" : "text-[--gray-400]")} />
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-[12px] font-bold text-[--gray-800]">Delete</span>
                 <span className="px-1.5 py-0.5 bg-[--gray-100] text-[--gray-500] rounded text-[8px] font-bold uppercase tracking-wide">default</span>
-                {config.action === "delete" && (
+                {draft?.action === "delete" && (
                   <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[8px] font-bold uppercase tracking-wide">active</span>
                 )}
               </div>
@@ -1558,19 +1691,19 @@ function RetentionSettingsPanel() {
           <button
             type="button"
             disabled={saving}
-            onClick={() => save(config.period_months, "archive")}
+            onClick={() => setDraft(d => d && { ...d, action: "archive" })}
             className={cn(
               "w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all",
-              config.action === "archive"
+              draft?.action === "archive"
                 ? "border-purple-300 bg-purple-50/40"
                 : "border-[--gray-200] hover:border-[--gray-300]"
             )}
           >
-            <Archive className={cn("w-4 h-4 flex-shrink-0 mt-0.5", config.action === "archive" ? "text-purple-600" : "text-[--gray-400]")} />
+            <Archive className={cn("w-4 h-4 flex-shrink-0 mt-0.5", draft?.action === "archive" ? "text-purple-600" : "text-[--gray-400]")} />
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-[12px] font-bold text-[--gray-800]">Compress &amp; Store</span>
-                {config.action === "archive" && (
+                {draft?.action === "archive" && (
                   <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[8px] font-bold uppercase tracking-wide">active</span>
                 )}
               </div>
@@ -1612,10 +1745,7 @@ function RetentionSettingsPanel() {
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setConfirmDelete(false);
-                  void save(config.period_months, "delete");
-                }}
+                onClick={commit}
                 className="px-3 py-2 rounded-lg bg-red-600 text-white text-[11px] font-bold hover:bg-red-700 transition-colors"
               >
                 Yes
@@ -1697,10 +1827,10 @@ function RetentionSettingsPanel() {
 
           <div className={cn(
             "rounded-xl border p-3.5",
-            config.action === "archive" ? "border-[--gray-100] bg-[--gray-25]" : "border-[--gray-100] bg-[--gray-25] opacity-50"
+            draft?.action === "archive" ? "border-[--gray-100] bg-[--gray-25]" : "border-[--gray-100] bg-[--gray-25] opacity-50"
           )}>
             <div className="text-[9px] font-semibold text-[--gray-400] uppercase tracking-wide">Archived (compressed)</div>
-            {config.action === "archive" && stats?.archive ? (
+            {draft?.action === "archive" && stats?.archive ? (
               <>
                 <div className="text-[18px] font-black text-[--gray-800] mt-1">
                   {formatBytes(stats.archive.total_bytes)}
@@ -1728,7 +1858,7 @@ function RetentionSettingsPanel() {
 
 // ── AI Provider panel ──────────────────────────────────────────────────────────
 
-type AIProvider = "anthropic" | "openai" | "gemini" | "ollama";
+type AIProvider = "openrouter" | "anthropic" | "openai" | "gemini" | "ollama";
 
 interface AIProviderConfig {
   configured:  boolean;
@@ -1752,6 +1882,7 @@ interface ProviderInfo {
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
+  openrouter: "OpenRouter",
   anthropic: "Anthropic (Claude)",
   openai:    "OpenAI (GPT)",
   gemini:    "Google Gemini",
@@ -1759,6 +1890,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 };
 
 const PROVIDER_COLORS: Record<string, string> = {
+  openrouter: "from-sky-500 to-cyan-500",
   anthropic: "from-orange-500 to-amber-500",
   openai:    "from-green-500 to-emerald-500",
   gemini:    "from-blue-500 to-indigo-500",
@@ -1766,6 +1898,7 @@ const PROVIDER_COLORS: Record<string, string> = {
 };
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
+  openrouter: "Recommended — one key reaches every model, including Claude. Free tiers available",
   anthropic: "Claude Haiku 4.5 — fast, cost-efficient, great for security analysis",
   openai:    "GPT-4o-mini — affordable API, broad compatibility",
   gemini:    "Gemini 1.5 Flash — fast & cheap, 1M token context",
@@ -1783,11 +1916,21 @@ function AIProviderPanel() {
   const [success,    setSuccess]    = useState<string | null>(null);
 
   // Form state
-  const [provider, setProvider] = useState<AIProvider>("anthropic");
+  const [provider, setProvider] = useState<AIProvider>("openrouter");
   const [apiKey,   setApiKey]   = useState("");
   const [model,    setModel]    = useState("");
   const [baseUrl,  setBaseUrl]  = useState("");
   const [showKey,  setShowKey]  = useState(false);
+
+  // Dirty is derived from a baseline snapshot rather than set by each control,
+  // so a field added later cannot forget to mark the form dirty. `api_key` is
+  // deliberately never returned by the API, so its baseline is always "".
+  const baseline = useRef({ provider: "openrouter" as AIProvider, apiKey: "", model: "", baseUrl: "" });
+  const dirty =
+    provider !== baseline.current.provider ||
+    apiKey   !== baseline.current.apiKey   ||
+    model    !== baseline.current.model    ||
+    baseUrl  !== baseline.current.baseUrl;
 
   const load = async () => {
     setLoading(true);
@@ -1804,6 +1947,10 @@ function AIProviderPanel() {
         setProvider(cfg.provider);
         setModel(cfg.model ?? "");
         setBaseUrl(cfg.base_url ?? "");
+        baseline.current = {
+          provider: cfg.provider, apiKey: "",
+          model: cfg.model ?? "", baseUrl: cfg.base_url ?? "",
+        };
       }
     } catch (e: any) {
       setError(e.message);
@@ -1973,8 +2120,8 @@ function AIProviderPanel() {
           {/* Provider selector */}
           <div>
             <p className="text-[10px] font-bold text-[--gray-600] uppercase tracking-wider mb-3">Choose Provider</p>
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-              {(["anthropic","openai","gemini","ollama"] as AIProvider[]).map(p => (
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+              {(["openrouter","anthropic","openai","gemini","ollama"] as AIProvider[]).map(p => (
                 <button key={p} onClick={() => handleProviderChange(p)}
                   className={cn(
                     "flex flex-col items-start p-3 rounded-xl border-2 text-left transition-all",
@@ -2102,14 +2249,10 @@ function AIProviderPanel() {
           )}
 
           {/* Save */}
-          <div className="flex justify-end">
-            <button onClick={handleSave} disabled={saving}
-              className="flex items-center gap-2 px-5 py-2.5 text-[11px] font-bold bg-violet-600 text-white rounded-xl hover:bg-violet-700 disabled:opacity-50 transition-all shadow-sm">
-              {saving
-                ? <><RefreshCw className="w-3.5 h-3.5 animate-spin" />Saving &amp; Testing…</>
-                : <><Save className="w-3.5 h-3.5" />Save Configuration</>}
-            </button>
-          </div>
+          <SaveBar
+            dirty={dirty} saved={!!success} saving={saving}
+            onSave={handleSave} savingLabel="Saving & Testing…"
+          />
         </div>
       </div>
 

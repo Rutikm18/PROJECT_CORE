@@ -47,6 +47,138 @@ _INFERENCE_SERVERS = (
     "jupyter-lab", "jupyterlab", "jupyter-notebook", "jupyter",
 )
 
+# AL-DEV-007 — the collector finds credential candidates by filename, which is
+# far too weak to alert on directly. These tables turn a credential-shaped NAME
+# into a graded credential STORE. Cross-platform on purpose: the same basenames
+# appear under $HOME on macOS/Linux and %USERPROFILE%/%APPDATA% on Windows.
+_CREDENTIAL_STORE_BASENAMES = {
+    # SSH / PKI
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ed25519_sk", "identity",
+    # Cloud providers
+    "credentials", "credentials.db", "access_tokens.db", "adc.json",
+    "application_default_credentials.json", "accessTokens.json".lower(),
+    "azureprofile.json", "msal_token_cache.json", "clouds.yaml",
+    # Kubernetes / containers / registries
+    ".dockercfg", "kubeconfig",
+    # Package registries and build tools
+    ".npmrc", ".pypirc", ".netrc", "_netrc", ".pgpass", ".my.cnf",
+    ".mylogin.cnf", "gradle.properties", "settings-security.xml",
+    "nuget.config", ".yarnrc.yml", ".sentryclirc", ".rediscli_auth",
+    # VCS and forge CLIs
+    ".git-credentials", "git-credentials",
+    # Infrastructure as code
+    "terraform.tfstate", ".terraformrc", "terraform.rc", "vault_pass",
+    ".vault_pass",
+    # AI / coding-agent credential stores — the surface this platform exists for
+    ".credentials.json", "claude_desktop_config.json", "buddy-tokens.json",
+    "token-store.json", "token_store.json", "auth.toml",
+}
+# Extensions that are credential material regardless of the file's name.
+_CREDENTIAL_STORE_SUFFIXES = (
+    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".asc",
+    ".gpg", ".kdbx", ".token", ".keytab", ".pkcs12",
+)
+# Names that hold credentials only in the right company. `config.json` is the
+# Vercel/Docker token store AND the `conf` package's scratch file for every
+# Node CLI ever published, so it is credible only next to a vendor CLI name.
+_CONTEXTUAL_CREDENTIAL_BASENAMES = {
+    "config.json", "config.yaml", "config.yml", "config.toml", "config",
+    "auth.json", "auth.yaml", "auth.yml", "hosts.yml", "hosts.yaml",
+    "secrets.yml", "secrets.yaml", "secrets.json", "credentials.json",
+    "token.json", "token", "access_token", "session.json",
+}
+# `.env`, `.env.local`, `.env.production` — but never `.env.example` (below).
+_ENV_FILE = re.compile(r"^\.?env(\.|$)", re.I)
+# A credential-store-shaped name, credible only inside a vendor CLI config dir.
+_CREDENTIAL_STORE_NAME = re.compile(
+    r"credential|token[-_]?store|^auth\b|secrets?[-_]?store|apikeys?", re.I,
+)
+# Vendor CLIs that persist a live token in their config directory. Matched as a
+# substring of the parent directory, so `com.vercel.cli` and `.config/gh` hit.
+_VENDOR_CLI_TOKENS = frozenset({
+    "vercel", "netlify", "heroku", "wrangler", "cloudflare", "railway",
+    "supabase", "doctl", "digitalocean", "fly", "circleci", "sentry", "snyk",
+    "gh", "glab", "gitlab", "github", "npm", "yarn", "pnpm", "aws", "azure",
+    "gcloud", "gcp", "oci", "aliyun", "kube", "docker", "helm", "pulumi",
+    "terraform", "stripe", "twilio", "sendgrid", "datadog", "pagerduty",
+    "openai", "anthropic", "huggingface", "replicate", "ollama", "claude",
+    "codex", "cursor", "continue", "aider", "copilot", "kimi",
+})
+# Derived/published artefacts: placeholders by definition.
+_DERIVED_SUFFIXES = (
+    ".example", ".template", ".sample", ".dist", ".default", ".tmpl",
+    ".tpl", ".stub", ".fixture", ".test", ".spec", "-example", "-template",
+    "-sample", ".bak", ".orig",
+)
+# Source, docs, and compiled output. A `.py` is never a credential store, and
+# `tokenizer.py` / `libtokenizers-*.rlib` are why this rule used to be useless.
+_NON_CREDENTIAL_SUFFIXES = (
+    ".py", ".pyc", ".pyo", ".pyi", ".rs", ".rlib", ".rmeta", ".d", ".go",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".map", ".java", ".class",
+    ".jar", ".kt", ".swift", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb",
+    ".php", ".pl", ".lua", ".sh", ".bash", ".zsh", ".ps1", ".psm1",
+    ".md", ".rst", ".txt", ".adoc", ".html", ".htm", ".css", ".scss",
+    ".o", ".a", ".so", ".dylib", ".dll", ".exe", ".bin", ".wasm",
+    ".zip", ".gz", ".tar", ".tgz", ".7z", ".rar", ".bz2", ".xz", ".whl",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf",
+    ".lock", ".sum", ".mod", ".snap", ".log", ".csv", ".tsv",
+)
+# Configuration files whose names collide with the collector's `config.json`
+# pattern but which never hold credentials.
+_FALSE_FRIEND_BASENAMES = {
+    "tsconfig.json", "jsconfig.json", "package.json", "package-lock.json",
+    "composer.json", "manifest.json", "angular.json", "nx.json",
+    "babel.config.json", "jest.config.json", "eslint.config.json",
+    "tslint.json", "renovate.json", "biome.json", "deno.json",
+    "launch.json", "settings.json", "extensions.json", "tasks.json",
+}
+# Build output, dependency trees, caches, and VCS internals.
+_EXCLUDED_PATH_SEGMENTS = {
+    "node_modules", "__pycache__", "site-packages", "dist-packages",
+    "bower_components", "vendor", "third_party", "external",
+    ".git", ".svn", ".hg", ".venv", "venv", "virtualenv", ".tox", ".nox",
+    "target", "build", "dist", "out", "bin", "obj", ".next", ".nuxt",
+    ".output", ".parcel-cache", ".turbo", ".gradle", ".m2", ".ivy2",
+    "deriveddata", "pods", ".cargo", ".rustup", ".stack", ".cabal",
+    ".cache", "caches", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "coverage", "htmlcov", ".terraform",
+    # Fixture and example trees: credential-shaped names are the point.
+    "tests", "test", "testdata", "test-data", "__tests__", "spec", "specs",
+    "fixtures", "fixture", "examples", "example", "samples", "sample",
+    "mocks", "__mocks__", "demo", "demos", "task-deps", "testcases",
+}
+# Detection corpora, wordlists, and exploit collections: they describe secrets.
+_CORPUS_SEGMENTS = {
+    "nuclei-templates", "seclists", "payloadsallthethings", "wordlists",
+    "wordlist", "exploitdb", "exploit-db", "metasploit-framework",
+    "atomic-red-team", "sigma", "detection-rules", "yara-rules",
+    "fuzzdb", "dirbuster", "rockyou", "trufflehog", "gitleaks",
+    "secretfinder", "semgrep-rules", "nuclei", "templates",
+}
+# Key material and registry tokens: a real finding in any location, so these
+# bypass the corpus-density suppression below.
+_HARD_CREDENTIAL_BASENAMES = {
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ed25519_sk", "identity",
+    "credentials", "credentials.db", "access_tokens.db", ".git-credentials",
+    "git-credentials", ".npmrc", ".pypirc", ".netrc", "_netrc", ".pgpass",
+    ".my.cnf", ".mylogin.cnf",
+}
+# OS and user container directories. These hold unrelated applications, so a
+# high credential-name density inside them says nothing about any one app and
+# must never mark the whole tree as a corpus.
+_CORPUS_ROOT_EXEMPT = {
+    "users", "home", "var", "opt", "etc", "usr", "private", "volumes",
+    "library", "application support", "appdata", "roaming", "local",
+    "localnow", "documents", "downloads", "desktop", "preferences",
+    "containers", "group containers", "public", "shared", "programdata",
+    ".config", ".local", ".cache", ".share", "share",
+}
+# A tree holding this many credential-shaped names is a corpus, not a vault.
+_CORPUS_DENSITY_THRESHOLD = 8
+# Credential stores are small; beyond this a match is an archive or artefact.
+_CREDENTIAL_MAX_BYTES = 1024 * 1024
+_CREDENTIAL_SAMPLE_LIMIT = 10
+
 RULE_SPECS: dict[str, dict[str, str]] = {
     "AL-DEV-001": {"asset": "editor extension", "condition": "auto activation AND command execution AND side-loaded/unverified publisher", "boundary": "all three anchors are required"},
     "AL-DEV-002": {"asset": "MCP server", "condition": "mutable @latest reference OR unpinned ephemeral runner with sensitive/capability access", "boundary": "an ephemeral runner alone is not sufficient"},
@@ -54,7 +186,7 @@ RULE_SPECS: dict[str, dict[str, str]] = {
     "AL-DEV-004": {"asset": "browser extension", "condition": "native messaging AND at least one dangerous browser/host permission", "boundary": "both anchors are required"},
     "AL-DEV-005": {"asset": "native messaging host", "condition": "temporary executable path OR group/world-writable executable", "boundary": "ordinary 0755 read/execute access is safe"},
     "AL-DEV-006": {"asset": "Git configuration", "condition": "core.hooksPath or core.sshCommand execution override", "boundary": "unrelated Git settings are silent"},
-    "AL-DEV-007": {"asset": "credential location", "condition": "group/other read or write permission on a credential-related file", "boundary": "owner-only 0600 and directories are silent"},
+    "AL-DEV-007": {"asset": "credential store", "condition": "group/other read or write permission on a file that grades as a real credential store (known store name, key material, env file, or vendor CLI token store), rolled up per directory", "boundary": "owner-only 0600, directories, *.example/*.template placeholders, source and build output, test fixtures, and credential-name-dense corpora are silent"},
     "AL-DEV-008": {"asset": "developer listener", "condition": "interesting developer/AI process AND wildcard bind", "boundary": "loopback or unrelated wildcard listeners are silent"},
     "AL-DEV-009": {"asset": "developer container", "condition": "privileged, host network, Docker socket/root bind, or SYS_ADMIN posture", "boundary": "ordinary bridge containers are silent"},
     "AL-DEV-010": {"asset": "MCP server", "condition": "launcher command is a shell/interpreter OR args pipe a remote payload into one (curl|sh, -c, iex)", "boundary": "a pinned npx/node/python server without inline-shell args is silent"},
@@ -279,19 +411,213 @@ def _git_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
     )]
 
 
-def _credential_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
-    hits = []
-    for row in _items(capabilities, "credential_locations", "locations"):
-        if not _mode_exposes_secret(row.get("mode")):
+def _credential_grade(row: dict[str, Any], corpus_roots: frozenset[str]) -> tuple[str, str] | None:
+    """Classify one credential-location row into a confidence grade.
+
+    The collector finds candidates by filename (`_SECRET_FILE`), which alone is
+    far too weak an anchor: on a developer laptop it matches NLP tokenizers,
+    `tsconfig.json`, Rust build artifacts, and every rule file in a cloned
+    detection corpus. Grading requires the row to look like an actual
+    credential *store*, not merely a credential-shaped *name*.
+
+    Returns (grade, reason) or None when the row must stay silent.
+      vault    — a known credential store (`.aws/credentials`, `id_rsa`, `.npmrc`)
+      declared — a credential directory the collector enumerated on purpose
+      named    — a credential-store-shaped name inside a vendor CLI config dir
+    """
+    path = str(row.get("path") or "")
+    if not path:
+        return None
+    normalized = path.replace("\\", "/")
+    segments = [segment.lower() for segment in normalized.split("/") if segment]
+    if not segments:
+        return None
+    basename = segments[-1]
+    parent = segments[-2] if len(segments) > 1 else ""
+
+    # A file the collector enumerated from its own known-locations list is a
+    # credential store by construction — it never came from a name walk.
+    if str(row.get("kind") or "") == "common_location":
+        return ("declared", "known credential location")
+
+    # Derived artefacts (.env.example, config.toml.sample) are published on
+    # purpose and hold placeholders. They are the single largest FP class.
+    if any(basename.endswith(suffix) for suffix in _DERIVED_SUFFIXES):
+        return None
+    # Source, documentation, and compiled output are not credential stores no
+    # matter what they are called — `tokenizer.py`, `libtokenizers-*.rlib`.
+    if any(basename.endswith(suffix) for suffix in _NON_CREDENTIAL_SUFFIXES):
+        return None
+    if basename in _FALSE_FRIEND_BASENAMES:
+        return None
+    # Build output, dependency trees, and caches restate upstream files; an
+    # exposure there is a property of the source, not a distinct finding.
+    if any(segment in _EXCLUDED_PATH_SEGMENTS for segment in segments):
+        return None
+    # A credential store is small. Multi-megabyte matches are archives or
+    # build artefacts; empty files hold nothing to steal.
+    size = row.get("size_bytes")
+    if isinstance(size, (int, float)) and (size <= 0 or size > _CREDENTIAL_MAX_BYTES):
+        return None
+
+    # Private-key and registry-token material is a real finding wherever it
+    # lands, so it is graded BEFORE the corpus checks below. A stray `id_rsa`
+    # inside a cloned repository still leaks the key.
+    if basename in _HARD_CREDENTIAL_BASENAMES or any(
+        basename.endswith(suffix) for suffix in _CREDENTIAL_STORE_SUFFIXES
+    ):
+        return ("vault", f"credential material ({basename})")
+
+    # Signature/wordlist corpora describe secrets; they do not contain them.
+    # `corpus_roots` adds the same verdict for dense trees we have not seen
+    # before, so a customer's private template repo is covered too.
+    if any(segment in _CORPUS_SEGMENTS for segment in segments):
+        return None
+    if any(root in corpus_roots for root in _path_roots(segments)):
+        return None
+
+    if basename in _CREDENTIAL_STORE_BASENAMES:
+        return ("vault", f"known credential store ({basename})")
+    if _ENV_FILE.match(basename):
+        return ("vault", "environment file with inline secrets")
+    if _is_vendor_cli_dir(parent):
+        if basename in _CONTEXTUAL_CREDENTIAL_BASENAMES:
+            return ("vault", f"vendor CLI credential store ({parent}/{basename})")
+        if _CREDENTIAL_STORE_NAME.search(basename):
+            return ("named", f"credential-shaped name in a vendor CLI directory "
+                             f"({parent}/{basename})")
+    return None
+
+
+def _is_vendor_cli_dir(directory: str) -> bool:
+    """True when a directory name identifies a CLI that persists a live token.
+
+    Matched on whole name tokens rather than substrings: `com.vercel.cli` and
+    `.config/gh` must hit, while `highlight-js` must not match `gh`.
+    """
+    tokens = {token for token in re.split(r"[^a-z0-9]+", directory.lower()) if token}
+    return bool(tokens & _VENDOR_CLI_TOKENS)
+
+
+def _path_roots(segments: list[str]) -> tuple[str, ...]:
+    """Candidate project roots for a path, used for corpus-density lookup.
+
+    Starts at depth 3 and skips OS container directories, so `$HOME` and
+    `~/Library/Application Support` can never themselves be graded as a
+    corpus — only the project trees inside them can.
+    """
+    roots = []
+    for depth in range(3, min(len(segments), 6) + 1):
+        if segments[depth - 1] in _CORPUS_ROOT_EXEMPT:
             continue
+        roots.append("/".join(segments[:depth]))
+    return tuple(roots)
+
+
+def _corpus_roots(rows: list[dict[str, Any]]) -> frozenset[str]:
+    """Directory trees dense enough in credential-shaped names to be a corpus.
+
+    Real credential stores are sparse — a host has one `~/.aws/credentials`,
+    not 141 of them. A tree holding many name-matched candidates is a rule
+    pack, a wordlist, or a source repository whose files merely mention
+    tokens. This generalizes the well-known-corpus list to trees we have
+    never seen, which is what makes the rule portable across customers.
+    """
+    density: dict[str, int] = {}
+    for row in rows:
+        if str(row.get("kind") or "") != "name_match":
+            continue
+        segments = [s.lower() for s in str(row.get("path") or "").replace("\\", "/").split("/") if s]
+        for root in _path_roots(segments):
+            density[root] = density.get(root, 0) + 1
+    return frozenset(
+        root for root, count in density.items() if count >= _CORPUS_DENSITY_THRESHOLD
+    )
+
+
+def _credential_hits(capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    """AL-DEV-007 — exposed credential stores, graded and rolled up per directory.
+
+    Three anchors are required, not one: the mode must actually expose the file
+    to group or other, the object must grade as a credential *store*, and it
+    must not sit in a context (build output, corpus, fixture, example) where a
+    credential-shaped name is expected. Findings are keyed to the containing
+    directory so one misconfigured folder is one finding, not N.
+    """
+    rows = _items(capabilities, "credential_locations", "locations")
+    corpus_roots = _corpus_roots(rows)
+
+    groups: dict[tuple[str, str, bool], dict[str, Any]] = {}
+    for row in rows:
+        mode = row.get("mode")
+        if not _mode_exposes_secret(mode):
+            continue
+        graded = _credential_grade(row, corpus_roots)
+        if graded is None:
+            continue
+        grade, reason = graded
+        writable = _mode_is_group_or_world_writable(mode)
         path = str(row.get("path") or "unknown")
+        directory = path.replace("\\", "/").rsplit("/", 1)[0] or path
+        key = (directory, grade, writable)
+        bucket = groups.setdefault(key, {
+            "directory": directory, "grade": grade, "writable": writable,
+            "paths": [], "modes": set(), "reasons": set(), "user": row.get("user"),
+        })
+        bucket["paths"].append(path)
+        bucket["modes"].add(str(mode))
+        bucket["reasons"].add(reason)
+
+    hits = []
+    for (directory, grade, writable), bucket in sorted(groups.items()):
+        paths = sorted(bucket["paths"])
+        if writable:
+            severity = "critical"
+            exposure = "writable by its group or by other users"
+            action = (
+                "Restrict the file to its owner (chmod 600), rotate the credentials it "
+                "holds, and audit for modification — a writable credential store can be "
+                "replaced as well as read."
+            )
+        elif grade in ("vault", "declared"):
+            severity = "high"
+            exposure = "readable by its group or by other users"
+            action = (
+                "Restrict the file to its owner (chmod 600) and rotate the credentials "
+                "it holds if other local accounts may have read it."
+            )
+        else:
+            severity = "medium"
+            exposure = "readable by its group or by other users"
+            action = (
+                "Confirm the file holds a live credential, then restrict it to its "
+                "owner (chmod 600) and rotate if it was exposed."
+            )
+        count = len(paths)
+        subject = paths[0] if count == 1 else f"{count} credential files in {directory}"
         hits.append(_hit(
-            "AL-DEV-007", "high", "Credential file permissions expose secrets",
-            "A discovered credential-related file is readable or writable by its group or other users.",
-            {"path": path, "mode": row.get("mode"), "user": row.get("user"), "kind": row.get("kind")},
+            "AL-DEV-007", severity, "Credential store permissions expose secrets",
+            f"{subject} is {exposure} ({', '.join(sorted(bucket['modes']))}). "
+            f"Matched because: {'; '.join(sorted(bucket['reasons']))}.",
+            {
+                "object": directory,
+                "member_count": count,
+                "sample_paths": paths[:_CREDENTIAL_SAMPLE_LIMIT],
+                "modes": sorted(bucket["modes"]),
+                "grade": grade,
+                "reasons": sorted(bucket["reasons"]),
+                "group_or_world_writable": writable,
+                "user": bucket["user"],
+            },
             technique="T1552.001", tactic="Credential Access",
-            action="Restrict the file to its owner and rotate credentials if unauthorized access may have occurred.",
-            item_key=f"credential_mode:{path}",
+            action=action,
+            item_key=f"credential_exposure:{directory}:{grade}:{'w' if writable else 'r'}",
+            fp=(
+                "Grading requires a real credential store, so build output, cloned rule "
+                "corpora, test fixtures, and *.example templates are already excluded. "
+                "Remaining false positives are vendor CLI configs that hold no live "
+                "token — confirm the file's contents before rotating."
+            ),
         ))
     return hits
 

@@ -145,6 +145,31 @@ _MIGRATIONS = [
 ]
 
 
+def _tenant_payload_scope() -> tuple[str | None, list]:
+    """Tenant restriction for raw-payload queries, taken from the request scope.
+
+    Raw telemetry is the customer's own data, so the portal shows it — but the
+    payload tables live in the manager DB, which has no notion of a tenant.
+    Rather than add a parameter to every method and every call site (where one
+    omission is a silent leak), the predicate is read from the same ContextVar
+    the auth layer publishes for finding queries.
+
+    None means an operator: no restriction. An empty tuple means a customer who
+    owns no agents, which must return nothing — `1=0` says that unambiguously.
+    """
+    try:
+        from .api.tenant_scope import current_tenant
+        tenant = current_tenant()
+    except Exception:                                       # pragma: no cover
+        return None, []
+    if tenant is None:
+        return None, []
+    if not tenant:
+        return "1=0", []
+    marks = ",".join("?" * len(tenant))
+    return f"agent_id IN ({marks})", list(tenant)
+
+
 class Database:
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
@@ -889,6 +914,13 @@ class Database:
         """
         parts: list[str] = []
         args: list = []
+        # Tenant boundary first and unconditional, ANDed with everything below
+        # — including an explicit agent_id, so a customer asking for another
+        # customer's agent gets nothing rather than a bypass.
+        _scope, _scope_args = _tenant_payload_scope()
+        if _scope:
+            parts.append(_scope)
+            args.extend(_scope_args)
         if agent_id:
             parts.append("agent_id=?")
             args.append(agent_id)
@@ -971,6 +1003,10 @@ class Database:
         """Efficient COUNT(*) for the payload table — never loads row data."""
         parts: list[str] = []
         args:  list      = []
+        _scope, _scope_args = _tenant_payload_scope()
+        if _scope:
+            parts.append(_scope)
+            args.extend(_scope_args)
         if agent_id: parts.append("agent_id=?");       args.append(agent_id)
         if section:  parts.append("section=?");        args.append(section)
         if start:    parts.append("collected_at >= ?"); args.append(start)

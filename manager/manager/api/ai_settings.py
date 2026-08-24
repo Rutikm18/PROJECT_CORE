@@ -70,6 +70,118 @@ class PrioritizeRequest(BaseModel):
     finding_ids: list[int] = Field(..., min_length=1, max_length=50)
 
 
+# ── Credential diagnostics ────────────────────────────────────────────────────
+
+# Prefixes that identify a key as belonging to a specific provider. Only used to
+# detect a *confident* mismatch — an unrecognised prefix is never rejected,
+# because providers change key formats and a false refusal is worse than one
+# wasted round trip.
+_KEY_PREFIXES: dict[str, tuple[str, ...]] = {
+    "openrouter": ("sk-or-",),
+    "anthropic":  ("sk-ant-",),
+    "gemini":     ("AIza",),
+}
+
+_PROVIDER_LABELS = {
+    "anthropic":  "Anthropic",
+    "openai":     "OpenAI",
+    "gemini":     "Google Gemini",
+    "openrouter": "OpenRouter",
+    "ollama":     "Ollama",
+}
+
+_PROVIDER_KEY_HINT = {
+    "anthropic":  "Anthropic keys start with 'sk-ant-' (console.anthropic.com)",
+    "openai":     "OpenAI keys start with 'sk-' or 'sk-proj-' (platform.openai.com)",
+    "gemini":     "Google AI Studio keys start with 'AIza' (aistudio.google.com)",
+    "openrouter": "OpenRouter keys start with 'sk-or-' (openrouter.ai/keys)",
+    "ollama":     "Ollama runs locally and needs no API key",
+}
+
+
+def _key_shape_mismatch(provider: str, api_key: str) -> Optional[str]:
+    """Return an actionable message when the key clearly belongs elsewhere.
+
+    Pasting an OpenRouter key while the provider selector says 'anthropic' is
+    the single most likely setup mistake, and without this the operator only
+    sees a raw upstream 401 that names neither cause nor fix.
+    """
+    key = (api_key or "").strip()
+    if not key or provider == "ollama":
+        return None
+
+    owner = next(
+        (name for name, prefixes in _KEY_PREFIXES.items() if key.startswith(prefixes)),
+        None,
+    )
+    if owner is None or owner == provider:
+        return None
+
+    owner_label = _PROVIDER_LABELS.get(owner, owner)
+    label = _PROVIDER_LABELS.get(provider, provider)
+    return (
+        f"That looks like an {owner_label} API key, but the selected provider "
+        f"is {label}. Either switch the provider to {owner_label}, or paste a "
+        f"key issued by {label} instead — {_PROVIDER_KEY_HINT.get(provider, '')}."
+    )
+
+
+def _explain_provider_failure(provider: str, model: str, raw: str) -> str:
+    """Turn a raw upstream error into something an operator can act on.
+
+    The transport reports failures verbatim, e.g.
+    `[ai:anthropic] HTTP 401 from https://api.anthropic.com/v1/messages:
+    {"type":"error","error":{...},"request_id":"req_..."}`. That is the right
+    thing to log and the wrong thing to show: it names no cause, suggests no
+    fix, and surfaces internal request ids in the UI.
+    """
+    text = str(raw or "")
+    lowered = text.lower()
+    hint = _PROVIDER_KEY_HINT.get(provider, "")
+    provider = _PROVIDER_LABELS.get(provider, provider)
+
+    if "401" in text or "authentication" in lowered or "invalid x-api-key" in lowered:
+        return (
+            f"The {provider} API rejected this key as invalid. Check it was "
+            f"copied whole, has not been revoked, and belongs to {provider}. "
+            f"{hint}."
+        )
+    if "403" in text or "permission" in lowered or "forbidden" in lowered:
+        return (
+            f"The {provider} API accepted the key but refused the request. "
+            "The key may lack permission for this model, or the account may be "
+            "restricted."
+        )
+    if "402" in text or "credit" in lowered or "quota" in lowered or "billing" in lowered:
+        return (
+            f"The {provider} account has no available credit or quota. "
+            "Add credit, or choose a free model."
+        )
+    if "404" in text or "not found" in lowered or "does not exist" in lowered:
+        return (
+            f"The {provider} API does not recognise the model '{model}'. "
+            "Pick a different model — GET /api/v1/ai/models lists what is "
+            "currently available."
+        )
+    if "429" in text or "rate" in lowered:
+        return (
+            f"The {provider} API rate-limited the test request. Wait and retry; "
+            "free tiers are limited most aggressively."
+        )
+    if "timeout" in lowered or "timed out" in lowered:
+        return (
+            f"The test request to {provider} timed out. Check outbound network "
+            "access and any proxy configuration."
+        )
+    if "cannot connect" in lowered or "dns" in lowered or "ssl" in lowered:
+        return (
+            f"Could not reach the {provider} API. Check outbound network "
+            f"access, DNS, and TLS trust from the manager. ({text[:200]})"
+        )
+    # Unrecognised — pass it through rather than hide a cause we did not map.
+    return f"Provider test failed: {text[:400]}"
+
+
 # ── Provider config endpoints ─────────────────────────────────────────────────
 
 @router.get("/provider")
@@ -114,9 +226,29 @@ async def set_provider_config(
     model    = body.model or DEFAULT_MODELS[body.provider]
     api_key  = body.api_key.strip()
 
-    # Ollama doesn't need a key
-    if body.provider != "ollama" and not api_key and body.test_first:
-        raise HTTPException(422, "api_key is required for non-Ollama providers")
+    # "Leave blank to keep the existing key" — which the dashboard offers and
+    # the API previously rejected with a 422. Only the same provider's key can
+    # be reused; switching provider always needs a new credential.
+    if not api_key and body.provider != "ollama":
+        existing = load_config()
+        if existing is not None and existing.provider == body.provider and existing.api_key:
+            api_key = existing.api_key
+        elif body.test_first:
+            raise HTTPException(
+                422,
+                detail=(
+                    f"An API key is required for provider '{body.provider}'. "
+                    "Paste one, or leave blank only when updating a provider "
+                    "that already has a stored key."
+                ),
+            )
+
+    # Catch an obvious provider/key mismatch before spending a network round
+    # trip on a call that can only fail, and before the raw upstream error
+    # reaches the operator as an unexplained 401.
+    mismatch = _key_shape_mismatch(body.provider, api_key)
+    if mismatch:
+        raise HTTPException(422, detail=mismatch)
 
     if body.test_first:
         from ..ai.base import ProviderConfig
@@ -129,7 +261,9 @@ async def set_provider_config(
         provider = build_provider(test_cfg)
         ok, msg  = await provider.health_check()
         if not ok:
-            raise HTTPException(400, detail=f"Provider test failed: {msg}")
+            raise HTTPException(
+                400, detail=_explain_provider_failure(body.provider, model, msg),
+            )
 
     cfg = save_config(
         provider = body.provider,

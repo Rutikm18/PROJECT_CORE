@@ -27,11 +27,12 @@ import re
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from . import finding_lifecycle as _lc
-from .pg_pool import PgPool
+from .pg_pool import PgConnection, PgPool
 
 log = logging.getLogger("manager.indexer")
 
@@ -64,6 +65,14 @@ class FindingQuery:
     min_precision: float | None = None
     validation_state: str | None = None
     live_agent_ids: tuple[str, ...] | None = None
+    # Tenant boundary. None means "no restriction" (an operator); a tuple —
+    # including an EMPTY tuple — restricts the query to those agents.
+    #
+    # Deliberately separate from live_agent_ids, which cannot carry this: that
+    # filter sits in an `elif` after `agent_id` and only applies when
+    # active_only is set, so a caller passing ?agent_id=<another tenant's>
+    # would bypass it entirely. This one is ANDed unconditionally.
+    tenant_agent_ids: tuple[str, ...] | None = None
     window_start: int | None = None
     window_end: int | None = None
 
@@ -149,6 +158,33 @@ def _compile_finding_filter(query: FindingQuery) -> tuple[str, list[Any]]:
     """Compile the sole allowlisted finding predicate used by pages and facets."""
     parts: list[str] = []
     args: list[Any] = []
+
+    # ── Tenant boundary ──────────────────────────────────────────────────────
+    # First, unconditional, and its own `if` — never part of the agent_id /
+    # live_agent_ids chain below. A customer passing ?agent_id=<someone else's>
+    # must get nothing rather than a bypass, so this is ANDed with that filter
+    # rather than replaced by it. An empty tuple means the tenant owns no
+    # agents and must see nothing; `1=0` says that unambiguously, where an
+    # empty IN list is a syntax error waiting to be "fixed" into matching all.
+    tenant = query.tenant_agent_ids
+    if tenant is None:
+        # Not set explicitly — fall back to the scope the auth layer published
+        # for this request. This is what makes the customer portal able to
+        # mirror every operator page: a handler that knows nothing about
+        # tenants still produces a scoped query for a customer.
+        try:
+            from .api.tenant_scope import current_tenant
+            tenant = current_tenant()
+        except Exception:                                # pragma: no cover
+            tenant = None
+    if tenant is not None:
+        if not tenant:
+            parts.append("1=0")
+        else:
+            marks = ",".join("?" * len(tenant))
+            parts.append(f"f.agent_id IN ({marks})")
+            args.extend(tenant)
+
     if query.agent_id:
         parts.append("f.agent_id=?"); args.append(query.agent_id)
     elif query.live_agent_ids is not None and query.active_only:
@@ -390,6 +426,35 @@ CREATE INDEX IF NOT EXISTS idx_validation_runs_finding
 CREATE INDEX IF NOT EXISTS idx_validation_runs_status
     ON validation_runs(status, completed_at DESC);
 
+-- Answered-prompt cache for AI tasks.
+--
+-- Deliberately NOT validation_runs. That table is an immutable audit log: one
+-- row per decision, kept for provenance. This is the opposite lifecycle —
+-- mutable hit counts, a TTL, and eviction. Sharing one table would collapse
+-- "how many times did we decide this" and "how many times did we avoid
+-- deciding it" into a single number, which is exactly the distinction needed
+-- to read cost.
+--
+-- The key is a hash of the whole prompt plus the model and contract versions,
+-- so a prompt change, a model change, or a schema bump all miss rather than
+-- serving a verdict produced under different rules.
+CREATE TABLE IF NOT EXISTS ai_verdict_cache (
+    cache_key           TEXT PRIMARY KEY,
+    task                TEXT NOT NULL DEFAULT 'validation',
+    verdict_json        TEXT NOT NULL,
+    model               TEXT NOT NULL DEFAULT '',
+    provider            TEXT NOT NULL DEFAULT '',
+    tokens_used         INTEGER NOT NULL DEFAULT 0,
+    cost_usd            DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    hit_count           INTEGER NOT NULL DEFAULT 0,
+    created_at          DOUBLE PRECISION NOT NULL,
+    last_hit_at         DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_verdict_cache_created
+    ON ai_verdict_cache(created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_verdict_cache_task
+    ON ai_verdict_cache(task, created_at DESC);
+
 -- Durable orchestration state for bounded retroactive recomputation. A job is
 -- resumed from cursor_id after restart and cancellation is checked between
 -- findings, so settings changes never require one uninterruptible table scan.
@@ -410,6 +475,101 @@ CREATE TABLE IF NOT EXISTS validation_recompute_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_validation_recompute_state
     ON validation_recompute_jobs(state, updated_at DESC);
+
+-- ── Multi-tenancy: customer orgs and portal users ───────────────────────────
+-- These live in the intel database, next to `findings`, because tenant scoping
+-- resolves an org to a set of agent_ids and then filters findings by it. Put
+-- them in the manager DB and every scoped read becomes a cross-database join.
+--
+-- Nothing here is wired into the read path yet; that is Phase 3. Creating the
+-- tables first means Phase 3 can add a mandatory filter rather than a schema
+-- change and a filter at the same time.
+CREATE TABLE IF NOT EXISTS orgs (
+    org_id          TEXT PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL,
+    contact_email   TEXT NOT NULL DEFAULT '',
+    -- active | suspended | pending. Checked on every portal request, not just
+    -- at login, so "disable access" ends a live session.
+    status          TEXT NOT NULL DEFAULT 'pending',
+    -- The licence is shown once at creation. Only its hash is stored, with the
+    -- entitlements denormalised alongside so seat limits are queryable without
+    -- re-parsing and re-verifying the key on every enrolment.
+    license_key_hash TEXT NOT NULL DEFAULT '',
+    license_kid     TEXT NOT NULL DEFAULT '',
+    license_issued_at  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    license_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    max_agents      INTEGER NOT NULL DEFAULT 0,
+    tier            TEXT NOT NULL DEFAULT 'standard',
+    features        TEXT NOT NULL DEFAULT '[]',
+    -- The customer's own dashboard configuration (display name, timezone,
+    -- notification target). The only thing a portal user may write, and it
+    -- affects nothing outside their own display.
+    preferences     TEXT NOT NULL DEFAULT '{}',
+    created_at      DOUBLE PRECISION NOT NULL,
+    created_by      TEXT NOT NULL DEFAULT '',
+    updated_at      DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_orgs_status ON orgs(status, name);
+
+-- Email is globally unique rather than unique-per-org: the portal login takes
+-- an email and a password with no org selector, which is both better UX and
+-- refuses to confirm whether a given org exists.
+CREATE TABLE IF NOT EXISTS portal_users (
+    user_id         TEXT PRIMARY KEY,
+    org_id          TEXT NOT NULL REFERENCES orgs(org_id) ON DELETE CASCADE,
+    email           TEXT NOT NULL UNIQUE,
+    password_hash   TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL DEFAULT 'portal_viewer',
+    -- invited | active | disabled. Separate from the org's own status so a
+    -- single user can be revoked without suspending the whole customer.
+    status          TEXT NOT NULL DEFAULT 'invited',
+    failed_count    INTEGER NOT NULL DEFAULT 0,
+    locked_until    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_login_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at      DOUBLE PRECISION NOT NULL,
+    activated_at    DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_portal_users_org ON portal_users(org_id, status);
+
+-- Single-use, expiring setup links. The token itself is never stored — only
+-- its SHA-256 — so a database read cannot be replayed into an account takeover.
+CREATE TABLE IF NOT EXISTS portal_invites (
+    token_hash      TEXT PRIMARY KEY,
+    org_id          TEXT NOT NULL REFERENCES orgs(org_id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL REFERENCES portal_users(user_id) ON DELETE CASCADE,
+    expires_at      DOUBLE PRECISION NOT NULL,
+    used_at         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at      DOUBLE PRECISION NOT NULL,
+    created_by      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_portal_invites_user ON portal_invites(user_id, used_at);
+
+-- Agent -> org binding. A join table rather than a column on the agent so a
+-- reassignment leaves a row behind instead of overwriting history; this is the
+-- table that decides what a customer can see, so its trail matters.
+CREATE TABLE IF NOT EXISTS org_agents (
+    org_id          TEXT NOT NULL REFERENCES orgs(org_id) ON DELETE CASCADE,
+    agent_id        TEXT NOT NULL,
+    assigned_at     DOUBLE PRECISION NOT NULL,
+    assigned_by     TEXT NOT NULL DEFAULT '',
+    -- An agent belongs to at most one org: PRIMARY KEY on agent_id alone, not
+    -- the pair. Allowing an agent in two orgs would leak one customer's
+    -- endpoint into another customer's dashboard.
+    PRIMARY KEY (agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_agents_org ON org_agents(org_id);
+
+CREATE TABLE IF NOT EXISTS portal_audit (
+    id              BIGSERIAL PRIMARY KEY,
+    org_id          TEXT NOT NULL DEFAULT '',
+    actor           TEXT NOT NULL DEFAULT '',
+    action          TEXT NOT NULL,
+    detail          TEXT NOT NULL DEFAULT '{}',
+    ip              TEXT NOT NULL DEFAULT '',
+    created_at      DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_portal_audit_org ON portal_audit(org_id, created_at DESC);
 
 -- ── Full-text search ──────────────────────────────────────────────────────
 -- SQLite's FTS5 needed a separate virtual table + 3 triggers to mirror data
@@ -1280,6 +1440,56 @@ class IngestDeduplicator:
         return finding
 
 
+class _TaskReentrantLock:
+    """An asyncio lock the owning task may re-acquire.
+
+    IntelDB._conn is a single connection shared by every writer in the process,
+    and an asyncpg connection cannot be used by two coroutines at once — the
+    second gets "another operation is in progress" and its write is simply
+    lost. Serialising that was left to each call site, and was applied at
+    roughly half of them.
+
+    write_txn() now takes this lock itself, so correctness no longer depends on
+    remembering. Several existing callers already wrap write_txn in
+    `async with idb._lock`, and a plain asyncio.Lock is not reentrant, so those
+    would deadlock instantly. Re-entry is scoped to the owning task, so two
+    different tasks still serialise exactly as before.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional[asyncio.Task] = None
+        self._depth = 0
+
+    async def acquire(self) -> bool:
+        task = asyncio.current_task()
+        if self._depth and self._owner is task:
+            self._depth += 1
+            return True
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return True
+
+    def release(self) -> None:
+        if not self._depth:
+            raise RuntimeError("release of un-acquired lock")
+        self._depth -= 1
+        if not self._depth:
+            self._owner = None
+            self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def __aenter__(self) -> "_TaskReentrantLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        self.release()
+
+
 class IntelDB:
     """
     Async Postgres wrapper for the intel database (migrated from SQLite —
@@ -1296,8 +1506,18 @@ class IntelDB:
         self._path = dsn  # kept as _path for any code/logs still reading it
         self._dsn = dsn
         self._pool: Optional[PgPool] = None
-        self._conn = None
-        self._lock = asyncio.Lock()  # kept for write-serialisation within Python
+        # Declared non-Optional deliberately. init() aliases a long-lived write
+        # checkout here and every write method runs inside that lifecycle, so
+        # treating it as Optional would turn ~180 correct call sites into
+        # union-attr noise and train readers to ignore the checker. The one
+        # narrow lie is this pre-init sentinel (and the matching reset in
+        # close()), which is why it is annotated rather than left to inference —
+        # unannotated, mypy inferred `None` and reported every .execute()/
+        # .commit() in the class as an error.
+        self._conn: PgConnection = None  # type: ignore[assignment]
+        # Reentrant so write_txn() can take it unconditionally without
+        # deadlocking the callers that already hold it. See _TaskReentrantLock.
+        self._lock = _TaskReentrantLock()  # write-serialisation within Python
         self._dedup = IngestDeduplicator()
         self._finding_notification_handler: Optional[FindingNotificationHandler] = None
 
@@ -1327,6 +1547,42 @@ class IntelDB:
                 log.debug("finding notification handler failed: %s", exc)
 
         task.add_done_callback(_done)
+
+    @asynccontextmanager
+    async def write_txn(self):
+        """Run writes on the shared connection, rolling back on any failure.
+
+        self._conn is a single long-lived write connection shared by every
+        writer in the process. Postgres poisons the whole transaction on the
+        first failed statement, so an `except` that swallows the error without
+        rolling back leaves that shared connection permanently broken: every
+        later write — in unrelated endpoints — then fails with "cannot commit;
+        the transaction is in error state" until the manager restarts. One
+        transient failure therefore takes out settings, case management and
+        validation together, which is exactly how it presented.
+
+        init() already handles this correctly for migrations; this makes the
+        same discipline available to request handlers:
+
+            async with intel_db.write_txn() as conn:
+                await conn.execute(...)
+            # committed here, or rolled back and re-raised
+        """
+        # Serialise here rather than trusting every call site: an asyncpg connection
+        # cannot be shared by two coroutines at once, and roughly half the
+        # write_txn callers were not holding the lock. The lock is reentrant,
+        # so the callers that already wrap this in `async with idb._lock` are
+        # unaffected.
+        async with self._lock:
+            try:
+                yield self._conn
+                await self._conn.commit()
+            except Exception:
+                try:
+                    await self._conn.rollback()
+                except Exception:           # pragma: no cover - already failing
+                    log.exception("rollback failed; connection may be unusable")
+                raise
 
     async def init(self) -> None:
         self._pool = PgPool(self._dsn, readers=3)
@@ -1484,7 +1740,7 @@ class IntelDB:
             if getattr(self, "_conn_ctx", None) is not None:
                 await self._conn_ctx.__aexit__(None, None, None)
             await self._pool.close()
-            self._conn = None
+            self._conn = None  # type: ignore[assignment]  # see __init__
 
     # ── Findings ──────────────────────────────────────────────────────────────
 
@@ -2813,6 +3069,137 @@ class IntelDB:
             out.append(shaped)
         return out
 
+    # ── AI verdict cache ─────────────────────────────────────────────────────
+    #
+    # The detection loop re-evaluates every open finding on each cycle. Without
+    # this cache each unchanged finding costs one model call per cycle, which
+    # exhausts a free provider's daily request quota long before it costs money.
+
+    async def get_cached_ai_verdict(
+        self, cache_key: str, *, max_age_s: float = 604800.0,
+    ) -> Optional[dict]:
+        """Return a cached verdict payload, or None on miss or expiry.
+
+        A read failure returns None rather than raising: a broken cache must
+        degrade to "call the model", never to "fail the validation".
+        """
+        if not cache_key:
+            return None
+        try:
+            row = await self._fetchone(
+                "SELECT verdict_json, created_at FROM ai_verdict_cache "
+                "WHERE cache_key=?",
+                (cache_key,),
+            )
+        except Exception:
+            log.debug("ai verdict cache read failed", exc_info=True)
+            return None
+        if row is None:
+            return None
+        age = time.time() - float(row["created_at"] or 0.0)
+        if max_age_s > 0 and age > max_age_s:
+            return None
+        value = _json_value(row["verdict_json"], None)
+        return value if isinstance(value, dict) else None
+
+    async def touch_ai_verdict_cache(self, cache_key: str) -> None:
+        """Record a hit. Best-effort — a failed counter must not fail the read.
+
+        Uses write_txn so a failure rolls back rather than poisoning the shared
+        write connection for every other writer.
+        """
+        if not cache_key:
+            return
+        try:
+            async with self.write_txn() as conn:
+                await conn.execute(
+                    "UPDATE ai_verdict_cache SET hit_count=hit_count+1, "
+                    "last_hit_at=? WHERE cache_key=?",
+                    (time.time(), cache_key),
+                )
+        except Exception:
+            log.debug("ai verdict cache touch failed", exc_info=True)
+
+    async def put_cached_ai_verdict(
+        self,
+        cache_key: str,
+        verdict: dict,
+        *,
+        task: str = "validation",
+        model: str = "",
+        provider: str = "",
+        tokens_used: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """Store a freshly computed verdict. Best-effort by the same argument."""
+        if not cache_key or not isinstance(verdict, dict):
+            return
+        now = time.time()
+        try:
+            async with self.write_txn() as conn:
+                await conn.execute(
+                    """INSERT INTO ai_verdict_cache
+                       (cache_key,task,verdict_json,model,provider,
+                        tokens_used,cost_usd,hit_count,created_at,last_hit_at)
+                       VALUES(?,?,?,?,?,?,?,0,?,0)
+                       ON CONFLICT (cache_key) DO UPDATE SET
+                         verdict_json=EXCLUDED.verdict_json,
+                         model=EXCLUDED.model,
+                         provider=EXCLUDED.provider,
+                         tokens_used=EXCLUDED.tokens_used,
+                         cost_usd=EXCLUDED.cost_usd,
+                         created_at=EXCLUDED.created_at""",
+                    (
+                        cache_key, task, json.dumps(verdict, default=str),
+                        model, provider, int(tokens_used or 0),
+                        float(cost_usd or 0.0), now,
+                    ),
+                )
+        except Exception:
+            log.debug("ai verdict cache write failed", exc_info=True)
+
+    async def sweep_ai_verdict_cache(self, *, max_age_s: float = 604800.0) -> int:
+        """Drop expired entries. Returns the number removed."""
+        cutoff = time.time() - max(0.0, max_age_s)
+        try:
+            async with self.write_txn() as conn:
+                cur = await conn.execute(
+                    "DELETE FROM ai_verdict_cache WHERE created_at < ?", (cutoff,),
+                )
+                return int(getattr(cur, "rowcount", 0) or 0)
+        except Exception:
+            log.debug("ai verdict cache sweep failed", exc_info=True)
+            return 0
+
+    async def ai_verdict_cache_stats(self, *, window_s: float = 86400.0) -> dict:
+        """Hit/miss telemetry for the Validation Settings status page.
+
+        `hit_count` accumulates per entry, so total hits are calls avoided and
+        the row count is calls actually made — the two numbers the operator
+        needs to see whether the cache is working.
+        """
+        try:
+            row = await self._fetchone(
+                "SELECT COUNT(*) AS entries, "
+                "COALESCE(SUM(hit_count),0) AS hits, "
+                "COALESCE(SUM(cost_usd),0) AS stored_cost "
+                "FROM ai_verdict_cache WHERE created_at >= ?",
+                (time.time() - max(0.0, window_s),),
+            )
+        except Exception:
+            log.debug("ai verdict cache stats failed", exc_info=True)
+            return {"entries": 0, "hits": 0, "hit_rate": 0.0, "calls_avoided": 0}
+        entries = int(row["entries"] or 0) if row else 0
+        hits = int(row["hits"] or 0) if row else 0
+        total = entries + hits
+        return {
+            "entries": entries,
+            "hits": hits,
+            "calls_avoided": hits,
+            "hit_rate": round(hits / total, 4) if total else 0.0,
+            "stored_cost_usd": round(float(row["stored_cost"] or 0.0), 6) if row else 0.0,
+        }
+
     async def get_activity(self, finding_id: int) -> list[dict]:
         rows = await self._fetchall(
             "SELECT * FROM soc_activity WHERE finding_id=? ORDER BY created_at ASC",
@@ -3490,30 +3877,39 @@ class IntelDB:
         On failure: increments error_count, updates last_error.
         """
         now = time.time()
+        # A fetch that raised nothing but imported nothing is not healthy. The
+        # CISA KEV row sat at status='ok' with entry_count=0 while the catalog
+        # was empty, so every KEV-based score was silently inert and the health
+        # page said everything was fine. "empty" is its own state.
+        status = "ok" if entry_count > 0 else "empty"
+        note = "" if entry_count > 0 else "fetch succeeded but imported 0 entries"
         async with self._lock:
-            if success:
-                await self._conn.execute("""
-                    INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
-                    VALUES(?,?,?,  '',      0,          ?,          'ok')
-                    ON CONFLICT(source) DO UPDATE SET
-                        last_attempt=excluded.last_attempt,
-                        last_success=excluded.last_success,
-                        last_error='',
-                        error_count=0,
-                        entry_count=excluded.entry_count,
-                        status='ok'
-                """, (source, now, now, entry_count))
-            else:
-                await self._conn.execute("""
-                    INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
-                    VALUES(?,?,           0,           ?,        1,           0,         'error')
-                    ON CONFLICT(source) DO UPDATE SET
-                        last_attempt=excluded.last_attempt,
-                        last_error=excluded.last_error,
-                        error_count=error_count+1,
-                        status=CASE WHEN error_count+1 >= 3 THEN 'error' ELSE 'degraded' END
-                """, (source, now, error[:200]))
-            await self._conn.commit()
+            # write_txn rolls back on failure. This runs on a timer for every
+            # feed, so without it one failed health write poisons the shared
+            # connection and breaks settings, cases and validation.
+            async with self.write_txn() as conn:
+                if success:
+                    await conn.execute("""
+                        INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
+                        VALUES(?,?,?,  ?,      0,          ?,          ?)
+                        ON CONFLICT(source) DO UPDATE SET
+                            last_attempt=excluded.last_attempt,
+                            last_success=excluded.last_success,
+                            last_error=excluded.last_error,
+                            error_count=0,
+                            entry_count=excluded.entry_count,
+                            status=excluded.status
+                    """, (source, now, now, note, entry_count, status))
+                else:
+                    await conn.execute("""
+                        INSERT INTO feed_health(source,last_attempt,last_success,last_error,error_count,entry_count,status)
+                        VALUES(?,?,           0,           ?,        1,           0,         'error')
+                        ON CONFLICT(source) DO UPDATE SET
+                            last_attempt=excluded.last_attempt,
+                            last_error=excluded.last_error,
+                            error_count=error_count+1,
+                            status=CASE WHEN error_count+1 >= 3 THEN 'error' ELSE 'degraded' END
+                    """, (source, now, error[:200]))
 
     async def get_all_feed_health(self) -> list[dict]:
         """Return health record for every known feed source."""
@@ -4891,6 +5287,562 @@ class IntelDB:
         async with self._pool.read() as conn:
             async with conn.execute(sql, args) as cur:
                 return await cur.fetchall()
+
+    # ── Multi-tenancy: orgs, portal users, agent binding ─────────────────────
+    #
+    # Read `org_agents` as the security boundary it is: `agent_ids_for_org` is
+    # what Phase 3 will feed into the query choke point, so anything that widens
+    # the set it returns widens what a customer can see.
+
+    async def create_org(
+        self, *, slug: str, name: str, contact_email: str = "",
+        license_key_hash: str = "", entitlements: Optional[dict] = None,
+        actor: str = "", status: str = "pending",
+    ) -> dict:
+        """Create a customer org. `entitlements` is licensing.Entitlements.to_dict()."""
+        slug = str(slug or "").strip().lower()
+        if not slug:
+            raise ValueError("org slug is required")
+        org_id = f"org_{uuid.uuid4().hex[:16]}"
+        ent = entitlements or {}
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO orgs (org_id,slug,name,contact_email,status,"
+                " license_key_hash,license_kid,license_issued_at,license_expires_at,"
+                " max_agents,tier,features,created_at,created_by,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    org_id, slug, str(name or slug), str(contact_email or ""),
+                    str(status), str(license_key_hash or ""),
+                    str(ent.get("kid") or ""),
+                    float(ent.get("issued_at") or 0),
+                    float(ent.get("expires_at") or 0),
+                    int(ent.get("max_agents") or 0),
+                    str(ent.get("tier") or "standard"),
+                    json.dumps(list(ent.get("features") or [])),
+                    now, str(actor or ""), now,
+                ),
+            )
+            await self._conn.commit()
+        return await self.get_org(org_id) or {}
+
+    async def get_org(self, org_id: str) -> Optional[dict]:
+        row = await self._fetchone("SELECT * FROM orgs WHERE org_id=?", (org_id,))
+        return _shape_org(dict(row)) if row else None
+
+    async def get_org_by_slug(self, slug: str) -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT * FROM orgs WHERE slug=?", (str(slug or "").strip().lower(),),
+        )
+        return _shape_org(dict(row)) if row else None
+
+    async def list_orgs(self) -> list[dict]:
+        """Every org with its agent count and user count, for the admin table."""
+        rows = await self._fetchall(
+            "SELECT o.*, "
+            "  (SELECT COUNT(*) FROM org_agents a WHERE a.org_id=o.org_id) AS agent_count, "
+            "  (SELECT COUNT(*) FROM portal_users u WHERE u.org_id=o.org_id) AS user_count "
+            "FROM orgs o ORDER BY o.name",
+            (),
+        )
+        return [_shape_org(dict(r)) for r in rows]
+
+    async def set_org_status(self, org_id: str, status: str, *, actor: str = "") -> bool:
+        """Suspending an org must take effect immediately, so callers pair this
+        with a session revocation rather than waiting for the next login."""
+        status = str(status or "").strip().lower()
+        if status not in {"active", "suspended", "pending"}:
+            raise ValueError(f"unknown org status {status!r}")
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE orgs SET status=?, updated_at=? WHERE org_id=?",
+                (status, time.time(), org_id),
+            )
+            await self._conn.commit()
+        changed = bool(getattr(cur, "rowcount", 0))
+        if changed:
+            await self.record_portal_audit(
+                org_id=org_id, actor=actor, action=f"org.status.{status}",
+            )
+        return changed
+
+    async def update_org_license(
+        self, org_id: str, *, license_key_hash: str, entitlements: dict,
+        actor: str = "",
+    ) -> bool:
+        ent = entitlements or {}
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE orgs SET license_key_hash=?, license_kid=?, "
+                " license_issued_at=?, license_expires_at=?, max_agents=?, "
+                " tier=?, features=?, updated_at=? WHERE org_id=?",
+                (
+                    str(license_key_hash or ""), str(ent.get("kid") or ""),
+                    float(ent.get("issued_at") or 0),
+                    float(ent.get("expires_at") or 0),
+                    int(ent.get("max_agents") or 0),
+                    str(ent.get("tier") or "standard"),
+                    json.dumps(list(ent.get("features") or [])),
+                    time.time(), org_id,
+                ),
+            )
+            await self._conn.commit()
+        changed = bool(getattr(cur, "rowcount", 0))
+        if changed:
+            await self.record_portal_audit(
+                org_id=org_id, actor=actor, action="org.license.rotated",
+            )
+        return changed
+
+    async def set_org_preferences(self, org_id: str, patch: dict) -> dict:
+        """Merge into the org's display preferences.
+
+        Merge rather than replace: the portal sends only the fields the customer
+        changed, and a replace would silently clear the rest.
+        """
+        row = await self._fetchone(
+            "SELECT preferences FROM orgs WHERE org_id=?", (org_id,),
+        )
+        if row is None:
+            raise ValueError(f"unknown org {org_id!r}")
+        current = _json_value(row["preferences"], {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update({str(k): v for k, v in (patch or {}).items()})
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE orgs SET preferences=?, updated_at=? WHERE org_id=?",
+                (json.dumps(current), time.time(), org_id),
+            )
+            await self._conn.commit()
+        return current
+
+    # ── Agent binding ────────────────────────────────────────────────────────
+
+    async def agent_ids_for_org(self, org_id: str) -> list[str]:
+        """The agents an org may see. This is the tenant boundary."""
+        rows = await self._fetchall(
+            "SELECT agent_id FROM org_agents WHERE org_id=? ORDER BY agent_id",
+            (org_id,),
+        )
+        return [str(r["agent_id"]) for r in rows]
+
+    async def org_for_agent(self, agent_id: str) -> Optional[str]:
+        row = await self._fetchone(
+            "SELECT org_id FROM org_agents WHERE agent_id=?", (agent_id,),
+        )
+        return str(row["org_id"]) if row else None
+
+    async def assign_agents_to_org(
+        self, org_id: str, agent_ids: list[str], *, actor: str = "",
+    ) -> dict:
+        """Bind agents to an org, enforcing the licensed seat cap.
+
+        Refuses the whole batch rather than partially applying it: a caller that
+        asked for ten agents and silently got four would believe the customer
+        can see ten.
+        """
+        org = await self.get_org(org_id)
+        if org is None:
+            raise ValueError(f"unknown org {org_id!r}")
+        wanted = [str(a).strip() for a in (agent_ids or []) if str(a).strip()]
+        if not wanted:
+            return {"assigned": [], "skipped": [], "agent_count": 0}
+
+        current = set(await self.agent_ids_for_org(org_id))
+        new = [a for a in dict.fromkeys(wanted) if a not in current]
+        max_agents = int(org.get("max_agents") or 0)
+        if max_agents and len(current) + len(new) > max_agents:
+            raise ValueError(
+                f"licence for {org['slug']} allows {max_agents} agents; "
+                f"{len(current)} assigned and {len(new)} requested"
+            )
+
+        # An agent already bound elsewhere is reported, never silently moved —
+        # reassignment has to be deliberate because it changes who sees a host.
+        taken: list[str] = []
+        for agent_id in new:
+            owner = await self.org_for_agent(agent_id)
+            if owner and owner != org_id:
+                taken.append(agent_id)
+        if taken:
+            raise ValueError(
+                f"already assigned to another org: {', '.join(sorted(taken))}"
+            )
+
+        now = time.time()
+        async with self._lock:
+            for agent_id in new:
+                await self._conn.execute(
+                    "INSERT INTO org_agents (org_id,agent_id,assigned_at,assigned_by) "
+                    "VALUES(?,?,?,?) ON CONFLICT (agent_id) DO NOTHING",
+                    (org_id, agent_id, now, str(actor or "")),
+                )
+            await self._conn.commit()
+        await self.record_portal_audit(
+            org_id=org_id, actor=actor, action="org.agents.assigned",
+            detail={"agent_ids": new},
+        )
+        return {
+            "assigned": new,
+            "skipped": [a for a in wanted if a in current],
+            "agent_count": len(current) + len(new),
+        }
+
+    async def unassign_agent(self, agent_id: str, *, actor: str = "") -> bool:
+        org_id = await self.org_for_agent(agent_id)
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM org_agents WHERE agent_id=?", (agent_id,),
+            )
+            await self._conn.commit()
+        removed = bool(getattr(cur, "rowcount", 0))
+        if removed and org_id:
+            await self.record_portal_audit(
+                org_id=org_id, actor=actor, action="org.agents.unassigned",
+                detail={"agent_ids": [agent_id]},
+            )
+        return removed
+
+    async def unassigned_agent_ids(self) -> list[str]:
+        """Agents not yet bound to any org — the pool the admin picks from."""
+        rows = await self._fetchall(
+            "SELECT DISTINCT f.agent_id FROM findings f "
+            "LEFT JOIN org_agents a ON a.agent_id = f.agent_id "
+            "WHERE a.agent_id IS NULL AND f.agent_id != '' "
+            "ORDER BY f.agent_id",
+            (),
+        )
+        return [str(r["agent_id"]) for r in rows]
+
+    # ── Portal users and invites ─────────────────────────────────────────────
+
+    async def create_portal_user(
+        self, *, org_id: str, email: str, role: str = "portal_viewer",
+        actor: str = "",
+    ) -> dict:
+        """Create a user in the `invited` state — no password is set here.
+
+        Credentials are established by the customer through a single-use invite
+        link, so no plaintext password ever exists in the database, the API, or
+        an operator's clipboard.
+        """
+        email = str(email or "").strip().lower()
+        if "@" not in email:
+            raise ValueError("a valid email address is required")
+        user_id = f"pu_{uuid.uuid4().hex[:16]}"
+        now = time.time()
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO portal_users (user_id,org_id,email,password_hash,role,"
+                " status,failed_count,locked_until,last_login_at,created_at,activated_at) "
+                "VALUES(?,?,?,'',?,'invited',0,0,0,?,0)",
+                (user_id, org_id, email, str(role or "portal_viewer"), now),
+            )
+            await self._conn.commit()
+        await self.record_portal_audit(
+            org_id=org_id, actor=actor, action="portal_user.created",
+            detail={"email": email, "role": role},
+        )
+        return await self.get_portal_user(user_id) or {}
+
+    async def get_portal_user(self, user_id: str) -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT * FROM portal_users WHERE user_id=?", (user_id,),
+        )
+        return dict(row) if row else None
+
+    async def get_portal_user_by_email(self, email: str) -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT * FROM portal_users WHERE email=?",
+            (str(email or "").strip().lower(),),
+        )
+        return dict(row) if row else None
+
+    async def list_portal_users(self, org_id: str) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT user_id,org_id,email,role,status,last_login_at,created_at,"
+            " activated_at FROM portal_users WHERE org_id=? ORDER BY email",
+            (org_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def create_invite(
+        self, *, user_id: str, org_id: str, token_hash: str,
+        ttl_seconds: int = 72 * 3600, actor: str = "",
+    ) -> dict:
+        """Store the SHA-256 of a setup token. The token itself never lands here."""
+        now = time.time()
+        async with self._lock:
+            # A new invite supersedes any outstanding one for the same user, so
+            # a resend cannot leave two live links.
+            await self._conn.execute(
+                "DELETE FROM portal_invites WHERE user_id=? AND used_at=0", (user_id,),
+            )
+            await self._conn.execute(
+                "INSERT INTO portal_invites (token_hash,org_id,user_id,expires_at,"
+                " used_at,created_at,created_by) VALUES(?,?,?,?,0,?,?)",
+                (token_hash, org_id, user_id, now + max(60, int(ttl_seconds)),
+                 now, str(actor or "")),
+            )
+            await self._conn.commit()
+        return {"user_id": user_id, "expires_at": now + ttl_seconds}
+
+    async def consume_invite(self, token_hash: str, password_hash: str) -> Optional[dict]:
+        """Redeem a setup token exactly once and activate the user.
+
+        Returns None for a token that is unknown, already used, or expired —
+        the caller must not distinguish these to the client.
+        """
+        row = await self._fetchone(
+            "SELECT * FROM portal_invites WHERE token_hash=?", (token_hash,),
+        )
+        if row is None:
+            return None
+        invite = dict(row)
+        if float(invite.get("used_at") or 0) > 0:
+            return None
+        if time.time() >= float(invite.get("expires_at") or 0):
+            return None
+
+        now = time.time()
+        async with self._lock:
+            # Guarded by used_at=0 so two concurrent redemptions cannot both win.
+            cur = await self._conn.execute(
+                "UPDATE portal_invites SET used_at=? WHERE token_hash=? AND used_at=0",
+                (now, token_hash),
+            )
+            if not getattr(cur, "rowcount", 0):
+                await self._conn.commit()
+                return None
+            await self._conn.execute(
+                "UPDATE portal_users SET password_hash=?, status='active', "
+                " activated_at=?, failed_count=0, locked_until=0 WHERE user_id=?",
+                (password_hash, now, invite["user_id"]),
+            )
+            await self._conn.commit()
+        await self.record_portal_audit(
+            org_id=invite["org_id"], actor=str(invite["user_id"]),
+            action="portal_user.activated",
+        )
+        return await self.get_portal_user(invite["user_id"])
+
+    async def set_portal_user_status(
+        self, user_id: str, status: str, *, actor: str = "",
+    ) -> bool:
+        status = str(status or "").strip().lower()
+        if status not in {"invited", "active", "disabled"}:
+            raise ValueError(f"unknown portal user status {status!r}")
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE portal_users SET status=? WHERE user_id=?", (status, user_id),
+            )
+            await self._conn.commit()
+        return bool(getattr(cur, "rowcount", 0))
+
+    async def record_portal_login(self, user_id: str) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE portal_users SET last_login_at=?, failed_count=0, "
+                " locked_until=0 WHERE user_id=?",
+                (time.time(), user_id),
+            )
+            await self._conn.commit()
+
+    async def record_portal_audit(
+        self, *, org_id: str = "", actor: str = "", action: str,
+        detail: Optional[dict] = None, ip: str = "",
+    ) -> None:
+        """Never raises — an audit write must not fail the action it records,
+        but a failure is logged so a silent gap in the trail is visible."""
+        try:
+            async with self._lock:
+                await self._conn.execute(
+                    "INSERT INTO portal_audit (org_id,actor,action,detail,ip,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        str(org_id or ""), str(actor or "")[:200], str(action)[:120],
+                        json.dumps(detail or {}, default=str)[:4000],
+                        str(ip or "")[:64], time.time(),
+                    ),
+                )
+                await self._conn.commit()
+        except Exception as exc:
+            log.warning("portal audit write failed for %s: %s", action, exc)
+
+    # ── Portal reads: every query is scoped by agent_ids ─────────────────────
+    #
+    # These are deliberately small, bespoke queries rather than reuse of the
+    # operator query builder. That builder carries a dozen optional filters and
+    # a scope would be one more argument someone could forget; here the scope is
+    # the first positional parameter of every method and there is no code path
+    # that omits it.
+    #
+    # An empty scope returns NOTHING. That is the whole ballgame: an org with no
+    # agents assigned must see zero findings, and the natural SQL for "IN ()" is
+    # either a syntax error or, worse, a predicate that matches everything.
+
+    @staticmethod
+    def _scope_clause(agent_ids: list[str]) -> tuple[str, tuple]:
+        """SQL fragment + args restricting rows to a tenant's agents."""
+        ids = [str(a) for a in (agent_ids or []) if str(a)]
+        if not ids:
+            # Fail closed. `AND FALSE` is unambiguous and cannot be misread as
+            # "no filter" the way an empty IN list can.
+            return " AND FALSE", ()
+        marks = ",".join("?" for _ in ids)
+        return f" AND f.agent_id IN ({marks})", tuple(ids)
+
+    async def portal_summary(self, agent_ids: list[str]) -> dict:
+        """Headline counts for the customer dashboard."""
+        scope, args = self._scope_clause(agent_ids)
+        rows = await self._fetchall(
+            "SELECT f.severity, COUNT(*) AS n FROM findings f "
+            "WHERE f.is_active=1" + scope + " GROUP BY f.severity",
+            args,
+        )
+        by_severity = {str(r["severity"]): int(r["n"]) for r in rows}
+        terrain_rows = await self._fetchall(
+            "SELECT COALESCE(NULLIF(f.terrain_id,''),'unclassified') AS terrain, "
+            "COUNT(*) AS n FROM findings f WHERE f.is_active=1" + scope +
+            " GROUP BY 1 ORDER BY 2 DESC",
+            args,
+        )
+        validated = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM findings f WHERE f.is_active=1 "
+            "AND f.validation_state='validated'" + scope, args,
+        )
+        return {
+            "total": sum(by_severity.values()),
+            "by_severity": by_severity,
+            "critical": by_severity.get("critical", 0),
+            "high": by_severity.get("high", 0),
+            "validated": int((validated or {}).get("n") or 0),
+            "by_terrain": {
+                str(r["terrain"]): int(r["n"]) for r in terrain_rows
+            },
+            "agent_count": len([a for a in (agent_ids or []) if a]),
+        }
+
+    async def portal_findings(
+        self, agent_ids: list[str], *,
+        severity: Optional[str] = None,
+        terrain_id: Optional[str] = None,
+        limit: int = 50, offset: int = 0,
+    ) -> dict:
+        scope, args = self._scope_clause(agent_ids)
+        where = "WHERE f.is_active=1" + scope
+        params = list(args)
+        if severity:
+            where += " AND f.severity=?"
+            params.append(str(severity))
+        if terrain_id:
+            where += " AND f.terrain_id=?"
+            params.append(str(terrain_id))
+
+        total_row = await self._fetchone(
+            f"SELECT COUNT(*) AS n FROM findings f {where}", tuple(params),
+        )
+        limit = max(1, min(int(limit), 200))
+        rows = await self._fetchall(
+            f"SELECT f.* FROM findings f {where} "
+            "ORDER BY COALESCE(f.composite_score, f.score) DESC, f.id DESC "
+            "LIMIT ? OFFSET ?",
+            tuple(params) + (limit, max(0, int(offset))),
+        )
+        return {
+            "findings": [dict(r) for r in rows],
+            "total": int((total_row or {}).get("n") or 0),
+            "limit": limit,
+            "offset": max(0, int(offset)),
+        }
+
+    async def portal_finding_detail(
+        self, agent_ids: list[str], finding_id: int,
+    ) -> Optional[dict]:
+        """One finding, or None when it is outside the caller's scope.
+
+        The scope is part of the WHERE clause rather than a check on the result,
+        so "does not exist" and "belongs to another customer" are the same query
+        and the caller can answer both with 404.
+        """
+        scope, args = self._scope_clause(agent_ids)
+        row = await self._fetchone(
+            "SELECT f.* FROM findings f WHERE f.id=?" + scope,
+            (int(finding_id),) + args,
+        )
+        return dict(row) if row else None
+
+    async def portal_trend(self, agent_ids: list[str], days: int = 30) -> list[dict]:
+        """Daily new-finding counts, for the dashboard sparkline."""
+        scope, args = self._scope_clause(agent_ids)
+        days = max(1, min(int(days), 365))
+        cutoff = time.time() - days * 86400
+        rows = await self._fetchall(
+            "SELECT FLOOR(f.first_detected_at / 86400) AS bucket, "
+            "COUNT(*) AS n, "
+            "SUM(CASE WHEN f.severity IN ('critical','high') THEN 1 ELSE 0 END) AS urgent "
+            "FROM findings f WHERE f.first_detected_at >= ?" + scope +
+            " GROUP BY 1 ORDER BY 1",
+            (cutoff,) + args,
+        )
+        return [
+            {
+                "day": int(r["bucket"]) * 86400,
+                "count": int(r["n"] or 0),
+                "urgent": int(r["urgent"] or 0),
+            }
+            for r in rows
+        ]
+
+    async def portal_agents(self, agent_ids: list[str]) -> list[dict]:
+        """The customer's own endpoints, with finding counts."""
+        ids = [str(a) for a in (agent_ids or []) if str(a)]
+        if not ids:
+            return []
+        marks = ",".join("?" for _ in ids)
+        rows = await self._fetchall(
+            f"SELECT ar.agent_id, ar.hostname, ar.os, ar.os_version, "
+            f"  (SELECT COUNT(*) FROM findings f WHERE f.agent_id=ar.agent_id "
+            f"     AND f.is_active=1) AS finding_count "
+            f"FROM asset_registry ar WHERE ar.agent_id IN ({marks}) "
+            f"ORDER BY ar.hostname",
+            tuple(ids),
+        )
+        found = {str(r["agent_id"]) for r in rows}
+        out = [dict(r) for r in rows]
+        # An assigned agent with no asset_registry row still belongs to the
+        # customer; omitting it would under-report their fleet.
+        for agent_id in ids:
+            if agent_id not in found:
+                out.append({
+                    "agent_id": agent_id, "hostname": agent_id,
+                    "os": "", "os_version": "", "finding_count": 0,
+                })
+        return out
+
+    async def portal_audit_for_org(self, org_id: str, limit: int = 100) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT * FROM portal_audit WHERE org_id=? ORDER BY created_at DESC LIMIT ?",
+            (org_id, max(1, min(int(limit), 500))),
+        )
+        return [dict(r) for r in rows]
+
+
+def _shape_org(row: dict) -> dict:
+    """Normalise an orgs row: parse features, never expose the licence hash."""
+    row.pop("license_key_hash", None)
+    row["features"] = _json_value(row.get("features"), [])
+    row["preferences"] = _json_value(row.get("preferences"), {})
+    row["agent_count"] = int(row.get("agent_count") or 0)
+    row["user_count"] = int(row.get("user_count") or 0)
+    expires = float(row.get("license_expires_at") or 0)
+    row["license_expired"] = bool(expires and time.time() >= expires)
+    row["license_days_remaining"] = (
+        max(0, int((expires - time.time()) // 86400)) if expires else None
+    )
+    return row
 
 
 def _sla_status(sla_due: float, status: str) -> str:

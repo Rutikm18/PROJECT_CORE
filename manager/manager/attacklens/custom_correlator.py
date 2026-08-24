@@ -197,12 +197,15 @@ class CustomCorrelator:
 
             # Increment hit counter (best-effort)
             try:
-                await self._idb._conn.execute(
-                    "UPDATE custom_correlation_rules "
-                    "SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?",
-                    (now, rule["id"]),
-                )
-                await self._idb._conn.commit()
+                # Best-effort, but it shares the one write connection: without
+                # a rollback a failed counter update poisons that connection
+                # and silently breaks settings, cases and validation.
+                async with self._idb.write_txn() as conn:
+                    await conn.execute(
+                        "UPDATE custom_correlation_rules "
+                        "SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?",
+                        (now, rule["id"]),
+                    )
             except Exception:
                 pass
 
@@ -229,12 +232,15 @@ class CustomCorrelator:
                     results.append(result)
                     # Increment hit counter async (best-effort — do not block)
                     try:
-                        await self._idb._conn.execute(
-                            "UPDATE custom_correlation_rules "
-                            "SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?",
-                            (now, rule["id"]),
-                        )
-                        await self._idb._conn.commit()
+                        # Best-effort, but it shares the one write connection: without
+                        # a rollback a failed counter update poisons that connection
+                        # and silently breaks settings, cases and validation.
+                        async with self._idb.write_txn() as conn:
+                            await conn.execute(
+                                "UPDATE custom_correlation_rules "
+                                "SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?",
+                                (now, rule["id"]),
+                            )
                     except Exception:
                         pass
             except Exception as exc:

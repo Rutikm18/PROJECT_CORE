@@ -244,6 +244,21 @@ def create_app() -> FastAPI:
 
     app.add_middleware(SecurityHeadersMiddleware)
 
+    # Confines a customer principal on the shared operator routes: read-only,
+    # operator-only paths refused, and a tenant scope attached for the query
+    # layer. Registered here so it runs before routing — a route that has not
+    # been scoped yet is unreachable to a customer rather than unfiltered.
+    # Held behind the same flag as the portal routers — with no portal there is
+    # no customer principal to confine, and the middleware would be pure
+    # overhead on every operator request.
+    _customer_portal_enabled = os.environ.get(
+        "ATTACKLENS_CUSTOMER_PORTAL", "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+    if _customer_portal_enabled:
+        from .api.tenant_scope import TenantScopeMiddleware
+        app.add_middleware(TenantScopeMiddleware, intel_db=intel_db)
+
     # CORS: same-origin only unless an origin is explicitly configured.
     #
     # An unset CORS_ORIGINS used to fall back to ["*"], which is unsafe here
@@ -665,6 +680,38 @@ def create_app() -> FastAPI:
     app.include_router(ingest_router,       prefix="/api/v1")   # allowlisted: agent HMAC
     app.include_router(enroll_router,       prefix="/api/v1")   # allowlisted: enrolment tokens
     app.include_router(auth_router)                             # allowlisted: issues the session
+
+    # ── Customer portal (off by default) ──────────────────────────────────────
+    #
+    # The whole feature is built and tested, but it is held behind this flag
+    # until a real customer is put on it. "Coming soon" means the routes are not
+    # registered at all, not merely hidden in the UI — a portal login that still
+    # answered while the dashboard showed a placeholder would be the worst of
+    # both. Must be kept in step with CUSTOMER_PORTAL_LIVE in the frontend's
+    # featureFlags.ts.
+    if _customer_portal_enabled:
+        # Portal authentication — allowlisted for the same reason as the
+        # operator login: it issues the session, so it cannot require one. Its
+        # own endpoints authenticate individually (require_portal_user), and
+        # the aud=portal token it mints is refused by every operator router.
+        from .api.portal_auth import make_portal_auth_router
+        app.include_router(make_portal_auth_router(intel_db))
+
+        # The customer data API. Gated at the router by require_portal_user, so
+        # a portal endpoint cannot exist without a resolved tenant scope.
+        from .api.portal import make_portal_router
+        app.include_router(make_portal_router(intel_db))
+
+        # Operator-side provisioning. Gated by require_admin at the router, so a
+        # portal token is refused before any handler runs.
+        from .api.customers import make_customers_router
+        app.include_router(make_customers_router(intel_db))
+        log.info("Customer portal ENABLED — /portal and /api/v1/customers are live")
+    else:
+        log.info(
+            "Customer portal disabled (set ATTACKLENS_CUSTOMER_PORTAL=true to "
+            "enable /portal, /api/v1/portal and /api/v1/customers)"
+        )
 
     app.include_router(agents_router,       prefix="/api/v1/agents",     dependencies=_SESSION)
     app.include_router(attacklens_router,   prefix="/api/v1/attacklens", dependencies=_SESSION)

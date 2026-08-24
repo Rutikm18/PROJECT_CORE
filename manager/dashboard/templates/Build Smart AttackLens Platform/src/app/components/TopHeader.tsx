@@ -46,7 +46,7 @@ const SEG: Record<string, string> = {
   coverage: "Detection Coverage", "custom-rules": "Custom Rules",
   settings: "Settings", org: "Organisation", license: "License",
   roles: "Roles", platform: "Platform", validation: "Validation",
-  pipeline: "Validation Pipeline",
+  pipeline: "Validation Pipeline", customers: "Customer Dashboards",
   retention: "Data Retention", ai: "AI Configuration",
   notifications: "Notifications", integrations: "Integrations",
 };

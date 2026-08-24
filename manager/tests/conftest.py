@@ -98,6 +98,67 @@ def mac_key(derived_keys: tuple[bytes, bytes]) -> bytes:
     return derived_keys[1]
 
 
+# ── Orphaned test-database sweep ─────────────────────────────────────────────
+# The per-test fixtures above drop their database in a `finally`, which cannot
+# run when a session is killed — Ctrl-C, a CI step timeout, an OOM. Each of
+# those leaves a `test_<hex>` database behind on the shared instance forever.
+#
+# Only databases older than this are swept, so a concurrent session's live
+# databases are never dropped out from under it. A run that legitimately lasts
+# longer than the cutoff is still safe: its databases were *created* at the
+# start, but the sweep only runs at session start, before any of its own exist.
+_ORPHAN_DB_MIN_AGE_SECONDS = 2 * 3600
+
+
+async def _drop_orphaned_test_dbs() -> int:
+    import asyncpg
+    conn = await asyncpg.connect(_ADMIN_DSN)
+    try:
+        # Postgres does not record database creation time; the PG_VERSION file
+        # in the database's directory is written once at CREATE and not touched
+        # again, so its mtime is the closest available proxy.
+        rows = await conn.fetch(
+            "SELECT datname FROM pg_database"
+            " WHERE datname LIKE 'test\\_%'"
+            "   AND (pg_stat_file('base/' || oid || '/PG_VERSION')).modification"
+            "       < now() - ($1 || ' seconds')::interval",
+            str(_ORPHAN_DB_MIN_AGE_SECONDS),
+        )
+        dropped = 0
+        for row in rows:
+            name = row["datname"]
+            try:
+                await conn.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname=$1 AND pid <> pg_backend_pid()",
+                    name,
+                )
+                await conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+                dropped += 1
+            except Exception:
+                # Another session may have dropped it first, or hold it open.
+                # Leaking one stale database is not worth failing the run over.
+                pass
+        return dropped
+    finally:
+        await conn.close()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _sweep_orphaned_test_dbs():
+    """Best-effort cleanup of databases abandoned by previously killed runs."""
+    import asyncio
+    try:
+        dropped = asyncio.run(_drop_orphaned_test_dbs())
+        if dropped:
+            print(f"\nconftest: dropped {dropped} orphaned test database(s)")
+    except Exception:
+        # No Postgres reachable yet, or no permission. The tests that need it
+        # will fail with a far clearer message than this fixture could give.
+        pass
+    yield
+
+
 # ── Dashboard session helper ─────────────────────────────────────────────────
 # Every /api/v1/* data route now requires a dashboard session (see the auth
 # boundary in manager/manager/server.py and the coverage test in

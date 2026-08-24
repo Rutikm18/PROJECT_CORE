@@ -27,24 +27,70 @@ log = logging.getLogger("manager.ai.providers")
 _TIMEOUT = aiohttp.ClientTimeout(total=60)
 
 
+def _model_tier() -> str:
+    """Return the configured model tier: free | paid | auto.
+
+    - free (default): only free models accepted; training-on-input implied.
+    - paid: only paid models; training gate still applies as a double-check.
+    - auto: free models tried first; if the call fails, retried with the
+            configured ATTACKLENS_AI_FALLBACK_MODEL (a paid model).
+
+    Read per call so an operator can change it without a redeploy.
+    """
+    val = os.environ.get("ATTACKLENS_AI_MODEL_TIER", "free").lower().strip()
+    return val if val in {"free", "paid", "auto"} else "free"
+
+
 def _allow_training_models() -> bool:
     """Whether free, train-on-input models may receive endpoint telemetry.
 
-    Read per call rather than at import so an operator can flip it without a
-    redeploy, matching the OpenRouter kill switch.
+    Free and auto tiers implicitly opt in — the operator chose free models,
+    which by definition train on prompts. The explicit env var remains as a
+    last-resort escape hatch.
     """
+    if _model_tier() in {"free", "auto"}:
+        return True
     return os.environ.get(
         "ATTACKLENS_AI_ALLOW_TRAINING_MODELS", "false",
     ).lower() in {"1", "true", "yes", "on"}
 
 
+def _fallback_model() -> Optional[str]:
+    """Paid model to fall back to when the primary free model fails (auto tier only)."""
+    if _model_tier() != "auto":
+        return None
+    return os.environ.get("ATTACKLENS_AI_FALLBACK_MODEL", "openai/gpt-4o-mini").strip() or None
+
+
 class _OpenRouterUsageGuard:
-    """Process-local org guard; durable cost remains in validation_runs."""
+    """Process-local org guard; durable cost remains in validation_runs.
+
+    Three independent caps, because no single one covers free models:
+
+      • per-minute calls — OpenRouter allows 20/min on `:free` variants, and
+        that ceiling does not rise with account credit. The default matches it.
+      • per-day calls    — free accounts get 50 requests/day, or 1000/day after
+        a one-time $10 credit purchase. Nothing else bounds this.
+      • per-day cost     — the only cap that existed. It is *inert on free
+        models*, which report $0, so a runaway loop on a free model was
+        previously unbounded by anything local.
+
+    The call caps are what protect a free-tier deployment; the cost cap is what
+    protects a paid one.
+    """
 
     def __init__(self) -> None:
         self.calls: deque[float] = deque()
         self.day = ""
         self.cost_usd = 0.0
+        self.day_calls = 0
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(name, str(default))))
+        except ValueError:
+            return default
 
     def check(self) -> None:
         if os.environ.get("ATTACKLENS_OPENROUTER_ENABLED", "true").lower() not in {
@@ -55,43 +101,72 @@ class _OpenRouterUsageGuard:
                 error_type="kill_switch",
             )
         now = time.time()
+
+        # Roll the day window first, so the per-day counter is accurate even on
+        # the request that crosses midnight.
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        if day != self.day:
+            self.day = day
+            self.cost_usd = 0.0
+            self.day_calls = 0
+
         while self.calls and now - self.calls[0] >= 60:
             self.calls.popleft()
-        try:
-            rate_limit = max(1, int(os.environ.get(
-                "ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE", "60",
-            )))
-        except ValueError:
-            rate_limit = 60
+
+        # OpenRouter's free tier is 20 requests/minute and does not increase
+        # with account credit, so exceeding it locally only converts a local
+        # refusal into an upstream 429.
+        rate_limit = max(1, self._int_env(
+            "ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE", 20,
+        ))
         if len(self.calls) >= rate_limit:
             raise RateLimitedError(
                 "ai:openrouter", "AttackLens organization rate budget exhausted",
                 retry_after=max(0.1, 60 - (now - self.calls[0])),
                 error_type="local_rate_budget",
             )
-        day = time.strftime("%Y-%m-%d", time.gmtime(now))
-        if day != self.day:
-            self.day = day
-            self.cost_usd = 0.0
+
+        daily_calls = self._int_env("ATTACKLENS_OPENROUTER_MAX_CALLS_PER_DAY", 1000)
+        if daily_calls and self.day_calls >= daily_calls:
+            raise PermanentError(
+                "ai:openrouter",
+                f"AttackLens daily request budget exhausted "
+                f"({self.day_calls}/{daily_calls} calls today)",
+                error_type="local_call_budget",
+            )
+
         try:
             daily_budget = max(0.0, float(os.environ.get(
-                "ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD", "25",
+                "ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD", "0.5",
             )))
         except ValueError:
-            daily_budget = 25.0
+            daily_budget = 0.5
         if daily_budget and self.cost_usd >= daily_budget:
             raise PermanentError(
                 "ai:openrouter", "AttackLens organization daily cost budget exhausted",
                 error_type="local_cost_budget",
             )
+
         self.calls.append(now)
+        self.day_calls += 1
 
     def charge(self, cost_usd: float) -> None:
         self.cost_usd += max(0.0, float(cost_usd or 0.0))
 
+    def snapshot(self) -> dict:
+        """Current window usage, for the settings status page."""
+        return {
+            "calls_last_minute": len(self.calls),
+            "calls_today": self.day_calls,
+            "cost_usd_today": round(self.cost_usd, 6),
+            "day": self.day,
+        }
+
     def reset(self) -> None:
         self.calls.clear()
         self.day = ""
+        self.day_calls = 0
+        self.cost_usd = 0.0
         self.cost_usd = 0.0
 
 
@@ -344,6 +419,43 @@ class OpenRouterProvider(OpenAIProvider):
         schema: Optional[dict],
     ) -> AIResponse:
         _openrouter_usage_guard.check()
+        primary_model = self._cfg.model
+        is_free = catalog.is_free_model(primary_model)
+
+        if is_free and not _allow_training_models():
+            raise PermanentError(
+                "ai:openrouter",
+                f"Model '{primary_model}' is a free tier, which generally trains on "
+                "submitted prompts. AttackLens prompts contain endpoint "
+                "telemetry. Set ATTACKLENS_AI_MODEL_TIER=free (or auto) to accept "
+                "free models, or set ATTACKLENS_AI_ALLOW_TRAINING_MODELS=true.",
+                error_type="privacy_policy",
+            )
+
+        try:
+            return await self._chat_model(
+                primary_model, user_prompt, max_tokens=max_tokens, schema=schema,
+            )
+        except (PermanentError, TransientError) as exc:
+            fallback = _fallback_model()
+            if fallback and fallback != primary_model and is_free:
+                log.warning(
+                    "Free model %s failed (%s); retrying with paid fallback %s",
+                    primary_model, exc, fallback,
+                )
+                return await self._chat_model(
+                    fallback, user_prompt, max_tokens=max_tokens, schema=schema,
+                )
+            raise
+
+    async def _chat_model(
+        self,
+        model_id: str,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+        schema: Optional[dict],
+    ) -> AIResponse:
         t0 = time.monotonic()
         headers = {
             "Authorization": f"Bearer {self._cfg.api_key}",
@@ -359,22 +471,7 @@ class OpenRouterProvider(OpenAIProvider):
             headers["HTTP-Referer"] = app_url
         if app_title:
             headers["X-OpenRouter-Title"] = app_title
-        model_id = self._cfg.model
         is_free = catalog.is_free_model(model_id)
-
-        # Privacy gate. Free tiers generally train on submitted prompts, and the
-        # prompts here carry endpoint telemetry — process names, package lists,
-        # finding evidence. Sending that to a training-on-input model is a
-        # decision an operator has to make explicitly, so it is opt-in.
-        if is_free and not _allow_training_models():
-            raise PermanentError(
-                "ai:openrouter",
-                f"Model '{model_id}' is a free tier, which generally trains on "
-                "submitted prompts. AttackLens prompts contain endpoint "
-                "telemetry. Set ATTACKLENS_AI_ALLOW_TRAINING_MODELS=true to "
-                "accept this, or choose a paid model.",
-                error_type="privacy_policy",
-            )
 
         payload = {
             "model":       model_id,

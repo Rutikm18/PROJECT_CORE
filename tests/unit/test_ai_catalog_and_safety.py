@@ -131,23 +131,73 @@ def _provider(model_id):
 
 
 @pytest.mark.asyncio
-async def test_free_model_refused_without_explicit_optin(cache, monkeypatch):
+async def test_free_model_refused_when_tier_is_paid(cache, monkeypatch):
+    """tier=paid must reject free models even without the legacy flag."""
     from manager.manager.integrations.resilience import PermanentError
 
     _seed(cache)
+    monkeypatch.setenv("ATTACKLENS_AI_MODEL_TIER", "paid")
     monkeypatch.delenv("ATTACKLENS_AI_ALLOW_TRAINING_MODELS", raising=False)
     monkeypatch.setattr(
         "manager.manager.ai.providers._openrouter_usage_guard.check", lambda: None
     )
 
     p = _provider("deepseek/deepseek-chat-v3-0324:free")
-    with pytest.raises(PermanentError, match="ATTACKLENS_AI_ALLOW_TRAINING_MODELS"):
+    with pytest.raises(PermanentError, match="ATTACKLENS_AI_MODEL_TIER"):
         await p.chat("hello")
+
+
+@pytest.mark.asyncio
+async def test_free_model_allowed_when_tier_is_free(cache, monkeypatch):
+    """Default tier=free auto-allows free models without the legacy flag."""
+    _seed(cache)
+    monkeypatch.setenv("ATTACKLENS_AI_MODEL_TIER", "free")
+    monkeypatch.delenv("ATTACKLENS_AI_ALLOW_TRAINING_MODELS", raising=False)
+    # Just verifying no PermanentError raised — the payload goes through.
+    captured = await _capture_payload(monkeypatch, "deepseek/deepseek-chat-v3-0324:free", schema=None)
+    assert captured["model"] == "deepseek/deepseek-chat-v3-0324:free"
+
+
+@pytest.mark.asyncio
+async def test_auto_tier_falls_back_to_paid_on_failure(cache, monkeypatch):
+    """tier=auto retries free-model failures with the configured fallback."""
+    from manager.manager.integrations.resilience import PermanentError, TransientError
+    from manager.manager.ai.base import ProviderConfig
+    from manager.manager.ai.providers import OpenRouterProvider
+
+    _seed(cache)
+    monkeypatch.setenv("ATTACKLENS_AI_MODEL_TIER", "auto")
+    monkeypatch.setenv("ATTACKLENS_AI_FALLBACK_MODEL", "openai/gpt-4o-mini")
+    monkeypatch.setattr(
+        "manager.manager.ai.providers._openrouter_usage_guard.check", lambda: None
+    )
+    calls = []
+
+    p = OpenRouterProvider(
+        ProviderConfig(provider="openrouter", api_key="sk-or-x",
+                       model="deepseek/deepseek-chat-v3-0324:free")
+    )
+
+    async def _fake_request_json(method, url, headers=None, json_body=None):
+        calls.append(json_body["model"])
+        if json_body["model"].endswith(":free"):
+            raise TransientError("ai:openrouter", "free tier overloaded")
+        return {
+            "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0},
+            "model": json_body["model"],
+        }
+
+    monkeypatch.setattr(p._http, "request_json", _fake_request_json)
+    resp = await p.chat("hello")
+    assert calls == ["deepseek/deepseek-chat-v3-0324:free", "openai/gpt-4o-mini"]
+    assert resp.model == "openai/gpt-4o-mini"
 
 
 @pytest.mark.asyncio
 async def test_paid_model_needs_no_optin(cache, monkeypatch):
     _seed(cache)
+    monkeypatch.setenv("ATTACKLENS_AI_MODEL_TIER", "paid")
     monkeypatch.delenv("ATTACKLENS_AI_ALLOW_TRAINING_MODELS", raising=False)
     captured = await _capture_payload(monkeypatch, "openai/gpt-4o-mini", schema=None)
     assert captured["model"] == "openai/gpt-4o-mini"
@@ -156,7 +206,7 @@ async def test_paid_model_needs_no_optin(cache, monkeypatch):
 @pytest.mark.asyncio
 async def test_schema_omitted_for_model_without_structured_output(cache, monkeypatch):
     _seed(cache)
-    monkeypatch.setenv("ATTACKLENS_AI_ALLOW_TRAINING_MODELS", "true")
+    monkeypatch.setenv("ATTACKLENS_AI_MODEL_TIER", "free")
 
     captured = await _capture_payload(
         monkeypatch, "deepseek/deepseek-chat-v3-0324:free", schema={"type": "object"}
@@ -169,6 +219,7 @@ async def test_schema_omitted_for_model_without_structured_output(cache, monkeyp
 @pytest.mark.asyncio
 async def test_schema_sent_for_capable_model(cache, monkeypatch):
     _seed(cache)
+    monkeypatch.setenv("ATTACKLENS_AI_MODEL_TIER", "paid")
     captured = await _capture_payload(
         monkeypatch, "openai/gpt-4o-mini", schema={"type": "object"}
     )

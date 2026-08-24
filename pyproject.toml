@@ -23,10 +23,19 @@ ignore = [
 "tests/**" = ["S", "N"]   # relax security + naming in tests
 
 [tool.mypy]
-python_version        = "3.11"
+# 3.12, not 3.11: numpy ships stubs that use PEP 695 `type` statements, which
+# mypy refuses to parse below 3.12 — it aborts with a fatal [syntax] error
+# before checking a single project file, so `make lint`'s mypy step silently
+# checked nothing at all. Per-module ignore_errors/follow_imports do not help;
+# the stub is parsed either way. Runtime/syntax compatibility with the lower
+# floor is enforced by ruff's target-version instead, and CI already lints on
+# 3.12.
+python_version        = "3.12"
 ignore_missing_imports = true
 strict                = false
-warn_unused_imports   = true
+# NOT warn_unused_imports — that is not a mypy option and was silently ignored.
+# F401 in ruff already covers unused imports; this covers stale type: ignores.
+warn_unused_ignores   = true
 warn_return_any       = true
 
 [tool.pytest.ini_options]

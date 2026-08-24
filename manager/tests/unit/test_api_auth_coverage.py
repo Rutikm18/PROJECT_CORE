@@ -51,6 +51,15 @@ _ALLOWLIST: dict[str, str] = {
         "Reads the caller's own token and 401s itself when absent.",
     "/api/v1/auth/policy":
         "Password and session policy the login screen renders before sign-in.",
+    "/api/v1/portal/auth/login":
+        "Customer portal login. Cannot require a session in order to issue one. "
+        "Has its own lockout counters so it cannot be used to lock the operator "
+        "account.",
+    "/api/v1/portal/auth/logout":
+        "Clears the portal cookie; must work on an already-expired session.",
+    "/api/v1/portal/auth/accept-invite":
+        "Redeems a single-use setup token. The token IS the credential, so the "
+        "caller has no session yet by definition.",
 }
 
 
@@ -80,6 +89,20 @@ def _dependency_calls(route) -> set:
     return found
 
 
+def _is_protected(route) -> bool:
+    """Whether a route resolves any authentication dependency.
+
+    Two mechanisms, because the portal dependency is a closure built per
+    database handle and so has no stable identity to compare against: match the
+    module-level dependencies by identity, and closures by the
+    ``__auth_dependency__`` marker they set on themselves.
+    """
+    calls = _dependency_calls(route)
+    if _AUTH_CALLABLES & calls:
+        return True
+    return any(getattr(call, "__auth_dependency__", False) for call in calls)
+
+
 def _api_routes(app) -> list:
     return [
         r for r in app.routes
@@ -100,7 +123,7 @@ def test_every_api_route_is_protected_or_allowlisted(app):
         f"{','.join(sorted(r.methods - {'HEAD', 'OPTIONS'}))} {r.path}"
         for r in _api_routes(app)
         if r.path not in _ALLOWLIST
-        and not (_AUTH_CALLABLES & _dependency_calls(r))
+        and not _is_protected(r)
     )
     assert not unprotected, (
         "These /api/v1 routes answer anonymous callers. Add the router to the "
@@ -110,17 +133,45 @@ def test_every_api_route_is_protected_or_allowlisted(app):
     )
 
 
+# The portal routers are registered only when ATTACKLENS_CUSTOMER_PORTAL is
+# set, so their allowlist entries are conditional too.
+_PORTAL_ALLOWLIST = {p for p in _ALLOWLIST if p.startswith("/api/v1/portal")}
+
+
 def test_the_allowlist_is_closed(app):
     """A stale allowlist entry is as dangerous as a missing dependency."""
     live = {r.path for r in _api_routes(app)}
-    stale = sorted(set(_ALLOWLIST) - live)
+    stale = sorted(set(_ALLOWLIST) - live - _PORTAL_ALLOWLIST)
     assert not stale, f"_ALLOWLIST names routes that no longer exist: {stale}"
 
 
 def test_allowlisted_routes_did_not_silently_grow(app):
-    """Six exemptions today. A seventh must be a deliberate edit to this file."""
-    assert len(_ALLOWLIST) == 6
-    assert {r.path for r in _api_routes(app)} & set(_ALLOWLIST) == set(_ALLOWLIST)
+    """Nine exemptions today. A tenth must be a deliberate edit to this file."""
+    assert len(_ALLOWLIST) == 9
+    live = {r.path for r in _api_routes(app)}
+    # Every non-portal exemption must exist; the portal ones only when enabled.
+    assert (live & set(_ALLOWLIST)) >= (set(_ALLOWLIST) - _PORTAL_ALLOWLIST)
+
+
+def test_the_customer_portal_is_off_by_default(app):
+    """"Coming soon" has to mean the routes are absent, not merely hidden.
+
+    A portal login that still answered while the dashboard showed a placeholder
+    would be the worst of both — an unadvertised, unmonitored way in.
+    """
+    import os
+    if os.environ.get("ATTACKLENS_CUSTOMER_PORTAL", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        pytest.skip("portal explicitly enabled in this environment")
+    portal_routes = sorted(
+        r.path for r in _api_routes(app)
+        if r.path.startswith("/api/v1/portal") or r.path.startswith("/api/v1/customers")
+    )
+    assert not portal_routes, (
+        "customer portal routes are registered while the feature is off: "
+        + ", ".join(portal_routes)
+    )
 
 
 def test_the_high_value_routes_are_covered(app):
@@ -142,7 +193,7 @@ def test_the_high_value_routes_are_covered(app):
     missing = sorted(p for p in want if p not in by_path)
     assert not missing, f"expected routes are gone from the app: {missing}"
     for path in sorted(want):
-        assert _AUTH_CALLABLES & _dependency_calls(by_path[path]), path
+        assert _is_protected(by_path[path]), path
 
 
 def test_openapi_schema_is_not_served_by_default(app):

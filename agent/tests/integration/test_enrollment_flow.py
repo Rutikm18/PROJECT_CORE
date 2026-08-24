@@ -13,6 +13,7 @@ Uses FastAPI TestClient with in-memory SQLite (no real network).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import time
@@ -35,8 +36,33 @@ def app(tmp_path_factory):
     os.environ["ENROLLMENT_TOKENS"] = ENROLLMENT_TOKEN
     # API_KEY is now optional — not required for per-agent key flow
     os.environ.pop("API_KEY", None)
+
+    # Throwaway databases, created and dropped around this module.
+    #
+    # DATA_DIR above is not isolation any more. It was the whole story under
+    # SQLite, but Postgres is the authoritative store now and DATA_DIR only
+    # redirects TelemetryStore's optional file archive (server.py). Without
+    # these two variables create_app() falls back to DATABASE_URL's default and
+    # this module enrols its `integ-agent-00N` fixtures straight into whatever
+    # real `manager` database the developer has running — polluting it, and
+    # letting accumulated state decide whether assertions like
+    # test_enrolled_agent_visible_in_agents_list pass.
+    from manager.tests.conftest import _create_test_db, _drop_test_db
+    manager_dsn, manager_db = asyncio.run(_create_test_db())
+    intel_dsn,   intel_db   = asyncio.run(_create_test_db())
+    os.environ["MANAGER_DATABASE_URL"] = manager_dsn
+    os.environ["INTEL_DATABASE_URL"]   = intel_dsn
+
     from manager.manager.server import create_app
-    return create_app()
+    try:
+        yield create_app()
+    finally:
+        for key in ("MANAGER_DATABASE_URL", "INTEL_DATABASE_URL"):
+            os.environ.pop(key, None)
+        # `client` is module-scoped and depends on this fixture, so its
+        # TestClient context has already exited and closed the pools by now.
+        asyncio.run(_drop_test_db(manager_db))
+        asyncio.run(_drop_test_db(intel_db))
 
 
 @pytest.fixture(scope="module")

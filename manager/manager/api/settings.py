@@ -575,9 +575,9 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
 
         try:
             async with intel_db._lock:
-                for key, value in updates.items():
-                    await _write(key, str(value).strip(), actor, ip)
-                await intel_db._conn.commit()
+                async with intel_db.write_txn():
+                    for key, value in updates.items():
+                        await _write(key, str(value).strip(), actor, ip)
 
             raw      = await _load()
             settings = _redact(raw)
@@ -724,23 +724,23 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
         actor, ip = _actor_ip(request)
         try:
             async with intel_db._lock:
-                # Load current values for audit trail
-                raw = await _load()
-                await intel_db._conn.execute("DELETE FROM org_settings", ())
-                ts = time.time()
-                for key, value in ALL_DEFAULTS.items():
-                    old_val = raw.get(key, "")
-                    await intel_db._conn.execute(
-                        "INSERT INTO org_settings(key,value,updated_at) VALUES(?,?,?)",
-                        (key, value, ts),
-                    )
-                    if old_val != value:
+                async with intel_db.write_txn():
+                    # Load current values for audit trail
+                    raw = await _load()
+                    await intel_db._conn.execute("DELETE FROM org_settings", ())
+                    ts = time.time()
+                    for key, value in ALL_DEFAULTS.items():
+                        old_val = raw.get(key, "")
                         await intel_db._conn.execute(
-                            "INSERT INTO settings_audit(key,old_value,new_value,actor,ip,changed_at) "
-                            "VALUES(?,?,?,?,?,?)",
-                            (key, old_val, value, actor, ip, ts),
+                            "INSERT INTO org_settings(key,value,updated_at) VALUES(?,?,?)",
+                            (key, value, ts),
                         )
-                await intel_db._conn.commit()
+                        if old_val != value:
+                            await intel_db._conn.execute(
+                                "INSERT INTO settings_audit(key,old_value,new_value,actor,ip,changed_at) "
+                                "VALUES(?,?,?,?,?,?)",
+                                (key, old_val, value, actor, ip, ts),
+                            )
 
             return {
                 "reset":    True,
@@ -790,9 +790,9 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
 
         try:
             async with intel_db._lock:
-                for key, value in to_write.items():
-                    await _write(key, value, actor, ip)
-                await intel_db._conn.commit()
+                async with intel_db.write_txn():
+                    for key, value in to_write.items():
+                        await _write(key, value, actor, ip)
             raw = await _load()
             return {
                 "imported": sorted(to_write.keys()),
@@ -927,9 +927,9 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
 
         try:
             async with intel_db._lock:
-                for key, value in updates.items():
-                    await _write(key, value, actor, ip)
-                await intel_db._conn.commit()
+                async with intel_db.write_txn():
+                    for key, value in updates.items():
+                        await _write(key, value, actor, ip)
         except Exception as exc:
             log.exception("update_validation_settings failed")
             raise HTTPException(500, f"Failed to save validation settings: {exc}")

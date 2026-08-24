@@ -28,6 +28,7 @@ key is configured — the deterministic factors alone still produce a score.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import inspect
 import json
@@ -89,6 +90,12 @@ class AiVerdict:
     cost_usd: float = 0.0
     prompt_version: str = ""
     schema_version: str = ""
+    # True when this verdict was served from ai_verdict_cache rather than a
+    # fresh call. `used_llm` stays True — the verdict *is* model-derived, and
+    # flipping it would misroute the score into the deterministic-only path.
+    # tokens_used and cost_usd are zeroed on a hit because no spend occurred
+    # on this run, which is what makes the cost telemetry honest.
+    cached: bool = False
 
 
 @dataclass
@@ -148,7 +155,7 @@ async def validate_with_ai(
     else:
         try:
             ai_verdict = await _ai_evaluate_cluster(
-                cluster, enriched, validation_model,
+                cluster, enriched, validation_model, idb,
             )
         except asyncio.TimeoutError:
             ai_error = "llm_timeout"
@@ -406,12 +413,99 @@ def _is_transient_error(exc: Exception) -> bool:
     return isinstance(exc, (TransientError, asyncio.TimeoutError))
 
 
-async def _ai_evaluate_cluster(cluster, enriched: dict, validation_model) -> AiVerdict:
+_CACHE_FIELDS = (
+    "label", "confidence", "reasoning", "key_evidence", "risk_factors",
+    "provider", "model", "generation_id", "upstream_provider",
+    "finish_reason", "prompt_version", "schema_version",
+)
+
+
+def verdict_cache_key(prompt: str, model_id: str) -> str:
+    """Identity of an answered prompt.
+
+    The prompt already encodes every input the model sees — evidence, rule,
+    host, enrichment — so hashing it is exact rather than a guess about which
+    evidence fields matter. The model id and both contract versions are folded
+    in so a model switch, a prompt rewrite, or a schema bump all miss instead
+    of serving a verdict produced under different rules.
+
+    Returns '' when the model is unknown, which callers treat as uncacheable.
+    """
+    if not model_id:
+        return ""
+    from .validation_model import (
+        VALIDATION_PROMPT_VERSION, VALIDATION_RESPONSE_SCHEMA_VERSION,
+    )
+    material = "\x1f".join((
+        prompt, model_id,
+        VALIDATION_PROMPT_VERSION, VALIDATION_RESPONSE_SCHEMA_VERSION,
+    ))
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+
+def _verdict_to_cache_payload(verdict: AiVerdict) -> dict:
+    return {name: getattr(verdict, name) for name in _CACHE_FIELDS}
+
+
+def _verdict_from_cache_payload(payload: dict) -> Optional[AiVerdict]:
+    """Rebuild a verdict from cache, or None when the row is unusable.
+
+    A malformed row must behave exactly like a miss — the caller then makes a
+    real call — so every failure path here returns None rather than raising.
+    """
+    if not isinstance(payload, dict):
+        return None
+    label = payload.get("label")
+    if label not in {"tp", "fp", "uncertain"}:
+        return None
+    confidence = payload.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
+    evidence = payload.get("key_evidence")
+    risks = payload.get("risk_factors")
+    return AiVerdict(
+        label=str(label),
+        confidence=float(confidence),
+        reasoning=str(payload.get("reasoning") or ""),
+        key_evidence=[str(x) for x in evidence] if isinstance(evidence, list) else [],
+        risk_factors=[str(x) for x in risks] if isinstance(risks, list) else [],
+        used_llm=True,
+        tokens_used=0,          # no spend on this run
+        provider=str(payload.get("provider") or ""),
+        model=str(payload.get("model") or ""),
+        generation_id=str(payload.get("generation_id") or ""),
+        upstream_provider=str(payload.get("upstream_provider") or ""),
+        finish_reason=str(payload.get("finish_reason") or ""),
+        cost_usd=0.0,           # no spend on this run
+        prompt_version=str(payload.get("prompt_version") or ""),
+        schema_version=str(payload.get("schema_version") or ""),
+        cached=True,
+    )
+
+
+def _verdict_cache_ttl_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get(
+            "ATTACKLENS_AI_VERDICT_CACHE_TTL_S", "604800",
+        )))
+    except ValueError:
+        return 604800.0
+
+
+async def _ai_evaluate_cluster(
+    cluster, enriched: dict, validation_model, idb=None,
+) -> AiVerdict:
     """
     Ask the LLM to act as a senior SOC analyst and emit a structured TP/FP/uncertain
     verdict.  The prompt is heavily constrained: JSON only, exact schema, no prose.
     The ValidationModel adapter owns provider resolution, structured transport,
     and strict local response validation.
+
+    Answered prompts are served from `ai_verdict_cache` when `idb` is supplied.
+    The detection loop re-runs every open finding each cycle, so without this a
+    finding that stays open all day costs one call per cycle against evidence
+    that never changed — which exhausts a free provider's daily request quota
+    long before it costs money.
     """
     from .validation_model import resolve_validation_model
     prompt = _build_ai_prompt(cluster, enriched)
@@ -423,11 +517,27 @@ async def _ai_evaluate_cluster(cluster, enriched: dict, validation_model) -> AiV
     )
     if model is None:
         raise RuntimeError("No validation model configured")
+
+    cache_key = verdict_cache_key(prompt, str(getattr(model, "model_id", "") or ""))
+    if idb is not None and cache_key:
+        payload = await idb.get_cached_ai_verdict(
+            cache_key, max_age_s=_verdict_cache_ttl_s(),
+        )
+        if payload is not None:
+            hit = _verdict_from_cache_payload(payload)
+            if hit is not None:
+                await idb.touch_ai_verdict_cache(cache_key)
+                log.debug(
+                    "ai verdict cache hit agent=%s key=%s",
+                    getattr(cluster, "agent_id", "?"), cache_key[:12],
+                )
+                return hit
+
     timeout_s = max(5.0, min(120.0, float(
         ENGINE_CONFIG.get("ai_validation_timeout_sec", 45.0)
     )))
     verdict = await asyncio.wait_for(model.evaluate(prompt), timeout=timeout_s)
-    return AiVerdict(
+    result = AiVerdict(
         label=verdict.label,
         confidence=verdict.confidence,
         reasoning=verdict.reasoning,
@@ -444,6 +554,17 @@ async def _ai_evaluate_cluster(cluster, enriched: dict, validation_model) -> AiV
         prompt_version=verdict.prompt_version,
         schema_version=verdict.schema_version,
     )
+    if idb is not None and cache_key:
+        await idb.put_cached_ai_verdict(
+            cache_key,
+            _verdict_to_cache_payload(result),
+            task="validation",
+            model=result.model,
+            provider=result.provider,
+            tokens_used=result.tokens_used,
+            cost_usd=result.cost_usd,
+        )
+    return result
 
 
 def _build_ai_prompt(cluster, enriched: dict) -> str:

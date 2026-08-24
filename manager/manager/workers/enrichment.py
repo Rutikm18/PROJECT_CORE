@@ -385,22 +385,22 @@ class EnrichmentWorker:
             # transaction state ("transaction is in error state" on the next
             # unrelated commit, anywhere in the app).
             async with self._idb._lock:
-                await self._idb._conn.execute(  # type: ignore[attr-defined]
-                    "UPDATE findings SET tags=? WHERE id=?",
-                    (json.dumps(tags), finding.get("id")),
-                )
-                await self._idb._conn.commit()  # type: ignore[attr-defined]
+                async with self._idb.write_txn() as conn:
+                    await conn.execute(
+                        "UPDATE findings SET tags=? WHERE id=?",
+                        (json.dumps(tags), finding.get("id")),
+                    )
         except Exception as exc:
             log.debug("tag update failed for finding=%s: %s", finding.get("id"), exc)
 
     async def _update_severity(self, finding: dict, severity: str) -> None:
         try:
             async with self._idb._lock:  # see _add_tag's comment above
-                await self._idb._conn.execute(  # type: ignore[attr-defined]
-                    "UPDATE findings SET severity=? WHERE id=?",
-                    (severity, finding.get("id")),
-                )
-                await self._idb._conn.commit()  # type: ignore[attr-defined]
+                async with self._idb.write_txn() as conn:
+                    await conn.execute(
+                        "UPDATE findings SET severity=? WHERE id=?",
+                        (severity, finding.get("id")),
+                    )
             log.info(
                 "severity escalated to %s for finding=%s",
                 severity, finding.get("id"),

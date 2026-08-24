@@ -90,9 +90,13 @@ def make_custom_correlations_router(intel_db) -> APIRouter:
         return _row_to_dict(row)
 
     async def _write(sql: str, args: tuple) -> None:
-        """Execute a write statement on the shared write connection."""
-        await intel_db._conn.execute(sql, args)
-        await intel_db._conn.commit()
+        """Execute a write statement on the shared write connection.
+
+        write_txn rolls back on failure so a bad statement here cannot poison
+        the connection for every other endpoint.
+        """
+        async with intel_db.write_txn() as conn:
+            await conn.execute(sql, args)
 
     # ── GET /  ────────────────────────────────────────────────────────────────
     @router.get("")

@@ -70,13 +70,18 @@ TASK_SECTIONS: frozenset[str] = frozenset({
 
 # Ranges of Unicode characters that visually resemble ASCII or are invisible
 _HOMOGLYPH_RE = re.compile(
-    r"[а-я"       # Cyrillic lowercase (look like Latin)
-    r"Ѐ-Я"        # Cyrillic uppercase
-    r"Ͱ-Ͽ"        # Greek
-    r"​-‏"        # Zero-width characters
-    r" -⁯"        # General punctuation (includes invisible)
-    r"﻿"               # BOM / ZWNBSP
-    r"­"               # Soft hyphen
+    # Written as \uXXXX escapes, not literal characters. `re` interprets
+    # these identically, but the literal form embedded real bidirectional
+    # control characters (U+200F among them) in the source — so this file,
+    # whose whole job is catching hidden-character attacks, tripped every
+    # Trojan Source scanner including our own bandit run (B613, HIGH).
+    r"[\u0430-\u044f"     # Cyrillic lowercase (look like Latin)
+    r"\u0400-\u042f"      # Cyrillic uppercase
+    r"\u0370-\u03ff"      # Greek
+    r"\u200b-\u200f"      # Zero-width characters
+    r"\u2000-\u206f"      # General punctuation (includes invisible)
+    r"\ufeff"              # BOM / ZWNBSP
+    r"\u00ad"              # Soft hyphen
     r"]"
 )
 

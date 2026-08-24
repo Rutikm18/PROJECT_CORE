@@ -67,6 +67,38 @@ gen_b64_secret() {
   fi
 }
 
+# Dashboard admin password + its PBKDF2 hash, printed as two lines
+# (plaintext, then hash). Without this the manager falls back to a password
+# hardcoded in manager/manager/api/auth_ui.py that is byte-identical on every
+# install — a fresh deployment would ship with a credential anyone can look up.
+#
+# Reimplements security_policy.hash_password with stdlib only, rather than
+# importing it: env.sh is run before dependencies are installed and from
+# whatever directory the operator happens to be in. The construction must stay
+# in step with that function — pbkdf2:sha256:<iters>:<salt_hex>:<dk_hex>.
+gen_dashboard_secret() {
+  python3 - <<'PY'
+import hashlib, os, secrets, string
+
+lower, upper, digit = string.ascii_lowercase, string.ascii_uppercase, string.digits
+special = "!@#$%^&*()-_=+[]{}"
+alphabet = lower + upper + digit + special
+
+# Seed one character from each class before filling, so the result always
+# satisfies the policy the dashboard enforces on a password change (16-128
+# chars, upper + lower + digit + symbol) rather than satisfying it by luck.
+chars = [secrets.choice(pool) for pool in (lower, upper, digit, special)]
+chars += [secrets.choice(alphabet) for _ in range(20)]
+secrets.SystemRandom().shuffle(chars)
+password = "".join(chars)
+
+salt = os.urandom(32)
+dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600_000, 32)
+print(password)
+print(f"pbkdf2:sha256:600000:{salt.hex()}:{dk.hex()}")
+PY
+}
+
 # ── Detect public IP ──────────────────────────────────────────────────────────
 detect_ip() {
   local ip=""
@@ -209,6 +241,23 @@ if [[ -z "${JWT_SECRET:-}" ]]; then
   JWT_SECRET="$(gen_b64_secret 32)"
 fi
 
+# Dashboard login. Only the hash is persisted; the plaintext is shown once
+# below and then discarded, so it cannot be recovered from .env later.
+: "${DASHBOARD_EMAIL:=admin@attacklens.ai}"
+DASHBOARD_PASSWORD_IS_NEW=0
+DASHBOARD_PASSWORD=""
+if [[ -z "${DASHBOARD_PASSWORD_HASH:-}" ]]; then
+  if command -v python3 &>/dev/null; then
+    _dash_secret="$(gen_dashboard_secret 2>/dev/null || true)"
+    if [[ "$(printf '%s\n' "$_dash_secret" | wc -l)" -ge 2 ]]; then
+      DASHBOARD_PASSWORD="$(printf '%s\n' "$_dash_secret" | sed -n 1p)"
+      DASHBOARD_PASSWORD_HASH="$(printf '%s\n' "$_dash_secret" | sed -n 2p)"
+      DASHBOARD_PASSWORD_IS_NEW=1
+    fi
+    unset _dash_secret
+  fi
+fi
+
 ok "Admin token   : ${ADMIN_TOKEN:0:16}... (full value in .env)"
 if [[ "$OPEN_ENROLLMENT" == "false" ]]; then
 ok "Enroll token  : ${ENROLLMENT_TOKENS:0:16}... (full value in .env)"
@@ -217,6 +266,23 @@ if [[ "$JWT_SECRET_IS_NEW" == "1" ]]; then
   ok "JWT secret    : generated (32 bytes, base64)"
 else
   info "JWT secret    : preserved from existing .env"
+fi
+
+if [[ "$DASHBOARD_PASSWORD_IS_NEW" == "1" ]]; then
+  ok "Dashboard pw  : generated — only the hash is stored, SAVE THIS NOW:"
+  echo ""
+  echo "      email    : ${DASHBOARD_EMAIL}"
+  echo "      password : ${DASHBOARD_PASSWORD}"
+  echo ""
+  info "                This is the only time it is shown. Losing it means"
+  info "                clearing DASHBOARD_PASSWORD_HASH in .env and re-running."
+elif [[ -n "${DASHBOARD_PASSWORD_HASH:-}" ]]; then
+  info "Dashboard pw  : preserved from existing .env"
+else
+  warn "Dashboard pw  : NOT set (python3 unavailable). The manager will fall back"
+  warn "                to a password hardcoded in auth_ui.py that is identical on"
+  warn "                every install. Set DASHBOARD_PASSWORD_HASH before exposing"
+  warn "                this deployment — see .env.example."
 fi
 
 # Introducing JWT_SECRET where one was never set changes the HKDF master, so a
@@ -262,8 +328,25 @@ fi
 : "${OPENROUTER_APP_URL:=https://attacklens.ai}"
 : "${OPENROUTER_APP_TITLE:=AttackLens}"
 : "${ATTACKLENS_OPENROUTER_ENABLED:=true}"
-: "${ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE:=60}"
-: "${ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD:=25}"
+# 20/min matches OpenRouter's ceiling on :free model variants, which does not
+# rise with account credit. Setting this higher only turns a local refusal into
+# an upstream 429.
+: "${ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE:=20}"
+# Free accounts get 50 requests/day; a one-time $10 credit purchase raises that
+# to 1000/day permanently. Set to 50 if you have not purchased credit.
+: "${ATTACKLENS_OPENROUTER_MAX_CALLS_PER_DAY:=1000}"
+: "${ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD:=0.5}"
+# How long an answered prompt stays reusable. Evidence changes produce a new
+# key regardless, so this only bounds how stale an unchanged verdict may get.
+: "${ATTACKLENS_AI_VERDICT_CACHE_TTL_S:=604800}"
+# Model tier: free (default) | paid | auto
+#   free — use free OpenRouter models; training-on-input is implied and accepted.
+#   paid — require paid models only; ATTACKLENS_AI_ALLOW_TRAINING_MODELS is still
+#           the gate for the explicit opt-in path if you ever use a :free model.
+#   auto — try free first; fall back to ATTACKLENS_AI_FALLBACK_MODEL on failure.
+: "${ATTACKLENS_AI_MODEL_TIER:=free}"
+: "${ATTACKLENS_AI_FALLBACK_MODEL:=openai/gpt-4o-mini}"
+# Kept for backwards compatibility; tier=free/auto supersedes this.
 : "${ATTACKLENS_AI_ALLOW_TRAINING_MODELS:=false}"
 
 # Legacy env-var AI path (manager/manager/ai_analyst.py) — Anthropic only.
@@ -310,11 +393,14 @@ fi
 MANAGED_KEYS=(
   PUBLIC_IP DOMAIN BIND_PORT ADMIN_EMAIL TLS_MODE
   ADMIN_TOKEN OPEN_ENROLLMENT ENROLLMENT_TOKENS JWT_SECRET
+  DASHBOARD_EMAIL DASHBOARD_PASSWORD_HASH
   DEFAULT_KEY_EXPIRY_DAYS LOG_LEVEL CORS_ORIGINS APP_UID APP_GID
   AI_PROVIDER AI_MODEL AI_API_KEY AI_BASE_URL
   OPENROUTER_APP_URL OPENROUTER_APP_TITLE
   ATTACKLENS_OPENROUTER_ENABLED ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE
-  ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD ATTACKLENS_AI_ALLOW_TRAINING_MODELS
+  ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD ATTACKLENS_OPENROUTER_MAX_CALLS_PER_DAY
+  ATTACKLENS_AI_VERDICT_CACHE_TTL_S
+  ATTACKLENS_AI_MODEL_TIER ATTACKLENS_AI_FALLBACK_MODEL ATTACKLENS_AI_ALLOW_TRAINING_MODELS
   ANTHROPIC_API_KEY AI_ANALYST_MODEL AI_ANALYST_ENABLED
   LANGGRAPH_INVESTIGATIONS_ENABLED LANGGRAPH_AUTO_INVESTIGATE
   LANGGRAPH_AUTO_SEVERITIES LANGGRAPH_MAX_REVIEW_ROUNDS
@@ -396,6 +482,16 @@ ENROLLMENT_TOKENS=${ENROLLMENT_TOKENS}
 # Settings. Keep it stable, and treat it like any other production secret.
 JWT_SECRET="${JWT_SECRET}"
 
+# Dashboard login. Only the PBKDF2 hash is stored — the plaintext was shown once
+# by env.sh and is not recoverable from here. To rotate: clear the hash below and
+# re-run ./env.sh, or set your own with
+#   python3 -c "from manager.manager.security_policy import hash_password; \
+#               import getpass; print(hash_password(getpass.getpass()))"
+# Leaving the hash empty makes the manager fall back to a password hardcoded in
+# auth_ui.py and shared by every AttackLens install.
+DASHBOARD_EMAIL=${DASHBOARD_EMAIL}
+DASHBOARD_PASSWORD_HASH="${DASHBOARD_PASSWORD_HASH}"
+
 # ── Key policy ────────────────────────────────────────────────────────────────
 # Days until agent API keys expire. 0 = never expire.
 DEFAULT_KEY_EXPIRY_DAYS=${DEFAULT_KEY_EXPIRY_DAYS}
@@ -439,16 +535,27 @@ AI_BASE_URL="${AI_BASE_URL}"
 OPENROUTER_APP_URL="${OPENROUTER_APP_URL}"
 OPENROUTER_APP_TITLE="${OPENROUTER_APP_TITLE}"
 
-# Spend guard. The kill switch stops all OpenRouter calls immediately; the other
-# two cap per-minute call rate and daily spend (USD, process-local).
+# Usage guard. The kill switch stops all OpenRouter calls immediately. The two
+# call caps are what protect a FREE-tier deployment (free models report $0, so
+# the cost cap below never fires on them); the cost cap protects a paid one.
+#   20/min  — OpenRouter's ceiling on :free variants, fixed regardless of credit
+#   1000/day — free tier is 50/day until a one-time $10 credit purchase
 ATTACKLENS_OPENROUTER_ENABLED=${ATTACKLENS_OPENROUTER_ENABLED}
 ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE=${ATTACKLENS_OPENROUTER_MAX_CALLS_PER_MINUTE}
+ATTACKLENS_OPENROUTER_MAX_CALLS_PER_DAY=${ATTACKLENS_OPENROUTER_MAX_CALLS_PER_DAY}
 ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD=${ATTACKLENS_OPENROUTER_DAILY_BUDGET_USD}
 
-# Free OpenRouter models (':free') generally TRAIN ON SUBMITTED PROMPTS, and
-# these prompts carry endpoint telemetry: process names, package lists, finding
-# evidence. Calls to a free model are refused until you accept that here.
-# Set to true to use free models; keep false and pick a paid model otherwise.
+# Answered-prompt cache TTL. The detection loop re-evaluates every open finding
+# each cycle; without the cache one unchanged finding costs a call per cycle.
+ATTACKLENS_AI_VERDICT_CACHE_TTL_S=${ATTACKLENS_AI_VERDICT_CACHE_TTL_S}
+
+# Model tier: free (default) | paid | auto
+#   free  — use free models; training-on-prompt accepted implicitly.
+#   paid  — paid models only; ALLOW_TRAINING gate still protects accidental :free use.
+#   auto  — try free first, fall back to ATTACKLENS_AI_FALLBACK_MODEL on failure.
+ATTACKLENS_AI_MODEL_TIER=${ATTACKLENS_AI_MODEL_TIER}
+ATTACKLENS_AI_FALLBACK_MODEL=${ATTACKLENS_AI_FALLBACK_MODEL}
+# Legacy explicit opt-in (tier=free/auto supersedes this).
 ATTACKLENS_AI_ALLOW_TRAINING_MODELS=${ATTACKLENS_AI_ALLOW_TRAINING_MODELS}
 
 # Legacy Anthropic-only path used by the remediation API. Leave empty once the
@@ -560,6 +667,12 @@ EOF
 
 else
   # IP-only mode — Caddy internal CA (self-signed)
+  # Named sites, deduped: PUBLIC_IP is often already "localhost" on a laptop,
+  # and Caddy refuses to start on a duplicate site address.
+  CADDY_SITES="${PUBLIC_IP}:${BIND_PORT}"
+  if [ "${PUBLIC_IP}" != "localhost" ]; then
+    CADDY_SITES="${CADDY_SITES}, localhost:${BIND_PORT}"
+  fi
   cat > Caddyfile <<EOF
 # =============================================================================
 #  Caddyfile — Jarvis Manager (internal self-signed TLS on port ${BIND_PORT})
@@ -574,7 +687,11 @@ else
     local_certs
 }
 
-:${BIND_PORT} {
+# The site MUST be named. An address-only ":${BIND_PORT}" block gives Caddy's
+# internal CA no subject to issue a leaf certificate for, so it presents nothing
+# and every TLS handshake dies with "tlsv1 alert internal error" (alert 80) —
+# the listener is up, the port accepts, and nothing can connect.
+${CADDY_SITES} {
     # Internal self-signed TLS certificate
     tls internal
 

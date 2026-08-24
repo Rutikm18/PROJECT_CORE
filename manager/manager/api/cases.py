@@ -282,8 +282,12 @@ def make_cases_router(intel_db, *, auth_required: bool = False) -> APIRouter:
         return {"imported": imported, "count": len(imported)}
 
     async def _write(sql: str, args: tuple) -> None:
-        await intel_db._conn.execute(sql, args)
-        await intel_db._conn.commit()
+        # write_txn rolls back on failure. Without it a single bad statement
+        # left the shared connection poisoned, so every later case transition
+        # (open / close / investigate / accept risk / false positive) returned
+        # 500 until the manager was restarted.
+        async with intel_db.write_txn() as conn:
+            await conn.execute(sql, args)
 
     async def _finding_context(finding_id: int) -> dict:
         row = await intel_db._fetchone(
@@ -321,7 +325,10 @@ def make_cases_router(intel_db, *, auth_required: bool = False) -> APIRouter:
             finding_uid=ctx.get("finding_uid") or "",
             changed_fields=changed_fields or {},
         )
-        await intel_db._conn.commit()
+        # Same reasoning as _write: an activity-log failure must not poison the
+        # connection for unrelated writers.
+        async with intel_db.write_txn():
+            pass
 
     def _row(row) -> dict:
         if row is None:

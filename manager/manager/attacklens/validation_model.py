@@ -71,6 +71,16 @@ class ProviderValidationModel:
     def __init__(self, provider: AIProvider) -> None:
         self._provider = provider
 
+    @property
+    def model_id(self) -> str:
+        """Configured model id, or '' when the provider cannot report one.
+
+        Empty is meaningful: the verdict cache treats an unknown model as
+        uncacheable rather than risking a verdict from one model being served
+        for another. Test fakes that implement only `chat` land here.
+        """
+        return str(getattr(self._provider, "model_id", "") or "")
+
     async def evaluate(self, prompt: str) -> ValidationModelVerdict:
         if isinstance(self._provider, AIProvider):
             response = await self._provider.chat_structured(
