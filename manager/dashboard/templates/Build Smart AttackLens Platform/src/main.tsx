@@ -5,6 +5,12 @@
   import "./styles/index.css";
   import { initTimezone } from "./app/context/timezoneStore";
   import { ErrorBoundary } from "./app/components/ErrorBoundary";
+  import { installApiFetch } from "./app/lib/apiFetch";
+
+  // Make every same-origin /api call carry its credential (cookie + bearer
+  // fallback) before anything fetches — fixes 401s behind the AWS proxy where
+  // the default cookie mode is unreliable. Must run before initTimezone().
+  installApiFetch();
 
   // Kick off server timezone sync immediately — non-blocking.
   // useTimezone() hooks initialise from localStorage/default synchronously;

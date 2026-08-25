@@ -192,7 +192,11 @@ export default function CustomersPanel() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const r = await fetch(API);
+      // Customer-management routes require the operator session. Explicitly
+      // include the httpOnly session cookie so this keeps working behind an
+      // AWS proxy/domain where the browser's default credential mode is not
+      // reliable for the deployed dashboard.
+      const r = await fetch(API, { credentials: "include" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setCustomers((await r.json()).customers ?? []);
       setError(null);
@@ -208,6 +212,7 @@ export default function CustomersPanel() {
     try {
       const r = await fetch(`${API}${path}`, {
         ...init,
+        credentials: "include",
         headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
       });
       const body = await r.json().catch(() => ({}));
