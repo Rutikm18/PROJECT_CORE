@@ -555,6 +555,9 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
                 "required_fields":    sorted(REQUIRED_FIELDS),
                 "boolean_fields":     sorted(BOOLEAN_FIELDS),
                 "date_fields":        sorted(DATE_FIELDS),
+                # Once org_name is set it is locked to dashboard edits; only the
+                # server-side set-org-name command can change it thereafter.
+                "org_name_locked":    bool(raw.get("org_name", "").strip()),
             }
         except Exception as exc:
             log.exception("get_settings failed")
@@ -573,19 +576,33 @@ def make_settings_router(intel_db, store=None, db=None) -> APIRouter:
 
         actor, ip = _actor_ip(request)
 
+        # Org name is set once from the dashboard, then locked: only the
+        # server-side set-org-name command may change it afterwards. Re-submitting
+        # the same value is a no-op; a different value is dropped and reported so
+        # the UI can explain why it did not change.
+        locked: list[str] = []
+        if "org_name" in updates:
+            current = (await _load()).get("org_name", "").strip()
+            if current and str(updates["org_name"]).strip() != current:
+                locked.append("org_name")
+                updates.pop("org_name")
+
         try:
-            async with intel_db._lock:
-                async with intel_db.write_txn():
-                    for key, value in updates.items():
-                        await _write(key, str(value).strip(), actor, ip)
+            if updates:
+                async with intel_db._lock:
+                    async with intel_db.write_txn():
+                        for key, value in updates.items():
+                            await _write(key, str(value).strip(), actor, ip)
 
             raw      = await _load()
             settings = _redact(raw)
             return {
-                "settings": settings,
-                "license":  _license_status(raw),
-                "updated":  sorted(updates.keys()),
-                "actor":    actor,
+                "settings":        settings,
+                "license":         _license_status(raw),
+                "updated":         sorted(updates.keys()),
+                "locked":          locked,
+                "org_name_locked": bool(raw.get("org_name", "").strip()),
+                "actor":           actor,
             }
         except HTTPException:
             raise

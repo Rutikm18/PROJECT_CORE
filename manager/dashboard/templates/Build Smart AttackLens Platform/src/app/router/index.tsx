@@ -23,7 +23,7 @@
 import { createBrowserRouter, Navigate, Outlet } from "react-router";
 import { lazy, Suspense } from "react";
 import { AuthProvider } from "../context/AuthContext";
-import { RBACProvider } from "../context/RBACContext";
+import { RBACProvider, RequireAdmin } from "../context/RBACContext";
 import { ProtectedRoute } from "./guards";
 import AppShell from "../layouts/AppShell";
 import LoginPage from "../pages/LoginPage";
@@ -272,7 +272,9 @@ export const router = createBrowserRouter([
             path: "settings",
             children: [
               { index: true,        element: <Navigate to="/settings/org" replace /> },
-              { path: ":section",   element: <S><Settings /></S> },
+              // Settings manages keys, retention, org identity and customer
+              // dashboards — administrator-only for now.
+              { path: ":section",   element: <S><RequireAdmin><Settings /></RequireAdmin></S> },
             ],
           },
 

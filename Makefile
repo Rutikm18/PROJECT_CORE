@@ -410,6 +410,19 @@ ps: ## Show container status
 restart: ## Restart the manager container only
 	docker compose restart manager
 
+.PHONY: delete-agents
+delete-agents: ## Delete agents + ALL their data. Usage: make delete-agents AGENTS="id1 id2" OLDER_THAN=30d [DRY_RUN=1] [YES=1]
+	@docker compose exec -T manager python -m manager.manager.scripts.delete_agents \
+		$(if $(AGENTS),--agents "$(AGENTS)") \
+		$(if $(OLDER_THAN),--older-than "$(OLDER_THAN)") \
+		$(if $(DRY_RUN),--dry-run) \
+		$(if $(YES),--yes)
+
+.PHONY: set-org-name
+set-org-name: ## Set the (dashboard-locked) organization name. Usage: make set-org-name NAME="Acme Corp"
+	@test -n "$(NAME)" || (echo "  ERROR: NAME is required, e.g. make set-org-name NAME=\"Acme Corp\""; exit 1)
+	@docker compose exec -T manager python -m manager.manager.scripts.set_org_name --name "$(NAME)"
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 .PHONY: clean
 clean: ## Remove compiled Python files and test artifacts

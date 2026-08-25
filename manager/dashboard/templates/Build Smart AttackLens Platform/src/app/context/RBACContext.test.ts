@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  ROLES, isRole, permitted, userFromAuthMe, type Role,
+  ROLES, isRole, permitted, userFromAuthMe, isAdminRole, type Role,
 } from "./RBACContext";
 
 /**
@@ -86,5 +86,17 @@ describe("permission checks", () => {
     expect(permitted("analyst", "some_future_action")).toBe(false);
     expect(permitted("viewer", "some_future_action")).toBe(false);
     expect(permitted(null, "some_future_action")).toBe(false);
+  });
+});
+
+describe("administrator-only gate", () => {
+  it("treats only the admin role as privileged", () => {
+    expect(isAdminRole("admin")).toBe(true);
+  });
+
+  it("denies every non-admin role and the unresolved session", () => {
+    for (const role of ["analyst", "viewer", null] as (Role | null)[]) {
+      expect(isAdminRole(role), String(role)).toBe(false);
+    }
   });
 });

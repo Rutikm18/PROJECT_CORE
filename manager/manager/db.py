@@ -144,6 +144,19 @@ _MIGRATIONS = [
     ("detection_events", "correlated_at", "DOUBLE PRECISION"),
 ]
 
+# Tables in this database keyed by agent_id, children before the `agents` parent
+# so delete_agent() removes an agent and its telemetry in one transaction. Must
+# track the schema: test_delete_agents.py asserts this equals every table with an
+# agent_id column. detection_event_chunks (FK-cascades from detection_events) and
+# nonce_cache (no agent_id) are intentionally absent.
+AGENT_SCOPED_TABLES: tuple[str, ...] = (
+    "payloads",
+    "agent_sessions",
+    "agent_keys",
+    "detection_events",
+    "agents",
+)
+
 
 def _tenant_payload_scope() -> tuple[str | None, list]:
     """Tenant restriction for raw-payload queries, taken from the request scope.
@@ -385,6 +398,47 @@ class Database:
             )
             await db.commit()
             return cur.rowcount > 0
+
+    async def agent_exists(self, agent_id: str) -> bool:
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT 1 FROM agents WHERE agent_id=?", (agent_id,)
+            ) as cur:
+                return await cur.fetchone() is not None
+
+    async def agent_ids_seen_before(self, cutoff_epoch: int) -> list[str]:
+        """Every agent whose last_seen is older than cutoff_epoch (for --older-than)."""
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT agent_id FROM agents WHERE last_seen < ? ORDER BY last_seen",
+                (cutoff_epoch,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [r["agent_id"] for r in rows]
+
+    async def delete_agent(self, agent_id: str) -> dict[str, int]:
+        """Delete an agent and everything it produced in this database.
+
+        Returns rows removed per table. Children are deleted before parents so
+        the whole set goes in one transaction regardless of FK enforcement.
+        `detection_event_chunks` FK-cascades from detection_events on Postgres,
+        but is deleted explicitly so the count is reported and SQLite (FK off by
+        default) stays consistent.
+        """
+        deleted: dict[str, int] = {}
+        async with self._pool.write() as db:
+            cur = await db.execute(
+                "DELETE FROM detection_event_chunks WHERE event_id IN "
+                "(SELECT event_id FROM detection_events WHERE agent_id=?)",
+                (agent_id,),
+            )
+            deleted["detection_event_chunks"] = cur.rowcount or 0
+            for table in AGENT_SCOPED_TABLES:
+                # table is a trusted module constant, never user input.
+                cur = await db.execute(f"DELETE FROM {table} WHERE agent_id=?", (agent_id,))  # noqa: S608
+                deleted[table] = cur.rowcount or 0
+            await db.commit()
+        return deleted
 
     # ── Agent registry ────────────────────────────────────────────────────────
 

@@ -115,16 +115,25 @@ _DEFAULT_PASSWORD = "!HLwS=f73fHo$?p!#M77XA*M"
 _env_hash      = os.environ.get("DASHBOARD_PASSWORD_HASH", "").strip()
 _env_plaintext = os.environ.get("DASHBOARD_PASSWORD", _DEFAULT_PASSWORD).strip()
 
+# A password counts as "configured" only when the operator supplied one — a hash
+# or a custom plaintext. The built-in default is a first-run placeholder, not a
+# configured password: on a client deployment it must never authenticate.
+_PASSWORD_CONFIGURED = bool(_env_hash) or (_env_plaintext != _DEFAULT_PASSWORD)
+
 if _env_hash:
     _stored_hash = _env_hash
-else:
-    # Hash the plaintext password at startup (600k PBKDF2 rounds — ~0.5s once)
+elif _PASSWORD_CONFIGURED:
+    # Hash the custom plaintext at startup (600k PBKDF2 rounds — ~0.5s once)
     _stored_hash = hash_password(_env_plaintext)
-    if _env_plaintext not in (_DEFAULT_PASSWORD,):
-        log.warning(
-            "auth: DASHBOARD_PASSWORD_HASH not set — password hashed at startup. "
-            "Set DASHBOARD_PASSWORD_HASH in production to avoid recomputing on every restart."
-        )
+    log.warning(
+        "auth: DASHBOARD_PASSWORD_HASH not set — password hashed at startup. "
+        "Set DASHBOARD_PASSWORD_HASH in production to avoid recomputing on every restart."
+    )
+else:
+    # No password configured. Store a random, unguessable hash so verify_password
+    # still runs in constant time, but nothing can ever match it — the built-in
+    # default is refused. login() returns a clear "configure a password" error.
+    _stored_hash = hash_password(secrets.token_hex(32))
 
 # The built-in default credential is "active" (safe to surface on the login
 # screen for first-run convenience) ONLY when the operator has NOT overridden it
@@ -191,24 +200,25 @@ _PUBLICLY_ADDRESSED = (
     or _is_public_address(os.environ.get("PUBLIC_IP", ""))
 )
 
-_DEFAULT_PASSWORD_IN_USE = (not _env_hash) and (_env_plaintext == _DEFAULT_PASSWORD)
-# Only ever controls whether the login screen offers click-to-autofill. It does
-# NOT gate authentication — the default password keeps working when this is
-# False, it simply stops being advertised.
-_USING_DEFAULT_CREDENTIALS = _DEFAULT_PASSWORD_IN_USE and not _PUBLICLY_ADDRESSED
+_DEFAULT_PASSWORD_IN_USE = not _PASSWORD_CONFIGURED
+# The built-in default is never surfaced on the login screen and never
+# authenticates — login() refuses until a real password is configured. This flag
+# stays False permanently; the public-address gate now only sharpens the warning.
+_USING_DEFAULT_CREDENTIALS = False
 
 if _DEFAULT_PASSWORD_IN_USE and _PUBLICLY_ADDRESSED:
-    log.warning(
-        "auth: built-in DEFAULT dashboard password is in use on an "
-        "internet-reachable deployment (DOMAIN/PUBLIC_IP resolves to a public "
-        "address). It is NOT being surfaced on the login screen. Set "
-        "DASHBOARD_PASSWORD_HASH now — until you do, this install shares a "
-        "password with every other AttackLens install."
+    log.error(
+        "auth: NO dashboard password configured on an internet-reachable "
+        "deployment (DOMAIN/PUBLIC_IP resolves to a public address). Login is "
+        "REFUSED until DASHBOARD_PASSWORD_HASH (or DASHBOARD_PASSWORD) is set."
     )
 elif _DEFAULT_PASSWORD_IN_USE:
     log.warning(
-        "auth: using built-in DEFAULT dashboard password — surfaced on the login "
-        "screen for first-run setup. Set DASHBOARD_PASSWORD_HASH before deploying."
+        "auth: no dashboard password configured — the built-in default is "
+        "DISABLED and login is refused until DASHBOARD_PASSWORD_HASH (or "
+        "DASHBOARD_PASSWORD) is set. Generate a hash with: python3 -c "
+        "'from manager.security_policy import hash_password; "
+        "print(hash_password(\"yourpassword\"))'"
     )
 
 # Dummy hash used when the email is wrong: we still run PBKDF2 so the response
@@ -455,6 +465,17 @@ async def login(body: LoginRequest, request: Request, response: Response):
     if not email or not password:
         audit.warning("login.empty_fields ip=%s ua=%s", ip, ua)
         return _auth_error()
+
+    # No password configured → the built-in default is disabled; refuse with a
+    # clear, actionable message rather than a generic 401. This is deployment
+    # state, identical for every caller, so it is no enumeration or timing oracle.
+    if not _PASSWORD_CONFIGURED:
+        audit.warning("login.no_password_configured ip=%s ua=%s", ip, ua)
+        return JSONResponse(
+            {"error": "Dashboard password not configured. Set DASHBOARD_PASSWORD_HASH "
+                      "(or DASHBOARD_PASSWORD) and restart the manager."},
+            status_code=503,
+        )
 
     # ── Lockout check (IP + account, before any crypto) ──────────────────────
     ip_ok    = _ip_allowed(ip)

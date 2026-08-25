@@ -1490,6 +1490,30 @@ class _TaskReentrantLock:
         self.release()
 
 
+# Tables in the intel database keyed by agent_id — everything the dashboard
+# renders for an agent (findings, detections, correlations, SOC activity, assets,
+# signals). Ordered children-before-parents so delete_agent() removes them in one
+# transaction. Must track the schema: test_delete_agents.py asserts this equals
+# every table with an agent_id column.
+INTEL_AGENT_SCOPED_TABLES: tuple[str, ...] = (
+    "signals",
+    "signal_clusters",
+    "soc_comments",
+    "soc_actions",
+    "soc_activity",
+    "remediation_plans",
+    "validation_runs",
+    "detection_allowlist",
+    "change_timeline",
+    "behavior_baseline",
+    "entity_state",
+    "asset_registry",
+    "correlations",
+    "org_agents",
+    "findings",
+)
+
+
 class IntelDB:
     """
     Async Postgres wrapper for the intel database (migrated from SQLite —
@@ -2294,6 +2318,24 @@ class IntelDB:
                 (cutoff_ts,),
             )
             deleted["notification_deliveries"] = cur.rowcount or 0
+            await self._conn.commit()
+        return deleted
+
+    async def delete_agent(self, agent_id: str) -> dict[str, int]:
+        """Delete every row this agent owns across the intel database.
+
+        Returns rows removed per table — findings, detections, correlations, SOC
+        activity, assets and signals, i.e. everything the dashboard renders for
+        the agent. Ordered children-before-parents (see INTEL_AGENT_SCOPED_TABLES).
+        """
+        deleted: dict[str, int] = {}
+        async with self._lock:
+            for table in INTEL_AGENT_SCOPED_TABLES:
+                # table is a trusted module constant, never user input.
+                cur = await self._conn.execute(
+                    f"DELETE FROM {table} WHERE agent_id=?", (agent_id,)  # noqa: S608
+                )
+                deleted[table] = cur.rowcount or 0
             await self._conn.commit()
         return deleted
 

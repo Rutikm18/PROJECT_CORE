@@ -251,6 +251,8 @@ export default function Settings() {
   const [error,   setError]   = useState<string | null>(null);
   const [dirty,   setDirty]   = useState(false);
   const [dirtyFields, setDirtyFields] = useState<Set<keyof OrgSettings>>(() => new Set());
+  // Org name is set once from here, then locked — only a server command changes it.
+  const [orgLocked, setOrgLocked] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -261,6 +263,7 @@ export default function Settings() {
       setForm({ ...EMPTY, ...d.settings });
       setLicense(d.license ?? null);
       setRoles(d.roles ?? {});
+      setOrgLocked(!!d.org_name_locked);
       setError(null);
       setDirty(false);
       setDirtyFields(new Set());
@@ -310,6 +313,10 @@ export default function Settings() {
       const d = await r.json();
       setForm({ ...EMPTY, ...d.settings });
       setLicense(d.license ?? null);
+      setOrgLocked(!!d.org_name_locked);
+      if (Array.isArray(d.locked) && d.locked.includes("org_name")) {
+        setError("Organisation name is locked and was not changed — it can only be changed on the server.");
+      }
       setDirty(false);
       setDirtyFields(new Set());
       setSaved(true);
@@ -400,13 +407,19 @@ export default function Settings() {
           <div className="bg-white border border-[--gray-200] rounded-2xl shadow-card p-5 space-y-4">
             <SectionLabel icon={Building2}>Organisation Details</SectionLabel>
 
-            <Field label="Organisation Name" required>
+            <Field
+              label="Organisation Name"
+              required
+              hint={orgLocked ? "(locked — change on the server)" : undefined}
+            >
               <input
                 type="text"
                 value={form.org_name}
                 onChange={e => set("org_name", e.target.value)}
                 placeholder="e.g. Acme Security Inc."
-                className={inputCls}
+                disabled={orgLocked}
+                title={orgLocked ? "Set once and locked. Change it on the server: make set-org-name NAME=\"…\"" : undefined}
+                className={inputCls + (orgLocked ? " opacity-60 cursor-not-allowed bg-[--gray-50]" : "")}
               />
             </Field>
 

@@ -91,10 +91,16 @@ export function permitted(role: Role | null, action: string): boolean {
   return allowed.includes(role);
 }
 
+/** The single privileged role for now. A null (unresolved) session is not admin. */
+export function isAdminRole(role: Role | null): boolean {
+  return role === "admin";
+}
+
 interface RBACContextValue {
   user:    User;
   role:    Role | null;      // null while /auth/me is in flight
   loading: boolean;
+  isAdmin: boolean;          // convenience: the only privileged role for now
   can:     (action: string) => boolean;
   refresh: () => void;
 }
@@ -103,6 +109,7 @@ const RBACContext = createContext<RBACContextValue>({
   user:    ANONYMOUS,
   role:    null,
   loading: true,
+  isAdmin: false,
   can:     () => false,
   refresh: () => {},
 });
@@ -144,7 +151,7 @@ export function RBACProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <RBACContext.Provider value={{ user, role, loading, can, refresh }}>
+    <RBACContext.Provider value={{ user, role, loading, isAdmin: isAdminRole(role), can, refresh }}>
       {children}
     </RBACContext.Provider>
   );
@@ -152,4 +159,26 @@ export function RBACProvider({ children }: { children: ReactNode }) {
 
 export function useRBAC() {
   return useContext(RBACContext);
+}
+
+/**
+ * Gate a subtree to administrators. For the time being only the administrator
+ * role has access to management surfaces (settings, keys, customer dashboards);
+ * a non-admin can still sign in, but sees a notice here instead of the feature.
+ * While the role is still resolving it renders nothing to avoid a flash.
+ */
+export function RequireAdmin({ children }: { children: ReactNode }) {
+  const { role, loading } = useRBAC();
+  if (loading || role === null) return null;
+  if (!isAdminRole(role)) {
+    return (
+      <div className="m-6 rounded-2xl border border-[--gray-200] bg-white p-8 text-center shadow-card">
+        <p className="text-sm font-semibold text-[--gray-800]">Administrator access required</p>
+        <p className="mt-1 text-xs text-[--gray-500]">
+          This area is limited to administrators. Ask an administrator if you need access.
+        </p>
+      </div>
+    );
+  }
+  return <>{children}</>;
 }
