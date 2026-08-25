@@ -423,6 +423,16 @@ set-org-name: ## Set the (dashboard-locked) organization name. Usage: make set-o
 	@test -n "$(NAME)" || (echo "  ERROR: NAME is required, e.g. make set-org-name NAME=\"Acme Corp\""; exit 1)
 	@docker compose exec -T manager python -m manager.manager.scripts.set_org_name --name "$(NAME)"
 
+.PHONY: set-password reset-password
+set-password: ## Set/reset the dashboard login. Prompts for the password. Usage: make set-password [EMAIL=you@co] [PASSWORD=...]
+	@python3 -m manager.manager.scripts.set_password \
+		$(if $(EMAIL),--email "$(EMAIL)") \
+		$(if $(PASSWORD),--password "$(PASSWORD)")
+	@docker compose up -d --force-recreate manager
+	@echo "  Manager recreated — sign in with the new credentials."
+
+reset-password: set-password  ## Alias for set-password (change login email and/or password)
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 .PHONY: clean
 clean: ## Remove compiled Python files and test artifacts
