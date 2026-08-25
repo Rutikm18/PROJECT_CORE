@@ -434,6 +434,13 @@ set-password: ## Set/reset the dashboard login. Prompts for the password. Usage:
 
 reset-password: set-password  ## Alias for set-password (change login email and/or password)
 
+.PHONY: set-email
+set-email: ## Change the dashboard login email only (no password needed). Usage: make set-email EMAIL=you@co
+	@test -n "$(EMAIL)" || (echo "  ERROR: EMAIL is required, e.g. make set-email EMAIL=admin@acme.com"; exit 1)
+	@python3 -m manager.manager.scripts.set_email --email "$(EMAIL)"
+	@docker compose up -d --force-recreate manager
+	@echo "  Manager recreated — sign in with the new email."
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 .PHONY: clean
 clean: ## Remove compiled Python files and test artifacts
