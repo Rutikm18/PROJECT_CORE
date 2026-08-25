@@ -8,6 +8,9 @@ SOC activity, assets and signals.
 
 Run inside the manager container (it has the DATABASE_URL the manager uses):
 
+    # check what is enrolled first (no deletion)
+    python -m manager.manager.scripts.delete_agents --list
+
     # by id (space- or comma-separated)
     python -m manager.manager.scripts.delete_agents --agents "agent-a agent-b"
 
@@ -98,11 +101,34 @@ def _confirm(count: int, assume_yes: bool) -> bool:
         return False
 
 
+def _fmt_ts(ts: object) -> str:
+    epoch = int(ts or 0)
+    if epoch <= 0:
+        return "never seen"
+    age_days = (time.time() - epoch) / 86400
+    return f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(epoch))} ({age_days:.0f}d ago)"
+
+
+async def _list_agents(db: Database) -> int:
+    agents = await db.list_agents()
+    if not agents:
+        print("No agents enrolled.")
+        return 0
+    print(f"{len(agents)} agent(s):\n")
+    for a in agents:
+        name = (a.get("name") or "").strip()
+        line = f"  {a['agent_id']:<34}  {_fmt_ts(a.get('last_seen'))}"
+        print(line + (f"  {name}" if name else ""))
+    print('\nCheck one:   make delete-agents AGENTS="<id>" DRY_RUN=1   (preview, deletes nothing)')
+    print('Delete one:  make delete-agents AGENTS="<id>" YES=1       (deletes it)')
+    return 0
+
+
 async def _run(args: argparse.Namespace) -> int:
     age_seconds = _parse_age_seconds(args.older_than) if args.older_than else None
     ids = _parse_ids(args.agents or [])
-    if not ids and age_seconds is None:
-        print("Nothing to do: pass --agents and/or --older-than.", file=sys.stderr)
+    if not args.list and not ids and age_seconds is None:
+        print("Nothing to do: pass --list, --agents and/or --older-than.", file=sys.stderr)
         return 2
 
     db_dsn, intel_dsn = _resolve_dsns()
@@ -110,16 +136,25 @@ async def _run(args: argparse.Namespace) -> int:
     await db.init()
     await intel_db.init()
     try:
+        if args.list:
+            return await _list_agents(db)
+
         targets = await _resolve_targets(db, ids, age_seconds)
         if not targets:
             print("No matching agents. Nothing deleted.")
             return 0
 
-        print(f"Matched {len(targets)} agent(s):")
-        for agent_id in targets:
-            print(f"  • {agent_id}")
+        print(f"Matched {len(targets)} agent(s): " + ", ".join(targets))
 
         if args.dry_run:
+            for agent_id in targets:
+                counts = {**await db.count_agent_rows(agent_id),
+                          **await intel_db.count_agent_rows(agent_id)}
+                total = sum(counts.values())
+                print(f"\n[dry-run] {agent_id} — would delete {total} row(s):")
+                for table, n in counts.items():
+                    if n:
+                        print(f"    {table:<26} {n}")
             print("\n[dry-run] Nothing was deleted.")
             return 0
 
@@ -150,6 +185,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="delete_agents",
         description="Delete agents and all their data from the manager.",
     )
+    parser.add_argument("--list", action="store_true",
+                        help="list all agents (id, last-seen) and exit — no deletion")
     parser.add_argument("--agents", action="append", metavar="IDS",
                         help="agent id(s), comma- or space-separated (repeatable)")
     parser.add_argument("--older-than", metavar="AGE",

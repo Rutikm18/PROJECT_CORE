@@ -98,6 +98,34 @@ async def test_intel_delete_agent_isolates_and_covers_every_table(pg_intel_dsn):
         await intel.close()
 
 
+async def test_list_and_count_are_read_only(pg_manager_dsn, pg_intel_dsn):
+    db, intel = Database(pg_manager_dsn), IntelDB(pg_intel_dsn)
+    await db.init()
+    await intel.init()
+    try:
+        await _seed_manager(db, A)
+        await _seed_manager(db, B)
+        async with intel._pool.write() as conn:
+            await conn.execute("INSERT INTO asset_registry(agent_id) VALUES (?)", (A,))
+            await conn.commit()
+
+        assert {a["agent_id"] for a in await db.list_agents()} >= {A, B}
+
+        counts = {**await db.count_agent_rows(A), **await intel.count_agent_rows(A)}
+        assert counts["agents"] == 1
+        assert counts["payloads"] == 1
+        assert counts["detection_events"] == 1
+        assert counts["detection_event_chunks"] == 1
+        assert counts["asset_registry"] == 1
+
+        # counting must not delete — the agent and its rows are still there
+        assert await db.agent_exists(A) is True
+        assert (await db.count_agent_rows(A))["agents"] == 1
+    finally:
+        await intel.close()
+        await db.close()
+
+
 async def test_cli_run_deletes_end_to_end(pg_manager_dsn, pg_intel_dsn, monkeypatch):
     monkeypatch.setenv("MANAGER_DATABASE_URL", pg_manager_dsn)
     monkeypatch.setenv("INTEL_DATABASE_URL", pg_intel_dsn)
@@ -112,7 +140,7 @@ async def test_cli_run_deletes_end_to_end(pg_manager_dsn, pg_intel_dsn, monkeypa
             await conn.commit()
 
         def _args(**kw):
-            return argparse.Namespace(agents=["agent-C"], older_than=None,
+            return argparse.Namespace(list=False, agents=["agent-C"], older_than=None,
                                       dry_run=kw.get("dry_run", False), yes=True)
 
         # Dry run leaves everything in place.

@@ -105,6 +105,10 @@ class _FakeDB:
         return agent_id in {"a", "b", "old-1"}
     async def agent_ids_seen_before(self, _cutoff):
         return ["old-1"]
+    async def list_agents(self):
+        return [{"agent_id": "a", "name": "host-a", "last_seen": 1000, "last_ip": "1.2.3.4"}]
+    async def count_agent_rows(self, _agent_id):
+        return {"agents": 1, "payloads": 3}
     async def delete_agent(self, agent_id):
         self.deleted.append(agent_id)
         return {"agents": 1, "payloads": 3}
@@ -119,6 +123,8 @@ class _FakeIntel:
 
     async def init(self): ...
     async def close(self): ...
+    async def count_agent_rows(self, _agent_id):
+        return {"findings": 2}
     async def delete_agent(self, agent_id):
         self.deleted.append(agent_id)
         return {"findings": 2}
@@ -136,6 +142,7 @@ def fakes(monkeypatch):
 
 def _run(**kw):
     args = argparse.Namespace(
+        list=kw.get("list", False),
         agents=kw.get("agents"), older_than=kw.get("older_than"),
         dry_run=kw.get("dry_run", False), yes=kw.get("yes", True),
     )
@@ -172,3 +179,22 @@ def test_unknown_agent_is_skipped_not_deleted(fakes):
 
 def test_no_selectors_is_an_error(fakes):
     assert _run(agents=None, older_than=None) == 2
+
+
+def test_list_mode_lists_and_deletes_nothing(fakes, capsys):
+    FakeDB, _ = fakes
+    rc = _run(list=True)
+    assert rc == 0
+    assert FakeDB.instances[0].deleted == []          # --list never deletes
+    out = capsys.readouterr().out
+    assert "host-a" in out and "1 agent(s)" in out
+
+
+def test_dry_run_previews_counts_without_deleting(fakes, capsys):
+    FakeDB, FakeIntel = fakes
+    rc = _run(agents=["a"], dry_run=True)
+    assert rc == 0
+    assert FakeDB.instances[0].deleted == []
+    assert FakeIntel.instances[0].deleted == []
+    out = capsys.readouterr().out
+    assert "would delete" in out and "[dry-run]" in out

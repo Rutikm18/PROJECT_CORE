@@ -2339,6 +2339,18 @@ class IntelDB:
             await self._conn.commit()
         return deleted
 
+    async def count_agent_rows(self, agent_id: str) -> dict[str, int]:
+        """Rows this agent owns per table — the read-only mirror of delete_agent,
+        for the --dry-run preview."""
+        counts: dict[str, int] = {}
+        for table in INTEL_AGENT_SCOPED_TABLES:
+            # table is a trusted module constant, never user input.
+            row = await self._fetchone(
+                f"SELECT COUNT(*) AS c FROM {table} WHERE agent_id=?", (agent_id,)  # noqa: S608
+            )
+            counts[table] = int(row["c"]) if row else 0
+        return counts
+
     async def mark_resolved(self, agent_id: str, finding_id: int) -> None:
         ts = time.time()
         async with self._lock:

@@ -440,6 +440,34 @@ class Database:
             await db.commit()
         return deleted
 
+    async def list_agents(self) -> list[dict]:
+        """All agents with basic identity, newest-seen first (delete-agents --list)."""
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT agent_id, name, last_seen, last_ip FROM agents ORDER BY last_seen DESC"
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def count_agent_rows(self, agent_id: str) -> dict[str, int]:
+        """Rows this agent owns per table — the read-only mirror of delete_agent,
+        for the --dry-run preview."""
+        counts: dict[str, int] = {}
+        async with self._pool.read() as db:
+            async with db.execute(
+                "SELECT COUNT(*) AS c FROM detection_event_chunks WHERE event_id IN "
+                "(SELECT event_id FROM detection_events WHERE agent_id=?)",
+                (agent_id,),
+            ) as cur:
+                counts["detection_event_chunks"] = int((await cur.fetchone())["c"])
+            for table in AGENT_SCOPED_TABLES:
+                # table is a trusted module constant, never user input.
+                async with db.execute(
+                    f"SELECT COUNT(*) AS c FROM {table} WHERE agent_id=?", (agent_id,)  # noqa: S608
+                ) as cur:
+                    counts[table] = int((await cur.fetchone())["c"])
+        return counts
+
     # ── Agent registry ────────────────────────────────────────────────────────
 
     async def upsert_agent(self, agent_id: str, name: str, ip: str) -> None:
