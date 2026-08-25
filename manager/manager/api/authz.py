@@ -35,15 +35,26 @@ log = logging.getLogger("manager.api.authz")
 _ADMIN_ROLES = {"admin", "owner"}
 
 
-def _bearer_or_cookie(request: Request) -> str:
-    """Pull the session token from the al_session cookie or an Authorization header."""
-    token = request.cookies.get("al_session", "")
-    if token:
-        return token
+def _candidate_session_tokens(request: Request) -> list[str]:
+    """Every session token the caller presented, cookie first then bearer.
+
+    Both are returned rather than just the first: behind the AWS proxy a browser
+    can hold a stale `al_session` cookie (e.g. issued before an ephemeral-key
+    restart) while sending a fresh `Authorization: Bearer` from localStorage. If
+    we stopped at the cookie we would verify the dead one and 401 the request,
+    ignoring a credential that is actually valid. Trying each in turn is what
+    makes the bearer a real fallback rather than dead-lettered behind the cookie.
+    """
+    tokens: list[str] = []
+    cookie = request.cookies.get("al_session", "")
+    if cookie:
+        tokens.append(cookie)
     bearer = request.headers.get("Authorization", "")
     if bearer.startswith("Bearer "):
-        return bearer.removeprefix("Bearer ").strip()
-    return ""
+        stripped = bearer.removeprefix("Bearer ").strip()
+        if stripped and stripped not in tokens:
+            tokens.append(stripped)
+    return tokens
 
 
 def _session_principal(request: Request) -> Optional[dict]:
@@ -53,15 +64,16 @@ def _session_principal(request: Request) -> Optional[dict]:
     if isinstance(user, dict) and user.get("sub"):
         return user
 
-    token = _bearer_or_cookie(request)
-    if not token:
-        return None
-    try:
-        from .auth_ui import _verify_token
-        return _verify_token(token)
-    except Exception:                                    # pragma: no cover
-        log.debug("session verification failed", exc_info=True)
-        return None
+    from .auth_ui import _verify_token
+    for token in _candidate_session_tokens(request):
+        try:
+            payload = _verify_token(token)
+        except Exception:                                # pragma: no cover
+            log.debug("session verification failed", exc_info=True)
+            payload = None
+        if payload:
+            return payload
+    return None
 
 
 def _admin_token_matches(supplied: str) -> bool:
