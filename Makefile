@@ -415,8 +415,9 @@ list-agents: ## List all agents (id, last-seen) — check before deleting.
 	@docker compose exec -T manager python -m manager.manager.scripts.delete_agents --list
 
 .PHONY: delete-agents
-delete-agents: ## Delete agents + ALL their data. Usage: make delete-agents AGENTS="id1 id2" OLDER_THAN=30d [DRY_RUN=1] [YES=1]
+delete-agents: ## Delete agents + ALL their data. Usage: make delete-agents AGENTS="id1 id2" | OLDER_THAN=30d | ALL=1 [DRY_RUN=1] [YES=1]
 	@docker compose exec -T manager python -m manager.manager.scripts.delete_agents \
+		$(if $(ALL),--all) \
 		$(if $(AGENTS),--agents "$(AGENTS)") \
 		$(if $(OLDER_THAN),--older-than "$(OLDER_THAN)") \
 		$(if $(DRY_RUN),--dry-run) \

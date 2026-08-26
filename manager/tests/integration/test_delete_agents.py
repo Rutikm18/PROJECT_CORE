@@ -126,6 +126,29 @@ async def test_list_and_count_are_read_only(pg_manager_dsn, pg_intel_dsn):
         await db.close()
 
 
+async def test_cli_all_deletes_every_agent(pg_manager_dsn, pg_intel_dsn, monkeypatch):
+    monkeypatch.setenv("MANAGER_DATABASE_URL", pg_manager_dsn)
+    monkeypatch.setenv("INTEL_DATABASE_URL", pg_intel_dsn)
+    db, intel = Database(pg_manager_dsn), IntelDB(pg_intel_dsn)
+    await db.init()
+    await intel.init()
+    try:
+        await _seed_manager(db, A)
+        await _seed_manager(db, B)
+        assert len(await db.list_agents()) == 2
+
+        args = argparse.Namespace(list=False, all=True, agents=None,
+                                  older_than=None, dry_run=False, yes=True)
+        assert await da._run(args) == 0
+
+        assert await db.list_agents() == []
+        assert await _count(db._pool, "SELECT COUNT(*) c FROM agents WHERE agent_id=?", (A,)) == 0
+        assert await _count(db._pool, "SELECT COUNT(*) c FROM agents WHERE agent_id=?", (B,)) == 0
+    finally:
+        await intel.close()
+        await db.close()
+
+
 async def test_cli_run_deletes_end_to_end(pg_manager_dsn, pg_intel_dsn, monkeypatch):
     monkeypatch.setenv("MANAGER_DATABASE_URL", pg_manager_dsn)
     monkeypatch.setenv("INTEL_DATABASE_URL", pg_intel_dsn)
@@ -140,7 +163,7 @@ async def test_cli_run_deletes_end_to_end(pg_manager_dsn, pg_intel_dsn, monkeypa
             await conn.commit()
 
         def _args(**kw):
-            return argparse.Namespace(list=False, agents=["agent-C"], older_than=None,
+            return argparse.Namespace(list=False, all=False, agents=["agent-C"], older_than=None,
                                       dry_run=kw.get("dry_run", False), yes=True)
 
         # Dry run leaves everything in place.

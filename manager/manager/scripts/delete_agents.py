@@ -17,6 +17,9 @@ Run inside the manager container (it has the DATABASE_URL the manager uses):
     # by age — every agent not seen in the last 30 days
     python -m manager.manager.scripts.delete_agents --older-than 30d
 
+    # EVERY agent (careful — wipes them all)
+    python -m manager.manager.scripts.delete_agents --all --yes
+
     # preview without deleting
     python -m manager.manager.scripts.delete_agents --older-than 30d --dry-run
 
@@ -127,8 +130,8 @@ async def _list_agents(db: Database) -> int:
 async def _run(args: argparse.Namespace) -> int:
     age_seconds = _parse_age_seconds(args.older_than) if args.older_than else None
     ids = _parse_ids(args.agents or [])
-    if not args.list and not ids and age_seconds is None:
-        print("Nothing to do: pass --list, --agents and/or --older-than.", file=sys.stderr)
+    if not args.list and not args.all and not ids and age_seconds is None:
+        print("Nothing to do: pass --list, --all, --agents and/or --older-than.", file=sys.stderr)
         return 2
 
     db_dsn, intel_dsn = _resolve_dsns()
@@ -139,7 +142,10 @@ async def _run(args: argparse.Namespace) -> int:
         if args.list:
             return await _list_agents(db)
 
-        targets = await _resolve_targets(db, ids, age_seconds)
+        if args.all:
+            targets = [a["agent_id"] for a in await db.list_agents()]
+        else:
+            targets = await _resolve_targets(db, ids, age_seconds)
         if not targets:
             print("No matching agents. Nothing deleted.")
             return 0
@@ -187,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--list", action="store_true",
                         help="list all agents (id, last-seen) and exit — no deletion")
+    parser.add_argument("--all", action="store_true",
+                        help="select EVERY agent (still confirms unless --yes)")
     parser.add_argument("--agents", action="append", metavar="IDS",
                         help="agent id(s), comma- or space-separated (repeatable)")
     parser.add_argument("--older-than", metavar="AGE",

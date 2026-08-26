@@ -142,7 +142,7 @@ def fakes(monkeypatch):
 
 def _run(**kw):
     args = argparse.Namespace(
-        list=kw.get("list", False),
+        list=kw.get("list", False), all=kw.get("all", False),
         agents=kw.get("agents"), older_than=kw.get("older_than"),
         dry_run=kw.get("dry_run", False), yes=kw.get("yes", True),
     )
@@ -179,6 +179,14 @@ def test_unknown_agent_is_skipped_not_deleted(fakes):
 
 def test_no_selectors_is_an_error(fakes):
     assert _run(agents=None, older_than=None) == 2
+
+
+def test_all_selects_every_agent(fakes):
+    FakeDB, FakeIntel = fakes
+    rc = _run(all=True)                     # _FakeDB.list_agents() returns agent "a"
+    assert rc == 0
+    assert FakeDB.instances[0].deleted == ["a"]
+    assert FakeIntel.instances[0].deleted == ["a"]
 
 
 def test_list_mode_lists_and_deletes_nothing(fakes, capsys):
