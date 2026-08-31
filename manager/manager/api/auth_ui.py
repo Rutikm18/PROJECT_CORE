@@ -244,8 +244,18 @@ _COOKIE_NAME      = "al_session"
 # Revoked JTIs: {jti: expiry_epoch}. Pruned on logout and on /me calls.
 _revoked: dict[str, float] = {}
 
-# Active JTIs per account: {email: [jti, ...]} — new login revokes previous.
-_active_sessions: dict[str, list[str]] = defaultdict(list)
+# Active sessions per account: {email: [(jti, exp_epoch), ...]}, oldest first.
+# Expired entries are pruned on each login so an unlimited cap cannot grow forever.
+_active_sessions: dict[str, list[tuple[str, float]]] = defaultdict(list)
+
+# Max concurrent sessions per operator account. Operators share a single account,
+# and multiple people logging in from different systems with the same credentials
+# is intended — so the default is unlimited. A new login never evicts an existing
+# session; everyone stays logged in.
+#   0 = unlimited concurrent sessions (default)
+#   1 = single active session (new login evicts older ones — old strict behaviour)
+#   N = allow up to N concurrent sessions (evict the oldest beyond N, FIFO)
+_OPERATOR_MAX_SESSIONS = max(0, int(os.environ.get("OPERATOR_MAX_SESSIONS", "0")))
 
 # ── Rate limiting / lockout ───────────────────────────────────────────────────
 # IP log: {ip: [timestamp_of_failure, ...]}
@@ -408,8 +418,31 @@ def _prune_revoked() -> None:
 
 def _revoke_all_sessions(email: str) -> None:
     """Revoke every active JTI for this account (single-session enforcement)."""
-    for jti in _active_sessions.pop(email, []):
+    for jti, _exp in _active_sessions.pop(email, []):
         _revoked[jti] = time.time() + _JWT_TTL_HOURS * 3600
+
+
+def _register_session(email: str, jti: str, exp: float) -> None:
+    """Record a freshly issued session and enforce OPERATOR_MAX_SESSIONS.
+
+    cap == 0 → unlimited concurrent sessions: never evict (the default). Multiple
+               systems sharing one credential all stay logged in.
+    cap == 1 → single active session: evict (revoke) all prior JTIs.
+    cap  > 1 → keep the newest `cap` sessions, revoking the oldest beyond it (FIFO).
+
+    Expired entries are pruned first so the list stays bounded even when unlimited.
+    """
+    now = time.time()
+    sessions = [pair for pair in _active_sessions[email] if pair[1] > now]
+    sessions.append((jti, exp))
+    if _OPERATOR_MAX_SESSIONS > 0:
+        excess = len(sessions) - _OPERATOR_MAX_SESSIONS
+        if excess > 0:
+            revoke_until = now + _JWT_TTL_HOURS * 3600
+            for old_jti, _e in sessions[:excess]:
+                _revoked[old_jti] = revoke_until
+            del sessions[:excess]
+    _active_sessions[email] = sessions
 
 
 # ── Error responses — no user enumeration ─────────────────────────────────────
@@ -510,13 +543,14 @@ async def login(body: LoginRequest, request: Request, response: Response):
         pass
 
     # ── Issue token ───────────────────────────────────────────────────────────
-    # Revoke all previous sessions for this account (single active session)
-    _revoke_all_sessions(email)
+    # Register the new session and enforce OPERATOR_MAX_SESSIONS (default 0 =
+    # unlimited: multiple systems sharing one credential all stay logged in
+    # instead of 401'ing each other).
     _prune_revoked()
 
     role = _configured_role()
     token, jti, exp = _make_token(email, role)
-    _active_sessions[email].append(jti)
+    _register_session(email, jti, exp)
 
     _reset_counters(ip, email)
 
@@ -566,7 +600,9 @@ async def logout(
             if jti:
                 _revoked[jti] = exp
                 if email in _active_sessions:
-                    _active_sessions[email] = [j for j in _active_sessions[email] if j != jti]
+                    _active_sessions[email] = [
+                        pair for pair in _active_sessions[email] if pair[0] != jti
+                    ]
                 _prune_revoked()
             audit.info("logout.success ip=%s email=%s jti=%s", ip, email, jti[:8] if jti else "")
 

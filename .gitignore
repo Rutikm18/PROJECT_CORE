@@ -79,3 +79,5 @@ LEARNINGS.md
 agent/os/macos/pkg/.pkg_version
 
 make_private_owner.md
+
+core_level_detection_logic.md
