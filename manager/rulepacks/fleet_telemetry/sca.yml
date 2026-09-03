@@ -1,0 +1,104 @@
+category: SCA Compliance
+description: >
+  Software Composition Analysis (SCA) compliance rules: policy check failures,
+  license violations, and dependency posture signals.
+
+rules:
+  - id: SCA-001
+    title: SCA policy check failed
+    description: >
+      An SCA policy check (CIS benchmark, custom compliance policy, or SBOM
+      policy gate) returned a failed status — the host or package does not
+      meet the required compliance posture.
+    mitre_attack: [T1082, T1518]
+    severity: high
+    data_source: sca
+    detection:
+      logic: check status is failed or error
+      logic_mode: any
+      conditions_structured:
+        - field: status
+          op: in
+          values: ["failed", "fail", "error", "non_compliant"]
+        - field: result
+          op: in
+          values: ["failed", "fail", "error", "non_compliant"]
+        - field: passed
+          op: eq_false
+      conditions:
+        - status in [failed, fail, error, non_compliant]
+        - OR result in [failed, fail, error]
+        - OR passed == false
+      threshold: any occurrence
+    false_positives:
+      - Known exceptions already documented in the compliance waiver register
+    enrichment_sources:
+      - CIS benchmark reference
+    response_actions:
+      - Remediate the failing control per the associated remediation guidance
+    status: stable
+
+  - id: SCA-002
+    title: Critical SCA control failed
+    description: >
+      A critical-severity SCA benchmark control failed — this represents a
+      significant misconfiguration that must be remediated immediately.
+    mitre_attack: [T1082, T1548]
+    severity: critical
+    data_source: sca
+    detection:
+      logic: severity is critical AND check failed
+      logic_mode: all
+      conditions_structured:
+        - field: severity
+          op: in
+          values: ["critical", "high"]
+        - any:
+            - field: status
+              op: in
+              values: ["failed", "fail", "error"]
+            - field: passed
+              op: eq_false
+      conditions:
+        - severity in [critical, high]
+        - status == failed OR passed == false
+      threshold: any occurrence
+    false_positives:
+      - Approved deviations with a documented risk acceptance
+    enrichment_sources:
+      - CIS Controls v8 mapping
+    response_actions:
+      - Escalate to security team; remediate within SLA for critical findings
+    status: stable
+
+  - id: SCA-003
+    title: SCA dependency with known vulnerability (CVE)
+    description: >
+      An SCA scan found a dependency with one or more known CVEs — particularly
+      actionable when a fix is available or the CVE is in CISA KEV.
+    mitre_attack: [T1190, T1203]
+    severity: high
+    data_source: sca
+    detection:
+      logic: has CVE AND (kev OR patch_available)
+      logic_mode: any
+      conditions_structured:
+        - field: kev
+          op: eq_true
+        - field: cisa_kev
+          op: eq_true
+        - field: patch_available
+          op: eq_true
+        - field: cve_ids
+          op: truthy
+      conditions:
+        - kev == true OR cisa_kev == true OR patch_available == true OR cve_ids is set
+      threshold: any occurrence
+    false_positives:
+      - Transitive dependencies flagged in non-production-deployed code paths
+    enrichment_sources:
+      - CISA KEV catalog
+      - NVD EPSS scores
+    response_actions:
+      - Update to patched version; if no patch, apply virtual patch or remove dependency
+    status: stable

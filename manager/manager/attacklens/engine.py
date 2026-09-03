@@ -1901,10 +1901,14 @@ class AttackLensEngine:
 
         if detector_errors:
             source, first = detector_errors[0]
-            raise RuntimeError(
-                f"{len(detector_errors)} detector path(s) failed for {section}; "
-                f"first={source}:{type(first).__name__}:{first}"
-            ) from first
+            log.error(
+                "detector failure(s) section=%s: %d path(s) failed; first=%s:%s:%s "
+                "— returning %d partial finding(s); telemetry is still in raw store (replayable)",
+                section, len(detector_errors), source, type(first).__name__, first, len(findings),
+            )
+            stats = getattr(self, "_detect_stats", None)
+            if isinstance(stats, dict):
+                stats["detector_errors"] = stats.get("detector_errors", 0) + len(detector_errors)
         return findings
 
     # ── Section analyzers ─────────────────────────────────────────────────────

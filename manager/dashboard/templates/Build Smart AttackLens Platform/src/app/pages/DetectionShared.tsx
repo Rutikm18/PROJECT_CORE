@@ -63,6 +63,7 @@ export interface DetectionFinding {
   mitre_tactic?:     string;
   first_detected_at: number;
   last_detected_at:  number;
+  closed_at?:        number | null;
   scan_count:        number;
   status:            string;
   // Canonical attack-terrain bucket (server-assigned via terrain_validators) —
@@ -414,6 +415,33 @@ export function TerrainChip({ terrain }: { terrain?: string }) {
       {t.label}
     </span>
   );
+}
+
+// Safe clipboard helper — works in HTTP (non-HTTPS) and older browsers.
+// Returns true on success, false on failure. Never throws.
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through to execCommand fallback
+    }
+  }
+  // Fallback: create a transient textarea, select, and execCommand
+  try {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0";
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 // The stable unique incident id (AL-F-00000042) with UUID tooltip.
@@ -1449,9 +1477,12 @@ export function OSRemediationPanel({
   }, [findingId, os, override]);
 
   const onCopy = useCallback((cmd: string) => {
-    navigator.clipboard?.writeText(cmd);
-    setCopied(cmd);
-    setTimeout(() => setCopied(null), 1200);
+    copyToClipboard(cmd).then(ok => {
+      if (ok) {
+        setCopied(cmd);
+        setTimeout(() => setCopied(null), 1200);
+      }
+    });
   }, []);
 
   const riskClass =
@@ -2270,10 +2301,15 @@ export function FindingDetail({ finding: f, onClose, onChanged }: { finding: Det
             {/* Which host + how long present */}
             <div className="px-4 py-3">
               <div className="text-[9px] font-bold text-gray-400 uppercase tracking-wide mb-1.5">Affected Host</div>
-              {[["Agent", f.agent_id],["First detected", fmtTs(f.first_detected_at)],["Last detected", fmtTs(f.last_detected_at)]].map(([l,v]) => (
+              {([
+                ["Agent", f.agent_id],
+                ["First detected", fmtTs(f.first_detected_at)],
+                ["Last detected", fmtTs(f.last_detected_at)],
+                ...(f.closed_at ? [["Closed at", fmtTs(f.closed_at)]] : []),
+              ] as [string, string][]).map(([l, v]) => (
                 <div key={l} className="flex items-center gap-2 py-0.5">
                   <span className="w-24 text-[9px] text-gray-400 font-medium">{l}</span>
-                  <span className="text-[10px] text-gray-700 font-mono">{v}</span>
+                  <span className={`text-[10px] font-mono ${l === "Closed at" ? "text-red-500" : "text-gray-700"}`}>{v}</span>
                 </div>
               ))}
               <Why>Which machine to act on, and whether this is brand-new or a long-standing exposure.</Why>
@@ -2763,6 +2799,7 @@ function AIAnalysisPanel({ finding: f }: { finding: DetectionFinding }) {
   const [error,       setError]       = useState<string | null>(null);
   const [remError,    setRemError]    = useState<string | null>(null);
   const [osType,      setOsType]      = useState<"macos" | "windows" | "linux">("macos");
+  const [copiedCmd,   setCopiedCmd]   = useState<string | null>(null);
   const [noProvider,  setNoProvider]  = useState(false);
 
   // Peek cache on mount (GET — never spends an API call). Also detect whether
@@ -3066,10 +3103,20 @@ function AIAnalysisPanel({ finding: f }: { finding: DetectionFinding }) {
                   <div className="ml-7 bg-gray-900 rounded-lg px-3 py-2 flex items-center gap-2 mb-1.5">
                     <code className="text-[9px] font-mono text-green-400 flex-1 break-all">{step.command}</code>
                     <button
-                      onClick={() => navigator.clipboard.writeText(step.command!)}
-                      className="text-gray-500 hover:text-gray-300 flex-shrink-0"
+                      onClick={() => {
+                        copyToClipboard(step.command!).then(ok => {
+                          if (ok) {
+                            setCopiedCmd(step.command!);
+                            setTimeout(() => setCopiedCmd(null), 1200);
+                          }
+                        });
+                      }}
+                      title="Copy command"
+                      className="text-gray-500 hover:text-gray-300 flex-shrink-0 transition-colors"
                     >
-                      <Copy className="w-3 h-3" />
+                      {copiedCmd === step.command
+                        ? <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                        : <Copy className="w-3 h-3" />}
                     </button>
                   </div>
                 )}

@@ -187,7 +187,16 @@ def _compile_finding_filter(query: FindingQuery) -> tuple[str, list[Any]]:
 
     if query.agent_id:
         parts.append("f.agent_id=?"); args.append(query.agent_id)
-    elif query.live_agent_ids is not None and query.active_only:
+    elif (
+        query.live_agent_ids is not None
+        and query.active_only
+        # When a time window is set, skip the live-agent filter: findings from
+        # offline agents are still valid history for the selected period.
+        # The window filter (first_detected_at / last_detected_at) already
+        # constrains recency, so staleness filtering is redundant and actively
+        # hides incidents that were detected while the agent was online.
+        and not (query.window_start is not None and query.window_end is not None)
+    ):
         if not query.live_agent_ids:
             parts.append("1=0")
         else:
@@ -248,7 +257,19 @@ def _compile_finding_filter(query: FindingQuery) -> tuple[str, list[Any]]:
         elif operator == "not_contains":
             parts.append(f"{text_expression} NOT LIKE LOWER(?)"); args.append(f"%{condition.get('value', '')}%")
     if query.active_only and query.status not in _TERMINAL_FINDING_STATUSES:
-        parts.append("f.is_active=1")
+        if query.window_start is not None and query.window_end is not None:
+            # Historical window view: include findings that were active at any
+            # point during the selected period, not only those still open now.
+            # A finding closed/auto-resolved after window_start was "active"
+            # when it was detected, so it belongs in the historical view.
+            # COALESCE prefers closed_at (SOC-stamped), falls back to
+            # resolved_at (engine-stamped for auto-resolve), then 0.
+            parts.append(
+                "(f.is_active=1 OR COALESCE(f.closed_at, f.resolved_at, 0)>=?)"
+            )
+            args.append(float(query.window_start))
+        else:
+            parts.append("f.is_active=1")
     elif query.active_only and query.status in _TERMINAL_FINDING_STATUSES:
         parts.append("f.is_active=0")
     if query.window_start is not None and query.window_end is not None:
@@ -2263,9 +2284,9 @@ class IntelDB:
             id_ph = ",".join("?" * len(rows))
             ids = [r["id"] for r in rows]
             await self._conn.execute(
-                f"UPDATE findings SET is_active=0, resolved_at=?, status='auto_resolved' "
+                f"UPDATE findings SET is_active=0, resolved_at=?, closed_at=?, status='auto_resolved' "
                 f"WHERE agent_id=? AND id IN ({id_ph})",
-                (ts, agent_id, *ids),
+                (ts, ts, agent_id, *ids),
             )
             for r in rows:
                 # reason carried in the timeline note (item_data) field
@@ -2359,8 +2380,8 @@ class IntelDB:
                 (agent_id, finding_id),
             )
             await self._conn.execute(
-                "UPDATE findings SET is_active=0, resolved_at=? WHERE agent_id=? AND id=?",
-                (ts, agent_id, finding_id),
+                "UPDATE findings SET is_active=0, resolved_at=?, closed_at=? WHERE agent_id=? AND id=?",
+                (ts, ts, agent_id, finding_id),
             )
             if row:
                 await self._append_timeline(

@@ -1,4 +1,4 @@
-"""Required detector failures must leave payloads pending, never completed."""
+"""Detector failures return partial findings; they do not discard everything."""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +9,10 @@ from manager.manager.attacklens import engine as engine_module
 from manager.manager.attacklens import rulepack as rulepack_module
 from manager.manager.attacklens.behavioral import BehavioralAnalyzer
 from manager.manager.attacklens.engine import AttackLensEngine, _DeferredDetectionState
-from manager.manager.attacklens.rulepack import RulePackDetector, RulePackRule
+from manager.manager.attacklens.rulepack import (
+    RulePackDetector, RulePackRule,
+    _generic_yaml_evaluator, _eval_one_condition,
+)
 from manager.manager.attacklens.signals import Signal
 
 
@@ -22,19 +25,55 @@ class _EmptyRulepack:
         return []
 
 
-def test_rich_module_exception_fails_the_dispatch(monkeypatch):
+class _FindingRulepack:
+    """Returns one pre-baked finding regardless of input."""
+    async def analyze(self, *_args):
+        return [{"category": "compliance", "item_key": "rp:test", "severity": "medium",
+                 "score": 5.5, "title": "rulepack finding", "source": "rulepack"}]
+
+
+def test_rich_module_exception_returns_partial_findings_not_error(monkeypatch):
+    """A broken module logs an error but does NOT crash the whole section.
+    Partial findings from other paths (rulepack in this case) are still returned.
+    """
     async def broken(*_args):
         raise RuntimeError("detector offline")
 
     eng = object.__new__(AttackLensEngine)
     eng._idb = object()
     eng._feeds = None
-    eng._rulepack = _EmptyRulepack()
+    eng._detect_stats = {"processed": 0, "errors": 0}
+    eng._rulepack = _FindingRulepack()
     monkeypatch.setitem(engine_module._DETECTION_MODULE_ROUTES, "sca", [broken])
     monkeypatch.setitem(engine_module.ENGINE_CONFIG, "use_detection_modules", True)
 
-    with pytest.raises(RuntimeError, match="detector path"):
-        _run(eng._dispatch("agent-1", "sca", {"policies": []}))
+    # No RuntimeError — returns partial findings from the rulepack path
+    findings = _run(eng._dispatch("agent-1", "sca", {"policies": []}))
+    assert any(f["item_key"] == "rp:test" for f in findings), (
+        "_FindingRulepack finding should survive even though the module path failed"
+    )
+    assert eng._detect_stats["detector_errors"] == 1
+
+
+def test_rich_module_exception_increments_error_counter(monkeypatch):
+    """The detector_errors stat is incremented so operators can observe failures."""
+    async def broken(*_args):
+        raise RuntimeError("detector offline")
+
+    async def also_broken(*_args):
+        raise ValueError("second failure")
+
+    eng = object.__new__(AttackLensEngine)
+    eng._idb = object()
+    eng._feeds = None
+    eng._detect_stats = {"processed": 0, "errors": 0}
+    eng._rulepack = _EmptyRulepack()
+    monkeypatch.setitem(engine_module._DETECTION_MODULE_ROUTES, "sca", [broken, also_broken])
+    monkeypatch.setitem(engine_module.ENGINE_CONFIG, "use_detection_modules", True)
+
+    findings = _run(eng._dispatch("agent-1", "sca", {"policies": []}))
+    assert findings == []
+    assert eng._detect_stats["detector_errors"] == 2
 
 
 def test_rulepack_evaluator_exception_fails_the_payload(monkeypatch):

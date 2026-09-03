@@ -1,0 +1,490 @@
+category: Developer Security
+description: >
+  Developer ecosystem security: editor extensions, MCP servers, coding agents,
+  credential stores, Git hooks, browser extensions, and local inference servers.
+  These rules cover the DevMesh terrain (AL-DEV-*) and complement the
+  deeper Python module (detections/developer_security.py).
+
+rules:
+  - id: AL-DEV-001
+    title: Untrusted editor extension with auto-activation and command execution
+    description: >
+      A side-loaded or publisher-unverified editor extension automatically activates
+      and contains command-execution indicators — classic initial-access vector via
+      malicious VSCode/Cursor/Windsurf extension.
+    mitre_attack: [T1204.002, T1059]
+    severity: high
+    data_source: developer_security.editor_extensions
+    detection:
+      logic: auto_activates AND (code exec indicator) AND (side-loaded or unknown publisher)
+      logic_mode: all
+      conditions_structured:
+        - field: auto_activates
+          op: eq_true
+        - any:
+            - field: installed_from_vsix
+              op: eq_true
+            - field: unknown_publisher
+              op: eq_true
+      conditions:
+        - auto_activates == true
+        - installed_from_vsix == true OR unknown_publisher == true
+      threshold: any occurrence
+    false_positives:
+      - Legitimate internal extensions side-loaded by IT — add extension IDs to approved list
+    enrichment_sources:
+      - VSCode Marketplace publisher verification
+      - hash reputation of extension bundle
+    response_actions:
+      - Disable extension, verify publisher, review entrypoint code before re-enabling
+    status: stable
+
+  - id: AL-DEV-002
+    title: MCP server referencing mutable or unpinned package version
+    description: >
+      An MCP server launcher references a mutable tag (e.g., @latest) or an
+      ephemeral npx runner with broad capability access — supply chain hijack
+      risk when the editor restarts and re-fetches the package.
+    mitre_attack: [T1195.002, T1059.007]
+    severity: high
+    data_source: developer_security.mcp_servers
+    detection:
+      logic: uses_mutable_ref OR (ephemeral_runner AND sensitive_capability)
+      logic_mode: any
+      conditions_structured:
+        - field: uses_mutable_ref
+          op: eq_true
+        - field: uses_latest_tag
+          op: eq_true
+        - field: unpinned_ephemeral_runner
+          op: eq_true
+      conditions:
+        - uses_mutable_ref == true OR uses_latest_tag == true OR unpinned_ephemeral_runner == true
+      threshold: any occurrence
+    false_positives:
+      - Approved internal servers explicitly pinned in config — add to allowlist
+    enrichment_sources:
+      - npm package registry for pinned vs mutable ref check
+    response_actions:
+      - Pin MCP server to a specific version/hash; audit capability grants
+    status: stable
+
+  - id: AL-DEV-003
+    title: World-writable directory in executable PATH
+    description: >
+      A directory in the user or system PATH is world-writable — any local
+      process can plant a binary that executes with elevated privilege the next
+      time a PATH lookup runs (PATH hijacking / DLL planting).
+    mitre_attack: [T1574.007, T1574.008]
+    severity: high
+    data_source: developer_security.path_directories
+    detection:
+      logic: world_writable == true AND directory is in PATH
+      logic_mode: all
+      conditions_structured:
+        - field: world_writable
+          op: eq_true
+        - field: in_exec_path
+          op: eq_true
+      conditions:
+        - world_writable == true
+        - in_exec_path == true
+      threshold: any occurrence
+    false_positives:
+      - Intentionally permissive shared development directories on single-user systems
+    enrichment_sources: []
+    response_actions:
+      - chmod 755 the directory; verify no rogue binaries already planted
+    status: stable
+
+  - id: AL-DEV-004
+    title: Browser extension with native messaging and dangerous permissions
+    description: >
+      A browser extension uses the native messaging API (can spawn host-side
+      processes) AND holds a dangerous browser permission such as
+      webRequest/declarativeNetRequest, tabs, or <all_urls> host access.
+    mitre_attack: [T1176, T1185]
+    severity: high
+    data_source: developer_security.browser_extensions
+    detection:
+      logic: native_messaging AND dangerous_permission
+      logic_mode: all
+      conditions_structured:
+        - field: has_native_messaging
+          op: eq_true
+        - field: has_dangerous_permission
+          op: eq_true
+      conditions:
+        - has_native_messaging == true
+        - has_dangerous_permission == true
+      threshold: any occurrence
+    false_positives:
+      - Password managers and approved corporate SSO extensions — allowlist by extension ID
+    enrichment_sources:
+      - Chrome Web Store / AMO publisher verification
+    response_actions:
+      - Review extension manifest; remove if not business-critical
+    status: stable
+
+  - id: AL-DEV-005
+    title: Native messaging host binary in temp or group/world-writable path
+    description: >
+      A native messaging host executable lives in a temp directory or is
+      group/world-writable — can be replaced by a less-privileged process
+      and executed by the browser.
+    mitre_attack: [T1574.010, T1059]
+    severity: medium
+    data_source: developer_security.native_messaging_hosts
+    detection:
+      logic: exec_path in temp OR (group or world writable)
+      logic_mode: any
+      conditions_structured:
+        - field: exec_path
+          op: regex
+          pattern: "^/(?:tmp|private/tmp|var/tmp)/"
+        - field: world_writable
+          op: eq_true
+        - field: group_writable
+          op: eq_true
+      conditions:
+        - exec_path matches temp path OR world_writable OR group_writable
+      threshold: any occurrence
+    false_positives:
+      - Legitimate development builds staged in /tmp during install
+    enrichment_sources: []
+    response_actions:
+      - Relocate binary to a system path with 0755 permissions
+    status: stable
+
+  - id: AL-DEV-006
+    title: Git configuration overrides hooks path or SSH command
+    description: >
+      A Git configuration sets core.hooksPath (redirects hook execution to an
+      arbitrary directory) or core.sshCommand (replaces the SSH binary) — both
+      are known vectors for persistent code execution inside cloned repos.
+    mitre_attack: [T1195.001, T1059.004]
+    severity: high
+    data_source: developer_security.git_configs
+    detection:
+      logic: core.hooksPath or core.sshCommand is set in a git config file
+      logic_mode: any
+      conditions_structured:
+        - field: hooks_path_override
+          op: eq_true
+        - field: ssh_command_override
+          op: eq_true
+        - field: config_key
+          op: in
+          values: ["core.hookspath", "core.sshcommand"]
+      conditions:
+        - hooks_path_override == true OR ssh_command_override == true
+        - OR config_key in [core.hooksPath, core.sshCommand]
+      threshold: any occurrence
+    false_positives:
+      - Legitimate monorepo hook management tools (e.g., husky, lefthook) — verify target path
+    enrichment_sources: []
+    response_actions:
+      - Audit the hooks directory or SSH command binary for tampering
+    status: stable
+
+  - id: AL-DEV-007
+    title: Credential store file accessible to group or other users
+    description: >
+      A known credential store file (SSH key, cloud token, .netrc, etc.) has
+      group-readable or world-readable permissions — any local process running
+      as a different user or group can read the credential.
+    mitre_attack: [T1552.001, T1083]
+    severity: high
+    data_source: developer_security.credential_stores
+    detection:
+      logic: credential store file with group or world read/write permission
+      logic_mode: all
+      conditions_structured:
+        - field: is_credential_store
+          op: eq_true
+        - any:
+            - field: group_readable
+              op: eq_true
+            - field: world_readable
+              op: eq_true
+            - field: group_writable
+              op: eq_true
+            - field: world_writable
+              op: eq_true
+      conditions:
+        - is_credential_store == true
+        - group_readable OR world_readable OR group_writable OR world_writable
+      threshold: any occurrence
+    false_positives:
+      - Shared deployment credentials in CI — enforce vault/secrets manager instead
+    enrichment_sources: []
+    response_actions:
+      - chmod 600 the file; rotate the credential; audit access logs
+    status: stable
+
+  - id: AL-DEV-008
+    title: Developer or AI process listening on wildcard interface
+    description: >
+      A known developer or AI tool (Jupyter, local model server, debug server)
+      is listening on 0.0.0.0 or :: — reachable from any host on the network,
+      not just loopback.
+    mitre_attack: [T1049, T1133]
+    severity: medium
+    data_source: developer_security.developer_listeners
+    detection:
+      logic: known developer/AI process AND bind_addr is wildcard
+      logic_mode: all
+      conditions_structured:
+        - field: is_developer_process
+          op: eq_true
+        - field: bind_addr
+          op: in
+          values: ["0.0.0.0", "::", "*"]
+      conditions:
+        - is_developer_process == true
+        - bind_addr in [0.0.0.0, ::, *]
+      threshold: any occurrence
+    false_positives:
+      - Intentionally public dev servers on isolated networks — document and allowlist
+    enrichment_sources: []
+    response_actions:
+      - Restrict bind to 127.0.0.1; add firewall rule blocking external access to that port
+    status: stable
+
+  - id: AL-DEV-009
+    title: Privileged developer container or Docker socket mount
+    description: >
+      A developer or build container runs with --privileged, host network mode,
+      SYS_ADMIN capability, or mounts the Docker socket — any of these allows
+      container escape to the host.
+    mitre_attack: [T1611, T1552.007]
+    severity: critical
+    data_source: developer_security.developer_containers
+    detection:
+      logic: privileged OR host_network OR docker_socket_mount OR SYS_ADMIN
+      logic_mode: any
+      conditions_structured:
+        - field: privileged
+          op: eq_true
+        - field: host_network
+          op: eq_true
+        - field: docker_socket_mount
+          op: eq_true
+        - field: has_sys_admin_cap
+          op: eq_true
+      conditions:
+        - privileged == true OR host_network == true OR docker_socket_mount == true OR has_sys_admin_cap == true
+      threshold: any occurrence
+    false_positives:
+      - Docker-in-Docker in approved CI pipelines — allowlist by container name/image
+    enrichment_sources: []
+    response_actions:
+      - Remove privileged flag; use rootless Docker or dedicated namespace instead
+    status: stable
+
+  - id: AL-DEV-010
+    title: MCP server launcher is a shell interpreter or pipes remote payload
+    description: >
+      An MCP server's launch command IS a shell (sh/bash/zsh/powershell) or its
+      args pipe a remote payload into one (curl|sh, iex) — direct RCE the
+      moment the editor restarts and executes the server.
+    mitre_attack: [T1059.004, T1105]
+    severity: critical
+    data_source: developer_security.mcp_servers
+    detection:
+      logic: launcher_is_shell OR args_pipe_remote_payload
+      logic_mode: any
+      conditions_structured:
+        - field: launcher_is_shell
+          op: eq_true
+        - field: args_pipe_remote_payload
+          op: eq_true
+        - field: command
+          op: regex
+          pattern: "^(?:sh|bash|zsh|dash|fish|ksh|cmd|powershell|pwsh)(?:\\.exe)?$"
+      conditions:
+        - launcher_is_shell == true OR args_pipe_remote_payload == true
+      threshold: any occurrence
+    false_positives:
+      - Intentional shell-wrapper launchers — replace with explicit npx/node/python call
+    enrichment_sources: []
+    response_actions:
+      - Replace shell launcher with a pinned executable; review args for remote fetch
+    status: stable
+
+  - id: AL-DEV-011
+    title: Coding agent running with autonomy or sandbox-disabling flag
+    description: >
+      A known coding agent (Claude Code, Codex, Aider, etc.) is running with
+      --dangerously-skip-permissions, --yolo, --full-auto, or equivalent — any
+      prompt injection in a repo file becomes unattended code execution.
+    mitre_attack: [T1059, T1204.002]
+    severity: high
+    data_source: developer_security.agent_processes
+    detection:
+      logic: known agent binary AND autonomy/sandbox-disabling flag present
+      logic_mode: all
+      conditions_structured:
+        - field: is_known_agent
+          op: eq_true
+        - field: has_autonomy_flag
+          op: eq_true
+      conditions:
+        - is_known_agent == true
+        - has_autonomy_flag == true
+      threshold: any occurrence
+    false_positives:
+      - Explicitly approved headless automation pipelines — document and scope to CI hosts
+    enrichment_sources: []
+    response_actions:
+      - Review task scope; remove autonomy flag; add human-in-the-loop checkpoint
+    status: stable
+
+  - id: AL-DEV-012
+    title: Local inference server listening on wildcard interface
+    description: >
+      A local model/inference server (ollama, LM Studio, vLLM, Jupyter) is
+      bound to 0.0.0.0 or :: — any device on the network can query the model
+      or submit arbitrary code to a Jupyter kernel.
+    mitre_attack: [T1133, T1049]
+    severity: high
+    data_source: developer_security.inference_servers
+    detection:
+      logic: inference server AND wildcard bind
+      logic_mode: all
+      conditions_structured:
+        - field: is_inference_server
+          op: eq_true
+        - field: bind_addr
+          op: in
+          values: ["0.0.0.0", "::", "*"]
+      conditions:
+        - is_inference_server == true
+        - bind_addr in [0.0.0.0, ::]
+      threshold: any occurrence
+    false_positives:
+      - Shared model servers on isolated air-gapped lab networks
+    enrichment_sources: []
+    response_actions:
+      - Restrict to 127.0.0.1; add API key / authentication if public access is required
+    status: stable
+
+  - id: AL-DEV-013
+    title: Git URL rewrite (insteadOf/pushInsteadOf) configured
+    description: >
+      A Git config sets url.<base>.insteadOf or pushInsteadOf — transparently
+      redirects all git operations to an attacker-controlled server, enabling
+      supply-chain poisoning of every clone and push on the host.
+    mitre_attack: [T1195.001, T1036.005]
+    severity: high
+    data_source: developer_security.git_configs
+    detection:
+      logic: insteadof_override == true OR pushinsteadof_override == true
+      logic_mode: any
+      conditions_structured:
+        - field: insteadof_override
+          op: eq_true
+        - field: pushinsteadof_override
+          op: eq_true
+        - field: config_key
+          op: regex
+          pattern: "(?i)\\.insteadof$|\\.pushinsteadof$"
+      conditions:
+        - insteadof_override == true OR pushinsteadof_override == true
+        - OR config_key matches *.insteadOf or *.pushInsteadOf
+      threshold: any occurrence
+    false_positives:
+      - Corporate mirror configurations — document approved rewrites in allowlist
+    enrichment_sources: []
+    response_actions:
+      - Audit the rewrite target URL; remove if not approved by security policy
+    status: stable
+
+  - id: AL-DEV-014
+    title: Agent instruction file contains prompt-injection or exfiltration directive
+    description: >
+      A repo-level agent instruction file (CLAUDE.md, AGENTS.md, .cursorrules,
+      .clinerules, .windsurfrules) contains language indicating prompt injection,
+      exfiltration, credential access, or bypass of safety controls.
+    mitre_attack: [T1059, T1552]
+    severity: high
+    data_source: developer_security.agent_instruction_files
+    detection:
+      logic: instruction file AND injection indicator matched
+      logic_mode: all
+      conditions_structured:
+        - field: is_agent_instruction_file
+          op: eq_true
+        - field: has_injection_indicator
+          op: eq_true
+      conditions:
+        - is_agent_instruction_file == true
+        - has_injection_indicator == true
+      threshold: any match
+    false_positives:
+      - Security research repos containing prompt injection examples for testing
+    enrichment_sources: []
+    response_actions:
+      - Review instruction file content; remove injected directives; rotate any exposed credentials
+    status: experimental
+
+  - id: AL-DEV-015
+    title: VS Code workspace file auto-executes tasks or disables workspace trust
+    description: >
+      A workspace .vscode/settings.json or .code-workspace auto-runs a task on
+      folder-open, disables workspace trust, injects terminal environment
+      variables, or overrides a tool binary path — all execute code without
+      explicit user action when the folder is opened.
+    mitre_attack: [T1204.002, T1059]
+    severity: medium
+    data_source: developer_security.editor_workspace_files
+    detection:
+      logic: workspace file with auto-exec or trust-bypass signal
+      logic_mode: any
+      conditions_structured:
+        - field: auto_runs_on_open
+          op: eq_true
+        - field: disables_workspace_trust
+          op: eq_true
+        - field: injects_terminal_env
+          op: eq_true
+        - field: overrides_tool_path
+          op: eq_true
+      conditions:
+        - auto_runs_on_open OR disables_workspace_trust OR injects_terminal_env OR overrides_tool_path
+      threshold: any occurrence
+    false_positives:
+      - Approved corporate dev containers with documented task automation
+    enrichment_sources: []
+    response_actions:
+      - Review workspace file; remove auto-exec task; open in restricted mode
+    status: experimental
+
+  - id: AL-DEV-016
+    title: Pickle-format model artifact in untrusted location
+    description: >
+      A pickle-format model artifact (.pkl, .pickle, .pt with pickle payload)
+      exists in a non-system, untrusted path — pickle deserialization executes
+      arbitrary Python code and is a known attack vector for model poisoning.
+    mitre_attack: [T1195.002, T1059.006]
+    severity: high
+    data_source: developer_security.model_artifacts
+    detection:
+      logic: pickle format AND untrusted path
+      logic_mode: all
+      conditions_structured:
+        - field: is_pickle_format
+          op: eq_true
+        - field: in_trusted_path
+          op: eq_false
+      conditions:
+        - is_pickle_format == true
+        - in_trusted_path == false
+      threshold: any occurrence
+    false_positives:
+      - Model files from approved HuggingFace/internal repos — use safetensors format instead
+    enrichment_sources:
+      - hash reputation of model artifact
+    response_actions:
+      - Convert to safetensors; scan pickle opcodes with picklescan before loading
+    status: experimental

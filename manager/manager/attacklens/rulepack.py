@@ -108,6 +108,7 @@ _SECTION_CATEGORY: dict[str, str] = {
     "ports": "port",
     "processes": "process",
     "sbom": "sbom",
+    "sca": "compliance",
     "security": "security",
     "services": "service",
     "storage": "storage",
@@ -584,10 +585,18 @@ class RulePackDetector:
                     log.warning("invalid rule in %s: %s", path, exc)
                     continue
                 rules.setdefault(section, []).append(rule)
+        all_rules = [r for sec in rules.values() for r in sec]
+        python_exec = sum(1 for r in all_rules if r.id in _RULE_EVALUATORS)
+        declarative_exec = sum(
+            1 for r in all_rules
+            if r.id not in _RULE_EVALUATORS and bool(r.detection.get("conditions_structured"))
+        )
         log.info(
-            "loaded YAML rule pack: dir=%s files=%d rules=%d executable=%d",
-            root, len(list(root.glob("*.yml"))), sum(len(v) for v in rules.values()),
-            len(_RULE_EVALUATORS),
+            "loaded YAML rule pack: dir=%s files=%d rules=%d "
+            "python_evaluators=%d declarative_evaluators=%d declarative_only=%d",
+            root, len(list(root.glob("*.yml"))), len(all_rules),
+            python_exec, declarative_exec,
+            len(all_rules) - python_exec - declarative_exec,
         )
         return cls(rules)
 
@@ -595,8 +604,11 @@ class RulePackDetector:
         return self._rules.get(_canonical_section(section), [])
 
     def has_executable_rules(self, section: str) -> bool:
-        """Return true only when loaded YAML has an implemented evaluator."""
-        return any(rule.id in _RULE_EVALUATORS for rule in self.rules_for(section))
+        """Return true when loaded YAML has an implemented evaluator OR a declarative conditions_structured block."""
+        return any(
+            rule.id in _RULE_EVALUATORS or bool(rule.detection.get("conditions_structured"))
+            for rule in self.rules_for(section)
+        )
 
     def execution_inventory(self) -> dict[str, Any]:
         """Describe which declared rules can actually execute.
@@ -615,7 +627,7 @@ class RulePackDetector:
                 {"total": 0, "executable": 0, "declarative_only": 0},
             )
             counts["total"] += 1
-            if rule.id in _RULE_EVALUATORS:
+            if rule.id in _RULE_EVALUATORS or bool(rule.detection.get("conditions_structured")):
                 executable += 1
                 counts["executable"] += 1
             else:
@@ -645,11 +657,19 @@ class RulePackDetector:
         items = self._iter_items(section, data)
         for rule in rules:
             evaluator = _RULE_EVALUATORS.get(rule.id)
-            if evaluator is None:
+            # Fall through to the generic declarative evaluator when no Python
+            # evaluator exists but the rule has a conditions_structured block.
+            # This means adding a YAML file with conditions_structured is enough
+            # to activate detection with zero code changes.
+            use_generic = evaluator is None and bool(rule.detection.get("conditions_structured"))
+            if evaluator is None and not use_generic:
                 continue
             for item in items:
                 try:
-                    match = evaluator(self, agent_id, item, {"feeds": feeds})
+                    if evaluator is not None:
+                        match = evaluator(self, agent_id, item, {"feeds": feeds})
+                    else:
+                        match = _generic_yaml_evaluator(self, agent_id, item, {"feeds": feeds}, rule)
                 except Exception as exc:
                     errors.append(f"{rule.id}:{type(exc).__name__}:{exc}")
                     continue
@@ -928,6 +948,113 @@ class RulePackDetector:
 
 def _matched(*conditions: str, reason: str = "", **extra: Any) -> dict:
     return {"matched_conditions": list(conditions), "reason": reason, **extra}
+
+
+# ── Generic declarative evaluator ────────────────────────────────────────────
+# Evaluates `conditions_structured` blocks from YAML without requiring a
+# hand-written Python evaluator. Adding a rule to a YAML file with this block
+# automatically activates detection — no code change needed.
+#
+# Condition spec (each item is a dict):
+#   field: str            — field name (resolved via _FIELD_ALIASES)
+#   op: str               — operator (see _eval_one_condition)
+#   value / pattern / values — operand depending on op
+#   any: list[condition]  — disjunction: at least one sub-condition must pass
+
+_STRUCTURED_OPS = {
+    "eq", "neq", "eq_true", "eq_false", "truthy", "falsy",
+    "regex", "in", "not_in", "gt", "lt", "gte", "lte", "contains",
+}
+
+
+def _eval_one_condition(item: dict, cond: dict) -> tuple[bool, str]:
+    """Return (matched, label) for a single structured condition spec."""
+    if "any" in cond:
+        sub = cond["any"]
+        if not isinstance(sub, list):
+            return False, "any:<invalid>"
+        for sc in sub:
+            ok, label = _eval_one_condition(item, sc)
+            if ok:
+                return True, f"any({label})"
+        return False, f"any({[s.get('field','?') for s in sub]})"
+
+    field = str(cond.get("field") or "")
+    op = str(cond.get("op") or "truthy").lower()
+    value = _get(item, field)
+    label = f"{field} {op}"
+
+    if op == "truthy":
+        return bool(value), label
+    if op == "falsy":
+        return not bool(value), label
+    if op == "eq_true":
+        return _as_bool(value) is True, label
+    if op == "eq_false":
+        return _as_bool(value) is False, label
+    if op == "eq":
+        expected = cond.get("value")
+        return str(value).lower() == str(expected).lower(), f"{label}={expected}"
+    if op == "neq":
+        expected = cond.get("value")
+        return str(value).lower() != str(expected).lower(), f"{label}!={expected}"
+    if op == "regex":
+        pattern = str(cond.get("pattern") or "")
+        if not pattern:
+            return False, label
+        return bool(re.search(pattern, str(value or ""), re.I)), f"{field} matches {pattern[:40]}"
+    if op == "in":
+        vals = {str(v).lower() for v in (cond.get("values") or [])}
+        return str(value or "").lower() in vals, f"{field} in {cond.get('values')}"
+    if op == "not_in":
+        vals = {str(v).lower() for v in (cond.get("values") or [])}
+        return str(value or "").lower() not in vals, f"{field} not_in {cond.get('values')}"
+    if op in ("gt", "lt", "gte", "lte"):
+        fv = _as_float(value)
+        thr = _as_float(cond.get("value"))
+        if fv is None or thr is None:
+            return False, label
+        return {
+            "gt": fv > thr, "lt": fv < thr,
+            "gte": fv >= thr, "lte": fv <= thr,
+        }[op], f"{label} {thr}"
+    if op == "contains":
+        needle = str(cond.get("value") or "").lower()
+        if isinstance(value, list):
+            return any(needle in str(v).lower() for v in value), f"{field} contains {needle}"
+        return needle in str(value or "").lower(), f"{field} contains {needle}"
+    return False, f"unknown_op:{op}"
+
+
+def _generic_yaml_evaluator(
+    det: "RulePackDetector", agent_id: str, item: dict, ctx: dict | None, rule: "RulePackRule",
+) -> dict | None:
+    """Evaluate a rule's `conditions_structured` block without hand-written Python.
+
+    Logic modes (rule.detection['logic_mode']):
+      'all'  (default) — every condition must pass (AND)
+      'any'            — at least one condition must pass (OR)
+      'majority'       — more than half must pass
+    """
+    conds = rule.detection.get("conditions_structured")
+    if not conds or not isinstance(conds, list):
+        return None
+    mode = str(rule.detection.get("logic_mode") or "all").lower()
+    results: list[tuple[bool, str]] = [_eval_one_condition(item, c) for c in conds]
+    passed = [label for ok, label in results if ok]
+    total = len(results)
+    matched = len(passed)
+
+    if mode == "any":
+        satisfied = matched >= 1
+    elif mode == "majority":
+        satisfied = matched > total / 2
+    else:
+        satisfied = matched == total
+
+    if not satisfied:
+        return None
+    return _matched(*passed, reason=f"declarative:{mode}:{matched}/{total}")
 
 
 # ── Rule evaluators ──────────────────────────────────────────────────────────
