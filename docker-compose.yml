@@ -91,6 +91,16 @@ services:
     container_name: attacklens-caddy
     restart: unless-stopped
 
+    # Explicit public resolvers. On systemd-resolved hosts the container can
+    # otherwise inherit nameserver 127.0.0.53 (the host's DNS stub), which does
+    # not exist inside the container — every external lookup then fails with
+    # "connection refused" and Caddy can never reach Let's Encrypt to obtain a
+    # cert. Docker still serves internal service names via its embedded resolver
+    # (127.0.0.11); these entries only set the upstream for external lookups.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
     # Exposes the public-facing port(s) set by env.sh:
     #   8443 → self-signed (IP-only mode)
     #   443  → Let's Encrypt (domain mode)
@@ -133,6 +143,12 @@ services:
     image: attacklens-manager:latest
     container_name: attacklens-manager
     restart: unless-stopped
+
+    # See caddy.dns — external calls (AI provider, SMTP) need a resolver that
+    # exists inside the container; the host's 127.0.0.53 stub does not.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
 
     # Manager exposed on 8080 for direct agent access (no TLS — use on trusted networks)
     # Also reachable via Caddy on :8443 (HTTPS) or :80 (HTTP)
@@ -285,6 +301,12 @@ services:
     image: attacklens-threat-intel:latest
     container_name: attacklens-threat-intel
     restart: unless-stopped
+
+    # See caddy.dns — the feed sync (NVD, AbuseIPDB, OTX, GreyNoise) needs a
+    # resolver that exists inside the container; the host's 127.0.0.53 does not.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
 
     ports:
       - "${THREAT_INTEL_PORT:-8090}:8090"
