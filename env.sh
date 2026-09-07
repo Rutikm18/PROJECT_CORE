@@ -766,6 +766,58 @@ step "Creating runtime directories"
 mkdir -p data logs
 ok "data/ logs/ ready"
 
+# ── Step 8: Pre-flight — host port availability ───────────────────────────────
+# Caddy publishes ports 80 and ${BIND_PORT} (see docker-compose.yml). If another
+# process already holds one, `docker compose up` aborts with a cryptic
+# "failed to bind host port ...: address already in use" and no hint at the
+# culprit. Surface it here instead. This is a WARNING, not a hard failure: on a
+# re-run this stack's own attacklens-caddy may still hold the port, which is fine
+# — `docker compose up -d` replaces it.
+step "Checking host ports (80, ${BIND_PORT})"
+
+# Prints the listening socket's local address:port for $1, or nothing if free.
+# Tries ss (Linux/iproute2) then lsof (portable); skips the header row so an
+# empty result never reads as "in use".
+port_holder() {
+  local port="$1"
+  if command -v ss &>/dev/null; then
+    ss -ltn "sport = :${port}" 2>/dev/null | awk 'NR>1 {print $4; exit}'
+  elif command -v lsof &>/dev/null; then
+    lsof -iTCP:"${port}" -sTCP:LISTEN -Pn 2>/dev/null | awk 'NR>1 {print $1" (pid "$2")"; exit}'
+  fi
+}
+
+# Warns (returns 1) when $1 is occupied by something other than our own Caddy.
+check_port() {
+  local port="$1" holder
+  holder="$(port_holder "$port")"
+  if [[ -z "$holder" ]]; then
+    ok "Port ${port} is free"
+    return 0
+  fi
+  if command -v docker &>/dev/null \
+     && docker ps --filter "name=attacklens-caddy" --format '{{.Ports}}' 2>/dev/null \
+        | grep -q ":${port}->"; then
+    info "Port ${port} held by this stack's attacklens-caddy — compose will replace it (ok)"
+    return 0
+  fi
+  warn "Port ${port} is ALREADY IN USE (${holder}) — 'docker compose up -d' will"
+  warn "  fail to bind it. Free it first, then start the stack:"
+  warn "    sudo ss -ltnp 'sport = :${port}'                 # identify the holder"
+  warn "    sudo systemctl stop nginx apache2 2>/dev/null    # if a host web server"
+  warn "    docker rm -f <name>                              # if a stray container"
+  return 1
+}
+
+PORTS_OK=1
+check_port 80            || PORTS_OK=0
+check_port "${BIND_PORT}" || PORTS_OK=0
+if [[ "$PORTS_OK" == "1" ]]; then
+  ok "Required host ports are available"
+else
+  warn "Resolve the port conflict(s) above before running 'docker compose up -d'."
+fi
+
 # ── Final summary ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}${BOLD}"
