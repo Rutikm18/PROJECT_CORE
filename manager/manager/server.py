@@ -610,6 +610,7 @@ def create_app() -> FastAPI:
     from .api.assets    import make_assets_router
     from .api.posture    import make_posture_router
     from .api.detection  import make_detection_router
+    from .api.reports    import make_reports_router
     from .api.accuracy   import make_accuracy_router
     from .api.settings   import make_settings_router
     from .api.allowlist              import make_allowlist_router
@@ -644,6 +645,7 @@ def create_app() -> FastAPI:
     assets_router  = make_assets_router(db, intel_db)
     posture_router    = make_posture_router(db, intel_db)
     detection_router  = make_detection_router(intel_db, db)
+    reports_router    = make_reports_router(intel_db, db)
     accuracy_router   = make_accuracy_router(intel_db)
     settings_router   = make_settings_router(intel_db, store, db)
     allowlist_router          = make_allowlist_router(intel_db)
@@ -722,6 +724,7 @@ def create_app() -> FastAPI:
     app.include_router(assets_router,       prefix="/api/v1/assets",     dependencies=_SESSION)
     app.include_router(posture_router,      prefix="/api/v1/posture",    dependencies=_SESSION)
     app.include_router(detection_router,    prefix="/api/v1/detection",  dependencies=_SESSION)
+    app.include_router(reports_router,      prefix="/api/v1/reports",    dependencies=_SESSION)
     app.include_router(accuracy_router,     prefix="/api/v1/accuracy",   dependencies=_SESSION)
     app.include_router(settings_router,     prefix="/api/v1/settings",   dependencies=_SESSION)
     app.include_router(allowlist_router,    prefix="/api/v1/allowlist",  dependencies=_SESSION)
