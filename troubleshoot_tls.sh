@@ -114,6 +114,20 @@ if docker info >/dev/null 2>&1; then
   done
   docker inspect -f '{{.State.Status}}' "$CADDY" 2>/dev/null | grep -q running \
     || add_action "Caddy is not running — check: $DC logs caddy   then: $DC up -d"
+
+  # Fingerprint of a failed host-port bind: Caddy is "running" (its healthcheck
+  # only runs `caddy validate`, so "healthy" is misleading) but Docker couldn't
+  # finish networking — so it has no attached network AND no published ports.
+  # That's exactly what a port conflict on 443 looks like from up here.
+  if docker inspect -f '{{.State.Status}}' "$CADDY" 2>/dev/null | grep -q running; then
+    cnets="$(docker inspect "$CADDY" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null)"
+    cports="$(docker port "$CADDY" 2>/dev/null)"
+    if [ -z "$cnets" ] || [ -z "$cports" ]; then
+      fail "Caddy is 'running' but has NO network attachment / NO published ports"
+      hint "this means its host-port bind failed — almost always a port conflict (see Scenario 6)"
+      add_action "Caddy couldn't bind its host port (no network/ports) — resolve the port conflict in Scenario 6, then: $DC up -d --force-recreate caddy"
+    fi
+  fi
 fi
 
 # ── Scenario 5: host networking (IP forwarding, firewall) ─────────────────────
@@ -137,10 +151,20 @@ fi
 
 # ── Scenario 6: host port conflicts (the 'address already in use' case) ───────
 section "6. Host port availability (80, ${BIND_PORT})"
+# Names the process on $1 as "addr — <proc> pid <n>" (needs root for the proc
+# name; degrades to just the address otherwise). Naming the holder is what turns
+# "something else is on 443" into "Wazuh dashboard is on 443".
 port_holder(){
-  local p="$1"
-  if command -v ss >/dev/null 2>&1; then ss -ltn "sport = :${p}" 2>/dev/null | awk 'NR>1{print $4; exit}'
-  elif command -v lsof >/dev/null 2>&1; then lsof -iTCP:"${p}" -sTCP:LISTEN -Pn 2>/dev/null | awk 'NR>1{print $1" pid="$2; exit}'; fi
+  local p="$1" line proc addr
+  if command -v ss >/dev/null 2>&1; then
+    line="$(ss -ltnp "sport = :${p}" 2>/dev/null | awk 'NR>1{print; exit}')"
+    [ -z "$line" ] && return 0
+    addr="$(printf '%s' "$line" | awk '{print $4}')"
+    proc="$(printf '%s' "$line" | sed -nE 's/.*users:\(\("([^"]+)",pid=([0-9]+).*/\1 pid \2/p')"
+    [ -n "$proc" ] && printf '%s — %s\n' "$addr" "$proc" || printf '%s\n' "$addr"
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"${p}" -sTCP:LISTEN -Pn 2>/dev/null | awk 'NR>1{print $9" — "$1" pid="$2; exit}'
+  fi
 }
 for p in "${PORTS[@]}"; do
   h="$(port_holder "$p")"
@@ -150,8 +174,23 @@ for p in "${PORTS[@]}"; do
   elif docker ps --filter "name=${CADDY}" --format '{{.Ports}}' 2>/dev/null | grep -q ":${p}->"; then
     pass "Port ${p} held by ${CADDY} (expected)"
   else
-    fail "Port ${p} in use by something else (${h}) — Caddy can't bind it"
-    add_action "Free port ${p}:  sudo ss -ltnp 'sport = :${p}' ; sudo systemctl stop nginx apache2 2>/dev/null ; docker rm -f <name>  (or: $DC down && $DC up -d)"
+    # Identify common services that legitimately want the port so the advice is
+    # specific rather than a blind "kill whatever this is".
+    case "$h" in
+      *wazuh*|*node*)   svc="another app (looks like a Wazuh dashboard / Node service)";;
+      *nginx*)          svc="a host nginx";;
+      *apache*|*httpd*) svc="a host Apache";;
+      *docker-proxy*)   svc="a different container";;
+      *)                svc="another service";;
+    esac
+    fail "Port ${p} is held by ${svc} — Caddy can't bind it"
+    hint "holder: ${h}"
+    warn "  Two programs can't share one port. Either:"
+    warn "    (a) free ${p} — only if that service can move (systemd services respawn, so stop the unit, don't just kill the PID), OR"
+    warn "    (b) keep it and move AttackLens: set BIND_PORT=<free port, e.g. 8443> in .env,"
+    warn "        then '$DC up -d --force-recreate caddy'. Port 80 stays free for the ACME challenge,"
+    warn "        so you still get a trusted cert — the URL just becomes https://${DOMAIN:-<domain>}:8443"
+    add_action "Port ${p} held by ${svc} (${h}). Keep it and move AttackLens (BIND_PORT=8443 in .env + recreate caddy), or free ${p}."
   fi
 done
 
