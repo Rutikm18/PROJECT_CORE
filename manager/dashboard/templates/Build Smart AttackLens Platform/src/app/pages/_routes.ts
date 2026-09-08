@@ -89,6 +89,7 @@ export const ROUTES = {
 
   assets:   "/assets",
   timeline: "/timeline",
+  reports:  "/reports",
 
   analysis: {
     root:     "/analysis",

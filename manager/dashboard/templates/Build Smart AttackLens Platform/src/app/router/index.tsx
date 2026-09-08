@@ -68,6 +68,7 @@ const AssetRegistry      = lazy(() => import("../pages/AssetRegistry"));
 const Timeline           = lazy(() => import("../pages/Timeline"));
 const DeepAnalysis       = lazy(() => import("../pages/DeepAnalysis"));
 const DeepMesh           = lazy(() => import("../pages/DeepMesh"));
+const Reports            = lazy(() => import("../pages/Reports"));
 const Accuracy           = lazy(() => import("../pages/Accuracy"));
 const DetectionCoverage       = lazy(() => import("../pages/DetectionCoverage"));
 const CustomCorrelationRules  = lazy(() => import("../pages/CustomCorrelationRules"));
@@ -174,6 +175,7 @@ export const router = createBrowserRouter([
       { path: "timeline",            element: <S><Timeline /></S> },
       { path: "analysis",            element: <S><DeepAnalysis /></S> },
       { path: "deepmesh",            element: <S><DeepMesh /></S> },
+      { path: "reports",             element: <S><Reports /></S> },
       { path: "agents",              element: <S><AssetRegistry /></S> },
       { path: "settings",            element: <S><PortalSettings /></S> },
     ],

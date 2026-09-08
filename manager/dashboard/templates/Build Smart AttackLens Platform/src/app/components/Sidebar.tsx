@@ -14,6 +14,7 @@ import {
   ClipboardList, LayoutDashboard, Activity,
   Settings, Server, Building2, MapPin, Layers,
   ShieldCheck, ShieldAlert, GitMerge, Radio, PanelLeftClose, PanelLeftOpen,
+  FileText,
 } from "lucide-react";
 import { CIS_COMPLIANCE_LIVE } from "../featureFlags";
 import { useRefresh } from "../context/RefreshContext";
@@ -82,6 +83,7 @@ const GROUPS: NavGroup[] = [
       { label: "Timeline & History", to: "/timeline",          icon: BarChart3 },
       { label: "Deep Analysis",      to: "/analysis/deep",         icon: Database  },
       { label: "DeepMesh",           to: "/analysis/deepmesh",     icon: Radio, beta: true },
+      { label: "Reports",            to: "/reports",               icon: FileText  },
       { label: "Custom Rules",  to: "/analysis/custom-rules", icon: GitMerge, comingSoon: true },
       { label: "Asset Registry",     to: "/assets",                icon: Monitor   },
       // { label: "Detection Accuracy", to: "/analysis/accuracy", icon: Activity  },
