@@ -39,6 +39,11 @@ import time
 from ..db import Database
 from ..indexer import IntelDB
 
+# After de-enrolling a target, wait this long for any in-flight ingest
+# transaction to finish before deleting — that concurrent write is what
+# deadlocks the multi-table delete. Override with DELETE_AGENT_DRAIN_SECONDS.
+DRAIN_SECONDS = float(os.environ.get("DELETE_AGENT_DRAIN_SECONDS", "2.0"))
+
 _SUFFIX_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
@@ -167,6 +172,23 @@ async def _run(args: argparse.Namespace) -> int:
         if not _confirm(len(targets), args.yes):
             print("Aborted. Nothing deleted.")
             return 1
+
+        # De-enrol first: revoke each agent's key so the manager's ingest
+        # rejects it (get_agent_key returns None when revoked). An ACTIVE agent's
+        # concurrent writes are the root cause of the delete deadlock — stopping
+        # them up front lets the delete run uncontended, even while the agent is
+        # still online (it simply can no longer push data).
+        revoked_any = False
+        for agent_id in targets:
+            try:
+                if await db.revoke_key(agent_id):
+                    revoked_any = True
+                    print(f"De-enrolled {agent_id} — ingest now rejected")
+            except Exception as exc:  # revoke is best-effort; delete + retry still guards
+                print(f"  (warning: could not de-enroll {agent_id}: {exc})", file=sys.stderr)
+        if revoked_any and DRAIN_SECONDS > 0:
+            print(f"Waiting {DRAIN_SECONDS:g}s for in-flight ingest to drain…")
+            await asyncio.sleep(DRAIN_SECONDS)
 
         totals: dict[str, int] = {}
         for agent_id in targets:
