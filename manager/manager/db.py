@@ -24,6 +24,7 @@ import time
 import logging
 
 from .pg_pool import PgPool
+from .db_retry import run_with_deadlock_retry
 
 log = logging.getLogger("manager.db")
 
@@ -425,20 +426,26 @@ class Database:
         but is deleted explicitly so the count is reported and SQLite (FK off by
         default) stays consistent.
         """
-        deleted: dict[str, int] = {}
-        async with self._pool.write() as db:
-            cur = await db.execute(
-                "DELETE FROM detection_event_chunks WHERE event_id IN "
-                "(SELECT event_id FROM detection_events WHERE agent_id=?)",
-                (agent_id,),
-            )
-            deleted["detection_event_chunks"] = cur.rowcount or 0
-            for table in AGENT_SCOPED_TABLES:
-                # table is a trusted module constant, never user input.
-                cur = await db.execute(f"DELETE FROM {table} WHERE agent_id=?", (agent_id,))  # noqa: S608
-                deleted[table] = cur.rowcount or 0
-            await db.commit()
-        return deleted
+        async def _txn() -> dict[str, int]:
+            deleted: dict[str, int] = {}
+            async with self._pool.write() as db:
+                cur = await db.execute(
+                    "DELETE FROM detection_event_chunks WHERE event_id IN "
+                    "(SELECT event_id FROM detection_events WHERE agent_id=?)",
+                    (agent_id,),
+                )
+                deleted["detection_event_chunks"] = cur.rowcount or 0
+                for table in AGENT_SCOPED_TABLES:
+                    # table is a trusted module constant, never user input.
+                    cur = await db.execute(f"DELETE FROM {table} WHERE agent_id=?", (agent_id,))  # noqa: S608
+                    deleted[table] = cur.rowcount or 0
+                await db.commit()
+            return deleted
+
+        # A concurrent ingest for the same agent can deadlock this multi-table
+        # delete. The pool already rolled the aborted transaction back on error,
+        # so re-running the whole thing on a fresh transaction clears it.
+        return await run_with_deadlock_retry(_txn)
 
     async def list_agents(self) -> list[dict]:
         """All agents with basic identity, newest-seen first (delete-agents --list)."""

@@ -33,6 +33,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from . import finding_lifecycle as _lc
 from .pg_pool import PgConnection, PgPool
+from .db_retry import run_with_deadlock_retry
 
 log = logging.getLogger("manager.indexer")
 
@@ -2349,16 +2350,29 @@ class IntelDB:
         activity, assets and signals, i.e. everything the dashboard renders for
         the agent. Ordered children-before-parents (see INTEL_AGENT_SCOPED_TABLES).
         """
-        deleted: dict[str, int] = {}
-        async with self._lock:
-            for table in INTEL_AGENT_SCOPED_TABLES:
-                # table is a trusted module constant, never user input.
-                cur = await self._conn.execute(
-                    f"DELETE FROM {table} WHERE agent_id=?", (agent_id,)  # noqa: S608
-                )
-                deleted[table] = cur.rowcount or 0
-            await self._conn.commit()
-        return deleted
+        async def _txn() -> dict[str, int]:
+            deleted: dict[str, int] = {}
+            async with self._lock:
+                try:
+                    for table in INTEL_AGENT_SCOPED_TABLES:
+                        # table is a trusted module constant, never user input.
+                        cur = await self._conn.execute(
+                            f"DELETE FROM {table} WHERE agent_id=?", (agent_id,)  # noqa: S608
+                        )
+                        deleted[table] = cur.rowcount or 0
+                    await self._conn.commit()
+                except Exception:
+                    # Reset the poisoned transaction so a retry starts clean.
+                    try:
+                        await self._conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            return deleted
+
+        # A concurrent ingest for the same agent can deadlock this multi-table
+        # delete; re-running the whole transaction after rollback clears it.
+        return await run_with_deadlock_retry(_txn)
 
     async def count_agent_rows(self, agent_id: str) -> dict[str, int]:
         """Rows this agent owns per table — the read-only mirror of delete_agent,
